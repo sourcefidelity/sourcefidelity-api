@@ -235,3 +235,10 @@ COSTS.md
 SYSTEM_PROMPT.md
 STATE.md
 PLAN.md
+
+# Test scripts — operational scaffolding, not for publication.
+# Kept locally for development use; a clean tests/ directory with pytest
+# will be published as part of Phase 8. The loose scripts expose API patterns,
+# rate-limit strategies, and politically-sensitive domain lists that don't
+# belong in a public repo.
+test_*.py

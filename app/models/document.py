@@ -24,7 +24,10 @@ class StoredDocument(Base):
     # "journal_article" | "book" | "book_chapter"
 
     license_class: Mapped[str] = mapped_column(String(50))
-    # "open_access" | "campus_access" | "instructor_upload"
+    # "open_access" | "paywalled_db_retrieved" | "instructor_upload"
+    # (Renamed from "campus_access" → "paywalled_db_retrieved" 2026-07-25 for
+    # unambiguous TDM-risk categorization. See PLAN.md "Provenance categorization
+    # for compliance operations".)
 
     # ── Bibliographic metadata ──────────────────────────
     title: Mapped[str] = mapped_column(Text)
@@ -51,6 +54,10 @@ class StoredDocument(Base):
     # ── Provenance ──────────────────────────────────────
     provenance: Mapped[str] = mapped_column(String(50))
     # "instructor_upload" | "student_link" | "openalex" | "core" | "semantic_scholar"
+    # | "elsevier" | "crossref" | "gutenberg" | "wikisource" | "publisher_pdf"
+    # | "direct_pdf_link" | "html_fetch" | "web_search"
+    # (Extended 2026-07-25 to cover all retrieval paths in the resolution chain.
+    # See PLAN.md "Provenance categorization for compliance operations".)
 
     uploaded_by: Mapped[str | None] = mapped_column(Text, nullable=True)
 
