@@ -26,6 +26,8 @@ from dataclasses import dataclass
 import httpx
 import trafilatura
 
+from app.services.safe_fetch import safe_request
+
 from app.services.abstract_verifier import (
     verify_claim_against_abstract,
     AbstractVerificationResult,
@@ -84,17 +86,18 @@ def verify_citation_against_webpage(
         WebVerificationResult with the verification verdict.
     """
     # Step 1: Fetch the HTML
+    # Use a realistic browser user-agent — many sites (Britannica, news sites)
+    # return 403 to bot user-agents. This is for fetching content the student
+    # already cited (the URL is in their reference list), not for crawling.
     try:
-        resp = httpx.get(
+        resp = safe_request(
             url,
             headers={
-                "User-Agent": "SourceFidelity/0.1.0 (source-verification-bot; +https://github.com/sourcefidelity/sourcefidelity-api)",
-                "Accept": "text/html,application/xhtml+xml,*/*",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
             },
             timeout=timeout,
-            follow_redirects=True,
         )
-        resp.raise_for_status()
     except Exception as e:
         logger.warning("Web fetch failed for %s: %s", url, e)
         return WebVerificationResult(

@@ -12,6 +12,7 @@ from app.services.retrieval.crossref import CrossrefRetriever
 from app.services.retrieval.gutenberg import GutenbergRetriever
 from app.services.retrieval.wikisource import WikisourceRetriever
 from app.services.retrieval.elsevier import ElsevierRetriever
+from app.services.retrieval.web_search import WebSearchRetriever
 
 from app.config import settings
 
@@ -33,6 +34,10 @@ _RETRIEVER_CLASSES: dict[str, type[RetrievalSource]] = {
     "gutenberg": GutenbergRetriever,
     "wikisource": WikisourceRetriever,
     "elsevier": ElsevierRetriever,
+    # Web-search fallback: searches Google/Bing for source PDFs after the
+    # academic-DB chain fails. Only active when SEARCH_PROVIDER is configured.
+    # Add "web_search" to RETRIEVAL_SOURCES in .env to enable.
+    "web_search": WebSearchRetriever,
 }
 
 

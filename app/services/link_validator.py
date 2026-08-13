@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.services.safe_fetch import UnsafeUrlError, safe_request
+
 logger = logging.getLogger(__name__)
 
 # Categories
@@ -122,11 +124,11 @@ def check_link(
     }
 
     try:
-        resp = httpx.get(
+        resp = safe_request(
             url,
             headers=headers,
             timeout=timeout,
-            follow_redirects=True,
+            raise_on_status=False,  # we categorize status codes ourselves
         )
         status = resp.status_code
         category = _STATUS_CATEGORIES.get(status, OK if 200 <= status < 300 else SERVER_ERROR)
@@ -156,7 +158,7 @@ def check_link(
                     category=category,
                     status_code=status,
                     page_title=page_title,
-                    redirect_url=redirect_url if 'redirect_url' in dir() else None,
+                    redirect_url=redirect_url,
                     cited_title=cited_title,
                     title_match=title_match,
                     detail=_detail_for(category, page_title, cited_title),
@@ -178,6 +180,15 @@ def check_link(
             detail=_detail_for(category),
         )
 
+    except UnsafeUrlError as e:
+        # SSRF guard blocked a non-public target (localhost, private IP,
+        # cloud-metadata endpoint, or a redirect to one). Report it as DEAD
+        # so the instructor sees the link is unusable, with the reason.
+        return LinkCheckResult(
+            url=url,
+            category=DEAD,
+            detail=f"Blocked non-public target: {str(e)[:80]}",
+        )
     except httpx.TimeoutException:
         return LinkCheckResult(
             url=url,

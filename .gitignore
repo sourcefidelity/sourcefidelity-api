@@ -218,6 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 tmp/
 HiAgent YAML/
+
+# Private project reviews and planning artifacts
+Review 2.md
 .DS_Store
 
 # SourceFidelity project-specific
@@ -233,8 +236,10 @@ PHASE_3_5_IMPLEMENTATION.md
 RESEARCH.md
 COSTS.md
 SYSTEM_PROMPT.md
+AGENTS.md
 STATE.md
 PLAN.md
+REVIEW.md
 
 # Test scripts — operational scaffolding, not for publication.
 # Kept locally for development use; a clean tests/ directory with pytest
@@ -242,3 +247,20 @@ PLAN.md
 # rate-limit strategies, and politically-sensitive domain lists that don't
 # belong in a public repo.
 test_*.py
+
+# Maintained product regression tests are tracked. The ignore rule above only
+# applies to the loose, local research/operational scripts at repository root.
+!tests/
+!tests/**
+tests/**/__pycache__/
+tests/**/*.py[codz]
+
+# Local reference / planning documents — not for publication.
+HPC_SURVEY_ANSWERS.md
+ARCHITECTURE.md
+ROADMAP.md
+campus_test.py
+CAMPUS_TEST_INSTRUCTIONS.md
+campus_test_home.log
+test_data/campus_dois.json
+test_data/campus_test_results.json

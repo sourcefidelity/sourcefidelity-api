@@ -1,10 +1,10 @@
 # SourceFidelity API – Docker Compose
-version: "3.8"
 
 services:
   api:
     build: .
     container_name: sourcefidelity-api
+    restart: unless-stopped
     ports:
       - "8000:8000"
     env_file: .env
@@ -22,6 +22,7 @@ services:
   worker:
     build: .
     container_name: sourcefidelity-worker
+    restart: unless-stopped
     env_file: .env
     depends_on:
       redis:
@@ -35,24 +36,29 @@ services:
   redis:
     image: redis:7-alpine
     container_name: sourcefidelity-redis
+    restart: unless-stopped
+    # Loopback-only: Redis has no auth configured, so never expose it off-host.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
 
   postgres:
     image: postgres:16-alpine
     container_name: sourcefidelity-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: sourcefidelity
-      POSTGRES_PASSWORD: sourcefidelity
-      POSTGRES_DB: sourcefidelity
+      # Credentials come from .env (dev defaults preserved if unset). Never
+      # hardcode real DB credentials in the compose file (REVIEW §2.6).
+      POSTGRES_USER: ${POSTGRES_USER:-sourcefidelity}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sourcefidelity}
+      POSTGRES_DB: ${POSTGRES_DB:-sourcefidelity}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sourcefidelity"]
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\""]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -60,12 +66,18 @@ services:
   minio:
     image: minio/minio:latest
     container_name: sourcefidelity-minio
+    restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: sourcefidelity
-      MINIO_ROOT_PASSWORD: sourcefidelity123
+      # Same as the app's S3_ACCESS_KEY / S3_SECRET_KEY (see config.py). Override
+      # in .env for any non-dev deployment (REVIEW §2.6).
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-sourcefidelity}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-sourcefidelity123}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      # S3 API (9000) is needed by the host-side dev app; console (9001) is
+      # admin-only. Bind both to loopback so the object store / admin console
+      # are not reachable from the network (REVIEW §2.6).
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"

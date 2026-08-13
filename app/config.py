@@ -66,15 +66,26 @@ class Settings(BaseSettings):
     # that returns full text (or abstract if no PDF found). Reorder based on
     # your institution's access and the empirical hit-rate data from test runs.
     #
-    # Current rationale:
-    #   1. Elsevier — largest publisher; only source for Elsevier full text (PII issue)
-    #   2. OpenAlex — fast, broad coverage, provides OA flag + abstract; resolves ~60% of articles
-    #   3. CORE — unique OA PDFs from 10K+ repositories not in OpenAlex
-    #   4. Semantic Scholar — good OA coverage but throttled at 1 req/sec
-    #   5. Crossref — metadata + abstract only (no full text); reliable DOI resolution
-    #   6. Gutenberg — public-domain Western classics (~70K works)
-    #   7. Wikisource — multilingual public-domain texts (83 languages)
-    RETRIEVAL_SOURCES: str = "elsevier,openalex,core,semantic_scholar,crossref,gutenberg,wikisource"
+    # Current rationale (revised Aug 12 after the baseline run):
+    #   1. OpenAlex — does the bulk of the work (87 of 121 hits in the baseline).
+    #      Fast, broad, now codebase-unified with Unpaywall (so it also covers OA
+    #      full text that a separate Unpaywall adapter would have found).
+    #   2. Crossref — reliable DOI resolution, metadata + abstract only.
+    #   3. CORE — unique OA PDFs from 10K+ repositories. Now fully serialized
+    #      (per-key concurrency limit stalls parallel requests) so it's slower
+    #      per call; placed after the fast metadata sources. v3 `q=doi:` /
+    #      default-field title query (Aug 12 fix).
+    #   4. Elsevier — only source for Elsevier full text (PII-based URL).
+    #   5. Semantic Scholar — re-added (DOI-only OA): openAccessPdf sometimes
+    #      has PDFs OpenAlex's best_oa_location misses. Throttled ~1 req/s.
+    #   6. Wikisource — multilingual public-domain texts; only tried for refs
+    #      whose year is old enough to be public domain (see source code).
+    #   7. Gutenberg — public-domain Western classics; same PD year gate.
+    #      Volunteer-run and slow (timeout 45s); last resort for old works.
+    #   8. web_search (optional, last) — searches Google/Bing for PDFs of sources
+    #      the academic-DB chain couldn't find. Only active when SEARCH_PROVIDER
+    #      is configured. Add to the list to enable: "...,gutenberg,web_search"
+    RETRIEVAL_SOURCES: str = "openalex,crossref,core,elsevier,semantic_scholar,wikisource,gutenberg"
 
     # CORE API
     CORE_API_KEY: str | None = None
@@ -91,6 +102,37 @@ class Settings(BaseSettings):
 
     # Crossref polite email (uses OPENALEX_EMAIL as fallback)
     CROSSREF_EMAIL: str | None = None
+
+    # Web search provider for PDF fallback retrieval (after academic-DB chain fails).
+    # Pluggable: "google" (Custom Search), "bing" (Web Search), or None (disabled).
+    # When set, the retrieval chain searches the web for source titles + "filetype:pdf"
+    # and downloads/validates any PDFs found (author homepages, repositories, OA copies).
+    # Source-access neutrality applies (§3.5): the app verifies against whatever it finds,
+    # does NOT access Sci-Hub or pirated copies. Legitimate OA / author-homepage / institutional-repository PDFs only.
+    SEARCH_PROVIDER: str | None = None  # "google"|"bing"|"searxng"|"brave"|"duckduckgo"|"tavily"|"exa"|None
+    GOOGLE_SEARCH_API_KEY: str | None = None
+    GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
+    BING_SEARCH_API_KEY: str | None = None
+    # SearXNG (self-hosted meta-search — recommended for institutions)
+    SEARXNG_URL: str | None = None  # e.g., "http://localhost:8080"
+    # Brave Search (commercial API, free tier 2000/month)
+    BRAVE_SEARCH_API_KEY: str | None = None
+    # Tavily (AI-focused search, free tier 1000/month)
+    TAVILY_API_KEY: str | None = None
+    # Exa (neural/semantic search, free tier — good for academic content)
+    EXA_API_KEY: str | None = None
+
+    # DOI Resolver / Campus Proxy (institutional deployment).
+    # When set, the app constructs {DOI_RESOLVER_URL}{doi} to access papers
+    # through the institution's library proxy/subscription. This dramatically
+    # improves full-text retrieval for paywalled content — the proxy handles
+    # authentication, the app gets the PDF.
+    # Examples:
+    #   EZproxy:   "https://proxy.university.edu:2048/login?url=https://doi.org/"
+    #   OpenURL:   "https://resolver.university.edu/sfx?rft_id=info:doi/"
+    #   Custom:    "https://library.university.edu/fulltext/"
+    # The DOI is appended directly: {DOI_RESOLVER_URL}10.1234/foo
+    DOI_RESOLVER_URL: str | None = None
 
     # Student URL download limits (R9)
     STUDENT_URL_MAX_SIZE_MB: int = 50
