@@ -29,7 +29,18 @@ def _clean_text(text: str) -> str:
     citation regex, and LLM text comprehension.
 
     Also collapses excessive whitespace from the removal.
+
+    PDF line-wrap reconstruction: PDF text extraction emits a newline at every
+    visual line wrap, so a single paragraph becomes many "paragraphs". Real
+    paragraph breaks are the double-newlines the extractors already emit (and
+    that DOCX extraction produces natively). We join single newlines into
+    spaces while preserving ``\\n\\n`` paragraph boundaries, so downstream
+    paragraph splitters see real paragraphs. This is a no-op for DOCX (which
+    has no single-newline line-wraps). Hyphenated line-breaks ("represen-\\n
+    tation") are de-hyphenated; other single-newlines become a single space.
     """
+    import re
+
     # Remove zero-width characters
     text = text.replace("\u200b", "")  # zero-width space
     text = text.replace("\u200c", "")  # zero-width non-joiner
@@ -38,11 +49,26 @@ def _clean_text(text: str) -> str:
     text = text.replace("\u2060", "")  # word joiner
     text = text.replace("\u00ad", "")  # soft hyphen
 
-    # Collapse whitespace left behind by removals
-    # (multiple spaces → single, but preserve paragraph breaks \n\n)
-    import re
+    # Collapse whitespace left behind by zero-width removals
     text = re.sub(r"[ \t]{2,}", " ", text)  # collapse multiple spaces/tabs
     text = re.sub(r"\n{3,}", "\n\n", text)  # collapse 3+ newlines to 2
+
+    # PDF line-wrap reconstruction (see docstring). We join ONLY mid-sentence
+    # line-wraps, not reference-section line breaks. A newline is treated as a
+    # line-wrap (joined into a space) only when a lowercase letter precedes it
+    # and a lowercase letter follows (allowing optional whitespace on either
+    # side — pdfplumber sometimes inserts a leading space or residual zero-width
+    # chars at the start of the wrapped line). This preserves:
+    #   - Reference-list line breaks (each ref on its own line, typically starts
+    #     with an uppercase author name or [n] marker — not "lowercase\nlowercase")
+    #   - Heading lines ("References", "Works Cited") that stand alone on a line
+    #   - Paragraph breaks (\n\n, untouched)
+    # The de-hyphenation step runs first because "represen-\ntation" ends with a
+    # lowercase letter before \n and the join would merge it wrongly otherwise.
+    text = re.sub(r"-\n(?=\s*[a-z])", "", text)                    # join hyphenated line-breaks
+    text = re.sub(r"(?<=[a-z])\s*\n\s*(?=[a-z])", " ", text)        # join mid-sentence wraps only
+    # Tidy any double spaces introduced by the join
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
 

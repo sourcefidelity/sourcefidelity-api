@@ -53,7 +53,7 @@ class GutenbergRetriever(RetrievalSource):
             resp = httpx.get(
                 GUTENDEX_BASE,
                 params={"search": search_q},
-                timeout=20,
+                timeout=45,  # Gutenberg's Gutendex is volunteer-run and often slow
             )
             resp.raise_for_status()
             data = resp.json()

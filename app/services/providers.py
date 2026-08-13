@@ -14,6 +14,16 @@ Each provider defines:
     (DeepSeek: ~1500; GPT-4: ~100000; Claude: ~200000)
   - max_output_tokens: max output tokens the model can produce
   - short_json_keys: whether to use abbreviated JSON keys to save output space
+  - reasoning_disable_body: the extra_body payload to DISABLE the model's
+    thinking/reasoning mode for low-stakes structured-output calls, or None
+    when the provider does not expose reasoning control. Reasoning models
+    (DeepSeek V4 Flash/Pro, OpenAI o-series) emit hidden "thinking" tokens
+    before the answer; on large inputs the thinking phase can consume the
+    entire max_tokens budget and produce an EMPTY response. Disabling
+    thinking for low-stakes, structured passes (subject identification,
+    reference parsing) trades some reasoning quality for reliability and
+    speed. The verification judge (Phase 3.8 Stage 5) keeps thinking ON —
+    high-stakes, low-volume. Per-call via chat_completion(disable_thinking=True).
 
 Usage:
     from app.services.providers import get_provider_config
@@ -24,7 +34,7 @@ Usage:
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from app.config import settings
 
@@ -42,6 +52,18 @@ class ProviderConfig:
     input_batch_tokens: int = 100000
     max_output_tokens: int = 8192
     short_json_keys: bool = False
+    reasoning_disable_body: Optional[Dict[str, dict]] = None
+    # Whether the provider accepts reasoning_effort ("low"/"high"/"max") via
+    # extra_body. Guards the reasoning_effort param in chat_completion so that
+    # swapping cloud models does NOT silently degrade — if False, the effort
+    # string is dropped (with a log line) rather than sent to a provider that
+    # may reject it or no-op it. Only the SUPPORT flag lives here; the effort
+    # STRING is task-specific (MLA cleanup wants "low", the judge will want
+    # thinking ON) and stays in the application caller. Note the effort string
+    # maps per-model on the provider side (e.g. "low" on deepseek-v4-flash =
+    # low effort, but "low" on deepseek-v4-pro maps to "high") — documented
+    # per-call; re-validate if switching models within a provider.
+    reasoning_effort_supported: bool = False
 
 
 # Registry of known provider configurations.
@@ -55,6 +77,14 @@ _PROVIDERS: dict[str, ProviderConfig] = {
         input_batch_tokens=1500,  # stops returning output above ~2000 tokens
         max_output_tokens=8192,
         short_json_keys=True,  # keep output small
+        # V4 Flash/Pro are reasoning models — thinking tokens can exhaust the
+        # max_tokens budget on large inputs and return empty. Disabling via
+        # the OpenAI-compatible extra_body (DeepSeek thinking_mode docs).
+        reasoning_disable_body={"thinking": {"type": "disabled"}},
+        # V4 also supports reasoning_effort levels (low/high/max) via extra_body,
+        # validated Aug 9: MLA cleanup with "low" fixes the reasoning-budget
+        # empty-response problem (3/3 correct vs 0/3 empty on default).
+        reasoning_effort_supported=True,
     ),
     "gpt": ProviderConfig(
         name="OpenAI GPT",
@@ -93,13 +123,13 @@ _PROVIDERS: dict[str, ProviderConfig] = {
         short_json_keys=True,  # smaller models benefit from compact output
     ),
     "qwen": ProviderConfig(
-        name="Ollama Qwen (local)",
-        json_mode=True,
+        name="Qwen (local)",
+        json_mode=False,  # oMLX/Ollama response_format breaks Qwen JSON output; prompt alone works
         json_object_required=False,
         json_mode_required_for_json=False,
         input_batch_tokens=4000,
-        max_output_tokens=4096,
-        short_json_keys=True,
+        max_output_tokens=8192,
+        short_json_keys=False,
     ),
     "mistral": ProviderConfig(
         name="Ollama Mistral (local)",

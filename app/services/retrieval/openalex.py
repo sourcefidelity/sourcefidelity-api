@@ -106,9 +106,21 @@ class OpenAlexRetriever(RetrievalSource):
 
         title = data.get("title") or data.get("display_name", "")
 
-        # Check for OA PDF
+        # OpenAlex is now codebase-unified with Unpaywall (same org, OurResearch)
+        # and its snapshot contains all Unpaywall data, so best_oa_location is the
+        # authoritative OA pointer — no separate Unpaywall/arXiv adapter needed.
         best_oa = data.get("best_oa_location") or {}
         pdf_url = best_oa.get("pdf_url")
+
+        # best_oa_location can lack a direct pdf_url even when an OA copy exists
+        # elsewhere (Bronze OA, or a repository copy OpenAlex didn't rank first).
+        # Fall back to primary_location, then every location, for a direct PDF.
+        if not pdf_url:
+            for loc in [data.get("primary_location")] + (data.get("locations") or []):
+                u = (loc or {}).get("pdf_url")
+                if u:
+                    pdf_url = u
+                    break
 
         # Extract abstract from OpenAlex's inverted-index format
         abstract = _reconstruct_abstract(data.get("abstract_inverted_index"))

@@ -18,6 +18,8 @@ import logging
 
 import httpx
 
+from app.services.safe_fetch import safe_fetch_bytes
+
 logger = logging.getLogger(__name__)
 
 # Magic bytes for PDF
@@ -122,15 +124,15 @@ def try_download_publisher_pdf(
 
     for url in urls_to_try:
         try:
-            resp = httpx.get(url, headers=_BROWSER_HEADERS, timeout=_PDF_TIMEOUT, follow_redirects=True)
-            if resp.status_code == 200 and resp.content.startswith(PDF_MAGIC):
-                logger.info("Downloaded publisher PDF from %s (%d bytes)", url[:60], len(resp.content))
-                return resp.content
-            else:
-                logger.debug(
-                    "Publisher PDF URL %s returned status=%d, content-type=%s (not a PDF)",
-                    url[:60], resp.status_code, resp.headers.get("content-type", "?"),
-                )
+            data = safe_fetch_bytes(
+                url,
+                accept_content_types=("application/pdf",),
+                timeout=_PDF_TIMEOUT,
+                headers=_BROWSER_HEADERS,
+            )
+            if data.startswith(PDF_MAGIC):
+                logger.info("Downloaded publisher PDF from %s (%d bytes)", url[:60], len(data))
+                return data
         except Exception as e:
             logger.debug("Publisher PDF download failed for %s: %s", url[:60], e)
 
