@@ -10,7 +10,13 @@ import logging
 import httpx
 
 from app.config import settings
-from app.services.retrieval.base import RetrievalSource, RetrievalResult
+from app.services.retrieval.base import (
+    AcquisitionLocation,
+    RepresentationKind,
+    RetrievalResult,
+    RetrievalSource,
+)
+from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +25,42 @@ CROSSREF_BASE = "https://api.crossref.org"
 
 class CrossrefRetriever(RetrievalSource):
     name = "crossref"
+    capabilities = frozenset({"doi", "title_author", "isbn", "metadata", "abstract", "locations"})
+    documentation_url = "https://api.crossref.org/swagger-ui/index.html"
+    default_policy = ProviderPolicy(timeout_seconds=15.0)
+
+    def __init__(self) -> None:
+        self.policy = provider_policy(self.name, self.default_policy)
+        self.provider_metrics = {
+            "calls": 0,
+            "successes": 0,
+            "not_found": 0,
+            "client_errors": 0,
+            "server_errors": 0,
+            "network_errors": 0,
+        }
+
+    def _get(self, url: str, params: dict | None = None) -> httpx.Response:
+        self.provider_metrics["calls"] += 1
+        try:
+            resp = httpx.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=self.policy.timeout_seconds,
+            )
+        except httpx.HTTPError:
+            self.provider_metrics["network_errors"] += 1
+            raise
+        if resp.status_code == 404:
+            self.provider_metrics["not_found"] += 1
+        elif 400 <= resp.status_code < 500:
+            self.provider_metrics["client_errors"] += 1
+        elif resp.status_code >= 500:
+            self.provider_metrics["server_errors"] += 1
+        else:
+            self.provider_metrics["successes"] += 1
+        return resp
 
     def _headers(self) -> dict:
         email = settings.CROSSREF_EMAIL or settings.OPENALEX_EMAIL or "support@sourcefidelity.org"
@@ -27,7 +69,7 @@ class CrossrefRetriever(RetrievalSource):
     def search_by_doi(self, doi: str) -> RetrievalResult:
         url = f"{CROSSREF_BASE}/works/{doi}"
         try:
-            resp = httpx.get(url, headers=self._headers(), timeout=15)
+            resp = self._get(url)
             if resp.status_code == 404:
                 return RetrievalResult(source_name=self.name, success=False, error="Not found")
             resp.raise_for_status()
@@ -43,7 +85,7 @@ class CrossrefRetriever(RetrievalSource):
             if author:
                 params["query.author"] = author
             url = f"{CROSSREF_BASE}/works"
-            resp = httpx.get(url, headers=self._headers(), params=params, timeout=15)
+            resp = self._get(url, params)
             resp.raise_for_status()
             data = resp.json()
             items = data.get("message", {}).get("items", [])
@@ -63,7 +105,7 @@ class CrossrefRetriever(RetrievalSource):
         url = f"{CROSSREF_BASE}/works"
         params = {"filter": f"isbn:{isbn}", "rows": 1}
         try:
-            resp = httpx.get(url, headers=self._headers(), params=params, timeout=15)
+            resp = self._get(url, params)
             resp.raise_for_status()
             data = resp.json()
             items = data.get("message", {}).get("items", [])
@@ -108,6 +150,7 @@ class CrossrefRetriever(RetrievalSource):
 
         # Extract abstract — Crossref stores it as JATS XML, strip the tags.
         abstract = _strip_jats_xml(msg.get("abstract"))
+        locations = _parse_full_text_links(msg)
 
         return RetrievalResult(
             source_name=self.name,
@@ -116,14 +159,57 @@ class CrossrefRetriever(RetrievalSource):
             title=title,
             year=year,
             authors=authors,
-            full_text_url=None,  # Crossref is metadata-only
+            full_text_url=locations[0].url if locations else None,
+            locations=locations,
             abstract=abstract,
             metadata={
                 "message": msg,
                 "editors": editors,
                 "publisher": publisher,
+                "work_type": msg.get("type"),
+                "page": msg.get("page"),
             },
         )
+
+
+def _parse_full_text_links(msg: dict) -> list[AcquisitionLocation]:
+    """Preserve Crossref-deposited full-text/TDM URLs and their use metadata."""
+    locations: list[AcquisitionLocation] = []
+    seen: set[str] = set()
+    licenses = [
+        item.get("URL") for item in (msg.get("license") or [])
+        if isinstance(item, dict) and item.get("URL")
+    ]
+    for link in msg.get("link") or []:
+        url = link.get("URL") if isinstance(link, dict) else None
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        media_type = (link.get("content-type") or "").lower() or None
+        if media_type and "pdf" in media_type:
+            kind = RepresentationKind.PDF
+        elif media_type and "xml" in media_type:
+            kind = RepresentationKind.XML
+        elif media_type and ("html" in media_type or "xhtml" in media_type):
+            kind = RepresentationKind.HTML
+        elif media_type and "text/plain" in media_type:
+            kind = RepresentationKind.PLAIN_TEXT
+        else:
+            kind = None
+        locations.append(
+            AcquisitionLocation(
+                url=url,
+                provider="crossref",
+                media_type=media_type,
+                representation_kind=kind,
+                version=link.get("content-version"),
+                license=licenses[0] if licenses else None,
+                intended_application=link.get("intended-application"),
+                access_type="tdm" if link.get("intended-application") == "text-mining" else None,
+                metadata={"licenses": licenses},
+            )
+        )
+    return locations
 
 
 def _strip_jats_xml(raw: str | None) -> str | None:

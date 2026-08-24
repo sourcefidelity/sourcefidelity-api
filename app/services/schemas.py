@@ -5,8 +5,9 @@ ensuring type safety and catching malformed output.
 """
 
 from enum import Enum
+import re
 from typing import List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ParsedReference(BaseModel):
@@ -14,6 +15,14 @@ class ParsedReference(BaseModel):
 
     This is the canonical parsed reference format used across the system.
     """
+
+    reference_id: str = Field(
+        default="",
+        description=(
+            "Stable paper-local application identity. Unlike citation_key, this "
+            "is unique within a paper and is used for joins."
+        ),
+    )
 
     author: str = Field(
         default="",
@@ -47,6 +56,21 @@ class ParsedReference(BaseModel):
         default=False,
         description="True for film, TV, podcast, song, video, game, or similar media",
     )
+    source_kind: str = Field(
+        default="unknown",
+        description=(
+            "Bibliographic work type expected from the reference, independent "
+            "of representation format"
+        ),
+    )
+    source_kind_confidence: str = Field(
+        default="unknown",
+        description="Confidence in source_kind: high, medium, low, or unknown",
+    )
+    source_kind_evidence: List[str] = Field(
+        default_factory=list,
+        description="Bounded inspectable signals supporting source_kind",
+    )
     needs_review: bool = Field(
         default=False,
         description=(
@@ -66,6 +90,34 @@ class ParsedReference(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def classify_source_kind(self):
+        """Derive a conservative expected work type from the raw reference."""
+        from app.services.source_type import (
+            classify_reference_source_kind,
+            normalize_source_kind,
+        )
+
+        normalized = normalize_source_kind(self.source_kind)
+        if normalized != "unknown":
+            self.source_kind = normalized
+            if self.source_kind_confidence not in {"high", "medium", "low"}:
+                self.source_kind_confidence = "medium"
+            self.source_kind_evidence = self.source_kind_evidence[:4]
+            return self
+
+        assessment = classify_reference_source_kind(
+            self.raw_ref,
+            title=self.title,
+            url=self.url,
+        )
+        self.source_kind = assessment.kind
+        self.source_kind_confidence = assessment.confidence
+        self.source_kind_evidence = list(assessment.evidence[:4])
+        if assessment.kind in {"video", "podcast_episode", "traditional_media"}:
+            self.is_media_source = True
+        return self
+
     @field_validator("doi", mode="before")
     @classmethod
     def clean_doi(cls, v: str) -> str:
@@ -77,18 +129,35 @@ class ParsedReference(BaseModel):
     @field_validator("year", mode="before")
     @classmethod
     def clean_year(cls, v: str) -> str:
-        """Ensure year is 4 digits or 'n.d.'."""
+        """Ensure year is four digits plus an optional citation suffix."""
         if not v:
             return "n.d."
         v = str(v).strip()
-        if v.isdigit() and len(v) == 4:
-            return v
-        # Try to extract 4-digit year
-        import re
-        match = re.search(r"\b(19|20)\d{2}\b", v)
+        if re.fullmatch(r"(?:19|20)\d{2}[a-z]?", v, re.IGNORECASE):
+            return v.lower()
+        # Preserve APA/Harvard disambiguation suffixes such as 2020a.
+        match = re.search(r"\b(?:19|20)\d{2}[a-z]?\b", v, re.IGNORECASE)
         if match:
-            return match.group(0)
+            return match.group(0).lower()
         return "n.d."
+
+
+class CitationMarkerMember(BaseModel):
+    """One exact source marker inside a possibly grouped citation unit."""
+
+    text: str = Field(min_length=1, max_length=2_000)
+    local_start: int = Field(ge=0)
+    local_end: int = Field(gt=0)
+    reference_ids: List[str] = Field(default_factory=list)
+    marker_type: str = Field(default="unknown")
+
+    @model_validator(mode="after")
+    def validate_local_span(self):
+        if self.local_end <= self.local_start:
+            raise ValueError("Citation marker member span is empty")
+        if self.local_end - self.local_start != len(self.text):
+            raise ValueError("Citation marker member span does not match its text")
+        return self
 
 
 class InTextCitation(BaseModel):
@@ -97,6 +166,19 @@ class InTextCitation(BaseModel):
     Represents a passage (quotation or paraphrase) attributed to a cited source.
     Links to ParsedReference via citation_key.
     """
+
+    reference_ids: List[str] = Field(
+        default_factory=list,
+        description="Application-owned reference IDs linked to this marker member",
+    )
+    candidate_reference_ids: List[str] = Field(
+        default_factory=list,
+        description="Candidate IDs retained when deterministic linking is ambiguous",
+    )
+    link_status: str = Field(
+        default="linked",
+        description='"linked", "ambiguous", or "missing_reference"',
+    )
 
     text: str = Field(default="", description="The extracted passage (quotation or paraphrase)")
     claim_type: str = Field(
@@ -111,12 +193,28 @@ class InTextCitation(BaseModel):
         default="",
         description='The raw marker, e.g. "(Smith, 2020)" or "Elsaesser (1998) argues"',
     )
+    citation_markers: List[CitationMarkerMember] = Field(
+        default_factory=list,
+        description=(
+            "Exact marker spans and source membership for grouped citation units; "
+            "empty for legacy single-marker extractions"
+        ),
+    )
+    marker_member: str = Field(
+        default="",
+        description="The individual member parsed from a compound citation marker",
+    )
     marker_type: str = Field(
         default="parenthetical",
         description='"parenthetical" or "narrative"',
     )
     page_number: str = Field(default="", description="Page number if specified (MLA / APA page-specific)")
     paragraph_index: int = Field(default=0, description="Paragraph position in the paper (for reporting)")
+    sentence_index: int = Field(default=0, description="Sentence position within the paragraph")
+    marker_start: int = Field(default=-1, description="Marker start offset within the paragraph")
+    marker_end: int = Field(default=-1, description="Marker end offset within the paragraph")
+    passage_start: int = Field(default=-1, description="Passage start offset in normalized paper body")
+    passage_end: int = Field(default=-1, description="Passage end offset in normalized paper body")
     is_secondary: bool = Field(
         default=False,
         description='True for "as cited in" secondary citations',
@@ -136,7 +234,8 @@ class InTextCitation(BaseModel):
             "dropped (not a real citation). Values: 'hallucinated_key' (key not "
             "in reference list and re-attribution failed), 'text_not_in_original' "
             "(cited text not findable in the original body — likely fabricated/"
-            "altered, the R27 prompt-injection defense). Callers should filter "
+            "altered), or 'ambiguous_text_location' (more than one acceptable "
+            "body span). Callers should filter "
             "out drop_reason != None. Kept in the list for audit/reporting."
         ),
     )

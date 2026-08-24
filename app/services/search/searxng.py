@@ -1,15 +1,16 @@
 """SearXNG search provider — self-hosted meta-search engine.
 
-SearXNG is a free, open-source meta-search engine that aggregates results from
-multiple search engines (Google, Bing, DuckDuckGo, etc.) without tracking.
+SearXNG is a free, open-source metasearch application. Its upstream engines
+are not unlimited: they may impose CAPTCHAs, rate limits, access blocks and
+terms even when the SearXNG instance itself is healthy.
 It can be self-hosted (one Docker container) or accessed via public instances.
 
 This is the recommended search provider for:
   - Institutions (Path B): self-host a SearXNG instance on the university server.
-    Free, unlimited queries, private (queries don't go to a commercial API),
-    and configurable to search specific academic engines (Google Scholar, etc.).
+    Self-hosted and private at the aggregation layer, with configurable native
+    academic engines. Upstream availability must be measured and disclosed.
   - Restricted networks: configure SearXNG with accessible engines
-    reachable from the deployment.
+    (for example Crossref, CORE and arXiv) reachable from the deployment.
   - Path C (rented GPU): run SearXNG alongside the app on the rented server.
 
 Setup (self-hosted):
@@ -35,13 +36,13 @@ class SearXNGSearch(SearchProvider):
     """SearXNG meta-search provider.
 
     Queries a SearXNG instance (self-hosted or public) for web results.
-    The instance aggregates from multiple search engines — more comprehensive
-    than any single API, and free/unlimited when self-hosted.
+    The instance aggregates multiple engines, but does not remove their limits.
     """
 
     def __init__(self, instance_url: str):
         # Normalize URL (remove trailing slash)
         self._url = instance_url.rstrip("/")
+        self.last_unresponsive_engines: list[tuple[str, str]] = []
 
     @property
     def name(self) -> str:
@@ -54,10 +55,8 @@ class SearXNGSearch(SearchProvider):
         Args:
             query: The search query string.
             num_results: Max results to return.
-            engines: Optional comma-separated engine names to query (e.g.,
-                "google scholar" or "google"). If None, uses all configured
-                engines. Use this for cascading: try "google scholar" first,
-                then "google" as fallback.
+            engines: Optional comma-separated engine names to query. If None,
+                uses the instance defaults.
         """
         params = {
             "q": query,
@@ -76,7 +75,12 @@ class SearXNGSearch(SearchProvider):
             )
             resp.raise_for_status()
             data = resp.json()
+            self.last_unresponsive_engines = [
+                tuple(item[:2]) for item in data.get("unresponsive_engines", [])
+                if isinstance(item, list) and len(item) >= 2
+            ]
         except Exception as e:
+            self.last_unresponsive_engines = [(engines or "default", type(e).__name__)]
             logger.warning("SearXNG search failed for '%s': %s", query[:60], e)
             return []
 

@@ -15,3 +15,19 @@ def test_parsed_reference_normalizes_doi_and_year() -> None:
 
 def test_missing_year_is_explicitly_unknown() -> None:
     assert ParsedReference(year=None).year == "n.d."
+
+
+def test_parsed_reference_carries_deterministic_source_kind_evidence() -> None:
+    reference = ParsedReference(
+        author="Wu, T.",
+        year="2010",
+        title="The master switch",
+        raw_ref=(
+            "Wu, T. (2010). The master switch: The rise and fall of "
+            "information empires. Knopf."
+        ),
+    )
+
+    assert reference.source_kind == "monograph"
+    assert reference.source_kind_confidence == "high"
+    assert reference.source_kind_evidence

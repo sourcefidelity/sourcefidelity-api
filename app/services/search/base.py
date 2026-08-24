@@ -1,7 +1,7 @@
 """Abstract base class for web search providers.
 
-Pluggable search interface — Google Custom Search, Bing Web Search, or a
-future Baidu implementation. Used by the web-search PDF retrieval adapter
+Pluggable search interface for configured self-hosted or API-backed search.
+Used by the web-search PDF retrieval adapter
 to find open-access PDFs for sources the academic-DB chain couldn't locate.
 
 Follows the same pluggable pattern as retrieval adapters (retrieval/base.py):
@@ -28,7 +28,7 @@ class SearchResult:
 class SearchProvider(ABC):
     """Abstract web search provider.
 
-    Implementations: GoogleCustomSearch, BingWebSearch.
+    Implementations include SearXNGSearch, TavilySearch and ExaSearch.
     Selected via settings.SEARCH_PROVIDER in the factory (search/__init__.py).
     """
 

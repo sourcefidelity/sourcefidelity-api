@@ -1,7 +1,7 @@
 """Application configuration using pydantic-settings."""
 
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Literal, Optional
 
 
 class Settings(BaseSettings):
@@ -36,6 +36,47 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0  # Deterministic output
     LLM_MAX_TOKENS: int = 8192  # Max tokens per response (DeepSeek max output)
 
+    # Local specialist relationship signal (Phase 3.8). The runtime is an
+    # optional install because PyTorch/model weights materially enlarge the
+    # base API image. Deployments prefetch a pinned model, then enable it.
+    RELATIONSHIP_SIGNAL_BACKEND: Literal["disabled", "deberta_nli"] = "disabled"
+    RELATIONSHIP_MODEL_NAME: str = (
+        "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+    )
+    RELATIONSHIP_MODEL_REVISION: str = (
+        "6f5cf0a2b59cabb106aca4c287eed12e357e90eb"
+    )
+    RELATIONSHIP_MODEL_LOCAL_FILES_ONLY: bool = True
+    RELATIONSHIP_MODEL_DEVICE: Literal["cpu", "cuda", "mps"] = "cpu"
+    RELATIONSHIP_MODEL_BATCH_SIZE: int = 4
+
+    # Bounded structured judgment is shadow-only until a fixed-corpus
+    # calibration justifies allowing its validated outputs to change verdicts.
+    VERIFICATION_JUDGMENT_MODE: Literal["shadow", "adjudicate"] = "shadow"
+    VERIFICATION_JUDGMENT_MAX_PASSAGES: int = 3
+    VERIFICATION_JUDGMENT_MAX_INPUT_TOKENS: int = 4_000
+    VERIFICATION_JUDGMENT_MAX_OUTPUT_TOKENS: int = 1_600
+    # A committed lease lets the cleanup worker recover transient source,
+    # extracted-text, chunk, and embedding objects after a hard worker exit.
+    VERIFICATION_RUN_LEASE_SECONDS: int = 900
+    VERIFICATION_RUN_CLEANUP_INTERVAL_SECONDS: int = 300
+    VERIFICATION_RUN_MAX_TRANSIENT_MB: int = 200
+    # Student-paper uploads are temporary workflow inputs, not source-repository
+    # objects. The locator is committed before upload and stale cleanup removes
+    # an object after this recovery window even if a worker exits hard.
+    PAPER_UPLOAD_LEASE_SECONDS: int = 86_400
+    PAPER_UPLOAD_CLEANUP_INTERVAL_SECONDS: int = 300
+    # Only temporary is operational. The remaining recognized values reserve
+    # the policy boundary for a later, separately authorized student-paper
+    # comparison corpus; selecting one now fails closed at upload.
+    PAPER_RETENTION_MODE: Literal[
+        "temporary", "assessment", "course", "institutional"
+    ] = "temporary"
+    # Remote citation/relevance judgment is an explicit deployment capability.
+    # When false, the workflow still extracts, retrieves, persists candidates,
+    # and reports visible not-assessed model stages without sending paper text.
+    PAPER_LLM_PROCESSING_ENABLED: bool = False
+
     # LLM Provider options (configure via LLM_BASE_URL + LLM_MODEL)
     # DeepSeek: LLM_BASE_URL="https://api.deepseek.com/v1", LLM_MODEL="deepseek-chat"
     # OpenAI: LLM_BASE_URL=None (default), LLM_MODEL="gpt-4o-mini"
@@ -47,13 +88,43 @@ class Settings(BaseSettings):
     # OpenAlex
     OPENALEX_EMAIL: Optional[str] = None  # Recommended for polite pool
     OPENALEX_API_KEY: Optional[str] = None
+    # Experimental Boolean candidate generation for several title-only works.
+    # Disabled by default: the fixed-corpus run did not reduce provider calls.
+    OPENALEX_GROUPED_TITLE_PREFETCH_ENABLED: bool = False
 
     # File processing limits
     MAX_FILE_SIZE_MB: int = 50
     MAX_TEXT_LENGTH_CHARS: int = 100_000  # Truncation guard
+    MAX_PAPER_TEXT_LENGTH_CHARS: int = 2_000_000
+    MAX_PDF_PAGES: int = 5000
+    MAX_PDF_OBJECTS: int = 250_000
+
+    # Hostile-file inspection. A clamd socket is deliberately opt-in because
+    # its TCP protocol is unauthenticated and must remain on a trusted network.
+    CLAMD_UNIX_SOCKET: str | None = None
+    CLAMD_HOST: str | None = None
+    CLAMD_PORT: int = 3310
+    CLAMD_TIMEOUT_SECONDS: float = 30.0
+    MALWARE_SCAN_REQUIRED: bool = True
 
     # ── Source Repository (Phase 3.5) ────────────────────────
     SOURCE_REPOSITORY_ENABLED: bool = False
+    # Personal/local prototype scope. Institutional deployments must replace
+    # this fixed scope with the authenticated tenant/course authorization layer.
+    SOURCE_REPOSITORY_SCOPE_ID: str = "personal-default"
+
+    # Retention of representations downloaded successfully from ordinary
+    # public HTTP(S) URLs when no machine-readable licence/OA assertion is
+    # available. "store_scoped" records them as rights_unclassified without
+    # making a copyright/OA claim; "explicit_license_only" keeps the older
+    # conservative behavior and uses them only for the current run.
+    PUBLIC_RETRIEVAL_RETENTION_POLICY: Literal[
+        "store_scoped", "explicit_license_only"
+    ] = "store_scoped"
+    # Periodic physical cleanup is separate from immediate fail-closed lookup:
+    # expired representations are unusable at once even if object deletion is
+    # waiting for the next retryable cleanup pass.
+    SOURCE_RETENTION_CLEANUP_INTERVAL_SECONDS: int = 3600
 
     # Storage Backend: "s3" | "seafile"
     STORAGE_BACKEND: str = "s3"
@@ -68,24 +139,45 @@ class Settings(BaseSettings):
     #
     # Current rationale (revised Aug 12 after the baseline run):
     #   1. OpenAlex — does the bulk of the work (87 of 121 hits in the baseline).
-    #      Fast, broad, now codebase-unified with Unpaywall (so it also covers OA
-    #      full text that a separate Unpaywall adapter would have found).
+    #      Fast, broad, now codebase-unified with Unpaywall. DOI lookups can be
+    #      grouped into configurable filter batches. Title-only work uses
+    #      individual relevance-gated queries by default. Experimental grouped
+    #      Boolean candidate generation is opt-in because the fixed-corpus
+    #      measurement did not reduce calls.
     #   2. Crossref — reliable DOI resolution, metadata + abstract only.
-    #   3. CORE — unique OA PDFs from 10K+ repositories. Now fully serialized
-    #      (per-key concurrency limit stalls parallel requests) so it's slower
-    #      per call; placed after the fast metadata sources. v3 `q=doi:` /
-    #      default-field title query (Aug 12 fix).
+    #   3. CORE — unique OA PDFs from 10K+ repositories. v3 DOI lookups are
+    #      grouped into small Boolean queries and cached per run. Requests stay
+    #      serialized because concurrent calls stalled in live testing; quota
+    #      state and retry timing come from CORE's X-RateLimit-* headers.
     #   4. Elsevier — only source for Elsevier full text (PII-based URL).
-    #   5. Semantic Scholar — re-added (DOI-only OA): openAccessPdf sometimes
-    #      has PDFs OpenAlex's best_oa_location misses. Throttled ~1 req/s.
-    #   6. Wikisource — multilingual public-domain texts; only tried for refs
-    #      whose year is old enough to be public domain (see source code).
-    #   7. Gutenberg — public-domain Western classics; same PD year gate.
-    #      Volunteer-run and slow (timeout 45s); last resort for old works.
-    #   8. web_search (optional, last) — searches Google/Bing for PDFs of sources
+    #   5. Semantic Scholar — DOI-only OA supplement. DOI records are prefetched
+    #      in conservative five-item batches; title matching is disabled.
+    #   6. Gutenberg — preferred public-domain complete-work source. Uses the
+    #      official OPDS catalog and downloadable EPUB editions.
+    #   7. Wikisource — multilingual supplement. It fails closed where the root
+    #      page is only an index and complete subpage aggregation is unavailable.
+    #   8. web_search (optional, last) — searches configured discovery providers
     #      the academic-DB chain couldn't find. Only active when SEARCH_PROVIDER
     #      is configured. Add to the list to enable: "...,gutenberg,web_search"
-    RETRIEVAL_SOURCES: str = "openalex,crossref,core,elsevier,semantic_scholar,wikisource,gutenberg"
+    RETRIEVAL_SOURCES: str = "openalex,crossref,core,elsevier,semantic_scholar,gutenberg,wikisource"
+    # JSON object containing safe operational overrides for installed retrieval
+    # adapters. Credentials remain in their dedicated secret settings.
+    # Example: {"semantic_scholar":{"batch_size":5,"max_batches":5}}
+    RETRIEVAL_PROVIDER_CONFIG: str = "{}"
+    # Conservative routing heuristic only, not a copyright determination.
+    # Deployments should set this according to their jurisdiction and policy.
+    PUBLIC_DOMAIN_CUTOFF_YEAR: int = 1928
+    # Non-secret provider cooldown state. Personal uses this local file;
+    # Institutional deployments can point all workers at a shared mounted path.
+    PROVIDER_HEALTH_STATE_PATH: str = ".sourcefidelity/provider_health.json"
+    # Reusable canonical abstract/miss cache. Abstract evidence is reused while
+    # full-text discovery is refreshed on this bounded schedule. Increment the
+    # access revision after a subscription, proxy, or library-route change.
+    RETRIEVAL_LOOKUP_CACHE_ENABLED: bool = True
+    RETRIEVAL_ABSTRACT_REFRESH_DAYS: int = 30
+    RETRIEVAL_NEGATIVE_REFRESH_HOURS: int = 24
+    RETRIEVAL_LOOKUP_CACHE_RETENTION_DAYS: int = 180
+    RETRIEVAL_ACCESS_REVISION: str = "1"
 
     # CORE API
     CORE_API_KEY: str | None = None
@@ -104,15 +196,21 @@ class Settings(BaseSettings):
     CROSSREF_EMAIL: str | None = None
 
     # Web search provider for PDF fallback retrieval (after academic-DB chain fails).
-    # Pluggable: "google" (Custom Search), "bing" (Web Search), or None (disabled).
+    # Pluggable primary provider. Bing Search APIs were retired in August 2025
+    # and are intentionally unsupported.
     # When set, the retrieval chain searches the web for source titles + "filetype:pdf"
     # and downloads/validates any PDFs found (author homepages, repositories, OA copies).
     # Source-access neutrality applies (§3.5): the app verifies against whatever it finds,
     # does NOT access Sci-Hub or pirated copies. Legitimate OA / author-homepage / institutional-repository PDFs only.
-    SEARCH_PROVIDER: str | None = None  # "google"|"bing"|"searxng"|"brave"|"duckduckgo"|"tavily"|"exa"|None
+    SEARCH_PROVIDER: str | None = None  # "google"|"searxng"|"brave"|"duckduckgo"|"tavily"|"exa"|None
+    # Comma-separated paid/bounded fallbacks, tried only when the primary
+    # provider returns no usable candidates. Exact queries are cached per run.
+    SEARCH_ESCALATION_PROVIDERS: str = "tavily,exa"
+    # Per-process request ceilings for escalation providers. These are safety
+    # limits, not targets. Format: comma-separated provider:count pairs.
+    SEARCH_ESCALATION_MAX_CALLS: str = "tavily:50,exa:25"
     GOOGLE_SEARCH_API_KEY: str | None = None
     GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
-    BING_SEARCH_API_KEY: str | None = None
     # SearXNG (self-hosted meta-search — recommended for institutions)
     SEARXNG_URL: str | None = None  # e.g., "http://localhost:8080"
     # Brave Search (commercial API, free tier 2000/month)

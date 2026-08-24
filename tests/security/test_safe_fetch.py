@@ -1,8 +1,15 @@
 import socket
 
+import httpx
 import pytest
 
-from app.services.safe_fetch import UnsafeUrlError, _validate_host, _validate_url
+from app.services.safe_fetch import (
+    UnsafeUrlError,
+    _extract_meta_refresh_url,
+    safe_request,
+    _validate_host,
+    _validate_url,
+)
 
 
 @pytest.mark.security
@@ -48,3 +55,71 @@ def test_public_hostname_is_accepted_without_network(monkeypatch: pytest.MonkeyP
     )
 
     _validate_url("https://public.example/source.pdf")
+
+
+@pytest.mark.security
+def test_immediate_same_url_meta_refresh_is_bounded_candidate() -> None:
+    body = b'<html><head><meta http-equiv="refresh" content="1"></head></html>'
+
+    assert _extract_meta_refresh_url(
+        body, "text/html; charset=utf-8", "https://repository.example/view/1"
+    ) == "https://repository.example/view/1"
+
+
+@pytest.mark.security
+def test_relative_meta_refresh_target_is_resolved_but_not_pretrusted() -> None:
+    body = b'<meta http-equiv="Refresh" content="0; URL=../files/source.pdf">'
+
+    assert _extract_meta_refresh_url(
+        body, "text/html", "https://repository.example/view/1"
+    ) == "https://repository.example/files/source.pdf"
+
+
+@pytest.mark.security
+@pytest.mark.parametrize(
+    ("body", "content_type"),
+    [
+        (b'<meta http-equiv="refresh" content="5;url=/slow">', "text/html"),
+        (b'<meta http-equiv="refresh" content="now;url=/bad">', "text/html"),
+        (b'<meta http-equiv="refresh" content="0;url=/not-html">', "application/pdf"),
+    ],
+)
+def test_delayed_malformed_or_non_html_refresh_is_ignored(
+    body: bytes, content_type: str
+) -> None:
+    assert _extract_meta_refresh_url(
+        body, content_type, "https://repository.example/view/1"
+    ) is None
+
+
+@pytest.mark.security
+def test_opt_in_meta_refresh_reuses_cookie_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                content=b'<meta http-equiv="refresh" content="1">',
+                headers={"content-type": "text/html", "set-cookie": "viewer=ready"},
+                request=request,
+            )
+        assert request.headers.get("cookie") == "viewer=ready"
+        return httpx.Response(
+            200,
+            content=b"%PDF-repository",
+            headers={"content-type": "application/pdf"},
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("app.services.safe_fetch.httpx.Client", lambda **_kwargs: client)
+    monkeypatch.setattr("app.services.safe_fetch._validate_url", lambda _url: None)
+
+    response = safe_request(
+        "https://repository.example/view/1", max_meta_refreshes=1
+    )
+
+    assert response.content == b"%PDF-repository"
+    assert len(requests) == 2

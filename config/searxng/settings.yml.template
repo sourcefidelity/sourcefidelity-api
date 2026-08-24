@@ -1,0 +1,14 @@
+# SourceFidelity's private, loopback-only SearXNG configuration.
+# The Compose first-boot wrapper replaces the placeholder with a random secret
+# and writes the resulting untracked settings file into a persistent volume.
+use_default_settings: true
+
+server:
+  secret_key: "__SEARXNG_SECRET__"
+  image_proxy: false
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

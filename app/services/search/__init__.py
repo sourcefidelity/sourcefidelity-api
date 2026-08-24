@@ -1,6 +1,6 @@
 """Search provider factory.
 
-Selects the configured search provider (Google, Bing, or None).
+Selects configured search providers.
 Mirrors the retrieval factory pattern (retrieval/__init__.py).
 
 Usage:
@@ -8,6 +8,9 @@ Usage:
     provider = get_search_provider()
     if provider:
         results = provider.search('"Some Title" filetype:pdf')
+
+Bing Search API is intentionally absent: Microsoft retired the standalone
+service on August 11, 2025. Consumer-site scraping is not an API replacement.
 """
 
 import logging
@@ -19,14 +22,14 @@ from app.services.search.base import SearchProvider, SearchResult
 logger = logging.getLogger(__name__)
 
 
-def get_search_provider() -> Optional[SearchProvider]:
-    """Get the configured search provider, or None if not configured.
+def get_search_provider(provider_name: str | None = None) -> Optional[SearchProvider]:
+    """Get a named or configured search provider, or None if unavailable.
 
     Returns None silently (not an error) — web search is an optional fallback.
     The retrieval chain works without it; search just improves coverage for
     hard-to-find sources.
     """
-    provider_name = (settings.SEARCH_PROVIDER or "").lower().strip()
+    provider_name = (provider_name or settings.SEARCH_PROVIDER or "").lower().strip()
 
     if not provider_name:
         return None
@@ -43,15 +46,6 @@ def get_search_provider() -> Optional[SearchProvider]:
             settings.GOOGLE_SEARCH_API_KEY,
             settings.GOOGLE_SEARCH_CSE_ID,
         )
-
-    if provider_name == "bing":
-        if not settings.BING_SEARCH_API_KEY:
-            logger.warning(
-                "SEARCH_PROVIDER=bing but BING_SEARCH_API_KEY not set — web search disabled"
-            )
-            return None
-        from app.services.search.bing import BingWebSearch
-        return BingWebSearch(settings.BING_SEARCH_API_KEY)
 
     if provider_name == "searxng":
         if not settings.SEARXNG_URL:

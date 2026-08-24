@@ -37,6 +37,10 @@ _URL_PATTERN = re.compile(r'https?://[^\s]+', re.IGNORECASE)
 
 # Generic 4-digit year
 _YEAR_GENERIC = re.compile(r'\b(?:19|20)\d{2}\b')
+_TRAILING_PAGE_RANGE = re.compile(
+    r"\s*\((?:pp?\.?|pages?)\s*\d{1,5}\s*[-–—]\s*\d{1,5}\)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _clean_doi(doi: str) -> str:
@@ -50,13 +54,13 @@ def _clean_url(url: str) -> str:
 
 
 def _make_citation_key(author: str, year: str) -> str:
-    """Build a citation key from first surname + year (e.g. 'Smith2020')."""
+    """Build a display alias, preserving year suffixes such as ``2020b``."""
     if not author:
         return ""
     # First word before comma/space = surname
     surname = re.split(r'[, ]', author.strip())[0]
     surname = re.sub(r'[^A-Za-z]', '', surname)
-    yr = re.search(r'\d{4}', year) or (year if year else "")
+    yr = re.search(r'\d{4}[a-z]?', year, re.IGNORECASE) or (year if year else "")
     yr_str = yr.group(0) if hasattr(yr, 'group') else str(yr)
     return f"{surname}{yr_str}" if surname and yr_str else ""
 
@@ -109,9 +113,9 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     year_match = _APA_YEAR.search(ref)
     if year_match:
         year_raw = year_match.group(0)
-        # Extract 4-digit year from "(2020)" or use "n.d."
-        yr_inner = re.search(r'\d{4}', year_raw)
-        year = yr_inner.group(0) if yr_inner else "n.d."
+        # Preserve disambiguation suffixes from "(2020a)" / "(2020b)".
+        yr_inner = re.search(r'\d{4}[a-z]?', year_raw, re.IGNORECASE)
+        year = yr_inner.group(0).lower() if yr_inner else "n.d."
         year_pos = year_match.start()
     else:
         # No parenthetical year — try bare year
@@ -151,6 +155,9 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     # (heuristic: title shouldn't contain volume/issue patterns like "12(3)")
     if title:
         title = re.split(r'\s*,\s*\d+\(', title)[0].strip()
+        # Preserve a cited component locator in raw_ref, but keep it out of
+        # canonical title identity and retrieval queries.
+        title = _TRAILING_PAGE_RANGE.sub("", title).strip()
 
     # Success check — need both author and title
     if not author or not title:
@@ -323,10 +330,10 @@ def extract_fields_from_llm_response(response: str, raw_ref: str) -> ParsedRefer
     if url:
         url = _clean_url(url)
 
-    # Normalize year to 4-digit or n.d.
+    # Normalize year to four digits plus an optional disambiguation suffix.
     if year:
-        yr_match = _YEAR_GENERIC.search(year)
-        year = yr_match.group(0) if yr_match else "n.d."
+        yr_match = re.search(r'\b(?:19|20)\d{2}[a-z]?\b', year, re.IGNORECASE)
+        year = yr_match.group(0).lower() if yr_match else "n.d."
     else:
         year = "n.d."
 

@@ -3,10 +3,34 @@
 services:
   api:
     build: .
-    container_name: sourcefidelity-api
     restart: unless-stopped
     ports:
       - "8000:8000"
+    env_file: .env
+    depends_on:
+      clamav:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - ./app:/app/app
+    environment:
+      # Internal-only clamd TCP. The port is not published to the host/network.
+      CLAMD_HOST: clamav
+      CLAMD_PORT: 3310
+      MALWARE_SCAN_REQUIRED: "true"
+      # Host-side development uses localhost:8080 from .env. Containers must
+      # address the managed service by its Compose DNS name instead.
+      SEARXNG_URL: http://searxng:8080
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    restart: unless-stopped
     env_file: .env
     depends_on:
       redis:
@@ -17,11 +41,12 @@ services:
         condition: service_started
     volumes:
       - ./app:/app/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      SEARXNG_URL: http://searxng:8080
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
 
-  worker:
+  retention_scheduler:
     build: .
-    container_name: sourcefidelity-worker
     restart: unless-stopped
     env_file: .env
     depends_on:
@@ -31,11 +56,10 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/app/app
-    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.tasks.celery_app beat --loglevel=info
 
   redis:
     image: redis:7-alpine
-    container_name: sourcefidelity-redis
     restart: unless-stopped
     # Loopback-only: Redis has no auth configured, so never expose it off-host.
     ports:
@@ -43,9 +67,56 @@ services:
     volumes:
       - redis_data:/data
 
+  searxng:
+    # SearXNG used to be a manually started standalone container, so Docker
+    # Desktop restarts left it stopped. It now follows the same managed
+    # lifecycle as the rest of SourceFidelity's local services.
+    # Pin the verified 2026.8.11 image; update deliberately after a smoke test.
+    image: searxng/searxng@sha256:7a39e9e2610fb6f332393d0f1c69534d5f1fd4e85cb4b204cd1b1768195b8ee9
+    restart: unless-stopped
+    ports:
+      # The JSON search endpoint is needed by a host-side development process,
+      # but it must not be exposed to the LAN or public internet.
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Optional operator-supplied value. On first boot the wrapper generates
+      # a random secret and persists it in searxng_config when this is unset.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    volumes:
+      - searxng_config:/etc/searxng
+      - searxng_cache:/var/cache/searxng
+      - ./config/searxng/settings.yml.template:/tmp/sourcefidelity-settings.yml.template:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ ! -s /etc/searxng/settings.yml ]; then
+          python -c 'import os, pathlib, secrets; template = pathlib.Path("/tmp/sourcefidelity-settings.yml.template").read_text(); secret = os.environ.get("SEARXNG_SECRET") or secrets.token_urlsafe(48); pathlib.Path("/etc/searxng/settings.yml").write_text(template.replace("__SEARXNG_SECRET__", secret))'
+        fi
+        exec /usr/local/searxng/entrypoint.sh
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  clamav:
+    # Feature-release tag follows ClamAV's recommendation and receives patch
+    # updates without jumping automatically to a new feature release.
+    # Debian variant is the official multi-architecture image (amd64/arm64/
+    # ppc64le); the Alpine 1.5_base manifest does not support Apple Silicon.
+    image: clamav/clamav-debian:1.5_base
+    restart: unless-stopped
+    volumes:
+      # Persist signatures so restarts do not download the full database again.
+      - clamav_data:/var/lib/clamav
+    # The official image supplies a clamd PING healthcheck. Port 3310 remains
+    # reachable only on the private Compose network.
+
   postgres:
     image: postgres:16-alpine
-    container_name: sourcefidelity-postgres
     restart: unless-stopped
     environment:
       # Credentials come from .env (dev defaults preserved if unset). Never
@@ -65,7 +136,6 @@ services:
 
   minio:
     image: minio/minio:latest
-    container_name: sourcefidelity-minio
     restart: unless-stopped
     environment:
       # Same as the app's S3_ACCESS_KEY / S3_SECRET_KEY (see config.py). Override
@@ -83,6 +153,9 @@ services:
     command: server /data --console-address ":9001"
 
 volumes:
+  clamav_data:
   redis_data:
   postgres_data:
   minio_data:
+  searxng_config:
+  searxng_cache:

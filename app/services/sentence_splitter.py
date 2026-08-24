@@ -12,7 +12,7 @@ import re
 # Matched case-insensitively before a period + space.
 _ABBREVIATIONS = re.compile(
     r"\b("
-    r"Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|Rev|Hon|Capt|Lt|Sgt|Col|Gen"
+    r"Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|Rev|Hon|Capt|Lt|Sgt|Col|Gen|Bros"
     r"|i\.e|e\.g|etc|vs|cf|ca"
     r"|a\.m|p\.m|sec|min|hr"
     r"|B\.A|M\.A|Ph\.D|B\.S|M\.S|M\.D|Ed\.D|J\.D"
@@ -48,6 +48,15 @@ def split_sentences(text: str) -> list[str]:
 
     # Protect "et al." — it's followed by a parenthetical, not a sentence end
     protected = re.sub(r"(et al)\.(?=\s*\()", lambda m: m.group(1) + "\x00", protected, flags=re.IGNORECASE)
+
+    # Protect a middle initial inside a conventional person name. PDF text
+    # frequently exposes "Edward C. Judson" as ordinary prose; treating the
+    # initial as a sentence end truncates the citation unit at "Edward C.".
+    protected = re.sub(
+        r"\b([A-Z][a-z]{1,30}\s+[A-Z])\.(?=\s+[A-Z][a-z]{1,30}\b)",
+        lambda m: m.group(1) + "\x00",
+        protected,
+    )
 
     # Split on sentence-ending punctuation followed by whitespace
     parts = _SENTENCE_END.split(protected)

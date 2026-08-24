@@ -5,7 +5,7 @@ In production, this could write to a database table or monitoring system.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.tasks.celery_app import celery_app
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 _dead_letter_store: list[dict] = []
 
 
-@celery_app.task(name="dead_letter_handler")
+@celery_app.task(name="dead_letter_handler", soft_time_limit=30, time_limit=60)
 def dead_letter_handler(task_name: str, task_id: str, args: tuple, kwargs: dict, error: str):
     """
     Handle a task that failed after max retries.
@@ -39,7 +39,7 @@ def dead_letter_handler(task_name: str, task_id: str, args: tuple, kwargs: dict,
         "args": args,
         "kwargs": kwargs,
         "error": error,
-        "failed_at": datetime.utcnow().isoformat(),
+        "failed_at": datetime.now(timezone.utc).isoformat(),
     }
 
     _dead_letter_store.append(entry)

@@ -174,7 +174,7 @@ def extract_text_from_bytes(
                     page.extract_text() for page in pdf.pages if page.extract_text()
                 ]
             if pages:
-                return "\n\n".join(pages)
+                return _clean_text("\n\n".join(pages))
         except Exception as e:
             logger.warning(f"pdfplumber from bytes failed: {e}")
 
@@ -183,7 +183,7 @@ def extract_text_from_bytes(
             doc = fitz.open(stream=content, filetype="pdf")
             pages = [page.get_text() for page in doc]
             doc.close()
-            return "\n\n".join(pages)
+            return _clean_text("\n\n".join(pages))
         except Exception as e:
             raise TextExtractionError(f"PyMuPDF from bytes failed: {e}")
 
@@ -191,7 +191,7 @@ def extract_text_from_bytes(
         try:
             doc = Document(io.BytesIO(content))
             paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            return "\n\n".join(paragraphs)
+            return _clean_text("\n\n".join(paragraphs))
         except Exception as e:
             raise TextExtractionError(f"DOCX from bytes failed: {e}")
     else:

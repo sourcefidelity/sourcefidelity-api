@@ -9,9 +9,9 @@ Access levels (entitlement model):
   - API key alone:      full text for OA articles; metadata + abstract for all
   - API key + insttoken: full text for paywalled articles (if institution subscribes)
 
-Two-step workflow:
+Two-step workflow for Elsevier-owned DOI prefixes only:
   1. Fetch view=META_ABS → metadata + abstract + openaccess flag
-  2. If OA or insttoken configured → fetch view=FULL → complete article text (XML)
+  2. Fetch the native XML representation → complete article text when entitled
 
 The API returns XML (JATS-style), not PDF. We strip the XML tags to get clean
 text, reusing the same _strip_jats_xml approach as the Crossref adapter.
@@ -26,12 +26,27 @@ import re
 import httpx
 
 from app.config import settings
-from app.services.relevance import score_relevance
-from app.services.retrieval.base import RetrievalSource, RetrievalResult
+from app.services.retrieval.base import (
+    RepresentationKind,
+    RetrievalResult,
+    RetrievalSource,
+    SourceRepresentation,
+)
 
 logger = logging.getLogger(__name__)
 
 ELSEVIER_BASE = "https://api.elsevier.com/content/article"
+
+# Article Retrieval is a ScienceDirect-content API, not a general DOI
+# resolver. Calling it for every publisher produced slow 500 responses for
+# Cambridge, Wiley, MIT Press, Taylor & Francis, and other non-Elsevier works.
+# This conservative registrant-prefix set covers current Elsevier/ScienceDirect
+# and common legacy Academic Press/Mosby/Urban & Fischer content.
+_ELSEVIER_DOI_PREFIXES = ("10.1016/", "10.1006/", "10.1053/", "10.1078/")
+
+
+def _is_elsevier_doi(doi: str) -> bool:
+    return doi.strip().lower().startswith(_ELSEVIER_DOI_PREFIXES)
 
 
 class ElsevierRetriever(RetrievalSource):
@@ -53,6 +68,12 @@ class ElsevierRetriever(RetrievalSource):
         if not settings.ELSEVIER_API_KEY:
             return RetrievalResult(
                 source_name=self.name, success=False, error="No ELSEVIER_API_KEY configured"
+            )
+        if not _is_elsevier_doi(doi):
+            return RetrievalResult(
+                source_name=self.name,
+                success=False,
+                error="Not an Elsevier-owned DOI prefix; Article Retrieval skipped",
             )
 
         try:
@@ -97,12 +118,14 @@ class ElsevierRetriever(RetrievalSource):
             abstract_raw = coredata.get("dc:description") or coredata.get("abstract", "")
             abstract = _strip_xml_tags(abstract_raw) if abstract_raw else None
 
-            # Step 2: Attempt full text.
+            # Step 2: Attempt the native XML representation.
             # - OA articles: always entitled (API key alone).
             # - Paywalled articles: on a campus network, IP grants access
             #   (no insttoken needed). Off-campus without insttoken, the API
             #   returns 401/403 and we fall back to abstract.
-            # So we always TRY the FULL view and let the API decide entitlement.
+            # So we always try it and let the API decide entitlement. This key
+            # rejects an explicit FULL view, while the documented native XML
+            # representation works and includes article markup when entitled.
             full_text = self._fetch_full_text(doi)
             if full_text:
                 logger.info(
@@ -118,7 +141,16 @@ class ElsevierRetriever(RetrievalSource):
                 year=year,
                 authors=authors,
                 abstract=abstract,
-                full_text=full_text.encode("utf-8") if full_text else None,
+                representation=(
+                    SourceRepresentation(
+                        kind=RepresentationKind.PLAIN_TEXT,
+                        media_type="text/plain",
+                        content=full_text.encode("utf-8"),
+                        original_kind=RepresentationKind.XML,
+                        charset="utf-8",
+                        completeness="complete",
+                    ) if full_text else None
+                ),
                 metadata={
                     "coredata": coredata,
                     "is_oa": is_oa,
@@ -147,15 +179,14 @@ class ElsevierRetriever(RetrievalSource):
         )
 
     def _fetch_full_text(self, doi: str) -> str | None:
-        """Fetch the full text (view=FULL) for an article.
+        """Fetch the native XML representation for an article.
 
         Returns clean text (XML stripped), or None if not entitled.
         """
         try:
             resp = httpx.get(
                 f"{ELSEVIER_BASE}/doi/{doi}",
-                headers=self._headers(),
-                params={"view": "FULL", "httpAccept": "text/xml"},
+                headers=self._xml_headers(),
                 timeout=30,
             )
             if resp.status_code in (401, 403):
@@ -163,12 +194,18 @@ class ElsevierRetriever(RetrievalSource):
                 return None
             resp.raise_for_status()
 
-            # The response is XML; extract the article body text
+            # Metadata-only XML is possible without entitlement. The extractor
+            # requires article-body/paragraph markup before returning text.
             text = _extract_article_text(resp.text)
             return text if text and len(text) > 100 else None
         except Exception as e:
             logger.debug("Elsevier full text fetch failed for %s: %s", doi, e)
             return None
+
+    def _xml_headers(self) -> dict:
+        headers = self._headers()
+        headers["Accept"] = "text/xml"
+        return headers
 
 
 def _strip_xml_tags(text: str) -> str:
@@ -181,17 +218,25 @@ def _strip_xml_tags(text: str) -> str:
 def _extract_article_text(xml: str) -> str:
     """Extract readable article text from Elsevier's XML response.
 
-    Elsevier's FULL view returns JATS-style XML. The main body is typically in
+    Elsevier's native representation returns JATS-style XML when entitled. The main body is typically in
     <ce:para> or <body> tags. We strip all tags and return the text.
     """
-    # Remove XML declaration and DOCTYPE
-    text = re.sub(r"<\?xml[^>]*\?>", "", xml)
-    text = re.sub(r"<!DOCTYPE[^>]*>", "", text)
-
-    # Try to extract just the body (between <body> tags if present)
-    body_match = re.search(r"<body[^>]*>(.*?)</body>", text, re.DOTALL | re.IGNORECASE)
+    # Do not misclassify a metadata-only XML response as complete article text.
+    body_match = re.search(
+        r"<(?:[A-Za-z0-9_-]+:)?body\b[^>]*>(.*?)</(?:[A-Za-z0-9_-]+:)?body>",
+        xml,
+        re.DOTALL | re.IGNORECASE,
+    )
     if body_match:
         text = body_match.group(1)
+    elif re.search(r"<(?:[A-Za-z0-9_-]+:)?para\b", xml, re.IGNORECASE):
+        text = xml
+    else:
+        return ""
+
+    # Remove XML declaration and DOCTYPE
+    text = re.sub(r"<\?xml[^>]*\?>", "", text)
+    text = re.sub(r"<!DOCTYPE[^>]*>", "", text)
 
     # Strip all remaining tags
     text = re.sub(r"<[^>]+>", " ", text)

@@ -149,6 +149,7 @@ activemq-data/
 
 # Environments
 .env
+.sourcefidelity/
 .envrc
 .venv
 env/
@@ -226,7 +227,10 @@ Review 2.md
 # SourceFidelity project-specific
 test_data/
 test_data_synthetic/
+# Generated local evaluation/report artifacts may contain student or source text.
+outputs/
 venv_old_3.9/
+venv_broken_*/
 .continue/
 .zcode/
 .vscode/
@@ -247,6 +251,7 @@ REVIEW.md
 # rate-limit strategies, and politically-sensitive domain lists that don't
 # belong in a public repo.
 test_*.py
+run_retrieval_profile_test.sh
 
 # Maintained product regression tests are tracked. The ignore rule above only
 # applies to the loose, local research/operational scripts at repository root.
@@ -264,3 +269,14 @@ CAMPUS_TEST_INSTRUCTIONS.md
 campus_test_home.log
 test_data/campus_dois.json
 test_data/campus_test_results.json
+
+# Local retrieval evidence may contain bibliographic URLs and deployment details.
+.last_retrieval_run
+retrieval_baseline_*.json
+retrieval_baseline_*.log
+*_academic_adapters_*baseline*.json
+*_cited_urls_baseline*.json
+*_url_web_baseline*.json
+url_web_results.json
+*SFConflict*
+*conflicted copy*

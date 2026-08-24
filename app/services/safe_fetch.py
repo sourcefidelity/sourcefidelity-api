@@ -29,7 +29,9 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
+from html.parser import HTMLParser
 from typing import Iterable
+from urllib.parse import urljoin
 
 import httpx
 
@@ -40,6 +42,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 _MAX_REDIRECTS = 5
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
+_MAX_META_REFRESH_BODY_BYTES = 8192
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -56,6 +59,58 @@ class UnsafeUrlError(ValueError):
 
 class ResponseTooLargeError(Exception):
     """Raised when a response body exceeds the configured byte cap."""
+
+
+class _MetaRefreshParser(HTMLParser):
+    """Extract the first bounded HTML refresh directive without executing it."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.content: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.content is not None or tag.lower() != "meta":
+            return
+        values = {key.lower(): value for key, value in attrs if value is not None}
+        if values.get("http-equiv", "").strip().lower() == "refresh":
+            self.content = values.get("content", "")
+
+
+def _extract_meta_refresh_url(
+    body: bytes,
+    content_type: str,
+    current_url: str,
+) -> str | None:
+    """Return a same-session refresh target only for a short, immediate HTML page.
+
+    Repository viewers sometimes set a cookie and return ``<meta refresh>``
+    instead of an HTTP redirect before serving a PDF. This parser accepts only
+    delay values from zero through one second. The returned URL is still
+    validated by ``safe_request`` before the next request, including same-URL
+    refreshes, so the directive cannot bypass the SSRF boundary.
+    """
+    if len(body) > _MAX_META_REFRESH_BODY_BYTES or "html" not in content_type.lower():
+        return None
+    parser = _MetaRefreshParser()
+    try:
+        parser.feed(body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if parser.content is None:
+        return None
+    delay, separator, raw_target = parser.content.partition(";")
+    try:
+        if float(delay.strip()) > 1:
+            return None
+    except ValueError:
+        return None
+    if not separator:
+        return current_url
+    key, equals, value = raw_target.strip().partition("=")
+    if not equals or key.strip().lower() != "url":
+        return None
+    target = value.strip().strip("'\"")
+    return urljoin(current_url, target) if target else current_url
 
 
 # ── SSRF guard ───────────────────────────────────────────────────────────
@@ -139,6 +194,7 @@ def safe_request(
     headers: dict[str, str] | None = None,
     raise_on_status: bool = True,
     max_redirects: int = _MAX_REDIRECTS,
+    max_meta_refreshes: int = 0,
     trust_prefix: str | None = None,
 ) -> httpx.Response:
     """SSRF-safe, size-capped HTTP request with manual redirect following.
@@ -158,6 +214,9 @@ def safe_request(
             4xx/5xx. Set False for callers that need to inspect status codes
             themselves (e.g. the link validator, which categorizes 403/404).
         max_redirects: Maximum redirect hops before giving up.
+        max_meta_refreshes: Maximum immediate HTML meta-refresh hops. Disabled
+            by default; PDF acquisition enables one hop for repository viewers
+            that require a cookie-setting interstitial.
         trust_prefix: If set, the *initial* URL is exempted from the SSRF
             host check when it starts with this prefix. Use ONLY for
             operator-configured, trusted hosts (e.g. an institution's campus
@@ -175,12 +234,19 @@ def safe_request(
     """
     merged_headers = {**_DEFAULT_HEADERS, **(headers or {})}
     current = url
+    redirect_count = 0
+    meta_refresh_count = 0
 
     with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-        for hop in range(max_redirects + 1):
+        while True:
             # Only the very first hop may be a trusted operator host; every
             # redirect target is re-validated regardless of trust_prefix.
-            if hop == 0 and trust_prefix and current.startswith(trust_prefix):
+            if (
+                redirect_count == 0
+                and meta_refresh_count == 0
+                and trust_prefix
+                and current.startswith(trust_prefix)
+            ):
                 logger.debug("safe_request: trusting operator host for first hop (%s)", current[:60])
             else:
                 _validate_url(current)
@@ -190,7 +256,8 @@ def safe_request(
                     if not location:
                         raise UnsafeUrlError(f"redirect with no Location header from {current[:60]}")
                     current = str(httpx.URL(current).join(location))
-                    if hop == max_redirects:
+                    redirect_count += 1
+                    if redirect_count > max_redirects:
                         raise httpx.TooManyRedirects(
                             f"exceeded {max_redirects} redirects (last target: {current[:60]})",
                             request=resp.request,
@@ -209,10 +276,21 @@ def safe_request(
                     resp.raise_for_status()
                 # Cache the read body so .content / .text work after close.
                 resp._content = bytes(buf)
+                if method.upper() == "GET" and meta_refresh_count < max_meta_refreshes:
+                    refresh_url = _extract_meta_refresh_url(
+                        resp.content,
+                        resp.headers.get("content-type", ""),
+                        current,
+                    )
+                    if refresh_url is not None:
+                        meta_refresh_count += 1
+                        current = refresh_url
+                        logger.debug(
+                            "safe_request: following bounded same-session meta refresh (%s)",
+                            current[:60],
+                        )
+                        continue
                 return resp
-
-    # Unreachable: the loop either returns or raises on every path.
-    raise RuntimeError("safe_request exited its redirect loop without a response")
 
 
 def safe_fetch_bytes(
@@ -222,6 +300,7 @@ def safe_fetch_bytes(
     accept_content_types: Iterable[str] | None = None,
     timeout: float = 30.0,
     headers: dict[str, str] | None = None,
+    max_meta_refreshes: int = 0,
 ) -> bytes:
     """SSRF-safe, size-capped fetch returning the response body as bytes.
 
@@ -230,7 +309,13 @@ def safe_fetch_bytes(
     for binary streams of any kind); otherwise ``ValueError`` is raised. Use
     this for PDF downloads where the type should be constrained.
     """
-    resp = safe_request(url, max_bytes=max_bytes, timeout=timeout, headers=headers)
+    resp = safe_request(
+        url,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        headers=headers,
+        max_meta_refreshes=max_meta_refreshes,
+    )
     if accept_content_types:
         ct = resp.headers.get("content-type", "").lower()
         allowed = [a.lower() for a in accept_content_types]

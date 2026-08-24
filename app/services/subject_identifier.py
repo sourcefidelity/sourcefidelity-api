@@ -22,10 +22,9 @@ reference parsing, where JSON was dropped to avoid truncation on high-volume
 calls. Uses ``chat_completion_json`` to inherit JSON-mode enforcement,
 truncation salvage, and failure-aware retry.
 
-PII (R22): PII stripping is designed to run inside this pass (PLAN.md line
-790) but is implemented in a separate cross-cutting module that is not yet
-built. Until then, callers must pass already-deidentified text. See
-``# TODO(R22)`` at the call site below.
+The shared pre-LLM boundary masks bounded direct identifiers without changing
+offsets, JSON-encodes untrusted fields and checks the complete request budget.
+This is not a claim of exhaustive PII detection.
 """
 
 import logging
@@ -88,17 +87,32 @@ def identify_subject(
         logger.debug("identify_subject: no paragraphs after splitting")
         return _failed_result(0, references)
 
+    from app.services.llm_input_boundary import (
+        LLMInputBudgetExceeded,
+        enforce_complete_prompt_budget,
+        redact_direct_identifiers,
+    )
+    from app.services.providers import get_provider_config
+
+    redacted = redact_direct_identifiers(body_text)
+    if redacted.redaction_count:
+        logger.info(
+            "Subject LLM boundary masked %d direct identifier(s): %s",
+            redacted.redaction_count,
+            sorted(redacted.redaction_counts),
+        )
     user_prompt = build_subject_identification_user_prompt(
-        body_text=body_text,
+        body_text=redacted.text,
         references=references,
         paragraph_count=paragraph_count,
     )
 
-    # TODO(R22): route body_text through the PII stripper before this call.
-    # PII stripping is a cross-cutting module not yet built; until it exists,
-    # callers must pass already-deidentified text (the test harness uses
-    # deidentified papers). This is the single LLM call site for this pass.
     try:
+        enforce_complete_prompt_budget(
+            SUBJECT_IDENTIFICATION_SYSTEM_PROMPT,
+            user_prompt,
+            max_input_tokens=get_provider_config().input_batch_tokens,
+        )
         raw: Any = chat_completion_json(
             system_prompt=SUBJECT_IDENTIFICATION_SYSTEM_PROMPT,
             user_prompt=user_prompt,
@@ -108,6 +122,9 @@ def identify_subject(
             # Moral paper flakiness). The verification judge keeps thinking ON.
             disable_thinking=True,
         )
+    except LLMInputBudgetExceeded as e:
+        logger.warning("Subject-identification skipped by input budget: %s", e)
+        return _failed_result(paragraph_count, references)
     except Exception as e:
         # chat_completion_json raises RuntimeError on total failure. Degrade
         # to a safe default rather than crashing the caller — the subject-ID

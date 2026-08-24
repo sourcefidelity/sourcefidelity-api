@@ -99,6 +99,8 @@ def extract_and_parse_references(
     format_hint: Optional[str] = None,
     use_llm_split: bool = True,
     use_regex_first: bool = True,
+    use_llm_fallback: bool = True,
+    paper_version_id: str = "",
 ) -> List[ParsedReference]:
     """Extract and parse references into structured ParsedReference objects.
 
@@ -131,6 +133,9 @@ def extract_and_parse_references(
         If True (default), use the regex-first flow with LLM per-reference
         fallback. This is the recommended path — no JSON, model-neutral,
         robust to truncation.
+    paper_version_id:
+        Optional application-owned paper/version identity included in each
+        deterministic paper-local reference ID.
 
     Returns
     -------
@@ -152,7 +157,7 @@ def extract_and_parse_references(
         # (text in/text out) because MLA double-spacing defeats regex-based line
         # merging — the LLM understands reference structure, regex heuristics
         # can't distinguish period-within-reference from period-at-end-of-reference.
-        if fmt == "mla":
+        if fmt == "mla" and use_llm_fallback:
             try:
                 raw_refs = _mla_cleanup_split(raw_text)
             except Exception:
@@ -162,14 +167,25 @@ def extract_and_parse_references(
         else:
             raw_refs = split_references(raw_text, format_hint)
 
-        return _extract_fields_regex_first(raw_refs, format_hint)
+        from app.services.reference_identity import assign_reference_ids
+        return assign_reference_ids(
+            _extract_fields_regex_first(
+                raw_refs,
+                format_hint,
+                use_llm_fallback=use_llm_fallback,
+            ),
+            paper_version_id=paper_version_id,
+        )
 
     # ── Legacy flows (retained for backward compat / ablation) ───────────
     if use_llm_split:
-        return _split_and_parse_with_llm(raw_text, format_hint)
+        parsed = _split_and_parse_with_llm(raw_text, format_hint)
     else:
         refs = split_references(raw_text, format_hint)
-        return parse_reference_batch(refs, format_hint=format_hint)
+        parsed = parse_reference_batch(refs, format_hint=format_hint)
+
+    from app.services.reference_identity import assign_reference_ids
+    return assign_reference_ids(parsed, paper_version_id=paper_version_id)
 
 
 def _regex_fallback_references(
@@ -241,9 +257,18 @@ def _extract_fields_with_llm(
     )
 
     try:
+        from app.services.llm_input_boundary import enforce_complete_prompt_budget
+        from app.services.providers import get_provider_config
+
+        user_prompt = build_per_reference_extract_user_prompt(ref)
+        enforce_complete_prompt_budget(
+            PER_REFERENCE_EXTRACT_SYSTEM_PROMPT,
+            user_prompt,
+            max_input_tokens=get_provider_config().input_batch_tokens,
+        )
         response = chat_completion(
             system_prompt=PER_REFERENCE_EXTRACT_SYSTEM_PROMPT,
-            user_prompt=build_per_reference_extract_user_prompt(ref),
+            user_prompt=user_prompt,
             model=settings.LLM_MODEL,
             temperature=0.0,
             max_tokens=2000,  # ample for the 5-line answer
@@ -388,10 +413,19 @@ def _mla_cleanup_split(raw_text: str) -> List[str]:
 
     cleaned = ""
     try:
+        from app.services.llm_input_boundary import enforce_complete_prompt_budget
+        from app.services.providers import get_provider_config
+
+        user_prompt = build_mla_cleanup_user_prompt(raw_text)
+        enforce_complete_prompt_budget(
+            MLA_CLEANUP_SYSTEM_PROMPT,
+            user_prompt,
+            max_input_tokens=get_provider_config().input_batch_tokens,
+        )
         for attempt in range(MAX_EMPTY_RETRIES + 1):
             cleaned = chat_completion(
                 system_prompt=MLA_CLEANUP_SYSTEM_PROMPT,
-                user_prompt=build_mla_cleanup_user_prompt(raw_text),
+                user_prompt=user_prompt,
                 model=settings.LLM_MODEL,
                 temperature=0.0,
                 max_tokens=settings.LLM_MAX_TOKENS,  # reasoning models need room for thinking + output
@@ -473,13 +507,21 @@ Return a JSON object with a "references" array containing all references found.
 Be thorough - do not miss any references. Handle variations in formatting gracefully.
 If a reference spans multiple lines, merge them into one."""
 
-    user_prompt = f"""Parse all references from this reference section:
-
-{raw_text}
-
-Return a JSON object with a "references" array."""
+    from app.services.llm_input_boundary import json_data_envelope
+    user_prompt = (
+        "Parse all references from the reference_section string in this JSON data object:\n"
+        + json_data_envelope({"reference_section": raw_text})
+    )
 
     try:
+        from app.services.llm_input_boundary import enforce_complete_prompt_budget
+        from app.services.providers import get_provider_config
+
+        enforce_complete_prompt_budget(
+            system_prompt,
+            user_prompt,
+            max_input_tokens=get_provider_config().input_batch_tokens,
+        )
         response_data = chat_completion_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -762,6 +804,14 @@ def _parse_batch_with_llm(
 
     # Call LLM
     try:
+        from app.services.llm_input_boundary import enforce_complete_prompt_budget
+        from app.services.providers import get_provider_config
+
+        enforce_complete_prompt_budget(
+            system_prompt,
+            user_prompt,
+            max_input_tokens=get_provider_config().input_batch_tokens,
+        )
         response_data = chat_completion_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -940,5 +990,3 @@ def count_missing_identifiers(references: List[ParsedReference]) -> dict:
         "missing_should_have": len(missing_should_have),
         "missing_examples": missing_should_have[:10],
     }
-
-

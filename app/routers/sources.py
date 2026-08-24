@@ -1,30 +1,49 @@
-"""Source repository API endpoints.
+"""Source repository API endpoints backed by durable admission records."""
 
-Instructor-facing endpoints for uploading, searching, and deleting source
-documents. Uses an in-memory document registry for now; DB persistence
-(via StoredDocument + an Alembic migration) is deferred.
-"""
-
-import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.database import get_db
+from app.models.source_repository import (
+    CanonicalWorkRecord,
+    SourceRepresentationRecord,
+)
+from app.services.retrieval.base import RepresentationKind, SourceRepresentation
+from app.services.source_repository import (
+    AdmissionError,
+    AdmissionRequest,
+    WorkIdentity,
+    active_representation_clause,
+    admit_representation,
+    delete_representation,
+    finalize_pending_object_deletions,
+    retention_mode_for_scope,
+    representation_is_expired,
+)
 from app.services.storage import get_storage_backend
 from app.services.pdf_verifier import verify_instructor_upload
 from app.services.chapter_splitter import is_edited_collection, split_into_chapters
+from app.services.book_metadata import (
+    document_kind_for_source_kind,
+    normalize_source_kind,
+)
 from app.services.completeness_checker import check_completeness, INCOMPLETE, UNCERTAIN
+from app.services.file_safety import (
+    FileSafetyUnavailable,
+    SafetyVerdict,
+    inspect_uploaded_pdf,
+)
 from app.services.page_layout import classify_text_quality, PURE_SCAN, SCAN_OCR
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sources", tags=["sources"])
-
-# In-memory registry until DB integration (spec section 7 defers this).
-_stored_documents: list[dict] = []
 
 
 @router.post("/upload")
@@ -34,8 +53,14 @@ async def upload_source(
     isbn: str | None = Form(None),
     title: str | None = Form(None),
     author: str | None = Form(None),
+    year: str | None = Form(None),
     expected_pages: int | None = Form(None),
+    expected_first_page: int | None = Form(None),
+    expected_last_page: int | None = Form(None),
+    document_kind: str | None = Form(None),
+    source_kind: str | None = Form(None),
     description: str | None = Form(None),  # noqa: ARG001 (reserved for future use)
+    db: Session = Depends(get_db),
 ):
     """Upload an academic source document.
 
@@ -52,7 +77,77 @@ async def upload_source(
             detail="Provide at least a DOI, ISBN, or title for the source",
         )
 
+    normalized_source_kind = None
+    if source_kind is not None:
+        try:
+            normalized_source_kind = normalize_source_kind(source_kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if document_kind is not None:
+        document_kind = document_kind.strip().lower()
+        if document_kind not in {"article", "book", "chapter", "unknown"}:
+            raise HTTPException(
+                status_code=400,
+                detail="document_kind must be article, book, chapter, or unknown",
+            )
+    source_document_kind = (
+        document_kind_for_source_kind(normalized_source_kind)
+        if normalized_source_kind
+        else None
+    )
+    if document_kind and source_document_kind and document_kind != source_document_kind:
+        raise HTTPException(
+            status_code=400,
+            detail="document_kind conflicts with source_kind",
+        )
+    resolved_document_kind = document_kind or source_document_kind or (
+        "article" if doi is not None and isbn is None
+        else "book" if isbn is not None
+        else "unknown"
+    )
+    resolved_source_kind = normalized_source_kind or {
+        "article": "journal_article",
+        "book": "monograph",
+        "chapter": "book_section",
+        "unknown": "unknown",
+    }[resolved_document_kind]
+
+    if (expected_first_page is None) != (expected_last_page is None):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide both expected_first_page and expected_last_page",
+        )
+    expected_page_range = None
+    if expected_first_page is not None and expected_last_page is not None:
+        if expected_first_page < 1 or expected_last_page < expected_first_page:
+            raise HTTPException(
+                status_code=400,
+                detail="Expected page range is invalid",
+            )
+        expected_page_range = (expected_first_page, expected_last_page)
+
     file_bytes = await file.read()
+
+    # Safety precedes every metadata, text-quality, and completeness parser.
+    try:
+        safety_report = inspect_uploaded_pdf(file_bytes)
+    except FileSafetyUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Required malware inspection is unavailable",
+                "retryable": True,
+            },
+        ) from exc
+    if safety_report.verdict is SafetyVerdict.REJECTED:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "Upload rejected by hostile-file inspection",
+                "findings": list(safety_report.findings),
+            },
+        )
 
     # Verify the PDF matches the provided metadata.
     verified, messages = verify_instructor_upload(
@@ -105,10 +200,10 @@ async def upload_source(
             title=title,
             author=author,
             expected_pages=expected_pages,
-            # An ISBN indicates a book; a DOI without ISBN indicates a journal
-            # article. The completeness heuristics differ: books are checked for
-            # short-length/no-back-matter, articles are not (they're legitimately short).
-            is_article=(doi is not None and isbn is None),
+            expected_page_range=expected_page_range,
+            # Strong caller metadata selects source-specific rules. Title-only
+            # uploads remain unknown unless the operator supplies a bounded kind.
+            document_kind=resolved_document_kind,
         )
         completeness_verdict = report.verdict
         logical_pages = report.n_up_layout.logical_pages if report.n_up_layout else None
@@ -144,65 +239,115 @@ async def upload_source(
     if text_quality == PURE_SCAN and settings.STRICTNESS_MODE.lower() == "standard":
         review_status = "pending_review"
 
-    # ── Storage ───────────────────────────────────────────────────────
+    # ── Durable storage/admission ─────────────────────────────────────
     backend = get_storage_backend()
     results: list[dict] = []
 
-    # Detect edited collection (single pass) and split if applicable.
-    should_split = bool(isbn) and is_edited_collection(file_bytes)
+    # A supplied source kind guides detection but cannot prove that usable
+    # chapter boundaries exist. Split only after structural confirmation.
+    should_inspect_for_chapters = (
+        resolved_source_kind == "edited_collection" or bool(isbn)
+    )
+    should_split = should_inspect_for_chapters and is_edited_collection(file_bytes)
 
     if should_split:
         chapters = split_into_chapters(file_bytes)
-        for i, (info, chapter_bytes) in enumerate(chapters):
-            key = f"by-isbn/{isbn}/chapter_{i + 1:02d}.pdf"
-            backend.upload(chapter_bytes, key)
-            results.append(
-                _build_document_entry(
-                    content_type="book_chapter",
+        admission_items = [
+            (
+                WorkIdentity(
                     title=info.title,
-                    author=info.author or author or "",
-                    isbn=isbn,
-                    key=key,
-                    size=len(chapter_bytes),
-                    chapter_number=i + 1,
-                    page_start=info.page_start,
-                    page_end=info.page_end,
-                    logical_pages=logical_pages,
-                    completeness_verdict=completeness_verdict,
-                    text_quality=text_quality,
-                    review_status=review_status,
-                )
+                    author=info.author or author,
+                    year=year,
+                    work_type="book_section",
+                ),
+                chapter_bytes,
+                {
+                    "parent_isbn": isbn,
+                    "parent_title": title,
+                    "chapter_number": i + 1,
+                    "page_range_start": info.page_start,
+                    "page_range_end": info.page_end,
+                },
             )
+            for i, (info, chapter_bytes) in enumerate(chapters)
+        ]
     else:
-        key = _storage_key(doi, isbn, title)
-        backend.upload(file_bytes, key)
-        results.append(
-            _build_document_entry(
-                content_type="book" if isbn else "journal_article",
-                title=title or "",
-                author=author or "",
-                doi=doi,
-                isbn=isbn,
-                key=key,
-                size=len(file_bytes),
-                logical_pages=logical_pages,
-                completeness_verdict=completeness_verdict,
-                text_quality=text_quality,
-                review_status=review_status,
+        admission_items = [
+            (
+                WorkIdentity(
+                    work_type=resolved_source_kind,
+                    title=title or doi or isbn or "",
+                    author=author,
+                    year=year,
+                    doi=doi,
+                    isbn=isbn,
+                ),
+                file_bytes,
+                {},
             )
-        )
+        ]
 
-    # Register in the in-memory store so search/delete can find them.
-    _stored_documents.extend(results)
+    try:
+        for work, content, item_evidence in admission_items:
+            record = admit_representation(
+                db,
+                backend,
+                AdmissionRequest(
+                    work=work,
+                    representation=SourceRepresentation(
+                        kind=RepresentationKind.PDF,
+                        media_type="application/pdf",
+                        content=content,
+                    ),
+                    provenance="instructor_upload",
+                    license_class="commercial_user_upload",
+                    scope_type="personal_owner",
+                    scope_id=settings.SOURCE_REPOSITORY_SCOPE_ID,
+                    identity_verdict="verified",
+                    identity_confidence=1.0,
+                    completeness_verdict=(
+                        (completeness_verdict or "not_assessed").casefold()
+                    ),
+                    cleanliness_verdict=safety_report.verdict.value,
+                    text_quality=text_quality,
+                    admitted_by=None,
+                    validation_evidence={
+                        "upload_verification": messages,
+                        "file_safety": {
+                            "structural_verdict": safety_report.structural_verdict.value,
+                            "malware_verdict": safety_report.malware_verdict.value,
+                        },
+                        "logical_pages": logical_pages,
+                        "source_kind": resolved_source_kind,
+                        **item_evidence,
+                    },
+                    request_acceptance=(review_status == "accepted"),
+                ),
+            )
+            results.append(_representation_dict(record))
+        db.commit()
+    except AdmissionError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    durable_review_status = (
+        "accepted"
+        if results and all(item["admission_state"] == "accepted" for item in results)
+        else "needs_review"
+    )
 
     return {
         "status": "ok",
         "verification": messages,
         "text_quality": text_quality,
         "completeness_verdict": completeness_verdict,
-        "review_status": review_status,
+        "review_status": durable_review_status,
         "warnings": warnings,
         "split_detected": should_split,
+        "source_kind": resolved_source_kind,
         "documents": results,
     }
 
@@ -213,41 +358,62 @@ async def search_sources(
     isbn: str | None = Query(None),
     title: str | None = Query(None),
     author: str | None = Query(None),
+    db: Session = Depends(get_db),
 ):
     """Search for stored sources by DOI, ISBN, title, or author."""
-    results = _stored_documents
-
+    query = (
+        select(SourceRepresentationRecord)
+        .join(SourceRepresentationRecord.canonical_work)
+        .where(
+            SourceRepresentationRecord.scope_type == "personal_owner",
+            SourceRepresentationRecord.scope_id == settings.SOURCE_REPOSITORY_SCOPE_ID,
+            active_representation_clause(),
+        )
+    )
     if doi:
-        results = [d for d in results if d.get("doi") == doi]
+        normalized = doi.strip().lower().removeprefix("https://doi.org/")
+        query = query.where(CanonicalWorkRecord.doi == normalized)
     if isbn:
-        results = [d for d in results if d.get("isbn") == isbn]
+        normalized = "".join(char for char in isbn.upper() if char.isdigit() or char == "X")
+        query = query.where(CanonicalWorkRecord.isbn == normalized)
     if title:
-        t = title.lower()
-        results = [d for d in results if t in d.get("title", "").lower()]
+        query = query.where(CanonicalWorkRecord.display_title.ilike(f"%{title}%"))
     if author:
-        a = author.lower()
-        results = [d for d in results if a in d.get("author", "").lower()]
+        query = query.where(CanonicalWorkRecord.author.ilike(f"%{author}%"))
 
+    results = [_representation_dict(record) for record in db.scalars(query).all()]
     return {"count": len(results), "documents": results}
 
 
 @router.delete("/{doc_id}")
-async def delete_source(doc_id: str):
+async def delete_source(doc_id: str, db: Session = Depends(get_db)):
     """Delete a stored source by its ID."""
-    global _stored_documents
     backend = get_storage_backend()
-
-    for doc in _stored_documents:
-        if doc["id"] == doc_id:
-            backend.delete(doc["s3_key"])
-            _stored_documents = [d for d in _stored_documents if d["id"] != doc_id]
-            return {"status": "deleted", "id": doc_id}
-
-    raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        parsed_id = uuid.UUID(doc_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Document not found") from exc
+    try:
+        if not delete_representation(db, parsed_id):
+            raise HTTPException(status_code=404, detail="Document not found")
+        db.commit()
+        finalize_pending_object_deletions(db, backend)
+        db.commit()
+        return {"status": "deleted", "id": doc_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except AdmissionError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/{doc_id}/review")
-async def review_source(doc_id: str, decision: str = Form(...)):
+async def review_source(
+    doc_id: str,
+    decision: str = Form(...),
+    db: Session = Depends(get_db),
+):
     """Approve or reject a source held for review (Standard strictness mode).
 
     Args:
@@ -263,63 +429,57 @@ async def review_source(doc_id: str, decision: str = Form(...)):
 
     new_status = "accepted" if decision_lower == "accept" else "rejected"
 
-    for doc in _stored_documents:
-        if doc["id"] == doc_id:
-            doc["review_status"] = new_status
-            return {"status": "ok", "id": doc_id, "review_status": new_status}
-
-    raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        parsed_id = uuid.UUID(doc_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Document not found") from exc
+    record = db.get(SourceRepresentationRecord, parsed_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if representation_is_expired(record):
+        raise HTTPException(status_code=410, detail="Source representation has expired")
+    record.admission_state = new_status
+    if new_status == "accepted":
+        record.admitted_at = datetime.now(timezone.utc)
+        record.admitted_by = "manual_review"
+    else:
+        record.admitted_at = None
+        record.admitted_by = None
+    db.commit()
+    return {"status": "ok", "id": doc_id, "review_status": new_status}
 
 
 # ── Helpers ──────────────────────────────────────────────
 
 
-def _storage_key(doi: str | None, isbn: str | None, title: str | None) -> str:
-    if doi:
-        return f"by-doi/{doi}.pdf"
-    if isbn:
-        return f"by-isbn/{isbn}.pdf"
-    if title:
-        h = hashlib.sha256(title.strip().lower().encode()).hexdigest()[:12]
-        return f"by-title-hash/{h}.pdf"
-    raise ValueError("Need DOI, ISBN, or title for storage key")
-
-
-def _build_document_entry(
-    content_type: str,
-    title: str,
-    author: str,
-    key: str,
-    size: int,
-    doi: str | None = None,
-    isbn: str | None = None,
-    chapter_number: int | None = None,
-    page_start: int | None = None,
-    page_end: int | None = None,
-    logical_pages: int | None = None,
-    completeness_verdict: str | None = None,
-    text_quality: str | None = None,
-    review_status: str = "accepted",
-) -> dict:
+def _representation_dict(record: SourceRepresentationRecord) -> dict:
+    work = record.canonical_work
+    content = record.content_object
     return {
-        "id": str(uuid.uuid4()),
-        "content_type": content_type,
-        "title": title,
-        "author": author,
-        "doi": doi,
-        "isbn": isbn,
-        "s3_key": key,
-        "file_size_bytes": size,
-        "license_class": "instructor_upload",
-        "provenance": "instructor_upload",
-        "verified": True,
-        "verification_method": "instructor_attestation",
-        "chapter_number": chapter_number,
-        "page_range_start": page_start,
-        "page_range_end": page_end,
-        "logical_pages": logical_pages,
-        "completeness_verdict": completeness_verdict,
-        "text_quality": text_quality,
-        "review_status": review_status,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "id": str(record.id),
+        "canonical_work_id": str(record.canonical_work_id),
+        "content_type": work.work_type,
+        "title": work.display_title,
+        "author": work.author or "",
+        "year": work.year,
+        "doi": work.doi,
+        "isbn": work.isbn,
+        "s3_key": content.storage_key,
+        "file_size_bytes": content.byte_size,
+        "representation_kind": record.representation_kind,
+        "media_type": content.media_type,
+        "content_sha256": content.content_sha256,
+        "license_class": content.license_class,
+        "provenance": record.provenance,
+        "identity_verdict": record.identity_verdict,
+        "completeness_verdict": record.completeness_verdict,
+        "cleanliness_verdict": record.cleanliness_verdict,
+        "text_quality": record.text_quality,
+        "admission_state": record.admission_state,
+        "review_status": record.admission_state,
+        "scope_type": record.scope_type,
+        "scope_id": record.scope_id,
+        "retention_mode": retention_mode_for_scope(record.scope_type).value,
+        "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+        "created_at": record.created_at.isoformat(),
     }

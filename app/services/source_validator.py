@@ -22,8 +22,16 @@ Usage:
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional
+
+from app.services.source_type import (
+    SourceKindAssessment,
+    classify_content_source_kind,
+    compare_source_kinds,
+    normalize_source_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,8 @@ class ValidationResult:
     text_quality: str          # "digital" | "scan_ocr" | "pure_scan" | "skipped"
     reason: str                # human-readable explanation
     page_count: int = 0        # detected page count (for logging)
+    observed_source_kind: str = "unknown"
+    source_kind_verdict: str = "unknown"
 
 
 def validate_retrieved_pdf(
@@ -45,7 +55,13 @@ def validate_retrieved_pdf(
     expected_title: Optional[str] = None,
     expected_author: Optional[str] = None,
     expected_year: Optional[str] = None,
+    expected_isbn: Optional[str] = None,
     is_article: bool = True,
+    document_kind: str | None = None,
+    expected_page_range: tuple[int, int] | None = None,
+    expected_source_kind: str | None = None,
+    expected_source_kind_confidence: str = "unknown",
+    expected_source_kind_evidence: tuple[str, ...] = (),
     skip_completeness: bool = False,
     skip_text_quality: bool = False,
 ) -> ValidationResult:
@@ -94,6 +110,43 @@ def validate_retrieved_pdf(
                        "or instructor upload of a digital copy.",
             )
 
+    # Work type is part of source identity, not merely a completeness hint.
+    # A book review can repeat the reviewed book's title, author, year and DOI,
+    # so field overlap alone is not a safe identity boundary.
+    front_text = _extract_pdf_front_text(pdf_bytes)
+    observed_kind = classify_content_source_kind(front_text)
+    expected_kind = SourceKindAssessment(
+        normalize_source_kind(expected_source_kind),
+        expected_source_kind_confidence,
+        expected_source_kind_evidence,
+    )
+    kind_compatibility = compare_source_kinds(expected_kind, observed_kind)
+    if kind_compatibility.verdict == "incompatible":
+        return ValidationResult(
+            accept=False,
+            identity_confidence="rejected",
+            completeness="skipped",
+            text_quality=text_quality,
+            reason=f"Bibliographic type conflict — {kind_compatibility.reason}.",
+            observed_source_kind=observed_kind.kind,
+            source_kind_verdict=kind_compatibility.verdict,
+        )
+
+    listing_conflict = _detect_nonwork_listing(front_text)
+    if listing_conflict:
+        return ValidationResult(
+            accept=False,
+            identity_confidence="rejected",
+            completeness="skipped",
+            text_quality=text_quality,
+            reason=(
+                "Representation identity conflict — the PDF is "
+                f"{listing_conflict}, not the cited work itself."
+            ),
+            observed_source_kind=observed_kind.kind,
+            source_kind_verdict=kind_compatibility.verdict,
+        )
+
     # Layer 2: Identity check — is this the RIGHT source?
     # (Now safe to run — text quality check confirmed text is extractable.)
     identity = _check_identity(pdf_bytes, expected_doi, expected_title,
@@ -110,7 +163,15 @@ def validate_retrieved_pdf(
     completeness = "skipped"
     page_count = 0
     if not skip_completeness:
-        completeness, page_count = _check_completeness(pdf_bytes, is_article)
+        completeness, page_count = _check_completeness(
+            pdf_bytes,
+            is_article,
+            document_kind=document_kind,
+            expected_page_range=expected_page_range,
+            isbn=expected_isbn,
+            title=expected_title,
+            author=expected_author,
+        )
         if completeness == "incomplete":
             return ValidationResult(
                 accept=False, identity_confidence=identity,
@@ -120,7 +181,9 @@ def validate_retrieved_pdf(
                        "or significantly shorter than expected).",
             )
 
-    # All checks passed (or uncertain — accept with appropriate confidence)
+    # Only high-confidence identity can be used automatically.  Medium/low
+    # results remain inspectable but require review and must not become the
+    # accepted representation merely because their bytes were downloadable.
     reasons = [f"identity={identity}"]
     if completeness != "skipped":
         reasons.append(f"completeness={completeness}")
@@ -128,16 +191,111 @@ def validate_retrieved_pdf(
         reasons.append(f"text_quality={text_quality}")
 
     return ValidationResult(
-        accept=True,
+        accept=identity == "high",
         identity_confidence=identity,
         completeness=completeness,
         text_quality=text_quality,
         page_count=page_count,
-        reason="Accepted: " + ", ".join(reasons),
+        reason=("Accepted: " if identity == "high" else "Needs review: ")
+        + ", ".join(reasons),
+        observed_source_kind=observed_kind.kind,
+        source_kind_verdict=kind_compatibility.verdict,
     )
 
 
 # ── Layer 1: Identity check ─────────────────────────────────────────────
+
+def _extract_pdf_front_text(pdf_bytes: bytes) -> str:
+    """Extract a bounded front-matter sample for identity/type checks."""
+    import fitz
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            return "\n".join(
+                document[index].get_text() for index in range(min(3, len(document)))
+            )[:20000]
+        finally:
+            document.close()
+    except Exception:
+        return ""
+
+
+def _extract_pdf_identity_metadata(pdf_bytes: bytes) -> str:
+    """Extract bounded standard embedded identity fields."""
+    try:
+        import fitz
+
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            metadata = document.metadata or {}
+            return "\n".join(
+                str(metadata.get(field, ""))[:1000]
+                for field in ("title", "author", "subject", "keywords")
+                if metadata.get(field)
+            )
+        finally:
+            document.close()
+    except Exception:
+        return ""
+
+
+def _detect_nonwork_listing(front_text: str) -> str | None:
+    """Detect documents that only list or cite the expected work.
+
+    Exact title and author overlap is not source identity when the containing
+    representation is a CV/publication list or an awards listing. Keep this
+    fail-closed rule restricted to strong representation-level markers so an
+    ordinary article that merely discusses awards is not rejected.
+    """
+    visible = " ".join(front_text.split())[:12000]
+    normalized = _normalize_identity_text(visible)
+    leading = normalized[:4000]
+
+    cv_marker = bool(
+        re.search(r"\b(?:curriculum vitae|abridged c v)\b", leading)
+        or (
+            "academic employment" in leading
+            and "education" in leading
+            and "publications" in normalized
+        )
+    )
+    if cv_marker:
+        return "a curriculum vitae or publication list"
+
+    award_count = len(re.findall(r"\baward\b", leading))
+    if "award winners" in leading or (
+        award_count >= 4 and "outstanding" in leading
+    ):
+        return "an awards or contents listing"
+
+    return None
+
+
+def _visible_identity_support_count(
+    front_text: str,
+    expected_title: str | None,
+    expected_author: str | None,
+    expected_year: str | None,
+) -> int:
+    """Count independent visible front-matter support for embedded metadata."""
+    normalized = _normalize_identity_text(front_text)
+    support = 0
+    if expected_title:
+        title_tokens = {
+            token
+            for token in _normalize_identity_text(expected_title).split()
+            if len(token) >= 4
+        }
+        if title_tokens:
+            matches = sum(token in normalized for token in title_tokens)
+            support += int(matches / len(title_tokens) >= 0.6)
+    if expected_author:
+        surname = _normalize_identity_text(expected_author.split(",", 1)[0])
+        support += int(bool(surname and len(surname) >= 3 and surname in normalized))
+    if expected_year:
+        support += int(expected_year in front_text)
+    return support
 
 def _check_identity(
     pdf_bytes: bytes,
@@ -154,25 +312,29 @@ def _check_identity(
 
     Returns: "high" | "medium" | "low" | "rejected"
     """
-    import fitz
-
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = ""
-        for i in range(min(3, len(doc))):
-            text += doc[i].get_text()
-        doc.close()
-    except Exception:
-        return "rejected"
+    front_text = _extract_pdf_front_text(pdf_bytes)
+    identity_metadata = _extract_pdf_identity_metadata(pdf_bytes)
+    text = f"{front_text}\n{identity_metadata}"[:24000]
 
     if not text.strip():
         return "rejected"
 
     text_lower = text.lower()
+    text_identity = _normalize_identity_text(text)
 
     # ── DOI match (definitive — unique identifier) ──
-    if expected_doi and expected_doi.lower() in text_lower:
-        return "high"
+    if expected_doi:
+        normalized_doi = expected_doi.lower()
+        if normalized_doi in front_text.lower():
+            return "high"
+        if (
+            normalized_doi in identity_metadata.lower()
+            and _visible_identity_support_count(
+                front_text, expected_title, expected_author, expected_year
+            )
+            >= 2
+        ):
+            return "high"
 
     # ── Multi-field triangulation ──
     # Collect signals from each available field
@@ -183,20 +345,17 @@ def _check_identity(
     title_exact = False
     title_fuzzy = False
     if expected_title:
-        title_clean = expected_title.strip().lower()
+        title_clean = _normalize_identity_text(expected_title)
         # Check if the full title (or 80%+ of it) appears as a contiguous string
         if title_clean and len(title_clean) >= 10:
-            if title_clean in text_lower:
+            if title_clean in text_identity:
                 title_exact = True
-            elif len(title_clean) > 30:
-                # For long titles, check if first 30 chars appear as substring
-                if title_clean[:30] in text_lower:
-                    title_exact = True
         # Fuzzy: token overlap (only as a supporting signal, never standalone)
-        title_tokens = {t.lower() for t in re.split(r"[^A-Za-z0-9]+", expected_title)
-                       if len(t) >= 4}
+        title_tokens = {
+            token for token in title_clean.split() if len(token) >= 4
+        }
         if title_tokens:
-            matches = sum(1 for t in title_tokens if t in text_lower)
+            matches = sum(1 for token in title_tokens if token in text_identity)
             if matches / len(title_tokens) >= 0.6:
                 title_fuzzy = True
 
@@ -212,8 +371,8 @@ def _check_identity(
         author_raw = expected_author.split(",")[0].strip()
         if not author_raw:
             author_raw = expected_author.split()[0]
-        surname = author_raw.lower()
-        if surname and len(surname) >= 3 and surname in text_lower:
+        surname = _normalize_identity_text(author_raw)
+        if surname and len(surname) >= 3 and surname in text_identity:
             author_match = True
             signals.append(("author", 2))
 
@@ -234,6 +393,16 @@ def _check_identity(
         return "low"
     else:
         return "rejected"
+
+
+def _normalize_identity_text(value: str) -> str:
+    """Fold diacritics and punctuation variants for bibliographic comparison."""
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    ascii_like = "".join(
+        character for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", ascii_like).split())
 
 
 # ── Layer 2: Text quality ───────────────────────────────────────────────
@@ -261,7 +430,16 @@ def _check_text_quality(pdf_bytes: bytes) -> str:
 
 # ── Layer 3: Completeness ───────────────────────────────────────────────
 
-def _check_completeness(pdf_bytes: bytes, is_article: bool = True) -> tuple[str, int]:
+def _check_completeness(
+    pdf_bytes: bytes,
+    is_article: bool = True,
+    *,
+    document_kind: str | None = None,
+    expected_page_range: tuple[int, int] | None = None,
+    isbn: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+) -> tuple[str, int]:
     """Check if the PDF is complete (not truncated).
 
     Returns: (verdict, page_count)
@@ -269,8 +447,19 @@ def _check_completeness(pdf_bytes: bytes, is_article: bool = True) -> tuple[str,
     """
     from app.services.completeness_checker import check_completeness
     try:
-        report = check_completeness(pdf_bytes, is_article=is_article)
-        return report.verdict.lower(), report.page_count or 0
+        report = check_completeness(
+            pdf_bytes,
+            is_article=is_article,
+            document_kind=document_kind,
+            expected_page_range=expected_page_range,
+            isbn=isbn,
+            title=title,
+            author=author,
+        )
+        page_count = (
+            report.n_up_layout.logical_pages if report.n_up_layout else 0
+        )
+        return report.verdict.lower(), page_count
     except Exception as e:
         logger.debug("Completeness check failed: %s", e)
         return "uncertain", 0

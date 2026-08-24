@@ -12,7 +12,7 @@ Cache structure:
 import hashlib
 import logging
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def cache_reference(
         return
 
     # Add timestamp
-    data["_cached_at"] = datetime.utcnow().isoformat()
+    data["_cached_at"] = datetime.now(timezone.utc).isoformat()
 
     # Cache by DOI
     if doi:

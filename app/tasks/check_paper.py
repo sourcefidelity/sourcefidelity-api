@@ -1,75 +1,110 @@
-"""Celery task for citation checking a paper."""
+"""Checkpointed Celery workflow for one uploaded paper."""
 
 import logging
+import uuid
 
-from celery.exceptions import SoftTimeLimitExceeded
+from celery import chain
 
+from app.database import SessionLocal
+from app.models.job import Job
+from app.services.paper_workflow import (
+    extract_paper_job,
+    fail_paper_job,
+    finalize_paper_job,
+    retrieve_paper_sources,
+    verify_paper_sources,
+)
+from app.services.storage.backend import get_storage_backend
 from app.tasks.celery_app import celery_app
 
+
 logger = logging.getLogger(__name__)
-
-# Constants for retry behavior
 MAX_RETRIES = 3
-RETRY_BACKOFF = 60  # seconds
+RETRY_BACKOFF = 60
 
 
-@celery_app.task(
-    bind=True,
-    name="check_paper",
-    autoretry_for=(SoftTimeLimitExceeded, ConnectionError, TimeoutError),
-    max_retries=MAX_RETRIES,
-    default_retry_delay=RETRY_BACKOFF,
-    retry_backoff=True,       # Exponential backoff: 60s, 120s, 240s
-    retry_backoff_max=600,    # Max 10 minutes between retries
-    retry_jitter=True,        # Add randomness to avoid thundering herd
-    acks_late=True,           # Only ack after successful completion
-    reject_on_worker_lost=True,  # Requeue if worker crashes
-)
-def check_paper_task(self, job_id: str, file_path: str):
-    """
-    Run the full citation checking workflow.
-
-    This task orchestrates: text extraction → reference parsing →
-    OpenAlex lookup → full-text retrieval → verification → report generation.
-
-    Args:
-        job_id: UUID of the job in PostgreSQL.
-        file_path: Path to the uploaded paper file.
-
-    Raises:
-        NotImplementedError: Until Phase 5 implementation.
-        Retry: On transient failures, with exponential backoff.
-    """
-    logger.info(
-        "Starting check_paper_task",
-        extra={"job_id": job_id, "file_path": file_path, "attempt": self.request.retries},
-    )
-
+def _fail(job_id: str, exc: BaseException) -> None:
     try:
-        # Phase 5 placeholder
-        raise NotImplementedError("Phase 5 – Celery task wiring")
+        backend = get_storage_backend()
+        with SessionLocal() as session:
+            fail_paper_job(session, backend, job_id, exc)
+    except Exception as failure_error:
+        logger.error(
+            "Could not persist terminal paper-job failure: %s",
+            type(failure_error).__name__,
+            extra={"job_id": job_id},
+        )
 
-    except NotImplementedError:
-        # Don't retry implementation errors
-        logger.error("Task not yet implemented", extra={"job_id": job_id})
-        raise
 
-    except SoftTimeLimitExceeded:
-        logger.warning("Task timed out", extra={"job_id": job_id, "attempt": self.request.retries})
-        if self.request.retries < MAX_RETRIES:
-            raise self.retry(exc=SoftTimeLimitExceeded("Task timed out"))
-        raise
+def _retry_or_fail(task, job_id: str, exc: BaseException):
+    if isinstance(exc, (ConnectionError, TimeoutError)) and task.request.retries < MAX_RETRIES:
+        raise task.retry(
+            exc=exc,
+            countdown=min(600, RETRY_BACKOFF * (2 ** task.request.retries)),
+        )
+    _fail(job_id, exc)
+    raise exc
 
+
+@celery_app.task(bind=True, name="check_paper")
+def check_paper_task(self, job_id: str):
+    """Schedule durable stage checkpoints; never process the paper monolithically."""
+    with SessionLocal() as session:
+        try:
+            parsed_job_id = uuid.UUID(job_id)
+        except ValueError as exc:
+            raise ValueError("Invalid paper job ID") from exc
+        job = session.get(Job, parsed_job_id)
+        if job is None:
+            raise ValueError("Paper job does not exist")
+        steps = [extract_paper_task.si(job_id)]
+        if not job.store_only:
+            steps.extend(
+                [
+                    retrieve_paper_sources_task.si(job_id),
+                    verify_paper_sources_task.si(job_id),
+                ]
+            )
+        steps.append(finalize_paper_job_task.si(job_id))
+        workflow = chain(*steps).apply_async()
+        job.task_id = workflow.id
+        session.commit()
+    return {"job_id": job_id, "workflow_task_id": workflow.id}
+
+
+@celery_app.task(bind=True, name="extract_paper", max_retries=MAX_RETRIES)
+def extract_paper_task(self, job_id: str):
+    try:
+        backend = get_storage_backend()
+        with SessionLocal() as session:
+            return extract_paper_job(session, backend, job_id)
     except Exception as exc:
-        logger.exception(
-            "Task failed unexpectedly",
-            extra={"job_id": job_id, "attempt": self.request.retries},
-        )
-        if self.request.retries < MAX_RETRIES:
-            raise self.retry(exc=exc)
-        # Max retries exhausted – task goes to dead letter queue
-        logger.critical(
-            "Task failed after max retries – sending to dead letter queue",
-            extra={"job_id": job_id, "error": str(exc)},
-        )
-        raise
+        return _retry_or_fail(self, job_id, exc)
+
+
+@celery_app.task(bind=True, name="retrieve_paper_sources", max_retries=MAX_RETRIES)
+def retrieve_paper_sources_task(self, job_id: str):
+    try:
+        backend = get_storage_backend()
+        with SessionLocal() as session:
+            return retrieve_paper_sources(session, backend, job_id)
+    except Exception as exc:
+        return _retry_or_fail(self, job_id, exc)
+
+
+@celery_app.task(bind=True, name="verify_paper_sources", max_retries=MAX_RETRIES)
+def verify_paper_sources_task(self, job_id: str):
+    try:
+        return verify_paper_sources(SessionLocal, get_storage_backend(), job_id)
+    except Exception as exc:
+        return _retry_or_fail(self, job_id, exc)
+
+
+@celery_app.task(bind=True, name="finalize_paper_job", max_retries=MAX_RETRIES)
+def finalize_paper_job_task(self, job_id: str):
+    try:
+        backend = get_storage_backend()
+        with SessionLocal() as session:
+            return finalize_paper_job(session, backend, job_id)
+    except Exception as exc:
+        return _retry_or_fail(self, job_id, exc)

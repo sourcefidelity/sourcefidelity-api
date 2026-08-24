@@ -22,6 +22,16 @@ def test_apa_regex_extracts_identity_fields() -> None:
     assert reference.needs_review is False
 
 
+def test_apa_monograph_title_excludes_trailing_cited_page_range() -> None:
+    raw = "Hardy, J. (2010). Cross-media promotion (pp. 3-32). New York: Peter Lang."
+
+    reference = extract_fields_apa(raw)
+
+    assert reference is not None
+    assert reference.title == "Cross-media promotion"
+    assert "pp. 3-32" in reference.raw_ref
+
+
 def test_mla_regex_extracts_quoted_article_title() -> None:
     raw = (
         'Smith, Jane. "Platform Governance and Academic Integrity." '

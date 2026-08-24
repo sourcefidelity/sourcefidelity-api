@@ -1,0 +1,10 @@
+# Optional local Phase 3.8 relationship-signal runtime. This is separate from
+# the base API dependencies because the PyTorch wheel and model cache are large.
+# Install alongside requirements.txt, prefetch the configured immutable model
+# revision, then enable RELATIONSHIP_SIGNAL_BACKEND=deberta_nli.
+# PyTorch 2.9+ deprecates torch.jit.script while the upstream DeBERTa loader
+# still uses it, producing warning debt. 2.8 is the newest warning-clean line
+# for this pinned model/runtime combination.
+torch==2.8.0
+transformers==5.15.0
+sentencepiece==0.2.2
