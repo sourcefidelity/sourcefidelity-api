@@ -260,10 +260,28 @@ run_retrieval_profile_test.sh
 tests/**/__pycache__/
 tests/**/*.py[codz]
 
+# Private case-derived calibration modules. These remain local and must never
+# be staged or published with the maintained public regression suite.
+tests/unit/test_antecedent_resolver.py
+tests/unit/test_candidate_relationship_judgment.py
+tests/unit/test_citation_identity.py
+tests/unit/test_citation_structure.py
+tests/unit/test_citation_use_router.py
+tests/unit/test_claim_atomizer.py
+tests/unit/test_decisive_label_critic.py
+tests/unit/test_discourse_context.py
+tests/unit/test_facet_evidence_judgment.py
+tests/unit/test_pairwise_facet_judgment.py
+tests/unit/test_paper_extraction.py
+tests/unit/test_relationship_stage_evaluation.py
+tests/unit/test_source_attribution.py
+tests/unit/test_verification_report.py
+
 # Local reference / planning documents — not for publication.
 HPC_SURVEY_ANSWERS.md
 ARCHITECTURE.md
 ROADMAP.md
+private_guiding_history/
 campus_test.py
 CAMPUS_TEST_INSTRUCTIONS.md
 campus_test_home.log
@@ -280,3 +298,6 @@ retrieval_baseline_*.log
 url_web_results.json
 *SFConflict*
 *conflicted copy*
+
+# Private rendered report QA and local PDF artifacts.
+/output/pdf/

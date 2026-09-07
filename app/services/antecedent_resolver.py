@@ -27,11 +27,23 @@ _TYPED_HEADS = (
     "action", "actions", "decision", "decisions", "proposal", "proposals",
 )
 _TYPE_PATTERN = "|".join(sorted(_TYPED_HEADS, key=len, reverse=True))
+_MENTION_BOUNDARY_WORDS = {
+    "is", "are", "was", "were", "has", "have", "had", "can", "could",
+    "may", "might", "must", "should", "will", "would", "leads", "lead",
+    "creates", "create", "causes", "cause", "results", "result", "shows",
+    "show", "supports", "support", "limits", "limit", "derails", "derail",
+    "affects", "affect", "encourages", "encourage",
+}
+_DEMONSTRATIVE_WORD = (
+    rf"(?!(?:{'|'.join(sorted(_MENTION_BOUNDARY_WORDS))})\b)"
+    rf"[A-Za-z][\w'’\-]*"
+)
 _LEADING_DEPENDENCY = re.compile(
     rf"^\s*(?P<mention>"
-    rf"(?:this|these|those)\s+(?P<demonstrative>(?:[A-Za-z][\w'’\-]*\s+){{0,3}}[A-Za-z][\w'’\-]*)"
+    rf"(?:this|that|these|those)\s+"
+    rf"(?P<demonstrative>(?:{_DEMONSTRATIVE_WORD}\s+){{0,3}}{_DEMONSTRATIVE_WORD})"
     rf"|the\s+(?P<typed>{_TYPE_PATTERN})"
-    rf"|(?:it|its|they|their|them|he|his|she|her)\b)",
+    rf"|(?:this|that|these|those|it|its|they|their|them|he|his|she|her)\b)",
     re.IGNORECASE,
 )
 _NAMED_TYPED_PHRASE = re.compile(
@@ -79,13 +91,6 @@ _COMPATIBLE_GROUP_PHRASE = re.compile(
     re.IGNORECASE,
 )
 _PARAGRAPH = re.compile(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", re.DOTALL)
-_MENTION_BOUNDARY_WORDS = {
-    "is", "are", "was", "were", "has", "have", "had", "can", "could",
-    "may", "might", "must", "should", "will", "would", "leads", "lead",
-    "creates", "create", "causes", "cause", "results", "result", "shows",
-    "show", "supports", "support", "limits", "limit", "derails", "derail",
-    "affects", "affect", "encourages", "encourage",
-}
 
 
 def resolve_claim_antecedents(

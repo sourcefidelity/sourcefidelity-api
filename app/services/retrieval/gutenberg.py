@@ -10,6 +10,7 @@ from zipfile import BadZipFile, ZipFile
 from bs4 import BeautifulSoup
 import httpx
 
+from app.log_safety import safe_exception_code
 from app.services.relevance import extract_surnames, score_relevance
 from app.services.retrieval.base import (
     AcquisitionLocation,
@@ -90,8 +91,9 @@ class GutenbergRetriever(RetrievalSource):
                 error=f"No relevant match (top {min(5, len(candidates))} results rejected)",
             )
         except Exception as exc:
-            logger.warning("Gutenberg OPDS search failed: %s", exc)
-            return RetrievalResult(source_name=self.name, success=False, error=str(exc))
+            error = safe_exception_code(exc)
+            logger.warning("Gutenberg OPDS search failed (type=%s)", type(exc).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def _fetch_edition(self, item_url: str) -> RetrievalResult:
         response = httpx.get(
@@ -160,9 +162,9 @@ class GutenbergRetriever(RetrievalSource):
                 )
             )
         except Exception as exc:
-            logger.warning("Gutenberg acquisition failed: %s", exc)
+            logger.warning("Gutenberg acquisition failed (type=%s)", type(exc).__name__)
             result.success = False
-            result.error = str(exc)
+            result.error = safe_exception_code(exc)
         return result
 
 

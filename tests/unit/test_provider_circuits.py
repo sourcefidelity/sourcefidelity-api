@@ -6,14 +6,62 @@ import httpx
 from app.services.retrieval.core import CoreRetriever
 from app.services.retrieval import core as core_module
 from app.services.retrieval.openalex import OpenAlexRetriever
-from app.services.retrieval.provider_runtime import ProviderHealthStore
+from app.services.retrieval.provider_runtime import ProviderHealthStore, ProviderPolicy
 from app.services.retrieval.semantic_scholar import SemanticScholarRetriever
+from app.services.search.tavily import TavilySearch
+from app.services.search.duckduckgo import DuckDuckGoSearch
+from app.services.search.brave import BraveSearch
 from app.config import settings
 
 
 def _response(status_code: int) -> httpx.Response:
     request = httpx.Request("GET", "https://provider.example/query")
     return httpx.Response(status_code, request=request)
+
+
+def test_tavily_quota_response_opens_run_level_circuit(monkeypatch) -> None:
+    request = Mock(return_value=_response(432))
+    monkeypatch.setattr("app.services.search.tavily.httpx.post", request)
+    provider = TavilySearch("test-key")
+
+    assert provider.search("first query") == []
+    assert provider.last_status == "rate_limited"
+    assert provider.search("second query") == []
+    assert provider.last_status == "rate_limited"
+    request.assert_called_once()
+
+
+def test_direct_duckduckgo_challenge_is_not_reported_as_completed_no_results(
+    monkeypatch,
+) -> None:
+    response = _response(200)
+    response._content = b'<html><form id="challenge-form">not a Robot</form></html>'
+    monkeypatch.setattr(
+        "app.services.search.duckduckgo.httpx.post", Mock(return_value=response)
+    )
+    provider = DuckDuckGoSearch()
+
+    assert provider.search("bounded query") == []
+    assert provider.last_status == "captcha"
+
+
+def test_search_failure_log_hashes_query_and_omits_request_url(
+    monkeypatch, caplog
+) -> None:
+    query = "private bibliographic query"
+    request = httpx.Request(
+        "GET", "https://provider.example/search", params={"q": query}
+    )
+    response = httpx.Response(422, request=request)
+    monkeypatch.setattr(
+        "app.services.search.brave.httpx.get", Mock(return_value=response)
+    )
+
+    assert BraveSearch("test-key").search(query) == []
+    assert query not in caplog.text
+    assert str(request.url) not in caplog.text
+    assert "query_sha256=" in caplog.text
+    assert "failure=HTTP_422" in caplog.text
 
 
 def test_core_opens_run_level_circuit_after_429(monkeypatch) -> None:
@@ -364,6 +412,28 @@ def test_core_opens_bounded_timeout_circuit_and_cooldown(monkeypatch, tmp_path) 
     assert store.cooldown_remaining("core") > 0
 
 
+def test_provider_health_probe_lease_is_persistent_and_single_claim(tmp_path) -> None:
+    path = tmp_path / "health.json"
+    first = ProviderHealthStore(str(path))
+    second = ProviderHealthStore(str(path))
+    policy = ProviderPolicy(cooldown_seconds=0, max_cooldown_seconds=0)
+    first.record_unavailable("searxng:google cse", policy, status="rate_limited")
+
+    assert first.claim_recovery_probe("searxng:google cse", lease_seconds=60) is True
+    assert second.claim_recovery_probe("searxng:google cse", lease_seconds=60) is False
+    assert second.incident("searxng:google cse")["last_status"] == "rate_limited"
+
+
+def test_provider_success_reports_recovery_once_and_clears_incident(tmp_path) -> None:
+    store = ProviderHealthStore(str(tmp_path / "health.json"))
+    policy = ProviderPolicy(cooldown_seconds=0, max_cooldown_seconds=0)
+    store.record_timeout("searxng:google scholar", policy)
+
+    assert store.record_success("searxng:google scholar") is True
+    assert store.record_success("searxng:google scholar") is False
+    assert store.incident("searxng:google scholar") is None
+
+
 def test_core_opens_circuit_after_cumulative_intermittent_timeouts(
     monkeypatch, tmp_path
 ) -> None:
@@ -504,3 +574,44 @@ def test_semantic_scholar_batch_prefetch_chunks_conservatively(monkeypatch, tmp_
     assert retriever.prefetch_dois([f"10.1/{i}" for i in range(7)]) == 7
     assert request.call_count == 2
     assert [len(call.kwargs["json"]["ids"]) for call in request.call_args_list] == [5, 2]
+
+
+def test_semantic_scholar_batch_isolates_one_rejected_doi(monkeypatch, tmp_path) -> None:
+    rejected = "DOI:10.1/bad"
+
+    def response_for_request(*_args, **kwargs):
+        ids = kwargs["json"]["ids"]
+        if rejected in ids:
+            response = _response(400)
+            response._content = b'{"error":"bad paper id"}'
+            return response
+        response = _response(200)
+        response._content = json.dumps(
+            [
+                {
+                    "paperId": value,
+                    "title": f"Paper {value}",
+                    "year": 2024,
+                    "authors": [],
+                    "externalIds": {"DOI": value.removeprefix("DOI:")},
+                    "openAccessPdf": None,
+                }
+                for value in ids
+            ]
+        ).encode()
+        return response
+
+    request = Mock(side_effect=response_for_request)
+    monkeypatch.setattr("app.services.retrieval.semantic_scholar.httpx.request", request)
+    monkeypatch.setattr("app.services.retrieval.semantic_scholar._throttle", Mock())
+
+    retriever = SemanticScholarRetriever(
+        ProviderHealthStore(str(tmp_path / "health.json"))
+    )
+    count = retriever.prefetch_dois(["10.1/good-a", "10.1/bad", "10.1/good-b"])
+
+    assert count == 2
+    assert retriever.search_by_doi("10.1/good-a").success is True
+    assert retriever.search_by_doi("10.1/good-b").success is True
+    assert retriever.search_by_doi("10.1/bad").success is False
+    assert request.call_count == 5

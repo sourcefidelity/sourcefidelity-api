@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from app.log_safety import private_value_id
+
 from app.services.safe_fetch import UnsafeUrlError, safe_request
 
 logger = logging.getLogger(__name__)
@@ -187,7 +189,7 @@ def check_link(
         return LinkCheckResult(
             url=url,
             category=DEAD,
-            detail=f"Blocked non-public target: {str(e)[:80]}",
+            detail="Blocked non-public target",
         )
     except httpx.TimeoutException:
         return LinkCheckResult(
@@ -199,20 +201,24 @@ def check_link(
         return LinkCheckResult(
             url=url,
             category=DNS_ERROR,
-            detail=f"Connection failed: {str(e)[:80]}",
+            detail=f"Connection failed ({type(e).__name__})",
         )
     except httpx.HTTPError as e:
         return LinkCheckResult(
             url=url,
             category=SERVER_ERROR,
-            detail=f"HTTP error: {str(e)[:80]}",
+            detail=f"HTTP error ({type(e).__name__})",
         )
     except Exception as e:
-        logger.warning("Link check failed for %s: %s", url, e)
+        logger.warning(
+            "Link check failed for %s: %s",
+            private_value_id("url", url),
+            type(e).__name__,
+        )
         return LinkCheckResult(
             url=url,
             category=SERVER_ERROR,
-            detail=f"Unexpected error: {str(e)[:80]}",
+            detail=f"Unexpected error ({type(e).__name__})",
         )
 
 

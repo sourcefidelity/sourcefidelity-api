@@ -8,10 +8,15 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
+import pytest
+import uuid
 
 from app.database import get_db
+from app.config import settings
 from app.main import app
 from app.models import Base
+from app.models.job import Job
+from app.services.paper_dispatch import DISPATCH_KEY
 from app.routers import check
 from app.services import paper_upload
 from app.services.file_safety import SafetyVerdict
@@ -52,7 +57,9 @@ def _docx_bytes():
     return output.getvalue()
 
 
-def test_submit_persists_recoverable_job_and_status_is_shadow_only(monkeypatch):
+@pytest.mark.parametrize("queue_available", [True, False])
+def test_submit_persists_recoverable_job_and_status_is_shadow_only(monkeypatch, queue_available):
+    monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_local")
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -72,10 +79,17 @@ def test_submit_persists_recoverable_job_and_status_is_shadow_only(monkeypatch):
         "scan_with_clamd",
         lambda _content: (SafetyVerdict.CLEAN, "stream: OK"),
     )
+    def publish(job_id, attempt_id):
+        with Session(engine) as session:
+            assert session.get(Job, uuid.UUID(job_id)).upload_evidence[DISPATCH_KEY]["attempt_id"] == attempt_id
+        if not queue_available:
+            raise ConnectionError("queue unavailable")
+        return SimpleNamespace(id="queued-task-1")
+
     monkeypatch.setattr(
         check.check_paper_task,
         "delay",
-        lambda _job_id: SimpleNamespace(id="queued-task-1"),
+        publish,
     )
     try:
         client = TestClient(app)
@@ -93,6 +107,7 @@ def test_submit_persists_recoverable_job_and_status_is_shadow_only(monkeypatch):
         submitted = response.json()
         assert submitted["status"] == "pending"
         assert submitted["stage"] == "uploaded"
+        assert submitted["publication_pending"] is (not queue_available)
         assert len(storage.objects) == 1
 
         status_response = client.get(f"/status/{submitted['job_id']}")

@@ -14,6 +14,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.log_safety import safe_exception_code
 from app.services.retrieval.base import AcquisitionLocation, RepresentationKind, RetrievalSource, RetrievalResult
 from app.services.retrieval.provider_runtime import (
     ProviderHealthStore,
@@ -163,32 +164,63 @@ class SemanticScholarRetriever(RetrievalSource):
         for start in range(0, min(len(missing), batch_limit), self.policy.batch_size):
             chunk = missing[start:start + self.policy.batch_size]
             try:
-                resp = self._request(
-                    "POST",
-                    f"{SEMANTIC_SCHOLAR_BASE}/paper/batch",
-                    {"fields": self._fields()},
-                    {"ids": [f"DOI:{doi}" for doi in chunk]},
-                )
-                if resp is None:
+                chunk_count, terminal = self._prefetch_doi_chunk(chunk)
+                prefetched += chunk_count
+                if terminal:
                     break
-                resp.raise_for_status()
-                payload = resp.json()
-                if not isinstance(payload, list) or len(payload) != len(chunk):
-                    raise ValueError("Unexpected Semantic Scholar batch response shape")
-                self.provider_metrics["batch_calls"] += 1
-                self.provider_metrics["batch_items"] += len(chunk)
-                for doi, paper in zip(chunk, payload):
-                    if paper:
-                        self._doi_cache[doi] = self._parse_paper(paper)
-                        prefetched += 1
-                    else:
-                        self._doi_cache[doi] = RetrievalResult(
-                            source_name=self.name, success=False, error="Not found"
-                        )
             except Exception as exc:
-                logger.warning("S2 DOI batch prefetch failed: %s", exc)
+                logger.warning(
+                    "S2 DOI batch prefetch failed (type=%s)", type(exc).__name__
+                )
                 break
         return prefetched
+
+    def _prefetch_doi_chunk(self, chunk: list[str]) -> tuple[int, bool]:
+        """Prefetch one chunk; isolate a malformed identifier after batch 400.
+
+        Semantic Scholar rejects the complete request when any supplied paper
+        identifier is malformed. Recursively splitting the configured
+        five-item chunk preserves valid DOI results without enabling broad
+        individual fallback. A singleton 400 is cached as unavailable.
+        """
+        resp = self._request(
+            "POST",
+            f"{SEMANTIC_SCHOLAR_BASE}/paper/batch",
+            {"fields": self._fields()},
+            {"ids": [f"DOI:{doi}" for doi in chunk]},
+        )
+        if resp is None:
+            return 0, True
+        if resp.status_code == 400:
+            if len(chunk) > 1:
+                middle = len(chunk) // 2
+                left_count, left_terminal = self._prefetch_doi_chunk(chunk[:middle])
+                if left_terminal:
+                    return left_count, True
+                right_count, right_terminal = self._prefetch_doi_chunk(chunk[middle:])
+                return left_count + right_count, right_terminal
+            self._doi_cache[chunk[0]] = RetrievalResult(
+                source_name=self.name,
+                success=False,
+                error="Semantic Scholar rejected this DOI identifier",
+            )
+            return 0, False
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list) or len(payload) != len(chunk):
+            raise ValueError("Unexpected Semantic Scholar batch response shape")
+        self.provider_metrics["batch_calls"] += 1
+        self.provider_metrics["batch_items"] += len(chunk)
+        prefetched = 0
+        for doi, paper in zip(chunk, payload):
+            if paper:
+                self._doi_cache[doi] = self._parse_paper(paper)
+                prefetched += 1
+            else:
+                self._doi_cache[doi] = RetrievalResult(
+                    source_name=self.name, success=False, error="Not found"
+                )
+        return prefetched, False
 
     def search_by_doi(self, doi: str) -> RetrievalResult:
         normalized_doi = self._normalize_doi(doi)

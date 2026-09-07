@@ -704,11 +704,15 @@ def _decompose(
     value = text[start:end]
     special = _as_well_as_parts(text, start, end)
     if special:
-        first, second, predicate = special
+        first, additive_subject, predicate = special
         first_main, relatives = _remove_embedded_relative(text, first)
         specs = [
-            _CandidateSpec("shared_predicate", tuple([*first_main, predicate]), "as_well_as_shared_predicate", True),
-            _CandidateSpec("shared_predicate", (second, predicate), "as_well_as_shared_predicate", True),
+            _CandidateSpec(
+                "shared_predicate",
+                tuple([*first_main, additive_subject, predicate]),
+                "as_well_as_joint_subject_predicate",
+                True,
+            ),
         ]
         specs.extend(relatives)
         return specs
@@ -1158,6 +1162,8 @@ def _narrative_focus_omission_specs(text, marker_span, after):
             focus,
             "narrative_positive_source_emphasis",
             requires_context=True,
+            verification_scope="source_wide_coverage",
+            relationship_eligible=False,
         ),
         _CandidateSpec(
             "source_coverage",
@@ -1462,7 +1468,7 @@ def _requires_antecedent_context(text, spans):
 
 
 def _as_well_as_parts(text, start, end):
-    """Resolve X, as well as Y, P using the comma whose tail begins with P."""
+    """Resolve the joint subject `X, as well as Y, P` without asserting X or Y alone."""
     value = text[start:end]
     phrase = re.search(r",\s*as\s+well\s+as\s+", value, re.IGNORECASE)
     if not phrase:
@@ -1473,12 +1479,12 @@ def _as_well_as_parts(text, start, end):
         split = second_start + comma.start()
         predicate_start = split + 1
         predicate = _trim_optional(text, predicate_start, end)
-        second = _trim_optional(text, second_start, split)
-        if not predicate or not second:
+        additive_subject = _trim_optional(text, start + phrase.start(), split)
+        if not predicate or not additive_subject:
             continue
         first_word = next(_WORD.finditer(text[predicate[0]:predicate[1]]), None)
         if first_word and first_word.group(0).casefold() in _COMMON_PREDICATES:
-            return (first, second, predicate) if first else None
+            return (first, additive_subject, predicate) if first else None
     return None
 
 

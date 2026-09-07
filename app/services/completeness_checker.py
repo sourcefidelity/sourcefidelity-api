@@ -191,7 +191,7 @@ def check_completeness(
 
     # ── Signal C: back-matter presence ──────────────────────────────────
     # (Computed before Signal B because B uses back-matter as context.)
-    back_msg = _signal_back_matter(file_bytes, logical_pages)
+    back_msg = _signal_back_matter(file_bytes, logical_pages, document_kind=kind)
     signals.append(back_msg["detail"])
     if back_msg["vote"] == COMPLETE:
         complete_votes.append(back_msg["detail"])
@@ -353,7 +353,12 @@ def _signal_toc_cross_reference(file_bytes: bytes, logical_pages: int) -> dict:
     }
 
 
-def _signal_back_matter(file_bytes: bytes, logical_pages: int) -> dict:
+def _signal_back_matter(
+    file_bytes: bytes,
+    logical_pages: int,
+    *,
+    document_kind: DocumentKind = "unknown",
+) -> dict:
     """Signal C: is there back matter (index/references) near the end?"""
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -361,8 +366,13 @@ def _signal_back_matter(file_bytes: bytes, logical_pages: int) -> dict:
             n = len(doc)
             if n == 0:
                 return {"vote": None, "detail": "Back-matter check: no pages"}
-            # Scan the last 15% of pages
-            window = max(1, int(n * _BACK_MATTER_WINDOW))
+            # Article bibliographies can occupy several pages and therefore
+            # begin well before the final 15% of a manuscript. A heading in
+            # the final 35% is affirmative article-structure evidence; books
+            # retain the narrower window because excerpts often include their
+            # own references.
+            fraction = 0.35 if document_kind == "article" else _BACK_MATTER_WINDOW
+            window = max(1, math.ceil(n * fraction))
             start = max(0, n - window)
             tail_text = ""
             for page in doc[start:]:
@@ -818,7 +828,9 @@ def _lookup_google_books(
         ):
             return {"pages": result.expected_pages, "source": "Google Books"}
     except Exception as e:
-        logger.debug("Google Books page-count lookup failed: %s", e)
+        logger.debug(
+            "Google Books page-count lookup failed (type=%s)", type(e).__name__
+        )
     return None
 
 
@@ -834,7 +846,9 @@ def _lookup_open_library(
         if result.success and result.expected_pages:
             return {"pages": result.expected_pages, "source": "Open Library"}
     except Exception as e:
-        logger.debug("Open Library page-count lookup failed: %s", e)
+        logger.debug(
+            "Open Library page-count lookup failed (type=%s)", type(e).__name__
+        )
     return None
 
 

@@ -277,7 +277,9 @@ def assess_local_relationship(
             [artifact.claim.text] * len(passages),
         )
     except Exception as exc:
-        logger.warning("Local relationship signal failed: %s", exc)
+        logger.warning(
+            "Local relationship signal failed (type=%s)", type(exc).__name__
+        )
         return _abstain(
             artifact,
             status=RelationshipStatus.NOT_ASSESSED,

@@ -10,6 +10,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.models import Base
+from app.models.job import Job, JobStatus
+from sqlalchemy import select
 from app.services import paper_upload
 from app.services.file_safety import SafetyVerdict
 from app.services.paper_upload import (
@@ -85,11 +87,33 @@ def test_docx_job_commits_locator_verifies_hash_and_cleans(monkeypatch, session)
     assert loaded == content
     assert job.upload_evidence["structural_verdict"] == "clean"
     assert job.upload_evidence["paper_retention_mode"] == "temporary"
+    assert job.upload_evidence["paper_input_upload_state"] == "ready"
 
     job.input_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     session.commit()
     result = cleanup_stale_paper_job_inputs(session, storage)
     assert result == {"jobs_cleaned": 1, "jobs_pending": 0}
+    assert storage.objects == {}
+    assert job.input_storage_key is None
+    assert job.input_deleted_at is not None
+
+
+def test_interrupted_input_upload_retains_locator_and_fails_on_expiry(monkeypatch, session):
+    monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _content: (SafetyVerdict.CLEAN, "OK"))
+    monkeypatch.setattr(paper_upload, "prepare_dispatch", lambda _job: (_ for _ in ()).throw(RuntimeError("exit boundary")))
+    storage = MemoryStorage()
+    with pytest.raises(RuntimeError, match="exit boundary"):
+        create_paper_job(session, storage, content=_docx_bytes(), filename="paper.docx",
+                         media_type=DOCX_MEDIA_TYPE, scope_id="test")
+    session.rollback()
+    job = session.scalar(select(Job))
+    assert job.input_storage_key in storage.objects
+    assert job.upload_evidence["paper_input_upload_state"] == "pending"
+    assert "workflow_dispatch_v1" not in job.upload_evidence
+    result = cleanup_stale_paper_job_inputs(session, storage, now=job.input_expires_at + timedelta(seconds=1))
+    assert result["jobs_cleaned"] == 1
+    assert job.status == JobStatus.FAILED
+    assert job.error_message == "paper_upload_interrupted"
     assert storage.objects == {}
     assert job.input_storage_key is None
     assert job.input_deleted_at is not None

@@ -7,6 +7,7 @@ import re
 import httpx
 
 from app.config import settings
+from app.log_safety import safe_exception_code
 from app.services.retrieval.base import (
     AcquisitionLocation,
     RepresentationKind,
@@ -23,8 +24,11 @@ OPENALEX_BASE = "https://api.openalex.org"
 class OpenAlexRequestError(RuntimeError):
     """A credential-safe OpenAlex failure that never includes the request URL."""
 
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self, status_code: int, message: str, *, reason_code: str | None = None
+    ) -> None:
         self.status_code = status_code
+        self.reason_code = reason_code or f"http_{status_code}"
         super().__init__(message)
 
 
@@ -83,7 +87,9 @@ class OpenAlexRetriever(RetrievalSource):
         """Request without allowing a query-string credential into logs/errors."""
         if self._authentication_failed:
             raise OpenAlexRequestError(
-                401, "OpenAlex authentication circuit is open after an earlier 401"
+                401,
+                "OpenAlex authentication circuit is open after an earlier 401",
+                reason_code="authentication_circuit_open",
             )
         try:
             self.provider_metrics["calls"] += 1
@@ -167,7 +173,10 @@ class OpenAlexRetriever(RetrievalSource):
                 self.provider_metrics["grouped_doi_calls"] += 1
                 self.provider_metrics["grouped_doi_items"] += len(chunk)
             except Exception as exc:
-                logger.warning("OpenAlex grouped DOI prefetch failed: %s", exc)
+                logger.warning(
+                    "OpenAlex grouped DOI prefetch failed (type=%s)",
+                    type(exc).__name__,
+                )
                 break
         return prefetched
 
@@ -281,7 +290,10 @@ class OpenAlexRetriever(RetrievalSource):
                 self.provider_metrics["grouped_title_calls"] += 1
                 self.provider_metrics["grouped_title_items"] += len(chunk)
             except Exception as exc:
-                logger.warning("OpenAlex grouped title prefetch failed: %s", exc)
+                logger.warning(
+                    "OpenAlex grouped title prefetch failed (type=%s)",
+                    type(exc).__name__,
+                )
                 break
         self.provider_metrics["grouped_title_matches"] += matched_count
         return matched_count
@@ -298,7 +310,7 @@ class OpenAlexRetriever(RetrievalSource):
             mode = "configured key" if settings.OPENALEX_API_KEY else "unkeyed access"
             return True, f"OpenAlex preflight succeeded using {mode}"
         except Exception as exc:
-            return False, str(exc)
+            return False, safe_exception_code(exc)
 
     def search_by_doi(self, doi: str) -> RetrievalResult:
         normalized = self._normalize_doi(doi)
@@ -311,8 +323,9 @@ class OpenAlexRetriever(RetrievalSource):
             data = resp.json()
             return self._parse_work(data)
         except Exception as e:
-            logger.warning("OpenAlex DOI search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("OpenAlex DOI search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def search_by_title_author(self, title: str, author: str | None = None) -> RetrievalResult:
         key = self._title_key(title, author)
@@ -366,8 +379,9 @@ class OpenAlexRetriever(RetrievalSource):
             self._title_cache[key] = copy.deepcopy(result)
             return result
         except Exception as e:
-            logger.warning("OpenAlex title search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("OpenAlex title search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def _parse_work(self, data: dict) -> RetrievalResult:
         """Parse an OpenAlex work object into a RetrievalResult."""

@@ -114,8 +114,12 @@ Which result (1-{len(results)}) is the actual cited source? Return 0 if none mat
         # Convert to 0-based index, -1 if none
         idx = selected - 1 if 1 <= selected <= len(results) else -1
 
-        logger.info("LLM selected result %d/%d (confidence=%s): %s",
-                     selected, len(results), confidence, reason[:60])
+        logger.info(
+            "LLM selected result %d/%d (confidence=%s)",
+            selected,
+            len(results),
+            confidence,
+        )
 
         return SelectionResult(
             selected_index=idx,
@@ -128,9 +132,12 @@ Which result (1-{len(results)}) is the actual cited source? Return 0 if none mat
         # first PDF result is how wrong-source PDFs got downloaded. If the LLM
         # cannot make the selection, we select nothing; the caller skips the
         # download rather than risk a wrong source (REVIEW §3.1).
-        logger.warning("LLM result selection failed: %s — selecting nothing (fail-closed)", str(e)[:60])
+        logger.warning(
+            "LLM result selection failed (type=%s); selecting nothing",
+            type(e).__name__,
+        )
         return SelectionResult(
             selected_index=-1,
             confidence="none",
-            reason=f"LLM selection failed (fail-closed): {str(e)[:60]}",
+            reason="LLM selection failed; no result was selected",
         )

@@ -16,6 +16,7 @@ references where author OR title comes back empty are marked for LLM fallback.
 
 import re
 import logging
+import unicodedata
 from typing import Optional
 
 from app.services.schemas import ParsedReference
@@ -59,7 +60,11 @@ def _make_citation_key(author: str, year: str) -> str:
         return ""
     # First word before comma/space = surname
     surname = re.split(r'[, ]', author.strip())[0]
-    surname = re.sub(r'[^A-Za-z]', '', surname)
+    surname = re.sub(
+        r'[^A-Za-z]',
+        '',
+        unicodedata.normalize("NFKD", surname),
+    )
     yr = re.search(r'\d{4}[a-z]?', year, re.IGNORECASE) or (year if year else "")
     yr_str = yr.group(0) if hasattr(yr, 'group') else str(yr)
     return f"{surname}{yr_str}" if surname and yr_str else ""
@@ -85,7 +90,10 @@ def _extract_identifiers(text: str) -> tuple[str, str]:
 # ── APA field extraction ─────────────────────────────────────────────────────
 
 # APA year: (2020) or (n.d.) — full parenthetical including closing paren
-_APA_YEAR = re.compile(r'\((?:19|20)\d{2}[a-z]?\)|\(n\.d\.\)', re.IGNORECASE)
+_APA_YEAR = re.compile(
+    r'\((?:19|20)\d{2}[a-z]?(?:,\s*[^)]{1,60})?\)|\(n\.d\.\)',
+    re.IGNORECASE,
+)
 
 
 def extract_fields_apa(ref: str) -> Optional[ParsedReference]:

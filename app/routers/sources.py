@@ -4,12 +4,19 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.security import (
+    AuthenticatedPrincipal,
+    SOURCE_REPOSITORY_READ_CAPABILITY,
+    SOURCE_REPOSITORY_WRITE_CAPABILITY,
+    get_authenticated_principal,
+    require_same_origin_request,
+)
 from app.models.source_repository import (
     CanonicalWorkRecord,
     SourceRepresentationRecord,
@@ -23,10 +30,12 @@ from app.services.source_repository import (
     admit_representation,
     delete_representation,
     finalize_pending_object_deletions,
+    commit_source_admissions,
+    rollback_source_admissions,
     retention_mode_for_scope,
     representation_is_expired,
 )
-from app.services.storage import get_storage_backend
+from app.services.storage.backend import StorageBackend, get_storage_backend
 from app.services.pdf_verifier import verify_instructor_upload
 from app.services.chapter_splitter import is_edited_collection, split_into_chapters
 from app.services.book_metadata import (
@@ -46,8 +55,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sources", tags=["sources"])
 
 
+def _storage_backend() -> StorageBackend:
+    """Resolve storage at request time so deployment overrides remain effective."""
+    return get_storage_backend()
+
+
 @router.post("/upload")
-async def upload_source(
+def upload_source(
+    request: Request,
     file: UploadFile = File(...),
     doi: str | None = Form(None),
     isbn: str | None = Form(None),
@@ -59,8 +74,11 @@ async def upload_source(
     expected_last_page: int | None = Form(None),
     document_kind: str | None = Form(None),
     source_kind: str | None = Form(None),
+    edition_or_version: str | None = Form(None),
     description: str | None = Form(None),  # noqa: ARG001 (reserved for future use)
     db: Session = Depends(get_db),
+    backend: StorageBackend = Depends(_storage_backend),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
 ):
     """Upload an academic source document.
 
@@ -68,6 +86,8 @@ async def upload_source(
     verifies the PDF matches the provided metadata, then stores it. Edited
     collections (detected via TOC + editor markers) are split into chapters.
     """
+    principal.require(SOURCE_REPOSITORY_WRITE_CAPABILITY)
+    require_same_origin_request(request)
     if not settings.SOURCE_REPOSITORY_ENABLED:
         raise HTTPException(status_code=404, detail="Source repository is disabled")
 
@@ -127,7 +147,13 @@ async def upload_source(
             )
         expected_page_range = (expected_first_page, expected_last_page)
 
-    file_bytes = await file.read()
+    maximum = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    file_bytes = file.file.read(maximum + 1)
+    if len(file_bytes) > maximum:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Source exceeds the {settings.MAX_FILE_SIZE_MB} MB upload limit",
+        )
 
     # Safety precedes every metadata, text-quality, and completeness parser.
     try:
@@ -155,6 +181,8 @@ async def upload_source(
         provided_doi=doi,
         provided_title=title,
         provided_author=author,
+        provided_year=year,
+        provided_isbn=isbn,
     )
     if not verified:
         raise HTTPException(
@@ -240,7 +268,6 @@ async def upload_source(
         review_status = "pending_review"
 
     # ── Durable storage/admission ─────────────────────────────────────
-    backend = get_storage_backend()
     results: list[dict] = []
 
     # A supplied source kind guides detection but cannot prove that usable
@@ -301,15 +328,16 @@ async def upload_source(
                     ),
                     provenance="instructor_upload",
                     license_class="commercial_user_upload",
-                    scope_type="personal_owner",
-                    scope_id=settings.SOURCE_REPOSITORY_SCOPE_ID,
+                    scope_type=principal.scope_type,
+                    scope_id=principal.scope_id,
                     identity_verdict="verified",
-                    identity_confidence=1.0,
+                    identity_confidence=_upload_identity_confidence(messages),
                     completeness_verdict=(
                         (completeness_verdict or "not_assessed").casefold()
                     ),
                     cleanliness_verdict=safety_report.verdict.value,
                     text_quality=text_quality,
+                    edition_or_version=(edition_or_version or None),
                     admitted_by=None,
                     validation_evidence={
                         "upload_verification": messages,
@@ -325,12 +353,12 @@ async def upload_source(
                 ),
             )
             results.append(_representation_dict(record))
-        db.commit()
+        commit_source_admissions(db)
     except AdmissionError as exc:
-        db.rollback()
+        rollback_source_admissions(db, backend)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
-        db.rollback()
+        rollback_source_admissions(db, backend)
         raise
 
     durable_review_status = (
@@ -353,20 +381,24 @@ async def upload_source(
 
 
 @router.get("/search")
-async def search_sources(
+def search_sources(
     doi: str | None = Query(None),
     isbn: str | None = Query(None),
     title: str | None = Query(None),
     author: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=10_000),
     db: Session = Depends(get_db),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
 ):
     """Search for stored sources by DOI, ISBN, title, or author."""
+    principal.require(SOURCE_REPOSITORY_READ_CAPABILITY)
     query = (
         select(SourceRepresentationRecord)
         .join(SourceRepresentationRecord.canonical_work)
         .where(
-            SourceRepresentationRecord.scope_type == "personal_owner",
-            SourceRepresentationRecord.scope_id == settings.SOURCE_REPOSITORY_SCOPE_ID,
+            SourceRepresentationRecord.scope_type == principal.scope_type,
+            SourceRepresentationRecord.scope_id == principal.scope_id,
             active_representation_clause(),
         )
     )
@@ -381,19 +413,34 @@ async def search_sources(
     if author:
         query = query.where(CanonicalWorkRecord.author.ilike(f"%{author}%"))
 
+    query = query.order_by(SourceRepresentationRecord.created_at.desc()).offset(offset).limit(limit)
     results = [_representation_dict(record) for record in db.scalars(query).all()]
     return {"count": len(results), "documents": results}
 
 
 @router.delete("/{doc_id}")
-async def delete_source(doc_id: str, db: Session = Depends(get_db)):
+def delete_source(
+    doc_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    backend: StorageBackend = Depends(_storage_backend),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
+):
     """Delete a stored source by its ID."""
-    backend = get_storage_backend()
+    principal.require(SOURCE_REPOSITORY_WRITE_CAPABILITY)
+    require_same_origin_request(request)
     try:
         parsed_id = uuid.UUID(doc_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Document not found") from exc
     try:
+        record = db.get(SourceRepresentationRecord, parsed_id)
+        if (
+            record is None
+            or record.scope_type != principal.scope_type
+            or record.scope_id != principal.scope_id
+        ):
+            raise HTTPException(status_code=404, detail="Document not found")
         if not delete_representation(db, parsed_id):
             raise HTTPException(status_code=404, detail="Document not found")
         db.commit()
@@ -409,10 +456,12 @@ async def delete_source(doc_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{doc_id}/review")
-async def review_source(
+def review_source(
     doc_id: str,
+    request: Request,
     decision: str = Form(...),
     db: Session = Depends(get_db),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
 ):
     """Approve or reject a source held for review (Standard strictness mode).
 
@@ -420,6 +469,8 @@ async def review_source(
         decision: "accept" sets review_status to accepted (usable for verification).
                   "reject" sets review_status to rejected (excluded from lookups).
     """
+    principal.require(SOURCE_REPOSITORY_WRITE_CAPABILITY)
+    require_same_origin_request(request)
     decision_lower = decision.strip().lower()
     if decision_lower not in ("accept", "reject"):
         raise HTTPException(
@@ -434,7 +485,11 @@ async def review_source(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Document not found") from exc
     record = db.get(SourceRepresentationRecord, parsed_id)
-    if record is None:
+    if (
+        record is None
+        or record.scope_type != principal.scope_type
+        or record.scope_id != principal.scope_id
+    ):
         raise HTTPException(status_code=404, detail="Document not found")
     if representation_is_expired(record):
         raise HTTPException(status_code=410, detail="Source representation has expired")
@@ -464,22 +519,33 @@ def _representation_dict(record: SourceRepresentationRecord) -> dict:
         "year": work.year,
         "doi": work.doi,
         "isbn": work.isbn,
-        "s3_key": content.storage_key,
         "file_size_bytes": content.byte_size,
         "representation_kind": record.representation_kind,
         "media_type": content.media_type,
         "content_sha256": content.content_sha256,
         "license_class": content.license_class,
         "provenance": record.provenance,
+        "edition_or_version": record.edition_or_version,
         "identity_verdict": record.identity_verdict,
         "completeness_verdict": record.completeness_verdict,
         "cleanliness_verdict": record.cleanliness_verdict,
         "text_quality": record.text_quality,
         "admission_state": record.admission_state,
         "review_status": record.admission_state,
-        "scope_type": record.scope_type,
-        "scope_id": record.scope_id,
         "retention_mode": retention_mode_for_scope(record.scope_type).value,
         "expires_at": record.expires_at.isoformat() if record.expires_at else None,
         "created_at": record.created_at.isoformat(),
     }
+
+
+def _upload_identity_confidence(messages: list[str]) -> float:
+    evidence = set(messages)
+    if evidence & {"doi_match", "isbn_match"}:
+        return 1.0
+    if {"title_match", "author_match"} <= evidence:
+        return 0.9
+    if {"title_match", "year_match"} <= evidence:
+        return 0.85
+    if "distinctive_title_match" in evidence:
+        return 0.8
+    return 0.0

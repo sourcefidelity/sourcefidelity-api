@@ -19,7 +19,12 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 
-from app.services.search.base import SearchProvider, SearchResult
+from app.services.search.base import (
+    SearchProvider,
+    SearchResult,
+    classify_search_failure,
+    safe_search_failure_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,7 @@ class DuckDuckGoSearch(SearchProvider):
 
     def search(self, query: str, num_results: int = 10) -> list[SearchResult]:
         """Search via DuckDuckGo HTML endpoint."""
+        self.last_status = "started"
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -51,11 +57,25 @@ class DuckDuckGoSearch(SearchProvider):
                               follow_redirects=True)
             resp.raise_for_status()
         except Exception as e:
-            logger.warning("DuckDuckGo search failed for '%s': %s", query[:60], e)
+            self.last_status = classify_search_failure(e)
+            query_sha256, failure = safe_search_failure_log(query, e)
+            logger.warning(
+                "DuckDuckGo search failed query_sha256=%s failure=%s",
+                query_sha256,
+                failure,
+            )
             return []
 
         results = []
         soup = BeautifulSoup(resp.text, "html.parser")
+        if (
+            soup.find("form", id="challenge-form") is not None
+            or soup.find(id="anomaly-modal") is not None
+            or "not a robot" in soup.get_text(" ", strip=True).casefold()
+        ):
+            self.last_status = "captcha"
+            logger.warning("DuckDuckGo returned a challenge page")
+            return []
 
         # DDG HTML results: each result is in a div with class "result"
         # Title: <a class="result__a" href="...">
@@ -84,4 +104,5 @@ class DuckDuckGoSearch(SearchProvider):
                     url=url, title=title, snippet=snippet, is_pdf=is_pdf,
                 ))
 
+        self.last_status = "completed"
         return results

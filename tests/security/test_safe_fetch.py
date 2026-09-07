@@ -6,10 +6,44 @@ import pytest
 from app.services.safe_fetch import (
     UnsafeUrlError,
     _extract_meta_refresh_url,
+    _validate_connected_peer,
     safe_request,
+    trusted_url_matches_prefix,
     _validate_host,
     _validate_url,
 )
+
+
+@pytest.mark.security
+def test_trusted_prefix_requires_the_exact_origin() -> None:
+    prefix = "https://resolver.example/proxy/"
+
+    assert trusted_url_matches_prefix("https://resolver.example/proxy/work", prefix)
+    assert not trusted_url_matches_prefix(
+        "https://resolver.example@attacker.invalid/proxy/work", prefix
+    )
+    assert not trusted_url_matches_prefix(
+        "https://resolver.example.attacker.invalid/proxy/work", prefix
+    )
+
+
+@pytest.mark.security
+def test_connected_private_peer_is_rejected_before_body_processing() -> None:
+    class NetworkStream:
+        @staticmethod
+        def get_extra_info(name: str):
+            assert name == "server_addr"
+            return ("10.0.0.9", 443)
+
+    request = httpx.Request("GET", "https://public.example/source.pdf")
+    response = httpx.Response(
+        200,
+        request=request,
+        extensions={"network_stream": NetworkStream()},
+    )
+
+    with pytest.raises(UnsafeUrlError, match="connected peer"):
+        _validate_connected_peer(response, trusted=False)
 
 
 @pytest.mark.security

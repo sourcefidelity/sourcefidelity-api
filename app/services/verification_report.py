@@ -6,11 +6,16 @@ import hashlib
 import json
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.report import VerificationReportRecord
 from app.models.verification_run import VerificationRunRecord
+from app.services.evidence_package import (
+    build_evidence_package,
+    validate_evidence_package,
+)
+from app.services.source_navigation import build_source_navigation_descriptor
 from app.services.decisive_label_critic import (
     CHECK_TYPES,
     aggregate_critic_adjusted_citation,
@@ -24,16 +29,21 @@ from app.services.facet_evidence_judgment import (
     inherited_scope_mapping_is_invalid,
     source_discourse_annotation_is_valid,
 )
-from app.services.citation_use_router import routed_relationship_candidate_ids
+from app.services.citation_use_router import (
+    citation_use_route_input_ids,
+    routed_relationship_candidate_ids,
+)
+from app.services.student_claim_clarity import claim_clarity_explanation
 from app.services.verification_evidence import (
     FacetEvidenceMapping,
     VerificationEvidenceArtifact,
     passage_role_from_text,
+    _passage_boundary_status,
     passage_matches_page_locator,
 )
 
 
-REPORT_FORMAT_VERSION = "verification-report-v16"
+REPORT_FORMAT_VERSION = "verification-report-v18"
 MAX_REPORT_CLAIM_CHARACTERS = 5_000
 MAX_REPORT_PASSAGE_CHARACTERS = 1_200
 
@@ -63,6 +73,12 @@ def persist_verification_report(
     )
     payload = build_inspectable_report_payload(artifact)
     digest = _payload_digest(payload)
+    _lock_report_stream(
+        session,
+        scope_type=normalized_type,
+        scope_id=normalized_id,
+        verification_id=artifact.verification_id,
+    )
 
     latest = session.scalar(
         select(VerificationReportRecord)
@@ -73,6 +89,7 @@ def persist_verification_report(
         )
         .order_by(VerificationReportRecord.report_version.desc())
         .limit(1)
+        .with_for_update()
     )
     if (
         latest is not None
@@ -116,6 +133,9 @@ def build_inspectable_report_payload(
             "Legacy evidence artifact lacks exact source-specific binding; "
             "rebuild or explicitly migrate it before current report persistence"
         )
+    evidence_package = build_evidence_package(artifact)
+    validate_evidence_package(evidence_package)
+    source_navigation = build_source_navigation_descriptor(evidence_package)
     claim_text = artifact.claim.text
     passages = []
     for passage in artifact.passages:
@@ -149,6 +169,8 @@ def build_inspectable_report_payload(
         "evidence_created_at": artifact.created_at.isoformat(),
         "paper_version_id": artifact.claim.paper_version_id,
         "verification_run_id": artifact.source_identity.verification_run_id,
+        "authoritative_evidence_package": evidence_package.model_dump(mode="json"),
+        "source_navigation": source_navigation.model_dump(mode="json"),
         "claim": {
             **artifact.claim.model_dump(mode="json", exclude={"text"}),
             "text": claim_text[:MAX_REPORT_CLAIM_CHARACTERS],
@@ -169,6 +191,9 @@ def build_inspectable_report_payload(
             mode="json"
         ),
         "citation_use_routing": artifact.citation_use_routing.model_dump(
+            mode="json"
+        ),
+        "student_claim_clarity": artifact.student_claim_clarity.model_dump(
             mode="json"
         ),
         "candidate_passage_retrieval": artifact.candidate_passage_retrieval.model_dump(
@@ -242,6 +267,7 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
                 "Passage evidence does not match the authorized representation"
             )
     supplied_ids = {passage.passage_id for passage in artifact.passages}
+    _validate_evidence_obligations(artifact)
     relevance = artifact.passage_relevance
     assessment_ids = [
         assessment.passage_id for assessment in relevance.assessments
@@ -256,15 +282,45 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
         raise ReportAuthorizationError(
             "Passage-relevance gate refers to non-persisted passage evidence"
         )
+    passage_by_id = {passage.passage_id: passage for passage in artifact.passages}
+    for assessment in relevance.assessments:
+        if assessment.assessed_text_sha256 is None:
+            continue
+        passage = passage_by_id[assessment.passage_id]
+        end = assessment.assessed_text_offset_end
+        if end is None or end > len(passage.text):
+            raise ReportAuthorizationError(
+                "Passage-relevance assessed-text bounds are invalid"
+            )
+        excerpt = passage.text[assessment.assessed_text_offset_start:end]
+        if hashlib.sha256(excerpt.encode("utf-8")).hexdigest() != (
+            assessment.assessed_text_sha256
+        ):
+            raise ReportAuthorizationError(
+                "Passage-relevance assessment is not bound to its exact input text"
+            )
+        if assessment.assessment_input_truncated != (len(excerpt) != len(passage.text)):
+            raise ReportAuthorizationError(
+                "Passage-relevance truncation provenance is inconsistent"
+            )
     expected_relevant_ids = [
         assessment.passage_id
         for assessment in relevance.assessments
         if assessment.relevance in {"relevant", "partially_relevant"}
     ]
-    if relevance.relevant_passage_ids != expected_relevant_ids:
+    if (
+        len(relevance.relevant_passage_ids)
+        != len(set(relevance.relevant_passage_ids))
+        or set(relevance.relevant_passage_ids) != set(expected_relevant_ids)
+    ):
         raise ReportAuthorizationError(
             "Passage-relevance selected IDs do not match its typed assessments"
         )
+    _validate_obligation_relevance_findings(
+        artifact,
+        supplied_ids=supplied_ids,
+        passage_by_id=passage_by_id,
+    )
     for selected_id in [
         *artifact.relationship.passage_ids,
         *artifact.judgment.passage_ids,
@@ -292,11 +348,154 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
             )
     _validate_unit_judgment_segments(artifact)
     _validate_citation_use_routing(artifact)
+    _validate_student_claim_clarity(artifact)
     _validate_candidate_passage_retrieval(artifact, supplied_ids)
     _validate_candidate_relationships(artifact)
     _validate_facet_evidence(artifact)
     _validate_pairwise_facet_evaluation(artifact)
     _validate_decisive_critic(artifact)
+
+
+def _validate_evidence_obligations(artifact):
+    obligations = artifact.evidence_obligations
+    if obligations.status != "complete":
+        return
+    binding = artifact.source_binding
+    if binding is None or binding.status != "exact":
+        raise ReportAuthorizationError(
+            "Complete evidence obligations require an exact source binding"
+        )
+    ids = [item.obligation_id for item in obligations.obligations]
+    if not ids or len(ids) != len(set(ids)):
+        raise ReportAuthorizationError(
+            "Evidence obligations must be nonempty and uniquely identified"
+        )
+    interpretations = {
+        item.interpretation_id: item
+        for item in artifact.student_statement_interpretations
+    }
+    candidate_text = {
+        item.candidate_id: item.text
+        for item in artifact.verification_candidates.candidates
+    }
+    for interpretation in artifact.student_statement_interpretations:
+        text = candidate_text.get(interpretation.candidate_id)
+        if text is None or hashlib.sha256(text.encode("utf-8")).hexdigest() != (
+            interpretation.candidate_text_sha256
+        ):
+            raise ReportAuthorizationError(
+                "Student interpretation is not bound to an exact candidate"
+            )
+        if interpretation.source_evidence_received is not False:
+            raise ReportAuthorizationError(
+                "Student interpretation exceeded the source-blind boundary"
+            )
+    for item in obligations.obligations:
+        if item.reference_id != binding.reference_id:
+            raise ReportAuthorizationError(
+                "Evidence obligation does not match the active reference member"
+            )
+        if hashlib.sha256(item.target_text.encode("utf-8")).hexdigest() != (
+            item.target_text_sha256
+        ):
+            raise ReportAuthorizationError(
+                "Evidence obligation target hash does not match"
+            )
+        if item.obligation_type == "coverage_only_semantic_repair":
+            if (
+                item.accuracy_judgment_allowed
+                or not item.coverage_judgment_allowed
+                or not item.interpretation_id
+            ):
+                raise ReportAuthorizationError(
+                    "Coverage-only evidence obligation exceeded its judgment boundary"
+                )
+            interpretation = interpretations.get(item.interpretation_id)
+            if (
+                interpretation is None
+                or interpretation.status != "semantic_repair"
+                or not interpretation.coverage_judgment_allowed
+                or interpretation.interpreted_statement != item.target_text
+            ):
+                raise ReportAuthorizationError(
+                    "Coverage-only obligation is not bound to its source-blind repair"
+                )
+
+
+def _validate_obligation_relevance_findings(
+    artifact,
+    *,
+    supplied_ids,
+    passage_by_id,
+):
+    relevance = artifact.passage_relevance
+    findings = relevance.obligation_findings
+    if not findings:
+        return
+    obligations = artifact.evidence_obligations.obligations
+    obligation_by_id = {item.obligation_id: item for item in obligations}
+    finding_ids = [item.obligation_id for item in findings]
+    if len(finding_ids) != len(set(finding_ids)):
+        raise ReportAuthorizationError(
+            "Passage relevance contains duplicate obligation findings"
+        )
+    if any(item_id not in obligation_by_id for item_id in finding_ids):
+        raise ReportAuthorizationError(
+            "Passage relevance refers to an unknown evidence obligation"
+        )
+    for finding in findings:
+        obligation = obligation_by_id[finding.obligation_id]
+        if finding.obligation_type != obligation.obligation_type:
+            raise ReportAuthorizationError(
+                "Passage relevance changed an evidence-obligation type"
+            )
+        ids = [item.passage_id for item in finding.assessments]
+        if len(ids) != len(set(ids)) or any(item_id not in supplied_ids for item_id in ids):
+            raise ReportAuthorizationError(
+                "An obligation finding refers to invalid passage evidence"
+            )
+        expected = {
+            item.passage_id
+            for item in finding.assessments
+            if item.relevance in {"relevant", "partially_relevant"}
+        }
+        if set(finding.relevant_passage_ids) != expected:
+            raise ReportAuthorizationError(
+                "An obligation finding's selected passages do not match its assessments"
+            )
+        for assessment in finding.assessments:
+            if assessment.assessed_text_sha256 is None:
+                continue
+            passage = passage_by_id[assessment.passage_id]
+            end = assessment.assessed_text_offset_end
+            if end is None or end > len(passage.text):
+                raise ReportAuthorizationError(
+                    "An obligation finding has invalid assessed-text bounds"
+                )
+            excerpt = passage.text[assessment.assessed_text_offset_start:end]
+            if hashlib.sha256(excerpt.encode("utf-8")).hexdigest() != (
+                assessment.assessed_text_sha256
+            ):
+                raise ReportAuthorizationError(
+                    "An obligation finding is not bound to its exact input text"
+                )
+    primary = next(
+        (
+            finding
+            for finding in findings
+            if obligation_by_id[finding.obligation_id].accuracy_judgment_allowed
+            and finding.obligation_type != "coverage_only_semantic_repair"
+        ),
+        None,
+    )
+    if primary is None or (
+        relevance.outcome != primary.outcome
+        or relevance.relevant_passage_ids != primary.relevant_passage_ids
+        or relevance.assessments != primary.assessments
+    ):
+        raise ReportAuthorizationError(
+            "Top-level passage relevance is not the exact accuracy-eligible projection"
+        )
 
 
 def _validate_unit_judgment_segments(artifact):
@@ -391,11 +590,7 @@ def _validate_citation_use_routing(artifact):
         candidate.candidate_id: candidate
         for candidate in artifact.verification_candidates.candidates
     }
-    relationship_candidate_ids = {
-        candidate.candidate_id
-        for candidate in candidates.values()
-        if candidate.role == "relationship_candidate"
-    }
+    relationship_candidate_ids = citation_use_route_input_ids(artifact)
     route_ids = [route.candidate_id for route in routing.routes]
     if len(route_ids) != len(set(route_ids)):
         raise ReportAuthorizationError("Citation-use routing contains duplicate candidates")
@@ -459,6 +654,99 @@ def _validate_citation_use_routing(artifact):
             )
 
 
+def _validate_student_claim_clarity(artifact):
+    clarity = artifact.student_claim_clarity
+    if clarity.decision_applied:
+        raise ReportAuthorizationError("Student-claim clarity gate is shadow-only")
+    candidates = {
+        candidate.candidate_id: candidate
+        for candidate in artifact.verification_candidates.candidates
+    }
+    routed_ids = _routed_eligible_ids(artifact)
+    finding_ids = [finding.candidate_id for finding in clarity.findings]
+    if len(finding_ids) != len(set(finding_ids)):
+        raise ReportAuthorizationError(
+            "Student-claim clarity contains duplicate candidate findings"
+        )
+    if any(candidate_id not in routed_ids for candidate_id in finding_ids):
+        raise ReportAuthorizationError(
+            "Student-claim clarity refers to an unknown or unrouted candidate"
+        )
+    if clarity.status in {"complete", "incomplete"} and set(finding_ids) != routed_ids:
+        raise ReportAuthorizationError(
+            "Student-claim clarity did not assess every routed candidate"
+        )
+    if clarity.status == "complete" and any(
+        finding.status == "uncertain" for finding in clarity.findings
+    ):
+        raise ReportAuthorizationError(
+            "A complete student-claim clarity gate contains uncertainty"
+        )
+    expected_blocked = [
+        finding.candidate_id
+        for finding in clarity.findings
+        if finding.status == "not_assessed"
+    ]
+    if clarity.blocked_candidate_ids != expected_blocked:
+        raise ReportAuthorizationError(
+            "Student-claim blocked IDs do not match typed findings"
+        )
+    claim = artifact.claim
+    for finding in clarity.findings:
+        candidate = candidates[finding.candidate_id]
+        expected_hash = hashlib.sha256(candidate.text.encode("utf-8")).hexdigest()
+        if finding.candidate_text_sha256 != expected_hash:
+            raise ReportAuthorizationError(
+                "Student-claim clarity does not bind the exact candidate text"
+            )
+        if finding.explanation != claim_clarity_explanation(finding.reason_code):
+            raise ReportAuthorizationError(
+                "Student-claim clarity explanation is not application-derived"
+            )
+        if finding.status == "clear" and (
+            finding.reason_code != "interpretable_relationship"
+            or finding.problem_segments
+        ):
+            raise ReportAuthorizationError(
+                "A clear student claim cannot carry a wording problem"
+            )
+        if finding.status == "not_assessed" and (
+            finding.reason_code
+            not in {
+                "unresolved_local_reference",
+                "internally_underspecified_relationship",
+                "semantically_uninterpretable_wording",
+                "conflicting_internal_scope",
+            }
+            or not finding.problem_segments
+        ):
+            raise ReportAuthorizationError(
+                "A clarity abstention requires a typed exact wording problem"
+            )
+        if finding.status == "uncertain" and (
+            finding.reason_code
+            not in {"clarity_uncertain", "clarity_assessment_unavailable"}
+            or finding.problem_segments
+        ):
+            raise ReportAuthorizationError(
+                "An uncertain clarity finding cannot claim an exact wording problem"
+            )
+        candidate_ranges = [
+            (segment.local_start, segment.local_end)
+            for segment in candidate.segments
+        ]
+        for segment in finding.problem_segments:
+            _validate_candidate_segment(claim, segment)
+            if not any(
+                start <= segment.local_start
+                and segment.local_end <= end
+                for start, end in candidate_ranges
+            ):
+                raise ReportAuthorizationError(
+                    "A clarity problem span is outside the exact candidate"
+                )
+
+
 def _validate_candidate_relationships(artifact):
     candidate_set = artifact.verification_candidates
     evaluation = artifact.candidate_relationships
@@ -474,11 +762,15 @@ def _validate_candidate_relationships(artifact):
             "A complete verification-candidate set cannot contain uncovered text"
         )
     claim = artifact.claim
+    route_input_ids = citation_use_route_input_ids(artifact)
     for candidate in candidate_set.candidates:
         expected_eligible = (
             candidate.role == "relationship_candidate"
             and candidate.attribution == "cited_source"
             and candidate.verification_scope == "bounded_passage_relationship"
+            and candidate.candidate_id in route_input_ids
+            and "candidate_integrity:materially_redundant_candidate"
+            not in candidate.limitations
         )
         if candidate.relationship_eligible != expected_eligible:
             raise ReportAuthorizationError(
@@ -640,7 +932,12 @@ def _validate_candidate_passage_retrieval(artifact, supplied_ids):
                 "Candidate passage retrieval refers to non-persisted passage evidence"
             )
     passages = {passage.passage_id: passage for passage in artifact.passages}
-    excluded_roles = {"reference_list", "citation_notes", "publication_metadata"}
+    excluded_roles = {"reference_list", "publication_metadata"}
+    selected_channels_by_passage = {
+        item.passage_id: set(item.channels)
+        for selection in retrieval.selections
+        for item in selection.passages
+    }
     for passage_id in {
         item.passage_id
         for selection in retrieval.selections
@@ -651,9 +948,20 @@ def _validate_candidate_passage_retrieval(artifact, supplied_ids):
             raise ReportAuthorizationError(
                 "Candidate passage role is not application-derived"
             )
+        if passage.boundary_status != _passage_boundary_status(passage.text):
+            raise ReportAuthorizationError(
+                "Candidate passage boundary status is not application-derived"
+            )
         if passage.passage_role in excluded_roles:
             raise ReportAuthorizationError(
                 "Candidate passage retrieval admitted a definite non-body block"
+            )
+        if passage.passage_role == "citation_notes" and not (
+            selected_channels_by_passage.get(passage_id, set())
+            & {"candidate_explicit_note", "candidate_note_fallback"}
+        ):
+            raise ReportAuthorizationError(
+                "Citation-note evidence lacks an authorized note retrieval channel"
             )
 
 
@@ -1634,7 +1942,11 @@ def _validate_verification_run(
         )
     except (TypeError, ValueError) as exc:
         raise ReportAuthorizationError("Invalid verification-run identifier") from exc
-    run = session.get(VerificationRunRecord, parsed_id)
+    run = session.scalar(
+        select(VerificationRunRecord)
+        .where(VerificationRunRecord.id == parsed_id)
+        .with_for_update()
+    )
     if (
         run is None
         or run.scope_type != scope_type
@@ -1664,3 +1976,19 @@ def _payload_digest(payload: dict) -> str:
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _lock_report_stream(
+    session: Session,
+    *,
+    scope_type: str,
+    scope_id: str,
+    verification_id: str,
+) -> None:
+    """Serialize report-version allocation on PostgreSQL, including version one."""
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    material = f"{scope_type}\0{scope_id}\0{verification_id}".encode("utf-8")
+    lock_id = int.from_bytes(hashlib.sha256(material).digest()[:8], "big") & ((1 << 63) - 1)
+    session.execute(select(func.pg_advisory_xact_lock(lock_id))).scalar_one()

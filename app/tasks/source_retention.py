@@ -8,6 +8,7 @@ from app.services.source_repository import (
 )
 from app.services.storage import get_storage_backend
 from app.tasks.celery_app import celery_app
+from app.services.source_upload_recovery import cleanup_source_upload_intents
 
 
 _CLEANUP_BATCH_SIZE = 500
@@ -33,23 +34,23 @@ def cleanup_expired_source_representations() -> dict[str, int | str]:
         }
 
     backend = get_storage_backend()
-    expired_total = 0
     with SessionLocal() as session:
-        while True:
-            expired = expire_representations(
-                session,
-                batch_size=_CLEANUP_BATCH_SIZE,
-            )
-            session.commit()
-            expired_total += expired
-            if expired < _CLEANUP_BATCH_SIZE:
-                break
-
-        objects_deleted = finalize_pending_object_deletions(session, backend)
+        # One bounded batch per scheduled run prevents a large backlog from
+        # monopolizing a worker or running past the task's hard time limit.
+        expired_total = expire_representations(
+            session,
+            batch_size=_CLEANUP_BATCH_SIZE,
+        )
+        session.commit()
+        upload_cleanup = cleanup_source_upload_intents(session, backend, batch_size=100)
+        objects_deleted = finalize_pending_object_deletions(
+            session, backend, batch_size=_CLEANUP_BATCH_SIZE
+        )
         session.commit()
 
     return {
         "status": "ok",
         "representations_expired": expired_total,
         "objects_deleted": objects_deleted,
+        **{f"upload_intents_{key}": value for key, value in upload_cleanup.items()},
     }

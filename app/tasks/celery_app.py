@@ -3,6 +3,9 @@
 from celery import Celery
 
 from app.config import settings
+from app.log_safety import configure_sensitive_transport_logging
+
+configure_sensitive_transport_logging()
 
 celery_app = Celery(
     "sourcefidelity",
@@ -14,6 +17,8 @@ celery_app = Celery(
         "app.tasks.source_retention",
         "app.tasks.verification_run_cleanup",
         "app.tasks.paper_job_cleanup",
+        "app.tasks.provider_recovery",
+        "app.tasks.source_reanalysis",
     ],
 )
 
@@ -26,6 +31,7 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    broker_connection_retry_on_startup=True,
     # Do not impose one time or rate limit on every task. A paper is a durable,
     # checkpointed workflow whose report deadline is distinct from the safety
     # budget of any one stage. Executable stages and maintenance tasks own their
@@ -42,6 +48,10 @@ celery_app.conf.update(
     worker_send_task_events=True,         # Enable task events for monitoring
     task_send_sent_event=True,
     beat_schedule={
+        "recover-pending-paper-workflows": {
+            "task": "recover_pending_paper_workflows",
+            "schedule": 60,
+        },
         "cleanup-expired-source-representations": {
             "task": "cleanup_expired_source_representations",
             "schedule": max(
@@ -59,6 +69,10 @@ celery_app.conf.update(
         "cleanup-stale-paper-job-inputs": {
             "task": "cleanup_stale_paper_job_inputs",
             "schedule": max(60, settings.PAPER_UPLOAD_CLEANUP_INTERVAL_SECONDS),
+        },
+        "probe-retrieval-provider-recovery": {
+            "task": "probe_retrieval_provider_recovery",
+            "schedule": max(60, settings.PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS),
         },
     },
 )

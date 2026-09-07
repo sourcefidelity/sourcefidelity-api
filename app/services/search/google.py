@@ -3,10 +3,9 @@
 Uses the Custom Search JSON API (https://developers.google.com/custom-search/v1/overview).
 Requires GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_CSE_ID in .env.
 
-Free tier: 100 queries/day. Paid: $5 per 1000 queries.
-For a batch of 30 papers with ~40 refs each (~1200 lookups, but most hit the
-academic-DB chain first so only misses trigger search): typically 200-400
-search queries per batch = $1-2 in search costs.
+The API is closed to new customers and scheduled for discontinuation for
+existing customers on January 1, 2027. It remains only for existing configured
+deployments during migration; do not adopt it as a new production dependency.
 """
 
 import logging
@@ -14,7 +13,12 @@ from typing import Optional
 
 import httpx
 
-from app.services.search.base import SearchProvider, SearchResult
+from app.services.search.base import (
+    SearchProvider,
+    SearchResult,
+    classify_search_failure,
+    safe_search_failure_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,7 @@ class GoogleCustomSearch(SearchProvider):
 
     def search(self, query: str, num_results: int = 10) -> list[SearchResult]:
         """Search via Google Custom Search API."""
+        self.last_status = "started"
         # Google caps at 10 results per request
         num = min(num_results, 10)
         params = {
@@ -47,7 +52,13 @@ class GoogleCustomSearch(SearchProvider):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning("Google search failed for query '%s': %s", query[:60], e)
+            self.last_status = classify_search_failure(e)
+            query_sha256, failure = safe_search_failure_log(query, e)
+            logger.warning(
+                "Google search failed query_sha256=%s failure=%s",
+                query_sha256,
+                failure,
+            )
             return []
 
         results = []
@@ -61,4 +72,5 @@ class GoogleCustomSearch(SearchProvider):
                 results.append(SearchResult(
                     url=url, title=title, snippet=snippet, is_pdf=is_pdf,
                 ))
+        self.last_status = "completed"
         return results

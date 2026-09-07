@@ -22,6 +22,7 @@ Usage:
 
 import logging
 import re
+import statistics
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
@@ -47,6 +48,108 @@ class ValidationResult:
     page_count: int = 0        # detected page count (for logging)
     observed_source_kind: str = "unknown"
     source_kind_verdict: str = "unknown"
+
+
+def validate_ocr_derivative_text(
+    text: str,
+    *,
+    expected_doi: str | None = None,
+    expected_title: str | None = None,
+    expected_author: str | None = None,
+    expected_year: str | None = None,
+    expected_source_kind: str | None = None,
+    expected_source_kind_confidence: str = "unknown",
+    expected_source_kind_evidence: tuple[str, ...] = (),
+    completeness: str = "uncertain",
+    page_count: int = 0,
+) -> ValidationResult:
+    """Revalidate identity/type against bounded OCR text without PDF metadata.
+
+    OCR cannot preserve font prominence or embedded metadata. Automatic high
+    confidence therefore requires two visible bibliographic fields, including
+    an exact normalized title or DOI, and completeness must be established
+    independently from the immutable parent PDF.
+    """
+    if not text.strip() or len(text) > 20_000_000:
+        return ValidationResult(
+            accept=False,
+            identity_confidence="rejected",
+            completeness=completeness,
+            text_quality="scan_ocr",
+            reason="OCR derivative text is empty or exceeds its validation bound.",
+            page_count=page_count,
+        )
+    pages = text.split("\f")
+    front_text = "\n".join(pages[:3])[:24_000]
+    listing_conflict = _detect_nonwork_listing(front_text, expected_title)
+    if listing_conflict:
+        return ValidationResult(
+            accept=False,
+            identity_confidence="rejected",
+            completeness=completeness,
+            text_quality="scan_ocr",
+            reason=f"OCR representation is {listing_conflict}, not the cited work.",
+            page_count=page_count,
+        )
+    observed_kind = classify_content_source_kind(front_text)
+    expected_kind = SourceKindAssessment(
+        normalize_source_kind(expected_source_kind),
+        expected_source_kind_confidence,
+        expected_source_kind_evidence,
+    )
+    compatibility = compare_source_kinds(expected_kind, observed_kind)
+    if compatibility.verdict == "incompatible":
+        return ValidationResult(
+            accept=False,
+            identity_confidence="rejected",
+            completeness=completeness,
+            text_quality="scan_ocr",
+            reason=f"Bibliographic type conflict — {compatibility.reason}.",
+            page_count=page_count,
+            observed_source_kind=observed_kind.kind,
+            source_kind_verdict=compatibility.verdict,
+        )
+
+    normalized = _normalize_identity_text(front_text)
+    normalized_title = _normalize_identity_text(expected_title or "")
+    title_match = bool(
+        len(normalized_title) >= 10 and normalized_title in normalized
+    )
+    author_value = (expected_author or "").strip()
+    if "," in author_value:
+        surname_value = author_value.split(",", 1)[0].strip()
+    else:
+        author_tokens = author_value.split()
+        surname_value = author_tokens[-1] if author_tokens else ""
+    surname = _normalize_identity_text(surname_value)
+    author_match = bool(len(surname) >= 3 and surname in normalized)
+    year_match = bool(expected_year and expected_year in front_text)
+    normalized_doi = (expected_doi or "").strip().casefold()
+    doi_match = bool(normalized_doi and normalized_doi in front_text.casefold())
+    identity = (
+        "high"
+        if (doi_match and (title_match or author_match))
+        or (title_match and author_match)
+        else "medium"
+        if doi_match or title_match or (author_match and year_match)
+        else "low"
+        if author_match or year_match
+        else "rejected"
+    )
+    accept = identity == "high" and completeness == "complete"
+    return ValidationResult(
+        accept=accept,
+        identity_confidence=identity,
+        completeness=completeness,
+        text_quality="scan_ocr",
+        reason=("Accepted" if accept else "Needs review")
+        + ": OCR derivative identity="
+        + identity
+        + f", completeness={completeness}",
+        page_count=page_count,
+        observed_source_kind=observed_kind.kind,
+        source_kind_verdict=compatibility.verdict,
+    )
 
 
 def validate_retrieved_pdf(
@@ -132,7 +235,7 @@ def validate_retrieved_pdf(
             source_kind_verdict=kind_compatibility.verdict,
         )
 
-    listing_conflict = _detect_nonwork_listing(front_text)
+    listing_conflict = _detect_nonwork_listing(front_text, expected_title)
     if listing_conflict:
         return ValidationResult(
             accept=False,
@@ -240,11 +343,125 @@ def _extract_pdf_identity_metadata(pdf_bytes: bytes) -> str:
         return ""
 
 
-def _detect_nonwork_listing(front_text: str) -> str | None:
+def _has_prominent_front_title_support(
+    pdf_bytes: bytes,
+    expected_title: str | None,
+) -> bool:
+    """Return whether the expected title appears as visible front matter.
+
+    Plain full-text occurrence is unsafe identity evidence: a later document by
+    the same author can name the target work in its prose or bibliography. A
+    title receives the strong identity weight only when it appears in the upper
+    title zone or at the page's most prominent font size on one of the first
+    three pages. Embedded metadata is handled separately by ``_check_identity``.
+    """
+    title = _normalize_identity_text(expected_title or "")
+    if len(title) < 10:
+        return False
+    try:
+        import fitz
+
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            for index in range(min(3, len(document))):
+                page = document[index]
+                spans = [
+                    span
+                    for block in page.get_text("dict").get("blocks", [])
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                    if span.get("text", "").strip()
+                ]
+                if not spans:
+                    continue
+                max_size = max(float(span.get("size", 0.0)) for span in spans)
+                median_size = statistics.median(
+                    float(span.get("size", 0.0)) for span in spans
+                )
+                upper_limit = float(page.rect.height) * 0.30
+                has_distinct_display_type = max_size >= median_size + 1.5
+                prominent = " ".join(
+                    span["text"]
+                    for span in spans
+                    if float(span["bbox"][1]) <= upper_limit
+                    or (
+                        has_distinct_display_type
+                        and float(span.get("size", 0.0)) >= max_size - 0.1
+                    )
+                )
+                if title in _normalize_identity_text(prominent):
+                    return True
+        finally:
+            document.close()
+    except Exception:
+        return False
+    return False
+
+
+def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
+    """Extract explicitly dated document-version years from the first page."""
+    try:
+        import fitz
+
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if not len(document):
+                return set()
+            page = document[0]
+            lines = [
+                line
+                for block in page.get_text("dict").get("blocks", [])
+                for line in block.get("lines", [])
+                if line.get("spans")
+            ]
+            spans = [
+                span
+                for line in lines
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            ]
+            if not spans:
+                return set()
+            explicit_date_years: set[str] = set()
+            document_date_cues = re.compile(
+                r"\b(?:working paper|draft|version|revised|dated)\b",
+                re.IGNORECASE,
+            )
+            month_date = re.compile(
+                r"\b(?:january|february|march|april|(?-i:May)|june|july|august|"
+                r"september|october|november|december)\b.{0,24}"
+                r"\b(?:18|19|20)\d{2}\b",
+                re.IGNORECASE,
+            )
+            for line in lines:
+                line_text = " ".join(
+                    span.get("text", "") for span in line.get("spans", [])
+                )
+                line_top = min(
+                    float(span["bbox"][1]) for span in line.get("spans", [])
+                )
+                if line_top <= float(page.rect.height) * 0.55 and (
+                    document_date_cues.search(line_text)
+                    or month_date.search(line_text)
+                ):
+                    explicit_date_years.update(
+                        re.findall(r"\b(?:18|19|20)\d{2}\b", line_text)
+                    )
+            return explicit_date_years
+        finally:
+            document.close()
+    except Exception:
+        return set()
+
+
+def _detect_nonwork_listing(
+    front_text: str, expected_title: str | None = None
+) -> str | None:
     """Detect documents that only list or cite the expected work.
 
     Exact title and author overlap is not source identity when the containing
-    representation is a CV/publication list or an awards listing. Keep this
+    representation is a CV/publication list, awards listing or publisher
+    accessibility document about the work. Keep this
     fail-closed rule restricted to strong representation-level markers so an
     ordinary article that merely discusses awards is not rejected.
     """
@@ -268,6 +485,39 @@ def _detect_nonwork_listing(front_text: str) -> str | None:
         award_count >= 4 and "outstanding" in leading
     ):
         return "an awards or contents listing"
+
+    # A support PDF may prominently repeat the book's author/title/ISBN. Require
+    # an opening purpose heading, standards language AND a first-party platform
+    # declaration; accessibility vocabulary alone is ordinary scholarly content.
+    purpose = re.search(
+        r"\b(?:our commitment to accessibility|accessibility conformance report|"
+        r"voluntary product accessibility template|product accessibility report|"
+        r"accessibility statement)\b",
+        leading[:1200],
+    )
+    standards = bool(re.search(r"\b(?:wcag|vpats?|section 508)\b", normalized))
+    platform_declaration = bool(
+        re.search(
+            r"\bthis report (?:reflects|describes|documents) the accessibility "
+            r"(?:level|status|conformance)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:our|this) (?:product|platform) (?:conforms|supports|complies)\b",
+            normalized,
+        )
+    )
+    if purpose and standards and platform_declaration:
+        cited_title = _normalize_identity_text(expected_title or "")
+        # This is not an identity approval. An explicitly cited support report
+        # still has to pass the normal field, type and completeness checks.
+        cites_report_itself = bool(
+            cited_title
+            and (cited_title == purpose.group() or cited_title.startswith(purpose.group() + " "))
+            and cited_title in leading
+        )
+        if not cites_report_itself:
+            return "a publisher accessibility or conformance document"
 
     return None
 
@@ -319,7 +569,6 @@ def _check_identity(
     if not text.strip():
         return "rejected"
 
-    text_lower = text.lower()
     text_identity = _normalize_identity_text(text)
 
     # ── DOI match (definitive — unique identifier) ──
@@ -346,17 +595,34 @@ def _check_identity(
     title_fuzzy = False
     if expected_title:
         title_clean = _normalize_identity_text(expected_title)
-        # Check if the full title (or 80%+ of it) appears as a contiguous string
-        if title_clean and len(title_clean) >= 10:
-            if title_clean in text_identity:
-                title_exact = True
+        title_in_visible_text = bool(
+            title_clean and len(title_clean) >= 10 and title_clean in text_identity
+        )
+        title_in_metadata = bool(
+            title_clean
+            and len(title_clean) >= 10
+            and title_clean in _normalize_identity_text(identity_metadata)
+        )
+        # Strong title identity requires title-zone/prominent front matter. A
+        # same-author later work may repeat the exact target title and year in
+        # its prose or bibliography; that plain occurrence is supporting only.
+        title_exact = _has_prominent_front_title_support(pdf_bytes, expected_title)
+        if (
+            not title_exact
+            and title_in_metadata
+            and _visible_identity_support_count(
+                front_text, expected_title, expected_author, expected_year
+            )
+            >= 2
+        ):
+            title_exact = True
         # Fuzzy: token overlap (only as a supporting signal, never standalone)
         title_tokens = {
             token for token in title_clean.split() if len(token) >= 4
         }
         if title_tokens:
             matches = sum(1 for token in title_tokens if token in text_identity)
-            if matches / len(title_tokens) >= 0.6:
+            if title_in_visible_text or matches / len(title_tokens) >= 0.6:
                 title_fuzzy = True
 
     if title_exact:
@@ -385,8 +651,18 @@ def _check_identity(
     # ── Scoring: require triangulation (2+ signals) for acceptance ──
     total_score = sum(s[1] for s in signals)
 
+    # A prominent conflicting document year distinguishes an earlier/later
+    # working paper from the cited publication. The expected year may still
+    # occur in prose or references, so title+author overlap cannot override it.
+    prominent_years = _explicit_first_page_document_years(pdf_bytes)
+    visible_year_conflict = bool(
+        expected_year
+        and prominent_years
+        and expected_year not in prominent_years
+    )
+
     if total_score >= 5:  # e.g., title_exact(3) + author(2) = 5
-        return "high"
+        return "medium" if visible_year_conflict else "high"
     elif total_score >= 3:  # e.g., title_exact(3) alone, or title_fuzzy(1) + author(2)
         return "medium"
     elif total_score >= 2:  # e.g., author(2) alone, or title_fuzzy(1) + year(1)
@@ -421,7 +697,7 @@ def _check_text_quality(pdf_bytes: bytes) -> str:
         result = classify_text_quality(pdf_bytes, sample_size=8)
         return result.verdict  # extract the string ("digital"/"scan_ocr"/"pure_scan")
     except Exception as e:
-        logger.debug("Text quality check failed: %s", e)
+        logger.debug("Text quality check failed (type=%s)", type(e).__name__)
         # Report honestly — don't claim "digital" for a PDF we couldn't classify
         # (REVIEW §3.2). Callers see text_quality="unknown"; identity/completeness
         # checks still run, so this only affects the reported quality label.
@@ -461,5 +737,5 @@ def _check_completeness(
         )
         return report.verdict.lower(), page_count
     except Exception as e:
-        logger.debug("Completeness check failed: %s", e)
+        logger.debug("Completeness check failed (type=%s)", type(e).__name__)
         return "uncertain", 0

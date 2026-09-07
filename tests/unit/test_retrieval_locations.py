@@ -11,7 +11,8 @@ from app.services.retrieval.base import (
 from app.services.retrieval.crossref import _parse_full_text_links
 from app.services.retrieval.landing_page import discover_scholarly_locations
 from app.services.retrieval.openalex import OpenAlexRetriever, _parse_locations
-from app.services.source_resolver import SourceResolver
+from app.services.reference_discovery import ExpectedBibliographicFields
+from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.source_resolver import _verify_text_content_identity
 from app.services.source_type import SourceKindAssessment
 
@@ -209,6 +210,64 @@ def test_location_acquisition_tries_an_alternate_after_first_pdf_fails() -> None
     ]
 
 
+def test_location_trace_records_rank_origin_and_unattempted_disposition() -> None:
+    resolver = _resolver()
+    resolver._safe_download = Mock(return_value=b"%PDF-first")
+    resolver._preflight_acquired_representation = Mock(
+        return_value=(True, "acquired", "verified")
+    )
+    result = RetrievalResult(
+        source_name="canonical_work_graph",
+        success=True,
+        locations=[
+            AcquisitionLocation(
+                url="https://first.example/article.pdf",
+                provider="openalex",
+                representation_kind=RepresentationKind.PDF,
+                is_best=True,
+                metadata={"providers": ["openalex", "core"]},
+            ),
+            AcquisitionLocation(
+                url="https://second.example/article.pdf",
+                provider="crossref",
+                representation_kind=RepresentationKind.PDF,
+            ),
+        ],
+    )
+
+    assert resolver._acquire_from_locations(result)
+    attempts = result.metadata["location_attempts"]
+    assert attempts[0]["rank"] == 1
+    assert attempts[0]["origin_providers"] == ["openalex", "core"]
+    assert attempts[1]["rank"] == 2
+    assert attempts[1]["outcome"] == "not_attempted"
+    assert attempts[1]["reason_code"] == "accepted_candidate_found"
+
+
+def test_location_trace_explains_candidates_beyond_attempt_cap() -> None:
+    resolver = _resolver()
+    resolver._safe_download = Mock(side_effect=ValueError("unavailable"))
+    result = RetrievalResult(
+        source_name="canonical_work_graph",
+        success=True,
+        locations=[
+            AcquisitionLocation(
+                url=f"https://example.org/article-{index}.pdf",
+                provider="openalex",
+                representation_kind=RepresentationKind.PDF,
+            )
+            for index in range(6)
+        ],
+    )
+
+    assert resolver._acquire_from_locations(result) is False
+    attempts = result.metadata["location_attempts"]
+    assert len(attempts) == 6
+    assert [attempt["outcome"] for attempt in attempts[:5]] == ["unavailable"] * 5
+    assert attempts[5]["outcome"] == "not_attempted"
+    assert attempts[5]["reason_code"] == "attempt_limit_reached"
+
+
 def test_pdf_download_retries_one_transient_transport_failure(monkeypatch) -> None:
     resolver = _resolver()
     request = httpx.Request("GET", "https://repository.example/source.pdf")
@@ -345,6 +404,197 @@ def test_web_graph_uses_next_search_provider_after_candidates_are_rejected() -> 
     }
 
 
+def test_bounded_web_discovery_trace_preserves_each_rejected_location_candidate() -> None:
+    resolver = _resolver()
+    trace = {
+        "reference_id": "ref-web",
+        "expected": ExpectedBibliographicFields(title="Expected Work"),
+        "required": set(),
+        "queries": [],
+        "attempts": [],
+        "candidates": [],
+    }
+    token = _ACTIVE_DISCOVERY_TRACE.set(trace)
+    try:
+        result = RetrievalResult(
+            source_name="web_search",
+            success=True,
+            title="Expected Work",
+            metadata={
+                "retrieval_trace": [
+                    {
+                        "phase": "title_author",
+                        "search_attempts": [
+                            {
+                                "provider": "tavily",
+                                "query": '"Expected Work"',
+                                "outcome": "results",
+                                "result_count": 2,
+                            }
+                        ],
+                        "location_attempts": [
+                            {
+                                "url": "https://wrong.example/one.pdf",
+                                "provider": "web_search",
+                                "candidate_title": "Wrong Work One",
+                                "discovery_provider": "tavily",
+                                "outcome": "identity_rejected",
+                                "reason": "wrong content identity",
+                            },
+                            {
+                                "url": "https://wrong.example/two.pdf",
+                                "provider": "web_search",
+                                "candidate_title": "Wrong Work Two",
+                                "discovery_provider": "tavily",
+                                "outcome": "completeness_rejected",
+                                "reason": "truncated representation",
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+
+        resolver._record_discovery_attempt(
+            category="bounded_web",
+            provider="web_search",
+            result=result,
+            required=True,
+        )
+    finally:
+        _ACTIVE_DISCOVERY_TRACE.reset(token)
+
+    assert len(trace["candidates"]) == 2
+    assert {candidate.observed.title for candidate in trace["candidates"]} == {
+        "Wrong Work One",
+        "Wrong Work Two",
+    }
+    assert {candidate.acquisition_outcome for candidate in trace["candidates"]} == {
+        "identity_rejected",
+        "completeness_rejected",
+    }
+    assert all(
+        candidate.attempt_id == trace["attempts"][0].attempt_id
+        for candidate in trace["candidates"]
+    )
+    assert trace["queries"][0].normalized_query == '"expected work"'
+    assert trace["queries"][0].execution_provider == "tavily"
+    assert trace["queries"][0].execution_outcome == "results"
+    assert trace["queries"][0].result_count == 2
+    assert all(
+        candidate.discovery_provider == "tavily"
+        for candidate in trace["candidates"]
+    )
+
+
+def test_bounded_web_discovery_trace_preserves_unattempted_bounded_location() -> None:
+    resolver = _resolver()
+    trace = {
+        "reference_id": "ref-web",
+        "expected": ExpectedBibliographicFields(title="Expected Work"),
+        "required": set(),
+        "queries": [],
+        "attempts": [],
+        "candidates": [],
+    }
+    token = _ACTIVE_DISCOVERY_TRACE.set(trace)
+    try:
+        result = RetrievalResult(
+            source_name="web_search",
+            success=True,
+            metadata={
+                "retrieval_trace": [
+                    {
+                        "phase": "title_author",
+                        "candidate_locations": [
+                            {
+                                "url": "https://candidate.example/not-attempted.pdf",
+                                "provider": "web_search",
+                                "candidate_title": "Candidate Search Title",
+                                "outcome": "metadata_only",
+                            }
+                        ],
+                        "location_attempts": [],
+                    }
+                ]
+            },
+        )
+
+        resolver._record_discovery_attempt(
+            category="bounded_web",
+            provider="web_search",
+            result=result,
+            required=True,
+        )
+    finally:
+        _ACTIVE_DISCOVERY_TRACE.reset(token)
+
+    assert len(trace["candidates"]) == 1
+    candidate = trace["candidates"][0]
+    assert candidate.observed.title == "Candidate Search Title"
+    assert candidate.acquisition_outcome == "metadata_only"
+
+
+def test_structured_trace_deduplicates_doi_enrichment_and_binds_disposition() -> None:
+    resolver = _resolver()
+    trace = {
+        "reference_id": "ref-structured",
+        "expected": ExpectedBibliographicFields(title="Expected Work"),
+        "required": set(),
+        "queries": [],
+        "attempts": [],
+        "candidates": [],
+    }
+    location = AcquisitionLocation(
+        url="https://repository.example/work.pdf",
+        provider="core",
+        representation_kind=RepresentationKind.PDF,
+        metadata={"providers": ["core", "openalex"]},
+    )
+    result = RetrievalResult(
+        source_name="core",
+        success=True,
+        title="Expected Work",
+        locations=[location],
+    )
+    token = _ACTIVE_DISCOVERY_TRACE.set(trace)
+    try:
+        resolver._record_discovery_attempt(
+            category="academic_adapter",
+            provider="core",
+            result=result,
+            required=True,
+        )
+        resolver._record_discovery_attempt(
+            category="academic_adapter",
+            provider="core",
+            result=result,
+            required=True,
+        )
+        result.metadata = {
+            "location_attempts": [
+                {
+                    "url": location.url,
+                    "provider": "core",
+                    "rank": 1,
+                    "origin_providers": ["core", "openalex"],
+                    "outcome": "not_attempted",
+                    "reason_code": "accepted_candidate_found",
+                }
+            ]
+        }
+        resolver._record_canonical_location_outcomes(result)
+    finally:
+        _ACTIVE_DISCOVERY_TRACE.reset(token)
+
+    assert len(trace["candidates"]) == 1
+    candidate = trace["candidates"][0]
+    assert candidate.location_rank == 1
+    assert candidate.origin_providers == ["core", "openalex"]
+    assert candidate.acquisition_outcome == "not_attempted"
+    assert candidate.disposition_reason_code == "accepted_candidate_found"
+
+
 def test_explicit_full_text_html_is_acquired_as_typed_text(monkeypatch) -> None:
     resolver = _resolver()
     article = (
@@ -382,6 +632,132 @@ def test_explicit_full_text_html_is_acquired_as_typed_text(monkeypatch) -> None:
     assert result.representation.kind is RepresentationKind.PLAIN_TEXT
     assert result.representation.original_kind is RepresentationKind.HTML
     assert b"Substantive article body" in result.representation.content
+
+
+def test_landing_page_locations_inherit_web_candidate_provenance(monkeypatch) -> None:
+    resolver = _resolver()
+    landing_url = "https://journal.example/article"
+    pdf_url = "https://journal.example/article.pdf"
+    response = httpx.Response(
+        200,
+        text=(
+            "<html><head>"
+            "<meta name='citation_pdf_url' content='https://journal.example/article.pdf'>"
+            "</head><body>Publication record</body></html>"
+        ),
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", landing_url),
+    )
+    monkeypatch.setattr(
+        "app.services.source_resolver.safe_request", lambda *args, **kwargs: response
+    )
+    resolver._safe_download = Mock(return_value=b"%PDF-article")
+    resolver._preflight_acquired_representation = Mock(
+        return_value=(True, "acquired", "verified")
+    )
+    result = RetrievalResult(
+        source_name="web_search",
+        success=True,
+        locations=[
+            AcquisitionLocation(
+                url=landing_url,
+                provider="web_search",
+                representation_kind=RepresentationKind.HTML,
+                metadata={
+                    "search_provider": "tavily",
+                    "search_title": "Observed Article Title",
+                },
+            )
+        ],
+    )
+
+    assert resolver._acquire_from_locations(result)
+    discovered_attempt = next(
+        attempt
+        for attempt in result.metadata["location_attempts"]
+        if attempt["url"] == pdf_url
+    )
+    assert discovered_attempt["discovery_provider"] == "tavily"
+    assert discovered_attempt["candidate_title"] == "Observed Article Title"
+
+
+def test_landing_page_children_do_not_starve_strong_independent_candidate(
+    monkeypatch,
+) -> None:
+    resolver = _resolver()
+    landing_url = "https://first.example/article"
+    accepted_url = "https://second.example/fulltext"
+    landing_response = httpx.Response(
+        200,
+        text="<html><head><title>Publication record</title></head></html>",
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", landing_url),
+    )
+    accepted_response = httpx.Response(
+        200,
+        text=(
+            "<html><head><title>Example article</title></head><body><article>"
+            + " ".join(["Substantive article body sentence."] * 40)
+            + "</article></body></html>"
+        ),
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", accepted_url),
+    )
+    monkeypatch.setattr(
+        "app.services.source_resolver.safe_request",
+        lambda url, *args, **kwargs: (
+            landing_response if url == landing_url else accepted_response
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.source_resolver.discover_scholarly_locations",
+        lambda _html, base_url, **kwargs: (
+            [
+                AcquisitionLocation(
+                    url=f"https://first.example/derived-{index}.pdf",
+                    provider="web_search",
+                    representation_kind=RepresentationKind.PDF,
+                )
+                for index in range(4)
+            ]
+            if base_url == landing_url
+            else []
+        ),
+    )
+    resolver._safe_download = Mock(side_effect=ValueError("derived unavailable"))
+    resolver._preflight_acquired_representation = Mock(
+        return_value=(True, "acquired", "verified")
+    )
+    result = RetrievalResult(
+        source_name="web_search",
+        success=True,
+        title="Example article",
+        locations=[
+            AcquisitionLocation(
+                url=landing_url,
+                provider="web_search",
+                representation_kind=RepresentationKind.HTML,
+                is_best=True,
+            ),
+            AcquisitionLocation(
+                url=accepted_url,
+                provider="web_search",
+                representation_kind=RepresentationKind.HTML,
+                intended_application="text-mining",
+            ),
+        ],
+    )
+
+    assert resolver._acquire_from_locations(result)
+    attempts = result.metadata["location_attempts"]
+    assert [attempt["url"] for attempt in attempts[:2]] == [
+        landing_url,
+        accepted_url,
+    ]
+    assert [attempt["outcome"] for attempt in attempts[:2]] == [
+        "unavailable",
+        "acquired",
+    ]
 
 
 def test_web_search_html_hint_alone_does_not_promote_record_page(monkeypatch) -> None:
@@ -510,6 +886,79 @@ def test_non_pdf_content_identity_requires_evidence_inside_the_representation() 
     assert confidence == "high"
     assert "author/year support" in reason
     assert weak_confidence == "low"
+
+
+def test_accessibility_text_rejected_despite_provider_and_doi_match() -> None:
+    resolver = _resolver()
+    result = RetrievalResult(
+        source_name="test", success=True, title="Understanding Cinema",
+        authors=["Morgan"], year="2013", doi="10.1234/example-book",
+        representation=SourceRepresentation(
+            kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain",
+            original_kind=RepresentationKind.HTML,
+            content=(
+                b"Morgan, Understanding Cinema, 2013. 10.1234/example-book. "
+                b"Our Commitment to Accessibility. WCAG AA and VPAT. "
+                b"This report reflects the accessibility level of our platform."
+            ),
+        ),
+    )
+    accepted, outcome, reason = resolver._preflight_acquired_representation(
+        result, expected_doi="10.1234/example-book",
+        expected_title="Understanding Cinema", expected_author="Morgan",
+        expected_year="2013",
+    )
+    assert not accepted
+    assert outcome == "identity_rejected"
+    assert "accessibility" in result.metadata["identity_reason"]
+    assert result.metadata["identity_confidence"] == "rejected"
+    assert "accepted_representation_sha256" not in result.metadata
+
+
+def test_actual_pdf_purpose_rejection_continues_to_next_location(monkeypatch) -> None:
+    import fitz
+
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_textbox(fitz.Rect(40, 40, 550, 740), (
+        "Morgan, Understanding Cinema, 2013\n"
+        "Our Commitment to Accessibility\nWCAG AA and VPAT\n"
+        "This report reflects the accessibility level of our platform."
+    ))
+    payload = document.tobytes()
+    document.close()
+    resolver = _resolver()
+    resolver._safe_download = Mock(return_value=payload)
+    monkeypatch.setattr("app.services.source_resolver.safe_request", Mock(
+        return_value=httpx.Response(
+            200,
+            content=b"Understanding Cinema. Morgan. 2013. " + b"Book body content. " * 80,
+            request=httpx.Request("GET", "https://publisher.example/book.txt"),
+        )
+    ))
+    result = RetrievalResult(
+        source_name="test", success=True, title="Understanding Cinema",
+        authors=["Morgan"], year="2013",
+        locations=[
+            AcquisitionLocation(
+                url="https://publisher.example/support.pdf", provider="test",
+                representation_kind=RepresentationKind.PDF, is_best=True,
+            ),
+            AcquisitionLocation(
+                url="https://publisher.example/book.txt", provider="test",
+                representation_kind=RepresentationKind.PLAIN_TEXT,
+            ),
+        ],
+    )
+    assert resolver._acquire_from_locations(
+        result, expected_title="Understanding Cinema", expected_author="Morgan",
+        expected_year="2013",
+    )
+    assert [row["outcome"] for row in result.metadata["location_attempts"]] == [
+        "identity_rejected", "acquired",
+    ]
+    assert result.representation.content != payload
+    assert result.representation.source_url == "https://publisher.example/book.txt"
 
 
 def test_html_landing_page_cannot_satisfy_typed_journal_reference() -> None:

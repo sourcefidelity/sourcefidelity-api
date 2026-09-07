@@ -1,3 +1,5 @@
+import hashlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +11,8 @@ import pytest
 from app.config import settings
 from app.services.retrieval.base import AcquisitionLocation, RetrievalResult, RetrievalSource
 from app.services.retrieval.base import RepresentationKind
+from app.services.retrieval.base import SourceRepresentation
+from app.services.file_safety import FileSafetyReport, SafetyVerdict
 from app.services.source_resolver import (
     SourceResolutionError,
     SourceResolver,
@@ -50,6 +54,40 @@ class _DeferredSource(_MetadataOnlySource):
         )
 
 
+class _CompletedNoMatchWebSource(_MetadataOnlySource):
+    name = "web_search"
+    capabilities = frozenset({"web_discovery"})
+
+    @staticmethod
+    def _miss(query: str) -> RetrievalResult:
+        return RetrievalResult(
+            source_name="web_search",
+            success=False,
+            error="no search results",
+            metadata={
+                "search_attempts": [
+                    {
+                        "provider": "bounded-control",
+                        "query": query,
+                        "outcome": "no_results",
+                        "result_count": 0,
+                    }
+                ]
+            },
+        )
+
+    def search_by_doi(self, doi: str) -> RetrievalResult:
+        return self._miss(f'"{doi}"')
+
+    def search_by_title_author(
+        self,
+        title: str,
+        author: str | None = None,
+        year: str | None = None,
+    ) -> RetrievalResult:
+        return self._miss(f'"{title}"')
+
+
 class _LocatedSource(_MetadataOnlySource):
     def __init__(self, name: str, url: str, *, is_best: bool = False) -> None:
         self.name = name
@@ -75,13 +113,48 @@ class _LocatedSource(_MetadataOnlySource):
             metadata={"provider_record": self.name},
         )
 
+
+class _BarrierMetadataSource(_MetadataOnlySource):
+    def __init__(self, name: str, barrier: threading.Barrier) -> None:
+        self.name = name
+        self.barrier = barrier
+
+    def search_by_doi(self, doi: str) -> RetrievalResult:
+        self.barrier.wait(timeout=2)
+        return RetrievalResult(source_name=self.name, success=True, doi=doi)
+
+
 @pytest.fixture
-def resolver() -> SourceResolver:
+def resolver(monkeypatch) -> SourceResolver:
+    from app.services.retrieval.google_books import BookMetadataSearch
+    monkeypatch.setattr(
+        "app.services.retrieval.google_books.GoogleBooksRetriever.search_metadata_result",
+        lambda *args, **kwargs: BookMetadataSearch("title:test", "no_results"),
+    )
     instance = SourceResolver.__new__(SourceResolver)
     instance._backend = None
     instance._retrieval_sources = []
     instance._acquisition_capabilities = None
     return instance
+
+
+def test_structured_metadata_adapters_overlap_but_keep_configured_order(resolver):
+    barrier = threading.Barrier(2)
+    sources = [
+        _BarrierMetadataSource("first", barrier),
+        _BarrierMetadataSource("second", barrier),
+    ]
+
+    results = resolver._lookup_structured_sources(
+        sources,
+        "10.1234/example",
+        "Example",
+        "Author",
+        "2024",
+    )
+
+    assert [source.name for source, _result in results] == ["first", "second"]
+    assert all(result.success for _source, result in results)
 
 
 def _resolver_response(content: bytes, content_type: str) -> httpx.Response:
@@ -142,6 +215,101 @@ def test_resolve_reference_preserves_parsed_bibliographic_type_contract(
     assert resolver.resolve.call_args.kwargs["source_kind"] == "monograph"
     assert resolver.resolve.call_args.kwargs["source_kind_confidence"] == "high"
     assert resolver.resolve.call_args.kwargs["source_kind_evidence"]
+
+
+def test_resolve_reference_attaches_non_decisive_route_trace_on_success(
+    resolver: SourceResolver,
+) -> None:
+    cached = RetrievalResult(
+        source_name="local_cache",
+        success=True,
+        full_text=b"%PDF-trace-control",
+        title="Traceable scholarly source",
+        authors=["Scholar"],
+        year="2024",
+    )
+    resolver._check_local_cache = Mock(return_value=cached)
+    reference = ParsedReference(
+        reference_id="ref-trace-success",
+        author="Scholar",
+        year="2024",
+        title="Traceable scholarly source",
+    )
+
+    result = resolver.resolve_reference(reference)
+    trace = result.metadata["reference_discovery_trace"]
+
+    assert trace["trace_version"] == "reference-discovery-trace-v1"
+    assert trace["reference_id"] == "ref-trace-success"
+    assert trace["attempts"][0]["route_category"] == "durable_repository"
+    assert trace["attempts"][0]["outcome"] == "candidate_found"
+    assert len(trace["candidates"]) == 1
+    assert trace["candidates"][0]["attempt_id"] == trace["attempts"][0]["attempt_id"]
+    assert trace["candidates_complete"] is True
+    assert trace["outcome_derived"] is True
+    assert result.metadata["reference_discovery"]["outcome"] == "confirmed"
+
+
+def test_resolve_reference_failure_retains_each_attempt_without_deriving_absence(
+    resolver: SourceResolver,
+) -> None:
+    resolver._check_local_cache = Mock(
+        return_value=RetrievalResult(source_name="local_cache", success=False)
+    )
+    resolver._retrieval_sources = [_MetadataOnlySource()]
+    reference = ParsedReference(
+        reference_id="ref-trace-failure",
+        author="Scholar",
+        year="2024",
+        title="Unlocated but traceable source",
+    )
+
+    with pytest.raises(SourceResolutionError) as raised:
+        resolver.resolve_reference(reference)
+
+    trace = raised.value.reference_discovery_trace
+    assert trace is not None
+    assert [attempt["route_category"] for attempt in trace["attempts"]] == [
+        "durable_repository",
+        "academic_adapter",
+    ]
+    assert trace["required_route_categories"] == [
+        "academic_adapter",
+        "bounded_web",
+    ]
+    assert trace["candidates_complete"] is True
+    assert trace["outcome_derived"] is True
+    assert raised.value.reference_discovery["outcome"] == "search_incomplete"
+
+
+def test_live_unlocated_outcome_remains_suppressed_pending_real_control(
+    resolver: SourceResolver,
+) -> None:
+    resolver._check_local_cache = Mock(
+        return_value=RetrievalResult(source_name="local_cache", success=False)
+    )
+    resolver._retrieval_sources = [
+        _MetadataOnlySource(),
+        _CompletedNoMatchWebSource(),
+    ]
+    reference = ParsedReference(
+        reference_id="ref-unlocated-suppressed",
+        author="Scholar",
+        year="2024",
+        title="A sufficiently specific scholarly source",
+    )
+
+    with pytest.raises(SourceResolutionError) as raised:
+        resolver.resolve_reference(reference)
+
+    trace = raised.value.reference_discovery_trace
+    assert trace["candidates_complete"] is True
+    assert trace["outcome_derived"] is False
+    assert raised.value.reference_discovery is None
+    assert any(
+        "completed no-match outcome is suppressed" in limitation
+        for limitation in trace["limitations"]
+    )
 
 
 @pytest.mark.integration
@@ -604,6 +772,105 @@ def test_validator_does_not_accept_medium_identity_for_automatic_use() -> None:
 
 
 @pytest.mark.integration
+def test_opt_in_pure_scan_preflight_replaces_evidence_with_bound_derivative(
+    resolver: SourceResolver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = SourceRepresentation(
+        kind=RepresentationKind.PDF,
+        media_type="application/pdf",
+        content=b"%PDF-pure-scan-parent",
+        source_url="https://example.org/source.pdf",
+        completeness="complete",
+    )
+    derivative = SourceRepresentation(
+        kind=RepresentationKind.PLAIN_TEXT,
+        media_type="text/plain",
+        content=b"validated OCR derivative text",
+        source_url=parent.source_url,
+        original_kind=RepresentationKind.PDF,
+        completeness="complete",
+        metadata={"ocr_derivative_version": "local-pdf-ocr-derivative-v1"},
+    )
+    result = RetrievalResult(
+        source_name="test",
+        success=True,
+        representation=parent,
+        title="Expected title",
+        authors=["Scholar"],
+    )
+    safety = FileSafetyReport(
+        verdict=SafetyVerdict.CLEAN,
+        structural_verdict=SafetyVerdict.CLEAN,
+        malware_verdict=SafetyVerdict.CLEAN,
+    )
+    prepared = SimpleNamespace(
+        status="ready",
+        reason="Accepted OCR derivative",
+        parent=parent,
+        derivative=derivative,
+        derivative_record=SimpleNamespace(
+            parent_content_sha256=hashlib.sha256(parent.content).hexdigest(),
+            content_sha256=hashlib.sha256(derivative.content).hexdigest(),
+            manifest_sha256="b" * 64,
+            manifest={
+                "version": "local-pdf-ocr-derivative-v1",
+                "engine": "tesseract",
+                "engine_version": "test",
+                "language": "eng",
+            },
+        ),
+        validation=SimpleNamespace(
+            identity_confidence="high",
+            reason="Accepted OCR derivative",
+            completeness="complete",
+            text_quality="scan_ocr",
+            observed_source_kind="journal_article",
+            source_kind_verdict="compatible",
+        ),
+        page_labels=("1",),
+        page_mapping_method="observed_only",
+        page_mapping_sha256="c" * 64,
+    )
+    monkeypatch.setattr(settings, "PURE_SCAN_OCR_ENABLED", True)
+    monkeypatch.setattr(resolver, "_durable_repository_active", lambda: True)
+    monkeypatch.setattr(
+        "app.services.source_resolver.inspect_uploaded_pdf", lambda _content: safety
+    )
+    monkeypatch.setattr(
+        "app.services.source_resolver.validate_retrieved_pdf",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            identity_confidence="skipped",
+            reason="pure scan",
+            completeness="skipped",
+            text_quality="pure_scan",
+            observed_source_kind="unknown",
+            source_kind_verdict="unknown",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.source_resolver.prepare_pure_scan_ocr",
+        lambda *_args, **_kwargs: prepared,
+    )
+
+    accepted, outcome, _reason = resolver._preflight_acquired_representation(
+        result,
+        expected_doi=None,
+        expected_title="Expected title",
+        expected_author="Scholar",
+        expected_year="2024",
+        expected_source_kind=SourceKindAssessment(
+            "journal_article", "high", ("test",)
+        ),
+    )
+
+    assert accepted and outcome == "acquired"
+    assert result.representation is derivative
+    assert result.parent_representation is parent
+    assert result.metadata["text_quality"] == "scan_ocr"
+    assert result.metadata["ocr_derivative"]["parent_file_safety"]["verdict"] == "clean"
+
+
+@pytest.mark.integration
 def test_bounded_capabilities_suppress_publisher_constructor(
     resolver: SourceResolver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -787,3 +1054,24 @@ def test_library_locator_is_not_treated_as_source_content(resolver: SourceResolv
 
     resolver._try_web_fetch.assert_not_called()
     resolver._try_student_url.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("kind", "allowed"),
+    [
+        ("unknown", True),
+        ("monograph", True),
+        ("edited_collection", True),
+        ("book_section", True),
+        ("journal_article", False),
+        ("conference_paper", False),
+        ("report", False),
+        ("webpage", False),
+    ],
+)
+def test_public_domain_fallback_is_bounded_to_book_shaped_or_unknown_works(
+    kind: str, allowed: bool
+) -> None:
+    assessment = SourceKindAssessment(kind, "high" if kind != "unknown" else "unknown")
+
+    assert SourceResolver._public_domain_fallback_allowed(assessment) is allowed

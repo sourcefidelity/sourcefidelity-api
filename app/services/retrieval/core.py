@@ -14,6 +14,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.log_safety import safe_exception_code
 from app.services.retrieval.base import AcquisitionLocation, RepresentationKind, RetrievalSource, RetrievalResult
 from app.services.retrieval.provider_runtime import (
     ProviderHealthStore,
@@ -303,7 +304,10 @@ class CoreRetriever(RetrievalSource):
                 self.provider_metrics["grouped_doi_calls"] += 1
                 self.provider_metrics["grouped_doi_items"] += len(chunk)
             except Exception as exc:
-                logger.warning("CORE grouped DOI prefetch failed: %s", exc)
+                logger.warning(
+                    "CORE grouped DOI prefetch failed (type=%s)",
+                    type(exc).__name__,
+                )
                 break
         return prefetched
 
@@ -343,8 +347,9 @@ class CoreRetriever(RetrievalSource):
                 return RetrievalResult(source_name=self.name, success=False, error="No results")
             return self._parse_output(results[0])
         except Exception as e:
-            logger.warning("CORE DOI search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("CORE DOI search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def search_by_title_author(self, title: str, author: str | None = None) -> RetrievalResult:
         if not settings.CORE_API_KEY:
@@ -390,8 +395,9 @@ class CoreRetriever(RetrievalSource):
                 error=f"No relevant match (top {len(results)} results were keyword coincidences)",
             )
         except Exception as e:
-            logger.warning("CORE title search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("CORE title search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def _parse_output(self, data: dict) -> RetrievalResult:
         doi = data.get("doi")

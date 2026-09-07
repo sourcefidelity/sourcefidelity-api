@@ -1,6 +1,12 @@
 import fitz
+import pytest
 
-from app.services.source_validator import _normalize_identity_text, validate_retrieved_pdf
+from app.services.source_validator import (
+    _detect_nonwork_listing,
+    _normalize_identity_text,
+    validate_ocr_derivative_text,
+    validate_retrieved_pdf,
+)
 
 
 def _pdf(text: str, metadata: dict[str, str] | None = None) -> bytes:
@@ -12,6 +18,86 @@ def _pdf(text: str, metadata: dict[str, str] | None = None) -> bytes:
     payload = document.tobytes()
     document.close()
     return payload
+
+
+_ACCESSIBILITY_DOCUMENT = (
+    "Morgan, Understanding Cinema, 2013\n"
+    "Our Commitment to Accessibility\n"
+    "Our digital content is tested against WCAG AA. VPATs are available.\n"
+    "This report reflects the accessibility level of the content available "
+    "within our learning platform as it relates to this title.\n"
+    "Content Feature | Definitions | Status and Alternatives\n"
+    "Electronic book: partially supports keyboard navigation.\n"
+    "Related book identifier: 10.1234/example-book"
+)
+
+
+@pytest.mark.parametrize("source_kind", ["unknown", "webpage", "monograph"])
+def test_accessibility_document_is_not_book_even_with_matching_doi(source_kind) -> None:
+    result = validate_retrieved_pdf(
+        _pdf(_ACCESSIBILITY_DOCUMENT),
+        expected_title="Understanding Cinema",
+        expected_author="Morgan",
+        expected_year="2013",
+        expected_doi="10.1234/example-book",
+        expected_source_kind=source_kind,
+        skip_completeness=True,
+    )
+    assert not result.accept
+    assert result.identity_confidence == "rejected"
+    assert "accessibility or conformance document" in result.reason
+
+
+def test_ocr_accessibility_document_cannot_be_admitted_as_book() -> None:
+    result = validate_ocr_derivative_text(
+        _ACCESSIBILITY_DOCUMENT,
+        expected_title="Understanding Cinema",
+        expected_author="Morgan",
+        expected_doi="10.1234/example-book",
+        completeness="complete",
+        page_count=3,
+    )
+    assert not result.accept
+    assert result.identity_confidence == "rejected"
+    assert "accessibility or conformance document" in result.reason
+
+
+@pytest.mark.parametrize("removed", [
+    "Our Commitment to Accessibility",
+    "Our digital content is tested against WCAG AA. VPATs are available.",
+    "This report reflects the accessibility level of the content available "
+    "within our learning platform as it relates to this title.",
+])
+def test_accessibility_purpose_guard_requires_all_independent_cues(removed) -> None:
+    assert _detect_nonwork_listing(
+        _ACCESSIBILITY_DOCUMENT.replace(removed, ""), "Understanding Cinema"
+    ) is None
+
+
+def test_explicitly_cited_accessibility_report_remains_eligible() -> None:
+    result = validate_retrieved_pdf(
+        _pdf(_ACCESSIBILITY_DOCUMENT),
+        expected_title="Our Commitment to Accessibility",
+        expected_author="Morgan",
+        expected_year="2013",
+        skip_completeness=True,
+    )
+    assert result.accept
+    assert result.identity_confidence == "high"
+
+
+def test_accessibility_scholarship_is_not_rejected_for_shared_vocabulary() -> None:
+    text = (
+        "Understanding Cinema Accessibility\nMorgan, 2013\n"
+        "This study evaluates a publisher accessibility statement against WCAG.\n"
+        "The VPAT describes keyboard navigation and assistive technologies.\n"
+        "We compare these claims with observations of readers using the book."
+    )
+    result = validate_retrieved_pdf(
+        _pdf(text), expected_title="Understanding Cinema Accessibility",
+        expected_author="Morgan", expected_year="2013", skip_completeness=True,
+    )
+    assert result.accept
 
 
 def test_book_review_pdf_is_rejected_for_monograph_even_with_matching_fields() -> None:
@@ -93,6 +179,72 @@ def test_award_listing_cannot_satisfy_named_article_identity() -> None:
     assert result.accept is False
     assert result.identity_confidence == "rejected"
     assert "awards or contents listing" in result.reason
+
+
+def test_same_author_later_pdf_citing_target_cannot_satisfy_identity() -> None:
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text(
+        (60, 80),
+        "A Later Study of Digital Television Services",
+        fontsize=16,
+    )
+    page.insert_text((60, 112), "Jonathan Hardy", fontsize=11)
+    page.insert_text((60, 136), "2017", fontsize=11)
+    page.insert_textbox(
+        fitz.Rect(60, 260, 552, 720),
+        "This later paper discusses the earlier work.\n\n"
+        "References\n"
+        "Hardy, Jonathan. Cross-media promotion. 2010.",
+        fontsize=10,
+    )
+    payload = document.tobytes()
+    document.close()
+
+    result = validate_retrieved_pdf(
+        payload,
+        expected_title="Cross-media promotion",
+        expected_author="Hardy, Jonathan",
+        expected_year="2010",
+        expected_source_kind="unknown",
+        expected_source_kind_confidence="unknown",
+        skip_completeness=True,
+    )
+
+    assert result.accept is False
+    assert result.identity_confidence != "high"
+
+
+def test_prominent_working_paper_year_conflict_blocks_published_identity() -> None:
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text(
+        (60, 80),
+        "Vertical Integration During the Hollywood Studio Era",
+        fontsize=16,
+    )
+    page.insert_text((60, 112), "F. Andrew Hanssen", fontsize=11)
+    page.insert_text((60, 136), "Working paper - April 4, 2008", fontsize=11)
+    page.insert_textbox(
+        fitz.Rect(60, 260, 552, 720),
+        "A later reference list may still contain the published 2010 citation.",
+        fontsize=10,
+    )
+    payload = document.tobytes()
+    document.close()
+
+    result = validate_retrieved_pdf(
+        payload,
+        expected_title="Vertical Integration During the Hollywood Studio Era",
+        expected_author="Hanssen, F. Andrew",
+        expected_year="2010",
+        expected_source_kind="journal_article",
+        expected_source_kind_confidence="high",
+        skip_completeness=True,
+    )
+
+    assert result.accept is False
+    assert result.identity_confidence == "medium"
 
 
 def test_identity_matching_folds_diacritics_and_quote_variants() -> None:

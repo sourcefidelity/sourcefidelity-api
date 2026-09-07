@@ -14,6 +14,7 @@ the claim type (quotation/paraphrase), and a link to the cited reference.
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Optional
@@ -78,9 +79,11 @@ class SignalConfig:
 # Parenthesis blocks are parsed member-by-member below so compound markers are
 # lossless and one malformed member cannot silently consume another.
 PAREN_BLOCK_RE = re.compile(r"\(([^()]+)\)")
+_NAME_TOKEN = r"[^\W\d_](?:[^\W\d_]|[-'’](?=[^\W\d_]))+"
 APA_MEMBER_RE = re.compile(
-    r"^\s*(?P<author>[A-Z][A-Za-z\-'’]+(?:\s+(?:&|and)\s+"
-    r"[A-Z][A-Za-z\-'’]+|\s+et\s+al\.?)?)\s*,\s*"
+    rf"^\s*(?:see\s+)?(?P<author>{_NAME_TOKEN}(?:\s+(?:&|and)\s+"
+    rf"{_NAME_TOKEN}(?:\s+{_NAME_TOKEN})?|\s+et\s+al\.?|"
+    rf"(?:\s+{_NAME_TOKEN}){{1,4}})?)\s*,?\s*"
     r"(?P<year>(?:19|20)\d{2}[a-z]?)"
     r"(?:\s*,\s*(?P<locator>(?:p|pp)\.\s*\d+(?:\s*[-–—]\s*\d+)?))?\s*$",
     re.IGNORECASE,
@@ -88,9 +91,15 @@ APA_MEMBER_RE = re.compile(
 
 # APA narrative: Author (Year) or Author (Year) + verb
 APA_NARRATIVE_RE = re.compile(
-    r"([A-Z][A-Za-z\-']+(?:\s+(?:&|and)\s+[A-Z][A-Za-z\-']+|"
-    r"\s+et\s+al\.?)?)\s*\(((?:19|20)\d{2}[a-z]?)"
+    rf"(?<![\w’'\-])({_NAME_TOKEN}(?:\s+(?:&|and)\s+{_NAME_TOKEN}"
+    rf"(?:\s+{_NAME_TOKEN})?|\s+et\s+al\.?)?)\s*"
+    rf"\(((?:19|20)\d{{2}}[a-z]?)"
     r"(?:\s*,\s*((?:p|pp)\.\s*\d+(?:\s*[-–—]\s*\d+)?))?\)"
+)
+APA_YEAR_ONLY_RE = re.compile(
+    r"\(((?:19|20)\d{2}[a-z]?)"
+    r"(?:\s*,\s*((?:p|pp)\.\s*\d+(?:\s*[-–—]\s*\d+)?))?\)",
+    re.IGNORECASE,
 )
 
 # MLA parenthetical: (Author PageNum) — no year, no comma before page
@@ -304,15 +313,52 @@ def _attach_reference_identity(
 
 
 def _build_surname_index(references: list[ParsedReference]) -> dict[str, list[ParsedReference]]:
-    """Build a surname → reference lookup from the reference list."""
+    """Build a first-author surname → reference lookup.
+
+    APA/MLA in-text markers are keyed by the lead author. Indexing every
+    coauthor made ``Yang et al.`` ambiguous merely because another work listed
+    Yang as its sixth author.
+    """
     index: dict[str, list[ParsedReference]] = {}
     for ref in references:
-        # Extract surname from author field
-        surnames = _extract_ref_surnames(ref)
-        for surname in surnames:
-            key = surname.lower()
+        for surname in _reference_lead_surnames(ref)[:1]:
+            key = _surname_key(surname)
+            if not key:
+                continue
             index.setdefault(key, []).append(ref)
     return index
+
+
+def _surname_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    return re.sub(r"[^a-z0-9]+", "", normalized.casefold())
+
+
+def _reference_lead_surnames(ref: ParsedReference) -> list[str]:
+    author = ref.author.strip()
+    if not author:
+        return []
+    # Standard parsed APA form: ``Surname, Initials, & Surname, Initials``.
+    surnames = [
+        match.group(1).strip()
+        for match in re.finditer(
+            r"(?:^|,\s+|&\s+)([^,]+),\s*(?=[A-Z])",
+            author,
+        )
+    ]
+    if surnames:
+        return surnames
+    # Corporate authors are commonly cited by their first distinctive token.
+    first = re.split(r"\s+(?:&|and)\s+|;", author, maxsplit=1)[0].strip()
+    if "," in first:
+        first = first.split(",", 1)[0].strip()
+    else:
+        first = first.split()[0] if first.split() else ""
+    return [first] if first else []
+
+
+def _reference_author_count(ref: ParsedReference) -> int:
+    return max(1, len(_reference_lead_surnames(ref)))
 
 
 def _extract_ref_surnames(ref: ParsedReference) -> list[str]:
@@ -335,7 +381,7 @@ def _extract_ref_surnames(ref: ParsedReference) -> list[str]:
             # "First Last" format
             parts = a.split()
             surname = parts[-1] if parts else a
-        surname = re.sub(r"[^A-Za-z\-']", "", surname)
+        surname = re.sub(r"[^\w\-'’]", "", surname, flags=re.UNICODE)
         if len(surname) > 1:
             surnames.append(surname)
     return surnames
@@ -364,13 +410,60 @@ def _find_citations_in_paragraph(
         marker_type: str,
         is_secondary: bool = False,
         original_author: str = "",
+        exact_candidates: list[ParsedReference] | None = None,
     ) -> None:
-        surname = author.split()[0]
-        candidates = list(ref_index.get(surname.lower(), []))
+        surname = re.sub(r"['’]s$", "", author.split()[0], flags=re.IGNORECASE)
+        candidates = list(ref_index.get(_surname_key(surname), []))
         if year:
             candidates = [
                 ref for ref in candidates if (ref.year or "").casefold() == year.casefold()
             ]
+        if re.search(r"\bet\s+al\.?\b", author, re.IGNORECASE):
+            candidates = [
+                ref for ref in candidates if _reference_author_count(ref) >= 3
+            ]
+        else:
+            coordinated = re.search(
+                rf"(?:&|and)\s+(?P<second>{_NAME_TOKEN}(?:\s+{_NAME_TOKEN})?)",
+                author,
+                re.IGNORECASE,
+            )
+            if coordinated:
+                second_key = _surname_key(coordinated.group("second"))
+                candidates = [
+                    ref
+                    for ref in candidates
+                    if len(_reference_lead_surnames(ref)) >= 2
+                    and _surname_key(_reference_lead_surnames(ref)[1]) == second_key
+                ]
+                if not candidates:
+                    first_key = _surname_key(surname)
+                    fuzzy = []
+                    for refs in ref_index.values():
+                        for ref in refs:
+                            if (ref.year or "").casefold() != year.casefold():
+                                continue
+                            lead = _reference_lead_surnames(ref)
+                            if len(lead) < 2 or _surname_key(lead[1]) != second_key:
+                                continue
+                            observed = _surname_key(lead[0])
+                            if (
+                                abs(len(observed) - len(first_key)) <= 1
+                                and SequenceMatcher(None, observed, first_key).ratio() >= 0.86
+                            ):
+                                fuzzy.append(ref)
+                    candidates = list(
+                        {ref.reference_id: ref for ref in fuzzy}.values()
+                    )
+
+        if exact_candidates is not None:
+            candidates = exact_candidates
+        # A printed-page citation can distinguish an article from a same-year
+        # film by the same creator, but must not break ties between text works.
+        if len(candidates) > 1 and page and any(ref.source_kind == "traditional_media" for ref in candidates):
+            text_candidates = [ref for ref in candidates if ref.source_kind != "traditional_media"]
+            if len(text_candidates) == 1 and _reference_contains_locator(text_candidates[0], page):
+                candidates = text_candidates
 
         text, sentence_index, passage_local_start, passage_local_end = _extract_attributed_text_and_index(
             para_text, marker_start, marker_end, sentences, marker_type
@@ -469,7 +562,7 @@ def _find_citations_in_paragraph(
                 if parsed:
                     locator = parsed.group("locator") or ""
                     append_linked(
-                        author=parsed.group("author").split()[0],
+                        author=parsed.group("author"),
                         year=parsed.group("year"),
                         page=re.sub(r"^(?:p|pp)\.\s*", "", locator, flags=re.IGNORECASE),
                         raw_marker=raw_marker,
@@ -480,10 +573,43 @@ def _find_citations_in_paragraph(
                     )
 
         # APA narrative: Author (Year)
+        narrative_year_spans = []
+        references = list({ref.reference_id: ref for refs in ref_index.values() for ref in refs}.values())
+        for year_match in APA_YEAR_ONLY_RE.finditer(para_text):
+            title_matches = []
+            prefix = para_text[:year_match.start()].rstrip()
+            for ref in references:
+                if ref.source_kind != "traditional_media" or ref.year != year_match.group(1):
+                    continue
+                title = re.sub(r"\s*\[[^]]+\]\s*$", "", ref.title).strip().rstrip(".")
+                if not title:
+                    continue
+                pattern = r"(?<!\w)" + r"\s+".join(re.escape(part) for part in title.split()) + r"[\"’”']?$"
+                match = re.search(pattern, prefix, re.IGNORECASE)
+                if match:
+                    title_matches.append((match.start(), ref))
+            if title_matches:
+                start = min(item[0] for item in title_matches)
+                append_linked(author=para_text[start:year_match.start()].strip(), year=year_match.group(1),
+                              raw_marker=para_text[start:year_match.end()], marker_member=para_text[start:year_match.end()],
+                              marker_start=start, marker_end=year_match.end(), marker_type="narrative",
+                              exact_candidates=[ref for _, ref in title_matches])
+                narrative_year_spans.append((start, year_match.end()))
         for m in APA_NARRATIVE_RE.finditer(para_text):
+            if any(start <= m.start() and m.end() <= end for start, end in narrative_year_spans):
+                continue
+            lead_surface = re.sub(
+                r"['’]s$",
+                "",
+                m.group(1).split()[0],
+                flags=re.IGNORECASE,
+            )
+            if len(_surname_key(lead_surface)) < 2:
+                continue
             locator = m.group(3) or ""
+            citation_count = len(citations)
             append_linked(
-                author=m.group(1).split()[0],
+                author=m.group(1),
                 year=m.group(2),
                 page=re.sub(r"^(?:p|pp)\.\s*", "", locator, flags=re.IGNORECASE),
                 raw_marker=m.group(0),
@@ -492,8 +618,155 @@ def _find_citations_in_paragraph(
                 marker_end=m.end(),
                 marker_type="narrative",
             )
+            # The permissive narrative grammar can match an ordinary word
+            # immediately before a year-only marker (for example
+            # ``autonomous (2011)``).  Do not let that false structural match
+            # suppress the bounded author-signature recovery below.
+            if (
+                len(citations) > citation_count
+                and citations[-1].link_status == "missing_reference"
+            ):
+                citations.pop()
+                continue
+            narrative_year_spans.append((m.start(), m.end()))
+
+        # PDF text extraction can split a surname internally (for example at
+        # a combining accent) while leaving the year marker intact. Recover a
+        # narrative marker only when the immediately preceding normalized
+        # author signature and year identify exactly one submitted reference.
+        for m in APA_YEAR_ONLY_RE.finditer(para_text):
+            if any(start <= m.start() and m.end() <= end for start, end in narrative_year_spans):
+                continue
+            recovered = _recover_year_only_narrative_reference(
+                para_text,
+                m.start(),
+                m.group(1),
+                references=list({ref.reference_id: ref for refs in ref_index.values() for ref in refs}.values()),
+            )
+            if recovered is None:
+                continue
+            marker_start, reference = recovered
+            locator = m.group(2) or ""
+            author = _reference_lead_surnames(reference)[0]
+            append_linked(
+                author=author,
+                year=m.group(1),
+                page=re.sub(r"^(?:p|pp)\.\s*", "", locator, flags=re.IGNORECASE),
+                raw_marker=para_text[marker_start:m.end()],
+                marker_member=para_text[marker_start:m.end()],
+                marker_start=marker_start,
+                marker_end=m.end(),
+                marker_type="narrative",
+            )
 
     return citations
+
+
+def _reference_contains_locator(reference: ParsedReference, locator: str) -> bool:
+    """Corroborate a printed-page locator against explicit bibliographic pages."""
+    wanted = re.fullmatch(r"\s*(\d+)(?:\s*[-–—]\s*(\d+))?\s*", locator)
+    if wanted is None:
+        return False
+    low, high = int(wanted[1]), int(wanted[2] or wanted[1])
+    pages = re.search(r"\bpp?\.\s*(\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)", reference.raw_ref)
+    if pages is None:
+        return False
+    ranges = [(int(a), int(b or a)) for a, b in re.findall(r"(\d+)(?:\s*[-–—]\s*(\d+))?", pages[1])]
+    return low <= high and any(a <= low <= high <= b for a, b in ranges)
+
+
+def _recover_year_only_narrative_reference(
+    text: str,
+    year_start: int,
+    year: str,
+    *,
+    references: list[ParsedReference],
+) -> tuple[int, ParsedReference] | None:
+    window_start = max(0, year_start - 1_000)
+    prefix = text[window_start:year_start].rstrip()
+    if not prefix:
+        return None
+    # Recovery cannot borrow a name from an earlier sentence or cross an
+    # already explicit citation to attach an unrelated title/date mention.
+    sentences = split_sentences(prefix)
+    if sentences:
+        last = sentences[-1].strip()
+        offset = prefix.rfind(last)
+        if offset >= 0:
+            window_start += offset
+            prefix = prefix[offset:]
+    matches: list[tuple[int, int, ParsedReference]] = []
+    normalized_prefix, normalized_offsets = _surname_key_with_offsets(prefix)
+    for reference in references:
+        if (reference.year or "").casefold() != year.casefold():
+            continue
+        surnames = _reference_lead_surnames(reference)
+        if not surnames:
+            continue
+        lead = _surname_key(surnames[0])
+        signatures = {lead}
+        if len(surnames) == 2:
+            second = _surname_key(surnames[1])
+            signatures = {
+                f"{lead}{second}",
+                f"{lead}and{second}",
+            }
+        signatures.discard("")
+        if not signatures:
+            continue
+        positions = [
+            (normalized_prefix.rfind(signature), signature)
+            for signature in signatures
+        ]
+        position, _signature = max(positions, key=lambda item: item[0])
+        if position < 0:
+            continue
+        original_start = normalized_offsets[position]
+        if original_start > 0 and prefix[original_start - 1].isalnum():
+            continue
+        if re.search(r"\([^)]*(?:19|20)\d{2}[^)]*\)", prefix[original_start:]):
+            continue
+        matches.append(
+            (
+                position,
+                window_start + original_start,
+                reference,
+            )
+        )
+    unique = {}
+    for position, start, reference in matches:
+        current = unique.get(reference.reference_id)
+        if current is None or position > current[0]:
+            unique[reference.reference_id] = (position, start, reference)
+    if not unique:
+        return None
+    ordered = sorted(unique.values(), key=lambda item: item[0], reverse=True)
+    if len(ordered) > 1 and ordered[0][0] - ordered[1][0] <= 3:
+        return None
+    _position, start, reference = ordered[0]
+    return start, reference
+
+
+def _surname_key_with_offsets(value: str) -> tuple[str, list[int]]:
+    """Return a citation-comparison key and its original character offsets.
+
+    PDF extractors can split a name around a combining accent while the paper
+    still preserves a readable narrative citation.  The ordinary surname key
+    deliberately removes whitespace, punctuation and combining marks.  This
+    companion keeps the source coordinate for every retained character so a
+    recovered match can include the author wording rather than only ``(year)``.
+    """
+
+    normalized: list[str] = []
+    offsets: list[int] = []
+    for original_index, character in enumerate(value):
+        for decomposed in unicodedata.normalize("NFKD", character).casefold():
+            if unicodedata.category(decomposed) == "Mn":
+                continue
+            if decomposed.isalnum():
+                normalized.append(decomposed)
+                offsets.append(original_index)
+    return "".join(normalized), offsets
 
 
 def _extract_attributed_text(
@@ -535,14 +808,37 @@ def _extract_attributed_text_and_index(
 ) -> tuple[str, int, int, int]:
     """Return the attributed sentence and its stable paragraph-local index."""
     cursor = 0
-    for sentence_index, sentence in enumerate(sentences):
+    located_sentences: list[tuple[int, int, str]] = []
+    for sentence in sentences:
         sentence_start = para_text.find(sentence, cursor)
         if sentence_start < 0:
             continue
         sentence_end = sentence_start + len(sentence)
         cursor = sentence_end
+        located_sentences.append((sentence_start, sentence_end, sentence))
+
+    for sentence_index, (sentence_start, sentence_end, sentence) in enumerate(
+        located_sentences
+    ):
         if sentence_start <= marker_start < sentence_end:
-            return sentence, sentence_index, sentence_start, sentence_end
+            extended_start = _complete_quotation_span_start(
+                para_text,
+                located_sentences,
+                sentence_index=sentence_index,
+                sentence_start=sentence_start,
+                marker_start=marker_start,
+            )
+            extended_start = _trim_nonclaim_prefix(
+                para_text,
+                extended_start,
+                sentence_end,
+            )
+            return (
+                para_text[extended_start:sentence_end],
+                sentence_index,
+                extended_start,
+                sentence_end,
+            )
     fallback = _extract_attributed_text(
         para_text, marker_start, marker_end, sentences, marker_type
     )
@@ -550,6 +846,96 @@ def _extract_attributed_text_and_index(
     if fallback_start < 0:
         fallback_start = 0
     return fallback, 0, fallback_start, fallback_start + len(fallback)
+
+
+_STANDALONE_SECTION_HEADING = re.compile(
+    r"^\s*(?:abstract|introduction|background|literature\s+review|"
+    r"method(?:s|ology)?|results?|discussion|conclusion|references?|"
+    r"works\s+cited)\s*(?:\n+|$)",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_SPEAKER_PREFIX = re.compile(
+    r"^\s*\((?![^)\n]*(?:19|20)\d{2})[^)\n]{1,80}\)\s*\n+",
+    re.IGNORECASE,
+)
+
+
+def _trim_nonclaim_prefix(text: str, start: int, end: int) -> int:
+    """Exclude standalone headings and transcript labels from a cited sentence."""
+    candidate = text[start:end]
+    while candidate:
+        match = _STANDALONE_SECTION_HEADING.match(candidate)
+        if match is None:
+            match = _TRANSCRIPT_SPEAKER_PREFIX.match(candidate)
+        if match is None:
+            break
+        start += match.end()
+        candidate = text[start:end]
+    while start < end and text[start].isspace():
+        start += 1
+    return start
+
+
+def _complete_quotation_span_start(
+    para_text: str,
+    located_sentences: list[tuple[int, int, str]],
+    *,
+    sentence_index: int,
+    sentence_start: int,
+    marker_start: int,
+) -> int:
+    """Include a bounded earlier sentence when the marker sentence starts in a quote.
+
+    Sentence segmentation can split a multi-sentence quotation while its MLA/APA
+    marker remains after the closing quotation mark.  In that case the marker
+    sentence contains only the tail of the quote, which suppresses quotation
+    verification.  Extend only to the sentence containing the unmatched opening
+    mark; ordinary citation scope is unchanged.
+    """
+    prefix = para_text[:sentence_start]
+    opening: int | None = None
+
+    # A closing quote after !/? can form a complete tokenizer sentence before
+    # the citation marker. This is one quoted sentence, not inferred paragraph
+    # continuation: require only whitespace between that sentence and marker.
+    if sentence_index > 0 and not para_text[sentence_start:marker_start].strip():
+        previous_start, previous_end, previous = located_sentences[sentence_index - 1]
+        if (not para_text[previous_end:marker_start].strip()
+                and re.search(r'''[.!?][”’"']$''', previous.rstrip())
+                and QUOTE_RE.search(previous)
+                and marker_start - previous_start <= 4_000):
+            return previous_start
+
+    curly_open = prefix.rfind("“")
+    curly_close = prefix.rfind("”")
+    if curly_open > curly_close:
+        opening = curly_open
+
+    straight_quotes = [match.start() for match in re.finditer(r'(?<!\\)"', prefix)]
+    if len(straight_quotes) % 2:
+        straight_open = straight_quotes[-1]
+        opening = straight_open if opening is None else max(opening, straight_open)
+
+    if opening is None:
+        return sentence_start
+
+    opening_sentence_index = next(
+        (
+            index
+            for index, (start, end, _sentence) in enumerate(located_sentences)
+            if start <= opening < end
+        ),
+        None,
+    )
+    if opening_sentence_index is None:
+        return sentence_start
+    if sentence_index - opening_sentence_index > 5:
+        return sentence_start
+
+    extended_start = located_sentences[opening_sentence_index][0]
+    if marker_start - extended_start > 4_000:
+        return sentence_start
+    return extended_start
 
 
 def _detect_claim_type(text: str) -> str:
@@ -886,7 +1272,12 @@ Sentences:
             result if isinstance(result, list) else []
         )
     except Exception as e:
-        logger.warning("LLM citation extraction failed for batch %d-%d: %s", start_para, end_para, e)
+        logger.warning(
+            "LLM citation extraction failed for batch %d-%d (type=%s)",
+            start_para,
+            end_para,
+            type(e).__name__,
+        )
         return []
 
     citations: list[InTextCitation] = []
@@ -1055,7 +1446,11 @@ Unattributed sentences to check:
                         confidence="low",  # implicit — lower confidence
                     ))
         except Exception as e:
-            logger.debug("Implicit continuation detection failed for para %d: %s", para_idx, e)
+            logger.debug(
+                "Implicit continuation detection failed for para %d (type=%s)",
+                para_idx,
+                type(e).__name__,
+            )
 
     if new_citations:
         logger.info("Two-pass: found %d implicit continuations", len(new_citations))
@@ -1664,7 +2059,12 @@ def _cite_extract_batch(
             paragraph_body_start=paragraph_start,
         )
     except Exception as e:
-        logger.warning("<cite> extraction failed for batch %d-%d: %s", start_para, end_para, e)
+        logger.warning(
+            "<cite> extraction failed for batch %d-%d (type=%s)",
+            start_para,
+            end_para,
+            type(e).__name__,
+        )
         return []
 
     if not tagged_text or not tagged_text.strip():

@@ -25,17 +25,32 @@ from app.services.parsers.base_parser import BaseParser
 # - Authors have commas or periods before the year (e.g., "D. (2006)" or "Commerce. (n.d.)")
 # - Body text like "Section 6 of the regulations (2016)..." lacks this structure
 
+_APA_AUTHOR_ONLY_START = re.compile(
+    r'^\s*(?:\d+[\.\)]?\s+)?'
+    r'[^\W\d_][^,\n]{1,80},\s*(?:[A-Z]\.?){1,6}(?:\s*,|\s*$)'
+)
+
+_APA_DATE = re.compile(
+    r"(?<!\d)(?:(?:19|20)\d{2}[a-z]?|n\.d\.)(?!\d)",
+    re.IGNORECASE,
+)
+
+_APA_PERSONAL_AUTHOR_CUE = re.compile(
+    r",\s*(?:[A-Z](?:[-'\u2019][A-Z])?\.?)(?:\s*[A-Z]\.?)*"
+)
+
 _APA_START = re.compile(
     r'^\s*'
     r'(?:\d+[\.\)]?\s+)?'                                 # optional number
-    r'(?:[A-Z]|\[|[\u4e00-\u9fff\u3400-\u4dbf])'          # first char: capital, bracket, or CJK
-    r'[^\n]{0,80}?'                                        # rest of name
-    r'[.,]?'                                               # comma/period before year (optional for edge cases)
-    r'\s*'
-    r'\(?'
-    r'(?:(?:19|20)\d{2}|n\.d\.)'                           # year OR n.d.
-    r'\)?'
-    r'[.,\s]'                                              # MUST be followed by punctuation or space (not embedded in URL)
+    r'(?:'
+    r'(?:[A-Z]|\[|[\u4e00-\u9fff\u3400-\u4dbf])'          # ordinary complete first line
+    r'[^\n]{0,400}?'
+    r'[.,]?\s*\(?(?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)?[.,\s]'
+    r'|'
+    # A long author list may wrap before its year.  A leading surname plus
+    # initials is still a safe new-entry boundary even on that first line.
+    r'[^\W\d_][^,\n]{1,80},\s*(?:[A-Z]\.?){1,6}(?:\s*,|\s*$)'
+    r')',
 )
 
 
@@ -49,6 +64,57 @@ class ApaParser(BaseParser):
     ]
 
     REF_START_PATTERN = _APA_START
+
+    @classmethod
+    def _starts_new_reference(cls, stripped: str, current: List[str]) -> bool:
+        if not super()._starts_new_reference(stripped, current):
+            return False
+        if current and not _APA_DATE.search(" ".join(current)):
+            # A wrapped APA author list can occupy several extracted lines
+            # before the publication date appears.  Until that required date
+            # has been seen, another author-shaped line completes the current
+            # entry instead of starting a second one.
+            return False
+        date_match = _APA_DATE.search(stripped)
+        if date_match:
+            prefix = re.sub(
+                r"^\s*\d+[.)]?\s+", "", stripped[: date_match.start()]
+            ).strip().rstrip("(").rstrip()
+            closing_index = date_match.end()
+            date_is_apa_field = bool(
+                date_match.start() > 0
+                and stripped[date_match.start() - 1] == "("
+                and closing_index < len(stripped)
+                and stripped[closing_index] == ")"
+                and stripped[closing_index + 1 :].lstrip().startswith((".", ","))
+            )
+            has_explicit_author_structure = bool(
+                prefix.startswith("[")
+                or prefix.endswith((".", "]"))
+                or _APA_PERSONAL_AUTHOR_CUE.search(prefix)
+                # PDF extraction can omit the separator before the date in a
+                # long institutional author.  A long leading identity phrase
+                # is materially different from a short work-title/year
+                # continuation and remains an admissible entry boundary.
+                or len(prefix) >= 60
+            )
+            if (
+                current
+                and date_is_apa_field
+                and not has_explicit_author_structure
+                and not cls._block_ends_cleanly(" ".join(current))
+            ):
+                return False
+            has_author_structure = bool(
+                has_explicit_author_structure or date_is_apa_field
+            )
+            if not has_author_structure:
+                # A work title containing a date (for example a film title
+                # followed by its release year) is a continuation, not a new
+                # APA entry.  This structural rule replaces title-specific
+                # exceptions.
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Splitting
@@ -107,70 +173,25 @@ class ApaParser(BaseParser):
                     for i in range(len(starts) - 1)
                 ]
 
-        # Final cleanup with continuation merging
+        # Final cleanup with continuation merging.  ``_merge_lines`` already
+        # establishes entry boundaries.  A block that does not itself have a
+        # structurally credible APA start is therefore a wrapped continuation,
+        # not text to accept or discard according to a list of publishers,
+        # titles, or phrases observed in one paper.
         cleaned = []
         for ref in refs:
             ref = re.sub(r'^\d+\.\s*', '', ref)
             ref = re.sub(r'\s+', ' ', ref).strip()
-            
+
             if not ref:
                 continue
-            
-            lower = ref.lower()
-            
-            # Check continuation pattern first
-            if cls._CONTINUATION_PATTERN and cls._CONTINUATION_PATTERN.match(ref):
-                if cleaned:
-                    cleaned[-1] = cleaned[-1] + ' ' + ref
-                continue
-            
-            # Continuation-only lines: never standalone references
-            if re.match(r'^\[online\]', lower) or re.match(r'^retrieved\s', lower):
-                if cleaned:
-                    cleaned[-1] = cleaned[-1] + ' ' + ref
-                continue
-            if re.match(r'^coppola[\'\u2019]?s?\s', lower) or re.match(r'^classicmoviehub\.\s', lower):
-                if cleaned:
-                    cleaned[-1] = cleaned[-1] + ' ' + ref
-                continue
-            
-            # URL-only fragment: merge into previous
-            if re.match(r'^https?://', ref):
-                if cleaned:
-                    cleaned[-1] = cleaned[-1] + ' ' + ref
-                continue
-            
-            # Merge if previous ref ends incompletely AND current starts lowercase
-            if ref[0].islower() and cleaned:
-                prev_end = cleaned[-1].rstrip()[-1] if cleaned[-1].rstrip() else ''
-                if prev_end not in '.?!)\'"':
-                    cleaned[-1] = cleaned[-1] + ' ' + ref
-                    continue
-            
-            # Real reference markers
-            has_marker = (
-                'http' in lower
-                or 'doi' in lower
-                or any(kw in lower for kw in [
-                    'press', 'university', 'publishing', 'journal',
-                    'routledge', 'palgrave', 'oxford', 'cambridge',
-                    'berkeley', 'chicago', 'edinburgh', 'macmillan',
-                    'columbia', 'harvard', 'princeton', 'sage',
-                    'springer', 'wiley', 'elsevier', 'taylor',
-                    'thesis', 'dissertation', 'vol.', 'pp.', 'ed.',
-                    'retrieved', 'edn', '(ed)', '(eds)', 'editors',
-                    'available at', 'accessed', 'director', 'film',
-                    'motion picture', 'archives',
-                ])
-            )
-            
-            is_short = len(ref) < 100 and ref.count('.') >= 3
-            
-            if has_marker or is_short:
-                cleaned.append(ref)
+
+            if cleaned and (
+                not _APA_DATE.search(ref)
+                or not cls._starts_new_reference(ref, [])
+            ):
+                cleaned[-1] = cleaned[-1] + ' ' + ref
             else:
-                if len(ref) < 40 or any(p in lower for p in ['more like', 'greater focus', 'illustrates']):
-                    continue
                 cleaned.append(ref)
 
         return cleaned

@@ -108,8 +108,7 @@ def attach_citation_use_routes(
     routes = [
         _route_candidate(artifact, candidate)
         for candidate in candidate_set.candidates
-        if candidate.role == "relationship_candidate"
-        and candidate.generation_method not in _NON_PROPOSITIONAL_CONTEXT_METHODS
+        if candidate.candidate_id in citation_use_route_input_ids(artifact)
     ]
     unresolved = any(route.citation_use == "unresolved" for route in routes)
     status = (
@@ -134,6 +133,24 @@ def attach_citation_use_routes(
             )
         }
     )
+
+
+def citation_use_route_input_ids(
+    artifact: VerificationEvidenceArtifact,
+) -> set[str]:
+    """Return exact candidate IDs for which the router must emit a route.
+
+    Structural narrative frames remain preserved in the candidate ledger but
+    are not propositions and therefore do not receive evidence procedures.
+    Keeping this contract shared prevents report validation from demanding a
+    route that the router deliberately must not create.
+    """
+    return {
+        candidate.candidate_id
+        for candidate in artifact.verification_candidates.candidates
+        if candidate.role == "relationship_candidate"
+        and candidate.generation_method not in _NON_PROPOSITIONAL_CONTEXT_METHODS
+    }
 
 
 def routed_relationship_candidate_ids(

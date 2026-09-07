@@ -24,20 +24,26 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from app.models.source_repository import SourceRepresentationRecord
+from app.services.sentence_splitter import split_sentences
 from app.services.schemas import CitationMarkerMember, InTextCitation
 from app.services.source_repository import representation_is_expired
 from app.services.storage.backend import StorageBackend
 
 
-ARTIFACT_VERSION = "phase3.8-evidence-v16"
-RETRIEVAL_RULE_VERSION = "deterministic-passage-v1"
-CANDIDATE_RETRIEVAL_VERSION = "candidate-specific-union-v5"
+ARTIFACT_VERSION = "phase3.8-evidence-v33"
+EXTRACTION_VERSION = "source-text-extraction-v3-ocr-derivative-labels"
+RETRIEVAL_RULE_VERSION = "all-channel-section-boundary-v12"
+CANDIDATE_RETRIEVAL_VERSION = "candidate-specific-union-v15"
+SEMANTIC_RETRIEVAL_RESCUE_VERSION = "bm25-prefilter-local-nli-v1"
 MAX_SOURCE_PAGES = 2_000
 MAX_PAGE_CHARACTERS = 250_000
 MAX_SOURCE_CHARACTERS = 10_000_000
 MAX_PASSAGE_CHARACTERS = 1_800
+PASSAGE_WINDOW_STRIDE_CHARACTERS = MAX_PASSAGE_CHARACTERS // 3
+SUBSTANTIAL_PASSAGE_OVERLAP_RATIO = 0.50
 MAX_CANDIDATES = 10
-MAX_CANDIDATE_PASSAGES = 3
+MAX_CANDIDATE_PASSAGES = 10
+_NONSEMANTIC_C0_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 class EvidenceAuthorizationError(ValueError):
@@ -91,6 +97,48 @@ class ClaimSourceSegment(BaseModel):
     paper_start: int = Field(ge=0)
     paper_end: int = Field(gt=0)
     text: str = Field(min_length=1, max_length=50_000)
+
+
+class StudentInterpretationRepairOperationEvidence(BaseModel):
+    """One exact student-text span changed by a source-blind repair."""
+
+    kind: str = Field(min_length=1, max_length=80)
+    problem_segments: list[ClaimSourceSegment] = Field(min_length=1, max_length=4)
+
+
+class StudentStatementInterpretationEvidence(BaseModel):
+    """Inspectable source-blind interpretation; never a source judgment."""
+
+    contract_version: str = "source-blind-student-statement-interpretation-v1"
+    interpretation_id: str = Field(min_length=1, max_length=128)
+    candidate_id: str = Field(min_length=1, max_length=128)
+    candidate_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal[
+        "as_written",
+        "mechanically_normalized",
+        "semantic_repair",
+        "not_assessed",
+        "uncertain",
+    ]
+    interpreted_statement: str | None = Field(default=None, max_length=2_000)
+    reason_code: str = Field(min_length=1, max_length=100)
+    confidence: Literal["high", "medium", "low", "none"]
+    repair_operations: list[StudentInterpretationRepairOperationEvidence] = Field(
+        default_factory=list, max_length=8
+    )
+    accuracy_judgment_allowed: bool
+    coverage_judgment_allowed: bool
+    source_evidence_received: Literal[False] = False
+    prompt_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    failure_code: Literal[
+        "none",
+        "candidate_not_eligible",
+        "context_unresolved",
+        "prompt_budget_exceeded",
+        "provider_or_contract_failure",
+    ] = "none"
+    limitations: list[str] = Field(default_factory=list, max_length=6)
+    decision_applied: Literal[False] = False
 
 
 class ClaimContextSegment(BaseModel):
@@ -227,6 +275,9 @@ class SourceIdentityEvidence(BaseModel):
     canonical_work_id: str
     representation_id: str
     content_sha256: str
+    parent_content_sha256: str | None = None
+    derivation_method: str | None = None
+    derivation_manifest_sha256: str | None = None
     authorization_scope_type: str = ""
     authorization_scope_id: str = ""
     verification_run_id: str | None = None
@@ -244,9 +295,20 @@ class CoverageEvidence(BaseModel):
     media_type: str
     completeness_verdict: str
     text_quality: str
+    extraction_version: str = "legacy-unrecorded"
+    extracted_text_sha256: str = ""
     pages_total: int | None = None
     pages_inspected: list[int] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+class AcademicPracticeCheckEvidence(BaseModel):
+    """Bounded deterministic check that never implies intent or misconduct."""
+
+    status: Literal["not_run", "complete", "incomplete", "not_assessable"] = "not_run"
+    outcome: str | None = Field(default=None, max_length=100)
+    evidence_passage_ids: list[str] = Field(default_factory=list, max_length=16)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
 
 
 class SourcePassageEvidence(BaseModel):
@@ -263,11 +325,19 @@ class SourcePassageEvidence(BaseModel):
     text: str
     retrieval_method: str
     retrieval_score: float
+    consolidated_from_spans: list[tuple[int, int]] = Field(default_factory=list)
     passage_role: Literal[
         "body_prose",
+        "abstract",
+        "document_metadata",
         "reference_list",
         "citation_notes",
         "publication_metadata",
+        "unknown",
+    ] = "unknown"
+    boundary_status: Literal[
+        "sentence_complete",
+        "bounded_fragment_or_nonprose",
         "unknown",
     ] = "unknown"
     retrieval_rule_version: str = RETRIEVAL_RULE_VERSION
@@ -321,7 +391,52 @@ class CandidatePassageRelevanceEvidence(BaseModel):
         "relevant", "partially_relevant", "not_relevant", "uncertain"
     ]
     confidence: ConfidenceLevel
+    evidence_role: Literal[
+        "source_own_claim_or_finding",
+        "source_synthesis_or_conclusion",
+        "document_level_member_evidence",
+        "representation_of_other_work",
+        "methods_or_background",
+        "unclear",
+    ] = "unclear"
+    assessed_text_sha256: str | None = Field(default=None, min_length=64, max_length=64)
+    model_input_text_sha256: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
+    assessed_text_offset_start: int = Field(default=0, ge=0)
+    assessed_text_offset_end: int | None = Field(default=None, gt=0)
+    assessment_input_truncated: bool = False
     rationale: str = Field(default="", max_length=1_000)
+
+
+class ObligationPassageRelevanceEvidence(BaseModel):
+    """One relevance result for exactly one source-blind evidence obligation."""
+
+    obligation_id: str = Field(min_length=1, max_length=128)
+    obligation_type: Literal[
+        "exact_factual_assertion",
+        "aggregate_member_evidence",
+        "coverage_only_semantic_repair",
+    ]
+    status: Literal["complete", "not_assessed"]
+    method: str = Field(min_length=1, max_length=100)
+    model_id: str | None = None
+    gate_version: str
+    outcome: Literal[
+        "relevant_candidates_found",
+        "no_relevant_candidate_passage",
+        "uncertain",
+        "not_assessed",
+    ]
+    assessments: list[CandidatePassageRelevanceEvidence] = Field(
+        default_factory=list, max_length=18
+    )
+    relevant_passage_ids: list[str] = Field(default_factory=list, max_length=18)
+    candidate_count_assessed: int = Field(default=0, ge=0, le=18)
+    batch_count: int = Field(default=0, ge=0, le=6)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
+    processing_boundary: Literal["local", "configured_remote", "unknown"] = "unknown"
+    direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
 
 
 class PassageRelevanceGateEvidence(BaseModel):
@@ -339,13 +454,56 @@ class PassageRelevanceGateEvidence(BaseModel):
         "not_assessed",
     ] = "not_run"
     assessments: list[CandidatePassageRelevanceEvidence] = Field(
-        default_factory=list, max_length=3
+        default_factory=list, max_length=18
     )
-    relevant_passage_ids: list[str] = Field(default_factory=list, max_length=3)
+    relevant_passage_ids: list[str] = Field(default_factory=list, max_length=18)
+    candidate_count_assessed: int = Field(default=0, ge=0, le=18)
+    # Up to 18 candidates are assessed in provider-sized batches. The current
+    # conservative three-passage boundary therefore requires as many as six.
+    batch_count: int = Field(default=0, ge=0, le=6)
     limitations: list[str] = Field(default_factory=list)
     decision_applied: bool = False
     processing_boundary: Literal["local", "configured_remote", "unknown"] = "unknown"
     direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
+    obligation_findings: list[ObligationPassageRelevanceEvidence] = Field(
+        default_factory=list, max_length=4
+    )
+
+
+class EvidenceObligation(BaseModel):
+    """One exact relevance question for one citation/source member."""
+
+    obligation_id: str = Field(min_length=1, max_length=128)
+    obligation_type: Literal[
+        "exact_factual_assertion",
+        "aggregate_member_evidence",
+        "coverage_only_semantic_repair",
+    ]
+    reference_id: str = Field(min_length=1, max_length=255)
+    target_text: str = Field(min_length=1, max_length=50_000)
+    target_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    original_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    derivation_method: Literal[
+        "exact_source_attributed_text",
+        "source_blind_semantic_repair",
+    ]
+    interpretation_id: str | None = Field(default=None, max_length=128)
+    aggregate_scope: Literal["not_aggregate", "member_only"]
+    accuracy_judgment_allowed: bool
+    coverage_judgment_allowed: bool
+    limitations: list[str] = Field(default_factory=list, max_length=6)
+
+
+class EvidenceObligationSet(BaseModel):
+    """Typed relevance targets kept separate from retrieved source text."""
+
+    status: Literal["not_run", "complete", "incomplete", "not_assessed"] = (
+        "not_run"
+    )
+    method: str = "not_run"
+    obligation_version: str | None = None
+    obligations: list[EvidenceObligation] = Field(default_factory=list, max_length=4)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
 
 
 class UnitClaimFinding(BaseModel):
@@ -493,6 +651,46 @@ class CitationUseRoutingEvidence(BaseModel):
     decision_applied: Literal[False] = False
 
 
+class StudentClaimClarityFinding(BaseModel):
+    """Shadow assessment of whether one exact candidate defines a safe question."""
+
+    candidate_id: str = Field(min_length=1, max_length=128)
+    candidate_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["clear", "not_assessed", "uncertain"]
+    reason_code: Literal[
+        "interpretable_relationship",
+        "unresolved_local_reference",
+        "internally_underspecified_relationship",
+        "semantically_uninterpretable_wording",
+        "conflicting_internal_scope",
+        "clarity_uncertain",
+        "clarity_assessment_unavailable",
+    ]
+    confidence: Literal["high", "medium", "low", "none"]
+    problem_segments: list[ClaimSourceSegment] = Field(
+        default_factory=list, max_length=4
+    )
+    explanation: str = Field(min_length=1, max_length=500)
+
+
+class StudentClaimClarityEvidence(BaseModel):
+    """Bounded, exact-text clarity gate kept shadow-only during calibration."""
+
+    status: Literal["not_run", "complete", "incomplete", "not_assessed"] = (
+        "not_run"
+    )
+    method: str = "not_run"
+    gate_version: str | None = None
+    findings: list[StudentClaimClarityFinding] = Field(
+        default_factory=list, max_length=16
+    )
+    blocked_candidate_ids: list[str] = Field(default_factory=list, max_length=16)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
+    decision_applied: Literal[False] = False
+    processing_boundary: Literal["local", "configured_remote", "unknown"] = "unknown"
+    direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
+
+
 class CandidatePassageSelectionItem(BaseModel):
     """One authorized passage selected for one fixed verification candidate."""
 
@@ -516,6 +714,24 @@ class CandidatePassageSelection(BaseModel):
     limitations: list[str] = Field(default_factory=list, max_length=5)
 
 
+class ExcludedSourceBlockEvidence(BaseModel):
+    """Text-free provenance for a source span excluded from ordinary ranking."""
+
+    block_id: str = Field(min_length=64, max_length=64)
+    page_index: int | None = None
+    page_label: str | None = None
+    character_start: int = Field(ge=0)
+    character_end: int = Field(gt=0)
+    text_sha256: str = Field(min_length=64, max_length=64)
+    role: Literal[
+        "reference_list",
+        "citation_notes",
+        "publication_metadata",
+        "page_furniture",
+        "author_biography",
+    ]
+
+
 class CandidatePassageRetrievalEvidence(BaseModel):
     """Candidate-specific retrieval that supplements whole-citation retrieval."""
 
@@ -526,8 +742,26 @@ class CandidatePassageRetrievalEvidence(BaseModel):
         default_factory=list, max_length=16
     )
     excluded_block_counts: dict[
-        Literal["reference_list", "citation_notes", "publication_metadata"], int
+        Literal[
+            "reference_list",
+            "citation_notes",
+            "publication_metadata",
+            "page_furniture",
+            "author_biography",
+        ],
+        int,
     ] = Field(default_factory=dict)
+    excluded_blocks: list[ExcludedSourceBlockEvidence] = Field(
+        default_factory=list, max_length=10_000
+    )
+    semantic_rescue_status: Literal[
+        "not_run", "complete", "incomplete", "not_assessed"
+    ] = "not_run"
+    semantic_rescue_version: str | None = Field(default=None, max_length=100)
+    semantic_model_id: str | None = Field(default=None, max_length=300)
+    semantic_model_revision: str | None = Field(default=None, max_length=100)
+    semantic_prefilter_count: int = Field(default=0, ge=0, le=512)
+    semantic_addition_count: int = Field(default=0, ge=0, le=64)
     limitations: list[str] = Field(default_factory=list)
 
 
@@ -1026,11 +1260,23 @@ class VerificationEvidenceArtifact(BaseModel):
     source_binding: CitationSourceBinding | None = None
     source_identity: SourceIdentityEvidence
     coverage: CoverageEvidence
+    quotation_check: AcademicPracticeCheckEvidence = Field(
+        default_factory=AcademicPracticeCheckEvidence
+    )
+    locator_check: AcademicPracticeCheckEvidence = Field(
+        default_factory=AcademicPracticeCheckEvidence
+    )
     passages: list[SourcePassageEvidence] = Field(default_factory=list)
     relationship: ClaimRelationshipEvidence
     passage_relevance: PassageRelevanceGateEvidence = Field(
         default_factory=PassageRelevanceGateEvidence
     )
+    evidence_obligations: EvidenceObligationSet = Field(
+        default_factory=EvidenceObligationSet
+    )
+    student_statement_interpretations: list[
+        StudentStatementInterpretationEvidence
+    ] = Field(default_factory=list, max_length=4)
     judgment: StructuredJudgmentEvidence = Field(
         default_factory=StructuredJudgmentEvidence
     )
@@ -1042,6 +1288,9 @@ class VerificationEvidenceArtifact(BaseModel):
     )
     citation_use_routing: CitationUseRoutingEvidence = Field(
         default_factory=CitationUseRoutingEvidence
+    )
+    student_claim_clarity: StudentClaimClarityEvidence = Field(
+        default_factory=StudentClaimClarityEvidence
     )
     candidate_passage_retrieval: CandidatePassageRetrievalEvidence = Field(
         default_factory=CandidatePassageRetrievalEvidence
@@ -1090,6 +1339,24 @@ class AuthorizedRepresentation:
     created_at: datetime
     admitted_at: datetime | None
     verification_run_id: str | None = None
+    parent_content_sha256: str | None = None
+    derivation_method: str | None = None
+    derivation_manifest_sha256: str | None = None
+    page_labels: tuple[str | None, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _SourceStructuralSpan:
+    start: int
+    end: int
+    role: Literal[
+        "abstract",
+        "document_metadata",
+        "citation_notes",
+        "publication_metadata",
+        "page_furniture",
+        "author_biography",
+    ]
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1364,27 @@ class _SourcePage:
     index: int | None
     label: str | None
     text: str
+    structural_spans: tuple[_SourceStructuralSpan, ...] = ()
+
+
+@dataclass(frozen=True)
+class _QuotationLocation:
+    fragments: tuple[tuple[int | None, int, int], ...]
+    method: str
+
+
+@dataclass(frozen=True)
+class _PdfLayoutSpan:
+    page_index: int
+    start: int
+    end: int
+    text: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    page_width: float
+    page_height: float
 
 
 @dataclass(frozen=True)
@@ -1108,6 +1396,16 @@ class _PassageCandidate:
     text: str
     method: str
     score: float
+    passage_role: Literal[
+        "body_prose",
+        "abstract",
+        "document_metadata",
+        "reference_list",
+        "citation_notes",
+        "publication_metadata",
+        "unknown",
+    ] = "unknown"
+    consolidated_from_spans: tuple[tuple[int, int], ...] = ()
 
 
 def authorize_representation(
@@ -1169,6 +1467,31 @@ def authorize_representation(
     }:
         raise EvidenceAuthorizationError("Authorization audit evidence is inconsistent")
 
+    validation_evidence = record.validation_evidence or {}
+    derivative_evidence = validation_evidence.get("ocr_derivative") or {}
+    if derivative_evidence:
+        try:
+            parent_id = uuid.UUID(derivative_evidence["parent_representation_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EvidenceAuthorizationError(
+                "OCR derivative parent representation binding is invalid"
+            ) from exc
+        parent_record = session.get(SourceRepresentationRecord, parent_id)
+        expected_parent_hash = derivative_evidence.get("parent_content_sha256")
+        if (
+            parent_record is None
+            or parent_record.canonical_work_id != record.canonical_work_id
+            or parent_record.scope_type != record.scope_type
+            or parent_record.scope_id != record.scope_id
+            or representation_is_expired(parent_record, now=now)
+            or parent_record.content_object.deletion_pending
+            or parent_record.content_object.content_sha256 != expected_parent_hash
+            or not backend.exists(parent_record.content_object.storage_key)
+        ):
+            raise EvidenceAuthorizationError(
+                "OCR derivative immutable parent is unavailable or inconsistent"
+            )
+    page_labels = derivative_evidence.get("page_labels")
     return AuthorizedRepresentation(
         representation_id=str(record.id),
         canonical_work_id=str(record.canonical_work_id),
@@ -1187,6 +1510,16 @@ def authorize_representation(
         edition_or_version=record.edition_or_version,
         created_at=record.created_at,
         admitted_at=record.admitted_at,
+        parent_content_sha256=derivative_evidence.get("parent_content_sha256"),
+        derivation_method=derivative_evidence.get("derivation_method"),
+        derivation_manifest_sha256=derivative_evidence.get(
+            "derivation_manifest_sha256"
+        ),
+        page_labels=(
+            tuple(label if isinstance(label, str) else None for label in page_labels)
+            if isinstance(page_labels, list)
+            else None
+        ),
     )
 
 
@@ -1276,6 +1609,7 @@ def build_passage_evidence(
     cited_author_label: str | None = None,
 ) -> VerificationEvidenceArtifact:
     """Retrieve bounded inspectable passages and safely abstain from judgment."""
+    _validate_derivative_provenance(source)
     source_binding = _source_binding(
         claim,
         active_reference_id=active_reference_id,
@@ -1289,6 +1623,9 @@ def build_passage_evidence(
         claim_type=claim.claim_type,
         page_locator=claim.page_locator,
         top_k=bounded_top_k,
+        allow_ocr_token_sequence=bool(
+            source.text_quality == "scan_ocr" and source.derivation_method
+        ),
     )
     passages = [
         _passage_evidence(source, candidate) for candidate in candidates
@@ -1305,6 +1642,9 @@ def build_passage_evidence(
         canonical_work_id=source.canonical_work_id,
         representation_id=source.representation_id,
         content_sha256=source.content_sha256,
+        parent_content_sha256=source.parent_content_sha256,
+        derivation_method=source.derivation_method,
+        derivation_manifest_sha256=source.derivation_manifest_sha256,
         authorization_scope_type=source.scope_type,
         authorization_scope_id=source.scope_id,
         verification_run_id=source.verification_run_id,
@@ -1340,6 +1680,12 @@ def build_passage_evidence(
     relationship = ClaimRelationshipEvidence(
         passage_ids=[passage.passage_id for passage in passages]
     )
+    quotation_check, locator_check = _academic_practice_checks(
+        claim=claim,
+        source=source,
+        pages=pages,
+        passages=passages,
+    )
     verification_id = _stable_id(
         ARTIFACT_VERSION,
         claim.paper_version_id,
@@ -1355,6 +1701,8 @@ def build_passage_evidence(
         source_binding=source_binding,
         source_identity=identity,
         coverage=coverage,
+        quotation_check=quotation_check,
+        locator_check=locator_check,
         passages=passages,
         relationship=relationship,
         verdict=verdict,
@@ -1449,6 +1797,7 @@ def attach_candidate_passage_retrieval(
     artifact: VerificationEvidenceArtifact,
     *,
     top_k: int = MAX_CANDIDATE_PASSAGES,
+    accepted_facet_queries_by_candidate: dict[str, list[str]] | None = None,
 ) -> VerificationEvidenceArtifact:
     """Search the complete authorized source separately for each fixed candidate.
 
@@ -1457,6 +1806,7 @@ def attach_candidate_passage_retrieval(
     selection whose IDs are later used by the one-candidate relationship judge.
     No search result changes a verdict.
     """
+    _validate_derivative_provenance(source)
     from app.services.citation_use_router import (
         attach_citation_use_routes,
         routed_relationship_candidate_ids,
@@ -1530,9 +1880,29 @@ def attach_candidate_passage_retrieval(
         )
 
     excluded_block_counts: Counter[str] = Counter()
-    for _page, _start, _end, _block_text, role in _source_blocks(pages):
+    excluded_blocks: list[ExcludedSourceBlockEvidence] = []
+    for excluded_page, excluded_start, excluded_end, excluded_text, role in _source_blocks(pages):
         if role in _EXCLUDED_RETRIEVAL_ROLES:
             excluded_block_counts[role] += 1
+            text_sha256 = hashlib.sha256(excluded_text.encode("utf-8")).hexdigest()
+            excluded_blocks.append(
+                ExcludedSourceBlockEvidence(
+                    block_id=_stable_id(
+                        source.content_sha256,
+                        str(excluded_page.index),
+                        str(excluded_start),
+                        str(excluded_end),
+                        role,
+                        text_sha256,
+                    ),
+                    page_index=excluded_page.index,
+                    page_label=excluded_page.label,
+                    character_start=excluded_start,
+                    character_end=excluded_end,
+                    text_sha256=text_sha256,
+                    role=role,
+                )
+            )
 
     broad_by_id = {
         passage.passage_id: passage
@@ -1550,6 +1920,10 @@ def attach_candidate_passage_retrieval(
             page_locator=artifact.claim.page_locator,
             broad_passages=list(broad_by_id.values()),
             top_k=bounded_top_k,
+            include_document_metadata=len(artifact.claim.reference_ids) > 1,
+            accepted_facet_queries=(accepted_facet_queries_by_candidate or {}).get(
+                candidate.candidate_id, []
+            ),
         )
         items: list[CandidatePassageSelectionItem] = []
         for rank, (passage_candidate, channels) in enumerate(ranked, start=1):
@@ -1560,7 +1934,11 @@ def attach_candidate_passage_retrieval(
                     passage_id=passage.passage_id,
                     rank=rank,
                     score=round(passage_candidate.score, 6),
-                    channels=channels,
+                    # Consolidation can merge two retrieval channels per facet
+                    # into one overlapping source window. The selection schema
+                    # is intentionally bounded; complete query provenance is
+                    # retained separately in ``query_facet_sha256s``.
+                    channels=channels[:12],
                 )
             )
         if not items:
@@ -1572,7 +1950,30 @@ def attach_candidate_passage_retrieval(
             )
         if facet_queries:
             limitations.append(
-                "Material quantity facets were searched separately and passage slots were diversified across those exact query fragments."
+                "Accepted material facets were searched separately and passage slots were diversified across those complete propositions or exact constraint fragments."
+            )
+        if any(
+            "candidate_document_metadata" in channels
+            for _passage_candidate, channels in ranked
+        ):
+            limitations.append(
+                "The source title was retained as document-level member evidence for a multi-source aggregate citation; it does not establish the aggregate claim."
+            )
+        if any(
+            "candidate_explicit_note" in channels
+            or "candidate_note_fallback" in channels
+            for _passage_candidate, channels in ranked
+        ):
+            limitations.append(
+                "Labelled citation-note evidence was searched separately by explicit locator or after ordinary body-prose retrieval failed."
+            )
+        if any(
+            evidence_by_id[item.passage_id].boundary_status
+            == "bounded_fragment_or_nonprose"
+            for item in items
+        ):
+            limitations.append(
+                "At least one selected passage has a bounded fragment or non-prose boundary; inspect its source-page coordinates before treating omitted context as absent."
             )
         if not items:
             limitations.append(
@@ -1599,10 +2000,12 @@ def attach_candidate_passage_retrieval(
         retrieval_version=CANDIDATE_RETRIEVAL_VERSION,
         selections=selections,
         excluded_block_counts=dict(excluded_block_counts),
+        excluded_blocks=excluded_blocks,
         limitations=[
             "Candidate-specific retrieval is recall-oriented and does not establish support, contradiction, or source-wide absence.",
-            "Definite publication-metadata, reference-list, and citation-only note blocks are excluded before ranking; ordinary cited body prose and ambiguous blocks remain eligible.",
-            "Material quantity facets may reserve distinct passage slots, but the later evidence ledger still determines whether the complete qualifier is established.",
+            "Definite page furniture, publication metadata, author biography, reference-list, and citation-note blocks are excluded from ordinary body ranking; ambiguous blocks remain eligible.",
+            "Labelled citation notes are retained with exact coordinates and may be searched only by an explicit note locator or after ordinary body-prose retrieval fails.",
+            "Accepted material facets may reserve distinct passage slots, but retrieval does not establish that any facet is supported by the source.",
             "Dense-semantic retrieval remains an unvalidated optional channel and is not represented as active in this version.",
             *extraction_limitations,
         ],
@@ -1611,6 +2014,234 @@ def attach_candidate_passage_retrieval(
         update={
             "passages": list(evidence_by_id.values()),
             "candidate_passage_retrieval": retrieval,
+        }
+    )
+
+
+def attach_local_semantic_retrieval_rescue(
+    source: AuthorizedRepresentation,
+    artifact: VerificationEvidenceArtifact,
+    *,
+    scorer=None,
+    prefilter_count: int | None = None,
+    max_additions: int | None = None,
+) -> VerificationEvidenceArtifact:
+    """Add a bounded local semantic channel after a true candidate miss.
+
+    The protected lexical/locator passages remain in ``artifact.passages``.
+    Local NLI scores only rank a deterministic BM25-prefiltered subset; they do
+    not establish relevance, support, contradiction, or source-wide absence.
+    A second relevance-gate pass must assess any newly surfaced passages.
+    """
+    if artifact.passage_relevance.outcome != "no_relevant_candidate_passage":
+        return artifact
+    retrieval = artifact.candidate_passage_retrieval
+    if retrieval.status not in {"complete", "incomplete"} or not retrieval.selections:
+        return artifact
+    if not _source_matches_artifact(source, artifact):
+        return artifact.model_copy(
+            update={
+                "candidate_passage_retrieval": retrieval.model_copy(
+                    update={
+                        "semantic_rescue_status": "not_assessed",
+                        "semantic_rescue_version": SEMANTIC_RETRIEVAL_RESCUE_VERSION,
+                        "limitations": [
+                            *retrieval.limitations,
+                            "Local semantic rescue did not run because the supplied source did not match the authorized artifact.",
+                        ],
+                    }
+                )
+            }
+        )
+
+    from app.config import settings
+    from app.services.relationship_signal import TransformersNLIScorer
+
+    bounded_prefilter = max(
+        1,
+        min(
+            prefilter_count
+            if prefilter_count is not None
+            else settings.EVIDENCE_RETRIEVAL_SEMANTIC_PREFILTER,
+            32,
+        ),
+    )
+    bounded_additions = max(
+        1,
+        min(
+            max_additions
+            if max_additions is not None
+            else settings.EVIDENCE_RETRIEVAL_SEMANTIC_MAX_ADDITIONS,
+            4,
+        ),
+    )
+    local_scorer = scorer or TransformersNLIScorer(
+        model_id=settings.RELATIONSHIP_MODEL_NAME,
+        model_revision=settings.RELATIONSHIP_MODEL_REVISION,
+        local_files_only=settings.RELATIONSHIP_MODEL_LOCAL_FILES_ONLY,
+        device=settings.RELATIONSHIP_MODEL_DEVICE,
+        batch_size=settings.EVIDENCE_RETRIEVAL_SEMANTIC_BATCH_SIZE,
+    )
+    pages, extraction_limitations = _extract_pages(source)
+    candidates_by_id = {
+        candidate.candidate_id: candidate
+        for candidate in artifact.verification_candidates.candidates
+    }
+    evidence_by_id = {passage.passage_id: passage for passage in artifact.passages}
+    updated_selections: list[CandidatePassageSelection] = []
+    total_prefiltered = 0
+    total_added = 0
+    try:
+        for selection in retrieval.selections:
+            candidate = candidates_by_id.get(selection.candidate_id)
+            if candidate is None:
+                updated_selections.append(selection)
+                continue
+            query_text = _candidate_retrieval_text(artifact.claim, candidate)
+            prefiltered = _bm25_concept_candidates(
+                pages,
+                query_text=query_text,
+                page_locator=artifact.claim.page_locator,
+                top_k=bounded_prefilter,
+            )
+            total_prefiltered += len(prefiltered)
+            scores = local_scorer.score_pairs(
+                [item.text for item in prefiltered],
+                [query_text] * len(prefiltered),
+            )
+            if len(scores) != len(prefiltered):
+                raise ValueError("Local semantic scorer returned the wrong row count")
+            ranked = sorted(
+                zip(prefiltered, scores, strict=True),
+                key=lambda item: (
+                    max(item[1].entailment, item[1].contradiction),
+                    item[1].entailment,
+                    item[0].score,
+                    -item[0].start,
+                ),
+                reverse=True,
+            )[:bounded_additions]
+
+            previous_items = {item.passage_id: item for item in selection.passages}
+            semantic_items: list[CandidatePassageSelectionItem] = []
+            for passage_candidate, nli_score in ranked:
+                semantic_candidate = _PassageCandidate(
+                    page_index=passage_candidate.page_index,
+                    page_label=passage_candidate.page_label,
+                    start=passage_candidate.start,
+                    end=passage_candidate.end,
+                    text=passage_candidate.text,
+                    method="local_nli_bm25_prefilter",
+                    score=max(nli_score.entailment, nli_score.contradiction),
+                    passage_role=passage_candidate.passage_role,
+                )
+                passage = _passage_evidence(source, semantic_candidate)
+                evidence_by_id.setdefault(passage.passage_id, passage)
+                previous = previous_items.get(passage.passage_id)
+                channels = list(previous.channels) if previous is not None else []
+                channels = [
+                    channel
+                    for channel in channels
+                    if channel != "candidate_local_nli_rescue"
+                ][:11]
+                channels.append("candidate_local_nli_rescue")
+                semantic_items.append(
+                    CandidatePassageSelectionItem(
+                        passage_id=passage.passage_id,
+                        rank=1,
+                        score=round(semantic_candidate.score, 6),
+                        channels=channels,
+                    )
+                )
+                if previous is None:
+                    total_added += 1
+
+            ordered: list[CandidatePassageSelectionItem] = []
+            seen: set[str] = set()
+            for item in [*semantic_items, *selection.passages]:
+                if item.passage_id in seen:
+                    continue
+                seen.add(item.passage_id)
+                ordered.append(item)
+                if len(ordered) >= MAX_CANDIDATE_PASSAGES:
+                    break
+            reranked = [
+                item.model_copy(update={"rank": rank})
+                for rank, item in enumerate(ordered, start=1)
+            ]
+            updated_selections.append(
+                selection.model_copy(
+                    update={
+                        "passages": reranked,
+                        "rescue_applied": True,
+                        "limitations": list(
+                            dict.fromkeys(
+                                [
+                                    *selection.limitations,
+                                    "A pinned local NLI model ranked a 32-block-or-smaller BM25 prefilter after the bounded relevance gate found no connected candidate.",
+                                ]
+                            )
+                        ),
+                    }
+                )
+            )
+    except Exception:
+        return artifact.model_copy(
+            update={
+                "candidate_passage_retrieval": retrieval.model_copy(
+                    update={
+                        "semantic_rescue_status": "incomplete",
+                        "semantic_rescue_version": SEMANTIC_RETRIEVAL_RESCUE_VERSION,
+                        "semantic_model_id": getattr(local_scorer, "model_id", None),
+                        "semantic_model_revision": getattr(
+                            local_scorer, "model_revision", None
+                        ),
+                        "semantic_prefilter_count": total_prefiltered,
+                        "limitations": list(
+                            dict.fromkeys(
+                                [
+                                    *retrieval.limitations,
+                                    "Local semantic retrieval rescue was unavailable or returned invalid output; the protected retrieval union was preserved.",
+                                    *extraction_limitations[:4],
+                                ]
+                            )
+                        ),
+                    }
+                )
+            }
+        )
+
+    limitations = [
+        limitation
+        for limitation in retrieval.limitations
+        if not limitation.startswith("Dense-semantic retrieval remains")
+    ]
+    limitations.extend(
+        [
+            "A pinned local NLI model ranked only a deterministic BM25-prefiltered subset after the bounded relevance gate found no connected candidate.",
+            "Semantic rescue is retrieval-only: its scores do not establish relevance, support, contradiction, or source-wide absence.",
+            "The protected lexical/locator union remains retained in the artifact even when semantic candidates are promoted into bounded selection slots.",
+            *extraction_limitations,
+        ]
+    )
+    updated_retrieval = retrieval.model_copy(
+        update={
+            "method": f"{retrieval.method}+local_nli_bm25_prefilter",
+            "retrieval_version": CANDIDATE_RETRIEVAL_VERSION,
+            "selections": updated_selections,
+            "semantic_rescue_status": "complete",
+            "semantic_rescue_version": SEMANTIC_RETRIEVAL_RESCUE_VERSION,
+            "semantic_model_id": getattr(local_scorer, "model_id", None),
+            "semantic_model_revision": getattr(local_scorer, "model_revision", None),
+            "semantic_prefilter_count": total_prefiltered,
+            "semantic_addition_count": total_added,
+            "limitations": list(dict.fromkeys(limitations)),
+        }
+    )
+    return artifact.model_copy(
+        update={
+            "passages": list(evidence_by_id.values()),
+            "candidate_passage_retrieval": updated_retrieval,
         }
     )
 
@@ -1696,7 +2327,35 @@ def _source_matches_artifact(
         and source.scope_type == identity.authorization_scope_type
         and source.scope_id == identity.authorization_scope_id
         and source.verification_run_id == identity.verification_run_id
+        and source.parent_content_sha256 == identity.parent_content_sha256
+        and source.derivation_method == identity.derivation_method
+        and source.derivation_manifest_sha256 == identity.derivation_manifest_sha256
     )
+
+
+def _validate_derivative_provenance(source: AuthorizedRepresentation) -> None:
+    values = (
+        source.parent_content_sha256,
+        source.derivation_method,
+        source.derivation_manifest_sha256,
+        source.page_labels,
+    )
+    if not any(value is not None for value in values):
+        return
+    if any(value is None for value in values):
+        raise EvidenceAuthorizationError(
+            "Derivative source provenance must be complete and page-bound"
+        )
+    assert source.parent_content_sha256 is not None
+    assert source.derivation_manifest_sha256 is not None
+    if not re.fullmatch(r"[0-9a-f]{64}", source.parent_content_sha256):
+        raise EvidenceAuthorizationError("Derivative parent hash is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", source.derivation_manifest_sha256):
+        raise EvidenceAuthorizationError("Derivative manifest hash is invalid")
+    if source.parent_content_sha256 == source.content_sha256:
+        raise EvidenceAuthorizationError(
+            "Derivative content must remain distinct from its parent bytes"
+        )
 
 
 def _passage_matches_source(
@@ -1711,6 +2370,588 @@ def _passage_matches_source(
     )
 
 
+def _structural_role_for_range(
+    page: _SourcePage, start: int, end: int
+) -> str | None:
+    for span in page.structural_spans:
+        if start < span.end and end > span.start:
+            return span.role
+    return None
+
+
+def _layout_signature(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = re.sub(r"\d+", "#", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _probable_article_header_indices(
+    page_index: int,
+    spans: list[_PdfLayoutSpan],
+) -> set[int]:
+    """Identify a high-confidence opening-page title/byline/affiliation group.
+
+    A large multiword heading alone is not enough: a nearby short name-shaped
+    byline is required so an ordinary section heading stays body. Publisher
+    cover sheets can precede the article, so only the first three physical PDF
+    pages are eligible rather than assuming the article begins on page zero.
+    """
+    if page_index < 0 or page_index > 2:
+        return set()
+    if any(
+        re.search(r"\b(?:award|prize)\s+winners?\b", span.text, re.IGNORECASE)
+        and span.y0 <= span.page_height * 0.35
+        for span in spans
+    ):
+        return set()
+    non_header_labels = {
+        "award",
+        "awards",
+        "winner",
+        "winners",
+        "prize",
+        "prizes",
+    }
+    for title_index, title in enumerate(spans):
+        title_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", title.text)
+        title_lines = max(len(title.text.splitlines()), 1)
+        average_line_height = (title.y1 - title.y0) / title_lines
+        if not (
+            3 <= len(title_words) <= 60
+            and not any(word.casefold() in non_header_labels for word in title_words)
+            and average_line_height >= 12.0
+            and title.page_height * 0.08 <= title.y0 <= title.page_height * 0.55
+            and title.x0
+            >= title.page_width * (0.10 if page_index == 0 else 0.05)
+        ):
+            continue
+        for byline_index in range(title_index + 1, min(title_index + 4, len(spans))):
+            byline = spans[byline_index]
+            byline_name_text = byline.text
+            byline_lines = [line.strip() for line in byline.text.splitlines() if line.strip()]
+            if len(byline_lines) >= 2 and re.search(
+                r"\b(?:department|faculty|school|college|university|institute|"
+                r"institution|centre|center|academy)\b",
+                " ".join(byline_lines[1:]),
+                re.IGNORECASE,
+            ):
+                byline_name_text = byline_lines[0]
+            byline_words = re.findall(
+                r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", byline_name_text
+            )
+            semantic_byline_words = [
+                word
+                for word in byline_words
+                if not (len(word) == 1 and word.islower())
+                and word.casefold() not in {"id", "orcid"}
+            ]
+            capitalized = sum(
+                word[0].isupper() for word in semantic_byline_words if word
+            )
+            connectors = {"and", "et", "al"}
+            name_shaped = (
+                2 <= len(semantic_byline_words) <= 16
+                and capitalized >= 2
+                and all(
+                    word[0].isupper() or word.casefold() in connectors
+                    for word in semantic_byline_words
+                )
+                and not any(
+                    word.casefold() in non_header_labels
+                    for word in semantic_byline_words
+                )
+                and not re.search(r"\d", byline.text)
+            )
+            nearby = (
+                byline.y0 >= title.y1 - 2.0
+                and byline.y0 - title.y1 <= max(24.0, title.page_height * 0.06)
+                and abs(byline.x0 - title.x0) <= title.page_width * 0.12
+            )
+            if name_shaped and nearby:
+                if page_index > 0:
+                    nearby_opening_spans = spans[
+                        max(0, title_index - 3) : min(len(spans), byline_index + 7)
+                    ]
+                    has_abstract = any(
+                        re.match(r"^\s*ABSTRACT\b", item.text, re.IGNORECASE)
+                        for item in nearby_opening_spans
+                    )
+                    has_scholarly_header = any(
+                        re.search(
+                            r"(?:https?://doi\.org/10\.|\bdoi\s*:\s*10\.|"
+                            r"\b(?:journal|volume|vol\.|issue|no\.)\b[^\n]{0,100}"
+                            r"\b(?:18|19|20)\d{2}\b)",
+                            item.text,
+                            re.IGNORECASE,
+                        )
+                        for item in spans[:title_index]
+                    )
+                    if not (has_abstract or has_scholarly_header):
+                        continue
+                header_indices = {title_index, byline_index}
+                prior = byline
+                for affiliation_index in range(
+                    byline_index + 1, min(byline_index + 4, len(spans))
+                ):
+                    affiliation = spans[affiliation_index]
+                    normalized_affiliation = re.sub(
+                        r"\s+", " ", affiliation.text
+                    ).strip()
+                    affiliation_cue = re.search(
+                        r"\b(?:department|faculty|school|college|university|"
+                        r"institute|institution|centre|center|academy)\b",
+                        normalized_affiliation,
+                        re.IGNORECASE,
+                    )
+                    gap = affiliation.y0 - prior.y1
+                    affiliation_word_count = len(
+                        re.findall(r"\b\w+\b", normalized_affiliation)
+                    )
+                    affiliation_sentence_count = len(
+                        re.findall(r"[.!?](?:\s|$)", normalized_affiliation)
+                    )
+                    if (
+                        not affiliation_cue
+                        or affiliation_word_count > 80
+                        or affiliation_sentence_count > 2
+                        or affiliation.y1 - affiliation.y0
+                        > max(50.0, title.page_height * 0.09)
+                        or gap > max(24.0, title.page_height * 0.06)
+                        or affiliation.y0 > title.page_height * 0.60
+                    ):
+                        break
+                    header_indices.add(affiliation_index)
+                    prior = affiliation
+                return header_indices
+    return set()
+
+
+def _probable_article_title_indices(
+    spans: list[_PdfLayoutSpan], header_indices: set[int]
+) -> set[int]:
+    """Extend a detected article title over adjacent same-style layout blocks.
+
+    Some publisher PDFs split a multi-line title so its final line is one block
+    while the preceding title line shares neither a block nor a reliable text
+    boundary with it. Extension is deliberately backward-only and requires
+    close vertical, typographic, and horizontal alignment. It stops before
+    journal mastheads and other bibliographic furniture.
+    """
+    if not header_indices:
+        return set()
+    first = min(header_indices)
+    title_indices = {first}
+    current = spans[first]
+    for prior_index in range(first - 1, max(-1, first - 3), -1):
+        prior = spans[prior_index]
+        prior_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", prior.text)
+        prior_lines = max(len(prior.text.splitlines()), 1)
+        current_lines = max(len(current.text.splitlines()), 1)
+        prior_line_height = (prior.y1 - prior.y0) / prior_lines
+        current_line_height = (current.y1 - current.y0) / current_lines
+        vertical_gap = current.y0 - prior.y1
+        center_distance = abs(
+            ((prior.x0 + prior.x1) / 2) - ((current.x0 + current.x1) / 2)
+        )
+        metadata_cue = bool(
+            re.search(
+                r"(?:https?://|\bdoi\b|\b(?:vol(?:ume)?|issue|issn)\b|"
+                r"\b(?:18|19|20)\d{2}\b)",
+                prior.text,
+                re.IGNORECASE,
+            )
+        )
+        aligned = (
+            3 <= len(prior_words) <= 30
+            and 0 <= vertical_gap <= max(24.0, current.page_height * 0.04)
+            and 0.72 <= prior_line_height / max(current_line_height, 1.0) <= 1.38
+            and center_distance <= current.page_width * 0.12
+            and prior.y0 >= current.page_height * 0.08
+            and not metadata_cue
+        )
+        if not aligned:
+            break
+        title_indices.add(prior_index)
+        current = prior
+    return title_indices
+
+
+def _pdf_layout_spans(
+    page: fitz.Page, page_text: str, page_index: int
+) -> list[_PdfLayoutSpan]:
+    """Map PyMuPDF layout blocks back to the exact extracted text offsets."""
+    spans: list[_PdfLayoutSpan] = []
+    cursor = 0
+    occupied: list[tuple[int, int]] = []
+    # Classification needs visual order for footer and marginal-note rules.
+    # The occupied-coordinate selection below prevents a visually sorted
+    # repeated header or note number from mapping onto an earlier occurrence.
+    for block in page.get_text("blocks", sort=True):
+        if int(block[6]) != 0:
+            continue
+        block_text = str(block[4])
+        if not block_text.strip():
+            continue
+        occurrences: list[int] = []
+        search_from = 0
+        while True:
+            occurrence = page_text.find(block_text, search_from)
+            if occurrence < 0:
+                break
+            occurrences.append(occurrence)
+            search_from = occurrence + 1
+        non_overlapping = [
+            occurrence
+            for occurrence in occurrences
+            if not any(
+                occurrence < occupied_end
+                and occurrence + len(block_text) > occupied_start
+                for occupied_start, occupied_end in occupied
+            )
+        ]
+        after_cursor = [occurrence for occurrence in non_overlapping if occurrence >= cursor]
+        start = after_cursor[0] if after_cursor else (
+            non_overlapping[0] if non_overlapping else -1
+        )
+        if start < 0:
+            continue
+        end = start + len(block_text)
+        spans.append(
+            _PdfLayoutSpan(
+                page_index=page_index,
+                start=start,
+                end=end,
+                text=block_text,
+                x0=float(block[0]),
+                y0=float(block[1]),
+                x1=float(block[2]),
+                y1=float(block[3]),
+                page_width=float(page.rect.width),
+                page_height=float(page.rect.height),
+            )
+        )
+        occupied.append((start, end))
+        cursor = max(cursor, end)
+    return spans
+
+
+def _pdf_reading_order_text_and_spans(
+    page: fitz.Page, page_index: int
+) -> tuple[str, list[_PdfLayoutSpan], bool]:
+    """Rebuild clear two-column pages in visual column-major reading order.
+
+    PyMuPDF's content-stream order can place a complete right column before a
+    complete left column. Sentence windows over that stream then splice
+    unrelated column edges. Only pages with strong, balanced two-column layout
+    evidence are reordered; ambiguous layouts retain the ordinary extractor.
+    """
+    raw_text = page.get_text("text")
+    raw_blocks = [
+        block
+        for block in page.get_text("blocks")
+        if int(block[6]) == 0 and str(block[4]).strip()
+    ]
+    if len(raw_blocks) < 4:
+        return raw_text, _pdf_layout_spans(page, raw_text, page_index), False
+
+    page_width = float(page.rect.width)
+    page_height = float(page.rect.height)
+    headers = [block for block in raw_blocks if float(block[3]) <= page_height * 0.12]
+    footers = [block for block in raw_blocks if float(block[1]) >= page_height * 0.88]
+    body = [block for block in raw_blocks if block not in headers and block not in footers]
+    left = [
+        block
+        for block in body
+        if float(block[2]) <= page_width * 0.58
+        and (float(block[0]) + float(block[2])) / 2 < page_width * 0.48
+    ]
+    right = [
+        block
+        for block in body
+        if float(block[0]) >= page_width * 0.42
+        and (float(block[0]) + float(block[2])) / 2 > page_width * 0.52
+    ]
+    assigned_ids = {id(block) for block in [*left, *right]}
+    unassigned = [block for block in body if id(block) not in assigned_ids]
+    left_characters = sum(len(str(block[4]).strip()) for block in left)
+    right_characters = sum(len(str(block[4]).strip()) for block in right)
+    unassigned_characters = sum(len(str(block[4]).strip()) for block in unassigned)
+    assigned_characters = left_characters + right_characters
+    clear_two_column = (
+        len(left) >= 2
+        and len(right) >= 2
+        and left_characters >= 200
+        and right_characters >= 200
+        and unassigned_characters <= max(80, assigned_characters * 0.08)
+    )
+    if not clear_two_column:
+        return raw_text, _pdf_layout_spans(page, raw_text, page_index), False
+
+    ordered = [
+        *sorted(headers, key=lambda block: (float(block[1]), float(block[0]))),
+        *sorted(left, key=lambda block: (float(block[1]), float(block[0]))),
+        *sorted(right, key=lambda block: (float(block[1]), float(block[0]))),
+        *sorted(unassigned, key=lambda block: (float(block[1]), float(block[0]))),
+        *sorted(footers, key=lambda block: (float(block[1]), float(block[0]))),
+    ]
+    text_parts: list[str] = []
+    spans: list[_PdfLayoutSpan] = []
+    cursor = 0
+    for block in ordered:
+        block_text = str(block[4])
+        text_parts.append(block_text)
+        end = cursor + len(block_text)
+        spans.append(
+            _PdfLayoutSpan(
+                page_index=page_index,
+                start=cursor,
+                end=end,
+                text=block_text,
+                x0=float(block[0]),
+                y0=float(block[1]),
+                x1=float(block[2]),
+                y1=float(block[3]),
+                page_width=page_width,
+                page_height=page_height,
+            )
+        )
+        cursor = end
+    return "".join(text_parts), spans, True
+
+
+def _normalize_pdf_extracted_text(text: str) -> tuple[str, int]:
+    """Replace only nonsemantic C0 debris without shifting coordinates."""
+    return _NONSEMANTIC_C0_CONTROLS.subn(" ", text)
+
+
+def _normalize_pdf_page_label(label: str | None) -> str | None:
+    """Decode PyMuPDF's literal UTF-16 page-label prefix when present."""
+    if not label:
+        return None
+    match = re.fullmatch(r"<FEFF([0-9A-Fa-f]+)>(.*)", label)
+    if match:
+        try:
+            prefix = bytes.fromhex(match.group(1)).decode("utf-16-be")
+        except (ValueError, UnicodeDecodeError):
+            return label
+        return f"{prefix}{match.group(2)}"
+    return label
+
+
+def _visible_pdf_page_label(
+    text: str,
+    structural_spans: tuple[_SourceStructuralSpan, ...],
+) -> str | None:
+    """Recover one printed page number from high-confidence margin furniture."""
+    candidates: set[str] = set()
+    for span in structural_spans:
+        if span.role != "page_furniture":
+            continue
+        for line in text[span.start : span.end].splitlines():
+            match = re.fullmatch(r"\s*[-–—]?\s*(\d{1,4})\s*[-–—]?\s*", line)
+            if match:
+                candidates.add(match.group(1))
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _pdf_structural_spans(
+    layout_by_page: dict[int, list[_PdfLayoutSpan]],
+) -> dict[int, tuple[_SourceStructuralSpan, ...]]:
+    """Classify only high-confidence layout-derived non-body source spans."""
+    signature_pages: dict[str, set[int]] = {}
+    for page_index, spans in layout_by_page.items():
+        for span in spans:
+            near_margin = (
+                span.y1 <= span.page_height * 0.14
+                or span.y0 >= span.page_height * 0.84
+                or span.x1 <= span.page_width * 0.12
+                or span.x0 >= span.page_width * 0.88
+            )
+            signature = _layout_signature(span.text)
+            word_count = len(re.findall(r"\b\w+\b", signature))
+            if near_margin and signature and word_count <= 35:
+                signature_pages.setdefault(signature, set()).add(page_index)
+
+    roles: dict[tuple[int, int], str] = {}
+    for page_index, spans in layout_by_page.items():
+        article_header_indices = _probable_article_header_indices(page_index, spans)
+        article_title_indices = _probable_article_title_indices(
+            spans, article_header_indices
+        )
+        for index, span in enumerate(spans):
+            normalized = re.sub(r"\s+", " ", span.text).strip()
+            near_margin = (
+                span.y1 <= span.page_height * 0.14
+                or span.y0 >= span.page_height * 0.84
+                or span.x1 <= span.page_width * 0.12
+                or span.x0 >= span.page_width * 0.88
+            )
+            standalone_page_number = bool(re.fullmatch(r"[-–—]?\s*\d{1,4}\s*[-–—]?", normalized))
+            repeated_margin = (
+                near_margin
+                and len(signature_pages.get(_layout_signature(span.text), set())) >= 2
+            )
+            marked_furniture = any(
+                pattern.search(normalized)
+                for pattern in _STRONG_PAGE_FURNITURE_MARKERS
+            ) or (
+                any(pattern.search(normalized) for pattern in _PAGE_FURNITURE_MARKERS)
+                and (near_margin or span.y0 >= span.page_height * 0.65)
+            )
+            if index in article_title_indices:
+                roles[(page_index, index)] = "document_metadata"
+            elif index in article_header_indices:
+                roles[(page_index, index)] = "publication_metadata"
+            elif article_header_indices and re.match(
+                r"^\s*ABSTRACT\b", span.text, re.IGNORECASE
+            ):
+                roles[(page_index, index)] = "abstract"
+            elif (standalone_page_number and near_margin) or repeated_margin or marked_furniture:
+                roles[(page_index, index)] = "page_furniture"
+            elif _is_metadata_noise_block(span.text):
+                roles[(page_index, index)] = "publication_metadata"
+
+        # A definite footer cue makes every later layout line furniture. This
+        # retains odd IP/control lines between repeated download notices.
+        footer_indices = [
+            index
+            for index, span in enumerate(spans)
+            if roles.get((page_index, index)) == "page_furniture"
+            and span.y0 >= span.page_height * 0.72
+        ]
+        if footer_indices:
+            for index in range(min(footer_indices), len(spans)):
+                roles[(page_index, index)] = "page_furniture"
+
+        for index, span in enumerate(spans):
+            if _AUTHOR_BIOGRAPHY_START.search(span.text):
+                roles[(page_index, index)] = "author_biography"
+                prior = span
+                for continuation_index in range(index + 1, min(index + 4, len(spans))):
+                    continuation = spans[continuation_index]
+                    gap = continuation.y0 - prior.y1
+                    if gap > max(7.0, (prior.y1 - prior.y0) * 0.8):
+                        break
+                    if roles.get((page_index, continuation_index)) == "page_furniture":
+                        break
+                    if _NUMBERED_NOTE_LINE.search(continuation.text):
+                        break
+                    roles[(page_index, continuation_index)] = "author_biography"
+                    prior = continuation
+
+        note_starts = []
+        for index, span in enumerate(spans):
+            numbered = len(_NUMBERED_NOTE_LINE.findall(span.text))
+            citation_cues = len(_PARENTHETICAL_YEAR.findall(span.text)) + len(
+                re.findall(r"\b(?:18|19|20)\d{2}\b", span.text)
+            )
+            span_width = max(1.0, span.x1 - span.x0)
+            adjacent_main_column = any(
+                other_index != index
+                and max(0.0, min(span.y1, other.y1) - max(span.y0, other.y0)) > 0
+                and other.x1 - other.x0 >= span_width * 1.5
+                and (
+                    (
+                        span.x1 <= span.page_width * 0.35
+                        and 0 <= other.x0 - span.x1 <= span.page_width * 0.12
+                    )
+                    or (
+                        span.x0 >= span.page_width * 0.65
+                        and 0 <= span.x0 - other.x1 <= span.page_width * 0.12
+                    )
+                )
+                for other_index, other in enumerate(spans)
+            )
+            narrow_margin_note = (
+                numbered >= 1
+                and span.y0 >= span.page_height * 0.10
+                and adjacent_main_column
+            )
+            if (
+                narrow_margin_note
+                or (
+                    (_NOTES_HEADING.search(span.text) or numbered >= 2)
+                    and citation_cues >= 1
+                    # A numbered main-column method/results block in the lower
+                    # half of a two-column article is not a footnote section.
+                    # Ordinary bottom notes begin substantially closer to the
+                    # footer; marginal notes use the separate column rule.
+                    and span.y0 >= span.page_height * 0.62
+                )
+            ):
+                note_starts.append(index)
+        for start_index in note_starts:
+            seed = spans[start_index]
+            roles[(page_index, start_index)] = "citation_notes"
+            prior = seed
+            continuations = sorted(
+                (
+                    (index, span)
+                    for index, span in enumerate(spans)
+                    if index != start_index and span.y0 >= seed.y0
+                ),
+                key=lambda item: (item[1].y0, item[1].x0),
+            )
+            for index, span in continuations:
+                if span.y0 < prior.y1 - 1.0:
+                    continue
+                horizontal_overlap = max(
+                    0.0, min(seed.x1, span.x1) - max(seed.x0, span.x0)
+                )
+                minimum_width = max(1.0, min(seed.x1 - seed.x0, span.x1 - span.x0))
+                if horizontal_overlap / minimum_width < 0.55:
+                    continue
+                gap = span.y0 - prior.y1
+                if gap > max(8.0, (prior.y1 - prior.y0) * 0.85):
+                    break
+                if roles.get((page_index, index)) == "page_furniture":
+                    break
+                roles[(page_index, index)] = "citation_notes"
+                prior = span
+
+    output: dict[int, tuple[_SourceStructuralSpan, ...]] = {}
+    for page_index, spans in layout_by_page.items():
+        classified: list[_SourceStructuralSpan] = []
+        last_classified_index: int | None = None
+        for index, span in enumerate(spans):
+            role = roles.get((page_index, index))
+            if role is None:
+                continue
+            item = _SourceStructuralSpan(start=span.start, end=span.end, role=role)
+            if (
+                classified
+                and last_classified_index is not None
+                and index == last_classified_index + 1
+                and classified[-1].role == item.role
+                and item.start == classified[-1].end
+            ):
+                classified[-1] = _SourceStructuralSpan(
+                    start=classified[-1].start,
+                    end=item.end,
+                    role=item.role,
+                )
+            else:
+                classified.append(item)
+            last_classified_index = index
+        ordered = sorted(classified, key=lambda item: (item.start, item.end))
+        consolidated: list[_SourceStructuralSpan] = []
+        for item in ordered:
+            if (
+                consolidated
+                and consolidated[-1].role == item.role
+                and consolidated[-1].end == item.start
+            ):
+                consolidated[-1] = _SourceStructuralSpan(
+                    start=consolidated[-1].start,
+                    end=item.end,
+                    role=item.role,
+                )
+            else:
+                consolidated.append(item)
+        output[page_index] = tuple(consolidated)
+    return output
+
+
 def _extract_pages(
     source: AuthorizedRepresentation,
 ) -> tuple[list[_SourcePage], list[str]]:
@@ -1722,9 +2963,19 @@ def _extract_pages(
                 if document.page_count > MAX_SOURCE_PAGES:
                     return [], ["Source exceeds the verification page limit."]
                 pages = []
+                layout_by_page: dict[int, list[_PdfLayoutSpan]] = {}
                 total_characters = 0
+                normalized_control_characters = False
+                reordered_two_column_pages = 0
                 for index, page in enumerate(document):
-                    text = page.get_text("text")
+                    raw_text, layout_spans, reading_order_rebuilt = (
+                        _pdf_reading_order_text_and_spans(page, index)
+                    )
+                    reordered_two_column_pages += int(reading_order_rebuilt)
+                    text, substitutions = _normalize_pdf_extracted_text(raw_text)
+                    normalized_control_characters = (
+                        normalized_control_characters or substitutions > 0
+                    )
                     if len(text) > MAX_PAGE_CHARACTERS:
                         text = text[:MAX_PAGE_CHARACTERS]
                         limitations.append(f"Page {index + 1} text was truncated by policy.")
@@ -1743,14 +2994,44 @@ def _extract_pages(
                     pages.append(
                         _SourcePage(
                             index=index,
-                            label=page.get_label() or None,
+                            label=_normalize_pdf_page_label(page.get_label()),
                             text=text,
                         )
                     )
+                    layout_by_page[index] = [
+                        span for span in layout_spans if span.end <= len(text)
+                    ]
                     total_characters += len(text)
                     if source_limit_reached:
                         break
-                return pages, limitations
+                structural_by_page = _pdf_structural_spans(layout_by_page)
+                if normalized_control_characters:
+                    limitations.append(
+                        "PDF text contained nonsemantic control characters that "
+                        "were normalized to same-length spaces."
+                    )
+                if reordered_two_column_pages:
+                    limitations.append(
+                        "PDF visual column order was reconstructed on "
+                        f"{reordered_two_column_pages} page(s)."
+                    )
+                return [
+                    _SourcePage(
+                        index=page.index,
+                        label=page.label
+                        or _visible_pdf_page_label(
+                            page.text,
+                            structural_by_page.get(
+                                page.index if page.index is not None else 0, ()
+                            ),
+                        ),
+                        text=page.text,
+                        structural_spans=structural_by_page.get(
+                            page.index if page.index is not None else 0, ()
+                        ),
+                    )
+                    for page in pages
+                ], limitations
             finally:
                 document.close()
         except (fitz.FileDataError, fitz.mupdf.FzErrorBase, RuntimeError, ValueError):
@@ -1762,14 +3043,45 @@ def _extract_pages(
         if replacement_ratio > 0.01:
             limitations.append("Plain-text decoding produced replacement characters.")
         raw_pages = text.split("\f")
-        return [
-            _SourcePage(
-                index=index if len(raw_pages) > 1 else None,
-                label=str(index + 1) if len(raw_pages) > 1 else None,
-                text=page_text[:MAX_PAGE_CHARACTERS],
+        supplied_labels = source.page_labels
+        if supplied_labels is not None and len(supplied_labels) != len(raw_pages):
+            return [], ["OCR derivative page labels do not match its page count."]
+        pages: list[_SourcePage] = []
+        for index, page_text in enumerate(raw_pages[:MAX_SOURCE_PAGES]):
+            bounded_text = page_text[:MAX_PAGE_CHARACTERS]
+            label = (
+                supplied_labels[index]
+                if supplied_labels is not None
+                else (str(index + 1) if len(raw_pages) > 1 else None)
             )
-            for index, page_text in enumerate(raw_pages[:MAX_SOURCE_PAGES])
-        ], limitations
+            structural_spans: tuple[_SourceStructuralSpan, ...] = ()
+            if source.derivation_method and label:
+                matches = list(
+                    re.finditer(
+                        rf"(?m)^\s*{re.escape(label)}\s*(?:\n|$)", bounded_text
+                    )
+                )
+                if len(matches) == 1:
+                    structural_spans = (
+                        _SourceStructuralSpan(
+                            start=matches[0].start(),
+                            end=matches[0].end(),
+                            role="page_furniture",
+                        ),
+                    )
+            pages.append(
+                _SourcePage(
+                    index=(
+                        index
+                        if len(raw_pages) > 1 or source.derivation_method
+                        else None
+                    ),
+                    label=label,
+                    text=bounded_text,
+                    structural_spans=structural_spans,
+                )
+            )
+        return pages, limitations
 
     return [], [
         f"Representation kind {source.representation_kind!r} has no Phase 3.8 text extractor."
@@ -1783,45 +3095,55 @@ def _retrieve_candidates(
     claim_type: str,
     page_locator: str,
     top_k: int,
+    allow_ocr_token_sequence: bool = False,
 ) -> list[_PassageCandidate]:
     if not claim_text.strip():
         return []
     locator_pages = _page_locator_values(page_locator)
-    exact_target = _quotation_target(claim_text) if claim_type == "quotation" else None
+    exact_targets = _quotation_targets(claim_text) if claim_type == "quotation" else []
     exact: list[_PassageCandidate] = []
-    if exact_target:
+    if exact_targets:
         reference_section_started = False
         for page in pages:
             reference_heading = _REFERENCE_HEADING.search(page.text)
-            match = _normalized_find(page.text, exact_target)
-            if match is None:
-                reference_section_started = bool(
-                    reference_section_started or reference_heading
+            for exact_target in exact_targets:
+                quotation_match = _quotation_match(
+                    page.text,
+                    exact_target,
+                    allow_ocr_token_sequence=allow_ocr_token_sequence,
                 )
-                continue
-            start, end = _context_bounds(page.text, *match)
-            exact_text = page.text[start:end].strip()
-            role = (
-                "reference_list"
-                if reference_section_started
-                or (reference_heading is not None and start >= reference_heading.start())
-                else passage_role_from_text(exact_text)
-            )
+                if quotation_match is None:
+                    continue
+                match = quotation_match[:2]
+                start, end = _context_bounds_on_page(page, *match)
+                exact_text = page.text[start:end].strip()
+                structural_role = _structural_role_for_range(page, *match)
+                role = structural_role or (
+                    "reference_list"
+                    if reference_section_started
+                    or (reference_heading is not None and start >= reference_heading.start())
+                    else passage_role_from_text(exact_text)
+                )
+                if role in _EXCLUDED_RETRIEVAL_ROLES:
+                    continue
+                exact.append(
+                    _PassageCandidate(
+                        page_index=page.index,
+                        page_label=page.label,
+                        start=start,
+                        end=end,
+                        text=exact_text,
+                        method=(
+                            "ocr_token_sequence"
+                            if quotation_match[2] == "ocr_token_sequence"
+                            else "exact_quotation"
+                        ),
+                        score=min(1.0, 0.95 + _page_boost(page, locator_pages)),
+                        passage_role=role,
+                    )
+                )
             reference_section_started = bool(
                 reference_section_started or reference_heading
-            )
-            if role in _EXCLUDED_RETRIEVAL_ROLES:
-                continue
-            exact.append(
-                _PassageCandidate(
-                    page_index=page.index,
-                    page_label=page.label,
-                    start=start,
-                    end=end,
-                    text=exact_text,
-                    method="exact_quotation",
-                    score=min(1.0, 0.95 + _page_boost(page, locator_pages)),
-                )
             )
     if exact:
         return _deduplicate_candidates(exact)[:top_k]
@@ -1846,10 +3168,15 @@ def _retrieve_candidates(
                 text=text.strip(),
                 method="lexical_overlap",
                 score=score,
+                passage_role=role,
             )
         )
     scored.sort(key=lambda candidate: (candidate.score, -candidate.start), reverse=True)
-    return _deduplicate_candidates(scored)[:top_k]
+    consolidated = _consolidate_nested_passage_entries(
+        [(candidate, {"whole_citation_lexical"}) for candidate in _deduplicate_candidates(scored)],
+        page_text_by_index={page.index: page.text for page in pages},
+    )
+    return [candidate for candidate, _channels in consolidated[:top_k]]
 
 
 def _candidate_union_candidates(
@@ -1859,6 +3186,8 @@ def _candidate_union_candidates(
     page_locator: str,
     broad_passages: list[SourcePassageEvidence],
     top_k: int,
+    include_document_metadata: bool = False,
+    accepted_facet_queries: list[str] | None = None,
 ) -> tuple[list[tuple[_PassageCandidate, list[str]]], bool, list[str]]:
     """Union bounded channels and preserve distinct material-facet evidence."""
     entries: dict[
@@ -1880,6 +3209,23 @@ def _candidate_union_candidates(
         add(candidate, "candidate_exact_phrase")
     for candidate in _equivalent_phrase_candidates(pages, query_text):
         add(candidate, "candidate_equivalent_phrase")
+    if include_document_metadata:
+        for page, start, end, text, role in _source_blocks(pages):
+            if role != "document_metadata":
+                continue
+            add(
+                _PassageCandidate(
+                    page_index=page.index,
+                    page_label=page.label,
+                    start=start,
+                    end=end,
+                    text=text.strip(),
+                    method="document_level_member_evidence",
+                    score=0.95,
+                    passage_role="document_metadata",
+                ),
+                "candidate_document_metadata",
+            )
     normal = _retrieve_candidates(
         pages,
         claim_text=query_text,
@@ -1889,8 +3235,24 @@ def _candidate_union_candidates(
     )
     for candidate in normal:
         add(candidate, "candidate_lexical")
+    for candidate in _bm25_concept_candidates(
+        pages,
+        query_text=query_text,
+        page_locator=page_locator,
+        top_k=top_k,
+    ):
+        add(candidate, "candidate_bm25_concept")
 
-    facet_queries = _candidate_retrieval_facets(query_text)
+    facet_queries = list(
+        dict.fromkeys(
+            query.strip()
+            for query in [
+                *_candidate_retrieval_facets(query_text),
+                *(accepted_facet_queries or []),
+            ]
+            if query and query.strip() and query.strip() != query_text.strip()
+        )
+    )[:4]
     for index, facet_query in enumerate(facet_queries, start=1):
         for candidate in _retrieve_candidates(
             pages,
@@ -1907,9 +3269,37 @@ def _candidate_union_candidates(
             top_k=max(top_k * 3, top_k),
         ):
             add(candidate, f"candidate_facet_{index}_concept")
+        for candidate in _bm25_concept_candidates(
+            pages,
+            query_text=facet_query,
+            page_locator=page_locator,
+            top_k=top_k,
+        ):
+            add(candidate, f"candidate_facet_{index}_bm25")
 
     query_tokens = _meaningful_tokens(query_text)
+    page_by_index = {page.index: page for page in pages}
     for passage in broad_passages:
+        current_page = page_by_index.get(passage.page_index)
+        if current_page is None:
+            continue
+        if (
+            passage.character_start < 0
+            or passage.character_end > len(current_page.text)
+            or current_page.text[
+                passage.character_start : passage.character_end
+            ]
+            != passage.text
+        ):
+            continue
+        current_structural_role = _structural_role_for_range(
+            current_page, passage.character_start, passage.character_end
+        )
+        current_role = current_structural_role or passage_role_from_text(
+            passage.text
+        )
+        if current_role in _EXCLUDED_RETRIEVAL_ROLES:
+            continue
         score = _lexical_score(query_tokens, query_text, passage.text)
         if score <= 0:
             continue
@@ -1922,13 +3312,15 @@ def _candidate_union_candidates(
                 text=passage.text,
                 method="whole_citation_context",
                 score=min(0.94, score),
+                passage_role=current_role,
             ),
             "whole_citation_context",
         )
 
     best_normal_score = max((candidate.score for candidate in normal), default=0.0)
     distinct_before_rescue = _consolidate_nested_passage_entries(
-        list(entries.values())
+        list(entries.values()),
+        page_text_by_index={page.index: page.text for page in pages},
     )
     rescue_applied = len(distinct_before_rescue) < top_k or best_normal_score < 0.45
     if rescue_applied:
@@ -1940,7 +3332,24 @@ def _candidate_union_candidates(
         ):
             add(candidate, "candidate_concept_rescue")
 
-    consolidated = _consolidate_nested_passage_entries(list(entries.values()))
+    note_search_required = _has_explicit_note_locator(page_locator) or not entries
+    if note_search_required:
+        for candidate in _citation_note_candidates(
+            pages,
+            query_text=query_text,
+            page_locator=page_locator,
+            top_k=max(top_k * 2, top_k),
+        ):
+            add(
+                candidate,
+                "candidate_explicit_note" if _has_explicit_note_locator(page_locator)
+                else "candidate_note_fallback",
+            )
+
+    consolidated = _consolidate_nested_passage_entries(
+        list(entries.values()),
+        page_text_by_index={page.index: page.text for page in pages},
+    )
     ranked = _select_diverse_candidate_entries(
         consolidated,
         query_text=query_text,
@@ -1952,11 +3361,54 @@ def _candidate_union_candidates(
     ], rescue_applied, facet_queries
 
 
+def _has_explicit_note_locator(locator: str) -> bool:
+    return bool(
+        re.search(r"\b(?:n\.?|note|endnote)\s*\d{1,3}\b", locator or "", re.IGNORECASE)
+    )
+
+
+def _citation_note_candidates(
+    pages: list[_SourcePage],
+    *,
+    query_text: str,
+    page_locator: str,
+    top_k: int,
+) -> list[_PassageCandidate]:
+    """Search labelled notes only by explicit locator or after body retrieval fails."""
+    query_tokens = _meaningful_tokens(query_text)
+    if not query_tokens:
+        return []
+    locator_pages = _page_locator_values(page_locator)
+    candidates: list[_PassageCandidate] = []
+    for page, start, end, text, role in _source_blocks(pages):
+        if role != "citation_notes":
+            continue
+        score = _lexical_score(query_tokens, query_text, text)
+        if score <= 0:
+            continue
+        candidates.append(
+            _PassageCandidate(
+                page_index=page.index,
+                page_label=page.label,
+                start=start,
+                end=end,
+                text=text.strip(),
+                method="citation_note_fallback",
+                score=min(0.90, score + _page_boost(page, locator_pages)),
+                passage_role="citation_notes",
+            )
+        )
+    candidates.sort(key=lambda item: (item.score, -item.start), reverse=True)
+    return _deduplicate_candidates(candidates)[:top_k]
+
+
 def _candidate_entry_rank_key(item: tuple[_PassageCandidate, set[str]]):
     candidate, channels = item
     return (
         "candidate_exact_phrase" in channels,
         "candidate_equivalent_phrase" in channels,
+        "candidate_document_metadata" in channels,
+        "candidate_bm25_concept" in channels,
         candidate.score,
         "candidate_lexical" in channels,
         -candidate.start,
@@ -2071,8 +3523,39 @@ def _select_diverse_candidate_entries(
 
 def _consolidate_nested_passage_entries(
     entries: list[tuple[_PassageCandidate, set[str]]],
+    *,
+    page_text_by_index: dict[int | None, str] | None = None,
 ) -> list[tuple[_PassageCandidate, set[str]]]:
-    """Merge same-page containment before top-k consumes a redundant slot."""
+    """Consolidate contained and substantially overlapping same-page windows.
+
+    Sentence-complete source windows deliberately overlap to protect paragraph
+    recall. Retrieval must not then present those windows as independent
+    evidence. Containment and partial overlap retain the broader exact context
+    while recording every source span that was consolidated into it. A narrow
+    higher-scoring window must not erase material context already retrieved by
+    a broader candidate.
+    """
+
+    def source_spans(candidate: _PassageCandidate) -> set[tuple[int, int]]:
+        return set(candidate.consolidated_from_spans) or {
+            (candidate.start, candidate.end)
+        }
+
+    def with_sources(
+        candidate: _PassageCandidate, spans: set[tuple[int, int]]
+    ) -> _PassageCandidate:
+        return _PassageCandidate(
+            page_index=candidate.page_index,
+            page_label=candidate.page_label,
+            start=candidate.start,
+            end=candidate.end,
+            text=candidate.text,
+            method=candidate.method,
+            score=candidate.score,
+            passage_role=candidate.passage_role,
+            consolidated_from_spans=tuple(sorted(spans)),
+        )
+
     consolidated: list[tuple[_PassageCandidate, set[str]]] = []
     for candidate, channels in entries:
         merged = False
@@ -2090,14 +3573,18 @@ def _consolidate_nested_passage_entries(
             broader = candidate if candidate_contains else existing
             combined_channels = set(existing_channels) | set(channels)
             consolidated[index] = (
-                _PassageCandidate(
-                    page_index=broader.page_index,
-                    page_label=broader.page_label,
-                    start=broader.start,
-                    end=broader.end,
-                    text=broader.text,
-                    method=broader.method,
-                    score=max(existing.score, candidate.score),
+                with_sources(
+                    _PassageCandidate(
+                        page_index=broader.page_index,
+                        page_label=broader.page_label,
+                        start=broader.start,
+                        end=broader.end,
+                        text=broader.text,
+                        method=broader.method,
+                        score=max(existing.score, candidate.score),
+                        passage_role=broader.passage_role,
+                    ),
+                    source_spans(existing) | source_spans(candidate),
                 ),
                 combined_channels,
             )
@@ -2105,7 +3592,73 @@ def _consolidate_nested_passage_entries(
             break
         if not merged:
             consolidated.append((candidate, set(channels)))
-    return consolidated
+
+    ranked = sorted(
+        consolidated,
+        key=lambda item: (_candidate_entry_rank_key(item), len(item[0].text)),
+        reverse=True,
+    )
+    distinct: list[tuple[_PassageCandidate, set[str]]] = []
+    for candidate, channels in ranked:
+        matches = [
+            (index, _passage_overlap_ratio(candidate, existing))
+            for index, (existing, _existing_channels) in enumerate(distinct)
+            if candidate.page_index == existing.page_index
+            and _passage_overlap_ratio(candidate, existing)
+            >= SUBSTANTIAL_PASSAGE_OVERLAP_RATIO
+        ]
+        if not matches:
+            distinct.append((candidate, set(channels)))
+            continue
+        match_index, _ratio = max(matches, key=lambda item: item[1])
+        existing, existing_channels = distinct[match_index]
+        broader = max(
+            (existing, candidate),
+            key=lambda item: (item.end - item.start, item.score),
+        )
+        union_start = min(existing.start, candidate.start)
+        union_end = max(existing.end, candidate.end)
+        page_text = (page_text_by_index or {}).get(broader.page_index)
+        if page_text is not None and 0 <= union_start < union_end <= len(page_text):
+            while union_start < union_end and page_text[union_start].isspace():
+                union_start += 1
+            while union_end > union_start and page_text[union_end - 1].isspace():
+                union_end -= 1
+            union_text = page_text[union_start:union_end]
+        else:
+            union_start = broader.start
+            union_end = broader.end
+            union_text = broader.text
+        combined_channels = set(existing_channels) | set(channels)
+        combined_channels.add("substantial_overlap_consolidated")
+        distinct[match_index] = (
+            with_sources(
+                _PassageCandidate(
+                    page_index=broader.page_index,
+                    page_label=broader.page_label,
+                    start=union_start,
+                    end=union_end,
+                    text=union_text,
+                    method=broader.method,
+                    score=max(existing.score, candidate.score),
+                    passage_role=broader.passage_role,
+                ),
+                source_spans(existing) | source_spans(candidate),
+            ),
+            combined_channels,
+        )
+    return distinct
+
+
+def _passage_overlap_ratio(
+    left: _PassageCandidate, right: _PassageCandidate
+) -> float:
+    """Return same-page character overlap as a share of the shorter span."""
+    if left.page_index != right.page_index:
+        return 0.0
+    overlap = max(0, min(left.end, right.end) - max(left.start, right.start))
+    shorter = min(left.end - left.start, right.end - right.start)
+    return overlap / shorter if shorter > 0 else 0.0
 
 
 def _exact_phrase_candidates(
@@ -2124,9 +3677,10 @@ def _exact_phrase_candidates(
                 reference_section_started or reference_heading
             )
             continue
-        start, end = _context_bounds(page.text, *match)
+        start, end = _context_bounds_on_page(page, *match)
         text = page.text[start:end].strip()
-        role = (
+        structural_role = _structural_role_for_range(page, *match)
+        role = structural_role or (
             "reference_list"
             if reference_section_started
             or (reference_heading is not None and start >= reference_heading.start())
@@ -2144,6 +3698,7 @@ def _exact_phrase_candidates(
                 text=text,
                 method="candidate_exact_phrase",
                 score=0.98,
+                passage_role=role,
             )
         )
     return _deduplicate_candidates(candidates)
@@ -2189,9 +3744,83 @@ def _equivalent_phrase_candidates(
                         text=text,
                         method="candidate_equivalent_phrase",
                         score=0.96,
+                        passage_role=role,
                     )
                 )
     return _deduplicate_candidates(candidates)
+
+
+def _bm25_concept_candidates(
+    pages: list[_SourcePage],
+    *,
+    query_text: str,
+    page_locator: str,
+    top_k: int,
+) -> list[_PassageCandidate]:
+    """Rank eligible source blocks with deterministic document-local BM25.
+
+    Concept normalization improves morphological recall but never changes the
+    student proposition or establishes relevance. The channel is additive and
+    the ordinary protected lexical/locator candidates remain retained.
+    """
+    query_tokens = _concept_tokens(query_text)
+    if not query_tokens:
+        return []
+    blocks: list[tuple[_SourcePage, int, int, str, str, list[str]]] = []
+    document_frequency: Counter[str] = Counter()
+    for page, start, end, text, role in _source_blocks(pages):
+        if role in _EXCLUDED_RETRIEVAL_ROLES:
+            continue
+        tokens = _concept_tokens(text)
+        if not tokens:
+            continue
+        blocks.append((page, start, end, text, role, tokens))
+        document_frequency.update(set(tokens))
+    if not blocks:
+        return []
+
+    average_length = sum(len(item[5]) for item in blocks) / len(blocks)
+    query_terms = set(query_tokens)
+    locator_pages = _page_locator_values(page_locator)
+    scored: list[tuple[float, _SourcePage, int, int, str, str]] = []
+    for page, start, end, text, role, tokens in blocks:
+        counts = Counter(tokens)
+        score = 0.0
+        for token in query_terms:
+            frequency = counts[token]
+            if not frequency:
+                continue
+            inverse_document_frequency = math.log(
+                1.0
+                + (len(blocks) - document_frequency[token] + 0.5)
+                / (document_frequency[token] + 0.5)
+            )
+            denominator = frequency + 1.2 * (
+                0.25 + 0.75 * len(tokens) / max(average_length, 1.0)
+            )
+            score += inverse_document_frequency * (frequency * 2.2 / denominator)
+        if score <= 0:
+            continue
+        score += 0.1 * _page_boost(page, locator_pages)
+        scored.append((score, page, start, end, text, role))
+    scored.sort(key=lambda item: (item[0], -item[2]), reverse=True)
+    output = []
+    for rank, (_score, page, start, end, text, role) in enumerate(
+        scored[:top_k], start=1
+    ):
+        output.append(
+            _PassageCandidate(
+                page_index=page.index,
+                page_label=page.label,
+                start=start,
+                end=end,
+                text=text.strip(),
+                method="bm25_concept",
+                score=max(0.50, 0.94 - (rank - 1) * 0.01),
+                passage_role=role,
+            )
+        )
+    return _deduplicate_candidates(output)
 
 
 def _bounded_concept_rescue_candidates(
@@ -2210,7 +3839,7 @@ def _bounded_concept_rescue_candidates(
     query_concepts = set(_concept_tokens(query_text))
     if not query_concepts:
         return []
-    blocks: list[tuple[_SourcePage, int, int, str, set[str]]] = []
+    blocks: list[tuple[_SourcePage, int, int, str, str, set[str]]] = []
     document_frequency: Counter[str] = Counter()
     for page, start, end, text, role in _source_blocks(pages):
         if role in _EXCLUDED_RETRIEVAL_ROLES:
@@ -2218,7 +3847,7 @@ def _bounded_concept_rescue_candidates(
         concepts = set(_concept_tokens(text))
         if not concepts:
             continue
-        blocks.append((page, start, end, text, concepts))
+        blocks.append((page, start, end, text, role, concepts))
         document_frequency.update(concepts)
     if not blocks:
         return []
@@ -2232,7 +3861,7 @@ def _bounded_concept_rescue_candidates(
     maximum_query_weight = max(query_weights.values(), default=1.0)
     locator_pages = _page_locator_values(page_locator)
     rescued: list[_PassageCandidate] = []
-    for page, start, end, text, concepts in blocks:
+    for page, start, end, text, role, concepts in blocks:
         matched = query_concepts & concepts
         if not matched:
             continue
@@ -2260,6 +3889,7 @@ def _bounded_concept_rescue_candidates(
                 text=text.strip(),
                 method="bounded_concept_rescue",
                 score=score,
+                passage_role=role,
             )
         )
     rescued.sort(key=lambda candidate: (candidate.score, -candidate.start), reverse=True)
@@ -2291,8 +3921,29 @@ def _passage_evidence(
         text=candidate.text,
         retrieval_method=candidate.method,
         retrieval_score=round(candidate.score, 6),
-        passage_role=passage_role_from_text(candidate.text),
+        consolidated_from_spans=list(candidate.consolidated_from_spans),
+        passage_role=(
+            candidate.passage_role
+            if candidate.passage_role != "unknown"
+            else passage_role_from_text(candidate.text)
+        ),
+        boundary_status=_passage_boundary_status(candidate.text),
     )
+
+
+def _passage_boundary_status(
+    text: str,
+) -> Literal["sentence_complete", "bounded_fragment_or_nonprose", "unknown"]:
+    """Expose when a bounded passage is not visibly sentence-complete."""
+    normalized = text.strip()
+    if not normalized:
+        return "unknown"
+    visible_start = re.sub(r'^["“‘(\[]+', "", normalized).lstrip()
+    if visible_start and visible_start[0].islower():
+        return "bounded_fragment_or_nonprose"
+    if re.search(r"[.!?][\"')\]]*\s*$", normalized):
+        return "sentence_complete"
+    return "bounded_fragment_or_nonprose"
 
 
 def _coverage_evidence(
@@ -2301,11 +3952,14 @@ def _coverage_evidence(
     extraction_limitations: list[str],
 ) -> CoverageEvidence:
     complete = source.completeness_verdict in {"complete", "not_applicable"}
+    subset_limitations = [
+        item for item in extraction_limitations if _limits_source_coverage(item)
+    ]
     usable_text = any(page.text.strip() for page in pages)
     if not pages or not usable_text:
         level = CoverageLevel.UNAVAILABLE
         confidence = ConfidenceLevel.NONE
-    elif complete and not extraction_limitations:
+    elif complete and not subset_limitations:
         level = CoverageLevel.FULL_TEXT
         confidence = (
             ConfidenceLevel.HIGH
@@ -2320,24 +3974,61 @@ def _coverage_evidence(
         limitations.append(
             f"Representation completeness is {source.completeness_verdict!r}."
         )
-    if complete and extraction_limitations:
+    if complete and subset_limitations:
         limitations.append(
             "Verification inspected only a policy-bounded subset of the source text."
         )
     if source.text_quality not in {"digital", "born_digital"}:
         limitations.append(f"Text quality is {source.text_quality!r}.")
+    if source.derivation_method:
+        limitations.append(
+            "Verification used a separately hashed OCR derivative; OCR evidence remains confidence-limited."
+        )
     return CoverageEvidence(
         level=level,
         confidence=confidence,
-        method="validated_representation_text_extraction",
+        method=(
+            "validated_ocr_derivative_text_extraction"
+            if source.derivation_method
+            else "validated_representation_text_extraction"
+        ),
         representation_kind=source.representation_kind,
         media_type=source.media_type,
         completeness_verdict=source.completeness_verdict,
         text_quality=source.text_quality,
+        extraction_version=EXTRACTION_VERSION,
+        extracted_text_sha256=_extracted_pages_sha256(pages),
         pages_total=len(pages) if pages else None,
         pages_inspected=[page.index for page in pages if page.index is not None],
         limitations=limitations,
     )
+
+
+def _limits_source_coverage(limitation: str) -> bool:
+    """Separate true omission/truncation from lossless normalization notes."""
+    normalized = limitation.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "truncated",
+            "page limit",
+            "policy limit",
+            "excluded page",
+            "missing page",
+            "unavailable page",
+        )
+    )
+
+
+def _extracted_pages_sha256(pages: list[_SourcePage]) -> str:
+    """Bind page order, labels and normalized extracted text deterministically."""
+    digest = hashlib.sha256()
+    for page in pages:
+        for value in (str(page.index), page.label or "", page.text):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _identity_confidence(value: float | None) -> ConfidenceLevel:
@@ -2373,9 +4064,14 @@ _CONCEPT_EQUIVALENTS = {
     "highest": "high",
     "lower": "low",
     "lowest": "low",
-    "incapable": "capable",
-    "inability": "ability",
-    "unable": "able",
+    "incapable": "adequacy",
+    "inability": "adequacy",
+    "unable": "adequacy",
+    "adequate": "adequacy",
+    "inadequate": "adequacy",
+    "sufficient": "adequacy",
+    "insufficient": "adequacy",
+    "sufficiency": "adequacy",
     "impossible": "possible",
     "disabilities": "disability",
     "disabled": "disability",
@@ -2421,7 +4117,10 @@ def _concept_tokens(value: str) -> list[str]:
 
 
 _METADATA_NOISE_MARKERS = (
-    re.compile(r"\bdoi\s*:\s*10\.\d{4,9}/", re.IGNORECASE),
+    re.compile(
+        r"(?:\bdoi\s*:\s*|https?://doi\.org/)10\.\d{4,9}/",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(?:issn|isbn)\s*[:\-]", re.IGNORECASE),
     re.compile(r"\b(?:received|accepted|published)\s*[:\-]?\s*\d", re.IGNORECASE),
     re.compile(r"\b(?:volume|vol\.|issue|no\.)\s*\d", re.IGNORECASE),
@@ -2433,24 +4132,45 @@ _REFERENCE_HEADING = re.compile(
     r"(?im)^\s*(?:references|bibliography|works\s+cited)\s*$"
 )
 _NOTES_HEADING = re.compile(r"(?im)^\s*(?:notes|endnotes)\s*$")
+_NUMBERED_SECTION_HEADING_LINE = re.compile(
+    r"(?m)^\s*\d+(?:\.\d+)*\.?\s+[A-Z][^\n.!?]{2,120}\s*$"
+)
 _REFERENCE_ENTRY_LINE = re.compile(
     r"(?m)^\s*(?:\[?\d+\]?\.?\s+)?[A-Z][^\n]{0,140}"
     r"\((?:18|19|20)\d{2}[a-z]?\)"
 )
-_NUMBERED_NOTE_LINE = re.compile(r"(?m)^\s*\d{1,3}[.)]?\s+[A-Z]")
+_NUMBERED_NOTE_LINE = re.compile(r"(?m)^\s*\d{1,3}[.)]?\s+(?=\S)")
 _PARENTHETICAL_YEAR = re.compile(
     r"\((?:[^()]*)\b(?:18|19|20)\d{2}[a-z]?(?:[^()]*)\)"
 )
 _LEGAL_CITATION_CUE = re.compile(
-    r"\b\d+\s+(?:U\.S\.|F\.?\s*(?:2d|3d|4th)?|S\.\s*Ct\.|Stat\.|"
-    r"L\.\s*(?:Ed\.|Rev\.)|WL\b)",
+    r"(?:\b\d+\s+(?:U\.S\.|F\.?\s*(?:2d|3d|4th)?|S\.\s*Ct\.|Stat\.|"
+    r"L\.\s*(?:Ed\.|Rev\.))\s+\d+\b|\b(?:18|19|20)\d{2}\s+WL\s+\d+\b)",
     re.IGNORECASE,
 )
 _EXCLUDED_RETRIEVAL_ROLES = {
     "reference_list",
     "citation_notes",
     "publication_metadata",
+    "page_furniture",
+    "author_biography",
 }
+
+_PAGE_FURNITURE_MARKERS = (
+    re.compile(r"\bjournal homepage\b", re.IGNORECASE),
+    re.compile(r"(?:\bcopyright\b|©|\ball rights reserved\b)", re.IGNORECASE),
+)
+_STRONG_PAGE_FURNITURE_MARKERS = (
+    re.compile(r"\bthis content downloaded from\b", re.IGNORECASE),
+    re.compile(r"\ball use subject to\b", re.IGNORECASE),
+    re.compile(r"^\s*CONTACT\b", re.IGNORECASE),
+    re.compile(r"\bthis article has been republished\b", re.IGNORECASE),
+)
+_AUTHOR_BIOGRAPHY_START = re.compile(
+    r"^\s*[A-Z][\w .,'’\-]{1,100}\s+is\s+(?:an?\s+|the\s+)?"
+    r"(?:Lecturer|Professor|Reader|Researcher|Fellow|Instructor|Dean|Chair)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_metadata_noise_block(text: str) -> bool:
@@ -2463,16 +4183,28 @@ def _is_metadata_noise_block(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return True
+    # Publisher platform accessibility/conformance statements are not book
+    # contents. Require both a product-specific declaration and formal audit
+    # language, not merely discussion of accessibility in scholarly prose.
+    platform_statement = re.search(
+        r"\b(?:ebook|platform|smartbook|reader\s+app)\b.{0,100}\b(?:was built with accessibility|provides a student experience|conforms to|complies with)\b",
+        normalized, re.I,
+    )
+    conformance = re.search(r"\b(?:VPAT|Accessibility Conformance Report)\b", normalized, re.I)
+    standard = re.search(r"\bWCAG\s+2\.[012]\b", normalized, re.I)
+    if platform_statement and conformance and standard:
+        return True
     marker_count = sum(bool(pattern.search(normalized)) for pattern in _METADATA_NOISE_MARKERS)
     sentence_count = len(re.findall(r"[.!?](?:\s|$)", normalized))
     word_count = len(re.findall(r"\b\w+\b", normalized))
     if marker_count >= 2 and word_count <= 180 and sentence_count <= 6:
         return True
-    return marker_count >= 1 and word_count <= 35 and sentence_count <= 1
+    return marker_count >= 1 and word_count <= 35 and sentence_count == 0
 
 
 def passage_role_from_text(text: str) -> Literal[
     "body_prose",
+    "abstract",
     "reference_list",
     "citation_notes",
     "publication_metadata",
@@ -2490,6 +4222,8 @@ def passage_role_from_text(text: str) -> Literal[
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return "unknown"
+    if re.match(r"^ABSTRACT\b", normalized, re.IGNORECASE):
+        return "abstract"
     reference_entries = len(_REFERENCE_ENTRY_LINE.findall(text))
     if _REFERENCE_HEADING.search(text):
         return "reference_list"
@@ -2540,11 +4274,479 @@ def _retrieval_stem(token: str) -> str:
 
 
 def _quotation_target(claim_text: str) -> str:
-    quoted = re.findall(r"[\"“”‘’]([^\"“”‘’]{6,})[\"“”‘’]", claim_text)
-    return max(quoted, key=len).strip() if quoted else claim_text.strip()
+    targets = _quotation_targets(claim_text)
+    return max(targets, key=len) if targets else claim_text.strip()
 
 
-def _normalized_with_positions(value: str) -> tuple[str, list[int]]:
+def _quotation_targets(claim_text: str) -> list[str]:
+    """Return every complete double-quoted span in paper order."""
+    matches = []
+    for pattern in (r'"([^"]{2,})"', r"“([^”]{2,})”"):
+        matches.extend(
+            (match.start(), match.group(1).strip())
+            for match in re.finditer(pattern, claim_text)
+            if match.group(1).strip()
+        )
+    return [value for _start, value in sorted(matches)]
+
+
+def _ocr_token_sequence_match(
+    source_text: str, target: str
+) -> tuple[int, int, str] | None:
+    """Match a long exact word sequence while ignoring OCR punctuation noise."""
+
+    def unicode_casefold_with_positions(value: str) -> tuple[str, list[int]]:
+        output: list[str] = []
+        positions: list[int] = []
+        for index, character in enumerate(value):
+            for emitted in unicodedata.normalize("NFKC", character).casefold():
+                output.append(emitted)
+                positions.append(index)
+        return "".join(output), positions
+
+    normalized_target, _target_positions = unicode_casefold_with_positions(target)
+    target_words = [
+        match.group(0) for match in re.finditer(r"[^\W_]+", normalized_target)
+    ]
+    if len(target_words) < 8 or sum(len(word) for word in target_words) < 40:
+        return None
+    normalized_source, source_positions = unicode_casefold_with_positions(source_text)
+    source_matches = list(re.finditer(r"[^\W_]+", normalized_source))
+    source_words = [match.group(0) for match in source_matches]
+    width = len(target_words)
+    for index in range(0, len(source_words) - width + 1):
+        if source_words[index : index + width] != target_words:
+            continue
+        normalized_start = source_matches[index].start()
+        normalized_end = source_matches[index + width - 1].end()
+        if not source_positions or normalized_end <= normalized_start:
+            return None
+        return (
+            source_positions[normalized_start],
+            source_positions[normalized_end - 1] + 1,
+            "ocr_token_sequence",
+        )
+    return None
+
+
+def _quotation_match(
+    source_text: str,
+    target: str,
+    *,
+    allow_ocr_token_sequence: bool = False,
+) -> tuple[int, int, str] | None:
+    """Locate one complete quote with bounded editorial normalization.
+
+    Ellipses must have substantive text on both sides, preventing a short
+    prefix from being treated as a complete-span match.
+    """
+    # First retain a lexical hyphen across a PDF wrap. The historical
+    # dehyphenated alternative remains available for split ordinary words.
+    direct = _normalized_find(source_text, target, preserve_line_hyphens=True)
+    if direct is None:
+        direct = _normalized_find(source_text, target)
+    if direct is not None:
+        raw = source_text[direct[0] : direct[1]]
+        method = "literal" if raw == target else "normalized"
+        return direct[0], direct[1], method
+    if re.search(r"(?<=\w)-\s*\n\s*(?=\w)", target):
+        # Each proven line-wrap hyphen may be lexical or discretionary.
+        # Resolve them independently rather than dropping every hyphen at once.
+        for preserve in (True, False):
+            normalized, positions = _normalized_with_positions(source_text, preserve_line_hyphens=preserve)
+            found = re.search(_literal_quote_pattern(target), normalized)
+            if found and found.end() > found.start():
+                return positions[found.start()], positions[found.end()-1]+1, "linewrap_normalized"
+
+    editorial_target = re.sub(
+        r"\[\s*(?:sic|emphasis\s+added)\s*\]",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    )
+    editorial_target = re.sub(
+        r"\[([^\]]+)\]",
+        lambda match: match.group(1),
+        editorial_target,
+    )
+    if editorial_target != target:
+        bracket_match = _normalized_find(source_text, editorial_target)
+        if bracket_match is not None:
+            return bracket_match[0], bracket_match[1], "bracket_normalized"
+
+    editorial = _marked_editorial_match(source_text, target)
+    if editorial is None and re.search(r"(?<=\w)-\s*\n\s*(?=\w)", target):
+        editorial = _marked_editorial_match(source_text, re.sub(r"(?<=\w)-\s*\n\s*(?=\w)", "", target))
+    if editorial is not None:
+        return editorial
+
+    segments = [
+        segment.strip()
+        for segment in re.split(r"(?:\.(?:\s*\.){2,}|…)", editorial_target)
+        if segment.strip()
+    ]
+    segment_word_counts = [len(_meaningful_tokens(segment)) for segment in segments]
+    if (
+        len(segments) < 2
+        or any(count < 2 for count in segment_word_counts)
+        or sum(segment_word_counts) < 8
+    ):
+        return (
+            _ocr_token_sequence_match(source_text, target)
+            if allow_ocr_token_sequence
+            else None
+        )
+    matched_segments: list[tuple[int, int]] = []
+    cursor = 0
+    for segment in segments:
+        match = _normalized_find(source_text[cursor:], segment)
+        if match is None:
+            return (
+                _ocr_token_sequence_match(source_text, target)
+                if allow_ocr_token_sequence
+                else None
+            )
+        absolute = (cursor + match[0], cursor + match[1])
+        if matched_segments and absolute[0] - matched_segments[-1][1] > 3_000:
+            return None
+        matched_segments.append(absolute)
+        cursor = absolute[1]
+    return matched_segments[0][0], matched_segments[-1][1], "ellipsis_normalized"
+
+
+def _literal_quote_pattern(value: str) -> str:
+    normalized, positions = _normalized_with_positions(value, preserve_line_hyphens=True)
+    return ''.join('-?' if character == '-' and re.match(r'-\s*\n\s*\w', value[positions[index]:]) else re.escape(character)
+                   for index, character in enumerate(normalized))
+
+
+def _marked_editorial_match(source_text: str, target: str) -> tuple[int, int, str] | None:
+    """Match unchanged wording around explicitly marked edits, not their meaning.
+
+    Brackets may insert or replace text; ellipses may omit it. Keep gaps bounded,
+    require substantive unchanged wording, and never tolerate an unmarked edit.
+    The distinct method requires a visible context-review limitation.
+    """
+    marker = re.compile(r"\[[^\[\]]*\]|\.(?:\s*\.){2,}|…")
+    marks = list(marker.finditer(target))
+    if not marks or len(marks) > 12:
+        return None
+    pieces, cursor, literal_words = [], 0, 0
+    has_bracket = False
+    for item in marks:
+        literal = target[cursor:item.start()]
+        literal_words += len(_meaningful_tokens(literal))
+        pieces.append(_literal_quote_pattern(literal))
+        content = item.group()
+        ellipsis = bool(re.fullmatch(r"\[?\s*(?:\.(?:\s*\.){2,}|…)\s*\]?", content))
+        has_bracket |= not ellipsis
+        pieces.append(r".{0,3000}?" if ellipsis else r".{0,160}?")
+        cursor = item.end()
+    tail = target[cursor:]
+    literal_words += len(_meaningful_tokens(tail))
+    pieces.append(_literal_quote_pattern(tail))
+    if literal_words < 8:
+        return None
+    # Leading/trailing editorial marks cannot establish a replacement span;
+    # locate the unchanged wording and show its enclosing source context.
+    if not pieces[0]:
+        pieces = pieces[2:]
+    if pieces and not pieces[-1]:
+        pieces = pieces[:-2]
+    if not pieces or not pieces[0] or not pieces[-1]:
+        return None
+    pattern = re.compile("".join(pieces), re.DOTALL)
+    for preserve_hyphens in (True, False):
+        normalized_source, positions = _normalized_with_positions(source_text, preserve_line_hyphens=preserve_hyphens)
+        match = pattern.search(normalized_source)
+        if match is not None and match.end() > match.start():
+            return positions[match.start()], positions[match.end()-1]+1, (
+                "marked_editorial_match" if has_bracket else "ellipsis_normalized")
+    return None
+
+
+def _quotation_location(
+    pages: list[_SourcePage],
+    target: str,
+    *,
+    allow_ocr_token_sequence: bool = False,
+) -> _QuotationLocation | None:
+    """Locate a quote on one page or across adjacent eligible page blocks."""
+    for page in pages:
+        quotation_match = _quotation_match(
+            page.text,
+            target,
+            allow_ocr_token_sequence=allow_ocr_token_sequence,
+        )
+        if quotation_match is None:
+            continue
+        start, end, method = quotation_match
+        if _structural_role_for_range(page, start, end) in _EXCLUDED_RETRIEVAL_ROLES:
+            continue
+        return _QuotationLocation(
+            fragments=((page.index, start, end),),
+            method=method,
+        )
+
+    eligible_blocks = [
+        (page, start, end, text)
+        for page, start, end, text, role in _source_blocks(pages)
+        if role not in _EXCLUDED_RETRIEVAL_ROLES
+    ]
+    if not eligible_blocks:
+        return None
+
+    virtual_parts: list[tuple[_SourcePage, int, int, int, int]] = []
+    virtual_text_parts: list[str] = []
+    cursor = 0
+    for page, start, end, text in eligible_blocks:
+        if virtual_text_parts:
+            virtual_text_parts.append("\n")
+            cursor += 1
+        virtual_start = cursor
+        virtual_text_parts.append(text)
+        cursor += len(text)
+        virtual_parts.append((page, start, end, virtual_start, cursor))
+    virtual_text = "".join(virtual_text_parts)
+    quotation_match = _quotation_match(
+        virtual_text,
+        target,
+        allow_ocr_token_sequence=allow_ocr_token_sequence,
+    )
+    if quotation_match is None:
+        return None
+    virtual_start, virtual_end, method = quotation_match
+    fragments: list[tuple[int | None, int, int]] = []
+    for page, source_start, _source_end, part_start, part_end in virtual_parts:
+        overlap_start = max(virtual_start, part_start)
+        overlap_end = min(virtual_end, part_end)
+        if overlap_start >= overlap_end:
+            continue
+        fragments.append(
+            (
+                page.index,
+                source_start + overlap_start - part_start,
+                source_start + overlap_end - part_start,
+            )
+        )
+    if len(fragments) < 2:
+        return None
+    page_indices = [page_index for page_index, _start, _end in fragments]
+    concrete_pages = sorted({value for value in page_indices if value is not None})
+    if len(concrete_pages) < 2 or any(
+        following != previous + 1
+        for previous, following in zip(concrete_pages, concrete_pages[1:])
+    ):
+        return None
+    return _QuotationLocation(fragments=tuple(fragments), method=method)
+
+
+def _academic_practice_checks(
+    *,
+    claim: ClaimEvidence,
+    source: AuthorizedRepresentation,
+    pages: list[_SourcePage],
+    passages: list[SourcePassageEvidence],
+) -> tuple[AcademicPracticeCheckEvidence, AcademicPracticeCheckEvidence]:
+    """Check complete quotation spans and only evidence-backed locators."""
+    if claim.claim_type != "quotation":
+        quotation = AcademicPracticeCheckEvidence(
+            status="complete", outcome="not_applicable"
+        )
+        locator = (
+            AcademicPracticeCheckEvidence(
+                status="not_assessable",
+                outcome="paraphrase_locator_requires_relevant_evidence",
+                limitations=[
+                    "A locator on a paraphrase cannot be validated from retrieval rank alone."
+                ],
+            )
+            if claim.page_locator
+            else AcademicPracticeCheckEvidence(
+                status="complete", outcome="not_applicable"
+            )
+        )
+        return quotation, locator
+
+    targets = _quotation_targets(claim.text)
+    if not targets:
+        unresolved = AcademicPracticeCheckEvidence(
+            status="incomplete",
+            outcome="quotation_boundaries_unavailable",
+            limitations=[
+                "The citation was classified as a quotation but no complete double-quoted span was available."
+            ],
+        )
+        locator = (
+            AcademicPracticeCheckEvidence(
+                status="not_assessable",
+                outcome="quotation_not_located",
+            )
+            if claim.page_locator
+            else AcademicPracticeCheckEvidence(status="complete", outcome="not_applicable")
+        )
+        return unresolved, locator
+
+    target_matches: list[_QuotationLocation] = []
+    missing = 0
+    missing_editorial = 0
+    allow_ocr_token_sequence = bool(
+        source.text_quality == "scan_ocr" and source.derivation_method
+    )
+    for target in targets:
+        found = _quotation_location(
+            pages,
+            target,
+            allow_ocr_token_sequence=allow_ocr_token_sequence,
+        )
+        if found is None:
+            missing += 1
+            if re.search(r"\[[^\]]*\]|\.(?:\s*\.){2,}|…", target):
+                missing_editorial += 1
+        else:
+            target_matches.append(found)
+
+    evidence_ids = [
+        passage.passage_id
+        for passage in passages
+        if any(
+            passage.page_index == page_index
+            and passage.character_start <= start
+            and passage.character_end >= end
+            for match in target_matches
+            for page_index, start, end in match.fragments
+        )
+    ]
+    reliable_negative = (
+        source.completeness_verdict in {"complete", "not_applicable"}
+        and source.text_quality in {"digital", "born_digital"}
+    )
+    if missing == 0:
+        if all(match.method == "literal" for match in target_matches):
+            outcome = "all_spans_literal_match"
+        elif any(match.method == "ocr_token_sequence" for match in target_matches):
+            outcome = "all_spans_ocr_token_sequence_match"
+        else:
+            outcome = "all_spans_normalized_match"
+        quotation = AcademicPracticeCheckEvidence(
+            status="complete",
+            outcome=outcome,
+            evidence_passage_ids=evidence_ids,
+            limitations=([
+                "Unchanged quoted wording matches around marked brackets or omissions. The meaning of editorial changes and omitted context requires human review."
+            ] if any(match.method in {"marked_editorial_match", "ellipsis_normalized"} for match in target_matches) else []),
+        )
+    elif missing_editorial == missing:
+        quotation = AcademicPracticeCheckEvidence(
+            status="not_assessable", outcome="marked_editorial_changes_require_review",
+            evidence_passage_ids=evidence_ids,
+            limitations=["Marked quotation edits could not be matched reliably. Compare the unchanged wording and editorial changes with the source; this is not an automatic quotation-fidelity failure."],
+        )
+    elif reliable_negative:
+        quotation = AcademicPracticeCheckEvidence(
+            status="complete",
+            outcome="some_spans_not_located" if target_matches else "no_span_located",
+            evidence_passage_ids=evidence_ids,
+            limitations=[
+                "A non-match establishes only that the complete quoted span was not located in this admitted representation."
+            ],
+        )
+    else:
+        quotation = AcademicPracticeCheckEvidence(
+            status="not_assessable",
+            outcome="inconclusive_source_text_quality_or_coverage",
+            evidence_passage_ids=evidence_ids,
+        )
+
+    version = (
+        (source.edition_or_version or "")
+        .strip()
+        .casefold()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    pagination_may_differ = version in {
+        "acceptedversion",
+        "accepted_version",
+        "accepted_manuscript",
+        "author_accepted_manuscript",
+        "submittedversion",
+        "submitted_version",
+        "submitted_manuscript",
+        "preprint",
+    }
+    if not claim.page_locator:
+        locator = AcademicPracticeCheckEvidence(status="complete", outcome="not_applicable")
+    elif pagination_may_differ:
+        locator = AcademicPracticeCheckEvidence(
+            status="not_assessable",
+            outcome="source_version_pagination_may_differ",
+            evidence_passage_ids=evidence_ids,
+            limitations=[
+                "The available manuscript/preprint may not preserve the published version's pagination."
+            ],
+        )
+    elif not _page_locator_values(claim.page_locator):
+        locator = AcademicPracticeCheckEvidence(
+            status="incomplete", outcome="locator_not_parseable"
+        )
+    elif missing:
+        locator = AcademicPracticeCheckEvidence(
+            status="not_assessable",
+            outcome="quotation_not_fully_located",
+            evidence_passage_ids=evidence_ids,
+        )
+    else:
+        locator_pages = _page_locator_values(claim.page_locator)
+        matched_pages = {
+            page_index
+            for match in target_matches
+            for page_index, _start, _end in match.fragments
+            if page_index is not None
+        }
+        page_labels = {
+            page.index: {
+                int(value) for value in re.findall(r"\d+", page.label or "")
+            }
+            for page in pages
+        }
+        derivative_label_missing = bool(source.derivation_method) and any(
+            not page_labels.get(page_index)
+            for page_index in matched_pages
+            if page_index is not None
+        )
+        if derivative_label_missing:
+            locator = AcademicPracticeCheckEvidence(
+                status="not_assessable",
+                outcome="ocr_page_label_unavailable",
+                evidence_passage_ids=evidence_ids,
+                limitations=[
+                    "The OCR derivative did not preserve a reliable printed-page label for every matched span."
+                ],
+            )
+        else:
+            consistent = bool(matched_pages) and all(
+                (
+                    page_labels.get(page_index)
+                    or ({page_index + 1} if not source.derivation_method else set())
+                )
+                & locator_pages
+                for page_index in matched_pages
+                if page_index is not None
+            )
+            locator = AcademicPracticeCheckEvidence(
+                status="complete",
+                outcome=(
+                    "located_span_matches_supplied_locator"
+                    if consistent
+                    else "located_span_outside_supplied_locator"
+                ),
+                evidence_passage_ids=evidence_ids,
+            )
+    return quotation, locator
+
+
+def _normalized_with_positions(value: str, *, preserve_line_hyphens: bool = False) -> tuple[str, list[int]]:
     output: list[str] = []
     positions: list[int] = []
     index = 0
@@ -2561,6 +4763,9 @@ def _normalized_with_positions(value: str) -> tuple[str, list[int]]:
             while next_index < len(value) and value[next_index].isspace():
                 next_index += 1
             if next_index < len(value) and value[next_index].isalpha():
+                if preserve_line_hyphens:
+                    output.append("-")
+                    positions.append(index)
                 index = next_index
                 continue
         normalized = unicodedata.normalize("NFKC", character).casefold()
@@ -2585,9 +4790,9 @@ def _normalized_with_positions(value: str) -> tuple[str, list[int]]:
     return "".join(output), positions
 
 
-def _normalized_find(source: str, target: str) -> tuple[int, int] | None:
-    normalized_source, positions = _normalized_with_positions(source)
-    normalized_target, _ = _normalized_with_positions(target)
+def _normalized_find(source: str, target: str, *, preserve_line_hyphens: bool = False) -> tuple[int, int] | None:
+    normalized_source, positions = _normalized_with_positions(source, preserve_line_hyphens=preserve_line_hyphens)
+    normalized_target, _ = _normalized_with_positions(target, preserve_line_hyphens=preserve_line_hyphens)
     if not normalized_target:
         return None
     start = normalized_source.find(normalized_target)
@@ -2604,32 +4809,234 @@ def _context_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     bounded_end = len(text) if paragraph_end < 0 else paragraph_end
     if bounded_end - bounded_start <= MAX_PASSAGE_CHARACTERS:
         return bounded_start, bounded_end
-    margin = max(0, (MAX_PASSAGE_CHARACTERS - (end - start)) // 2)
-    return max(0, start - margin), min(len(text), end + margin)
+    local_start = start - bounded_start
+    local_end = end - bounded_start
+    containing = [
+        (window_start, window_end)
+        for window_start, window_end, _window_text in _sentence_complete_windows(
+            text[bounded_start:bounded_end]
+        )
+        if window_start <= local_start and local_end <= window_end
+    ]
+    if containing:
+        window_start, window_end = max(
+            containing,
+            key=lambda bounds: (
+                min(local_start - bounds[0], bounds[1] - local_end),
+                bounds[1] - bounds[0],
+                -bounds[0],
+            ),
+        )
+        return bounded_start + window_start, bounded_start + window_end
+    return start, end
+
+
+def _context_bounds_on_page(
+    page: _SourcePage, start: int, end: int
+) -> tuple[int, int]:
+    """Keep exact-match context inside its current structural/body interval.
+
+    Numbered section headings are hard semantic boundaries for every retrieval
+    channel. Ordinary lexical windows inherit those boundaries from
+    ``_text_blocks``; page-level exact matching must apply the same boundary
+    explicitly.
+    """
+    bounded_start, bounded_end = _context_bounds(page.text, start, end)
+    containing = [
+        span
+        for span in page.structural_spans
+        if span.start <= start and end <= span.end
+    ]
+    if containing:
+        span = min(containing, key=lambda item: item.end - item.start)
+        return max(bounded_start, span.start), min(bounded_end, span.end)
+    left_boundaries = [
+        span.end for span in page.structural_spans if span.end <= start
+    ]
+    right_boundaries = [
+        span.start for span in page.structural_spans if span.start >= end
+    ]
+    if left_boundaries:
+        bounded_start = max(bounded_start, max(left_boundaries))
+    if right_boundaries:
+        bounded_end = min(bounded_end, min(right_boundaries))
+
+    numbered_headings = list(_NUMBERED_SECTION_HEADING_LINE.finditer(page.text))
+    prior_headings = [
+        heading.start()
+        for heading in numbered_headings
+        if heading.start() <= start
+    ]
+    following_headings = [
+        heading.start()
+        for heading in numbered_headings
+        if heading.start() >= end
+    ]
+    if prior_headings:
+        bounded_start = max(bounded_start, max(prior_headings))
+    if following_headings:
+        bounded_end = min(bounded_end, min(following_headings))
+    return bounded_start, bounded_end
+
+
+def _exact_sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Map the shared sentence splitter's output back to exact source offsets."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for sentence in split_sentences(text):
+        start = text.find(sentence, cursor)
+        if start < 0:
+            # Binary/control debris in a PDF footer can be transformed by the
+            # shared splitter's abbreviation placeholders. Keep the exact
+            # body sentences already recovered rather than discarding the
+            # entire page or manufacturing coordinates for the damaged tail.
+            break
+        end = start + len(sentence)
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def _sentence_complete_windows(text: str) -> list[tuple[int, int, str]]:
+    """Build overlapping bounded windows that begin and end on sentences.
+
+    PDF extraction often represents visual lines rather than paragraphs. A
+    disjoint character window can therefore split the most relevant paragraph
+    and leave retrieval with only its tail. Two-thirds sentence-aligned overlap
+    ensures that an ordinary paragraph up to roughly 1,200 characters can
+    appear intact in at least one 1,800-character retrieval window.
+    """
+    spans = _exact_sentence_spans(text)
+    if not spans:
+        return []
+    bounded_spans: list[tuple[int, int]] = []
+    for start, end in spans:
+        if end - start <= MAX_PASSAGE_CHARACTERS:
+            bounded_spans.append((start, end))
+            continue
+        # A PDF/OCR text layer can expose several thousand characters as one
+        # sentence. Preserve exact coordinates and the hard passage contract by
+        # splitting only this pathological span at the latest available clause
+        # or word boundary. Ordinary sentences remain whole.
+        fragment_start = start
+        while fragment_start < end:
+            hard_end = min(fragment_start + MAX_PASSAGE_CHARACTERS, end)
+            fragment_end = hard_end
+            if hard_end < end:
+                bounded = text[fragment_start:hard_end]
+                clause_breaks = [match.end() for match in re.finditer(r"[;:]\s+", bounded)]
+                word_breaks = [match.start() for match in re.finditer(r"\s+", bounded)]
+                candidates = [
+                    offset
+                    for offset in clause_breaks + word_breaks
+                    if offset >= MAX_PASSAGE_CHARACTERS // 2
+                ]
+                if candidates:
+                    fragment_end = fragment_start + max(candidates)
+            if fragment_end <= fragment_start:
+                fragment_end = hard_end
+            bounded_spans.append((fragment_start, fragment_end))
+            fragment_start = fragment_end
+    spans = bounded_spans
+    windows: list[tuple[int, int, str]] = []
+    start_index = 0
+    while start_index < len(spans):
+        start = spans[start_index][0]
+        end_index = start_index
+        while (
+            end_index + 1 < len(spans)
+            and spans[end_index + 1][1] - start <= MAX_PASSAGE_CHARACTERS
+        ):
+            end_index += 1
+        end = spans[end_index][1]
+        windows.append((start, end, text[start:end]))
+        if end_index == len(spans) - 1:
+            break
+        threshold = start + PASSAGE_WINDOW_STRIDE_CHARACTERS
+        next_index = start_index + 1
+        while next_index < len(spans) and spans[next_index][0] < threshold:
+            next_index += 1
+        start_index = min(next_index, end_index + 1)
+    return windows
 
 
 def _text_blocks(text: str) -> list[tuple[int, int, str]]:
+    raw_blocks: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"\S(?:.*?\S)?(?=\n\s*\n|\s*\Z)", text, re.DOTALL
+    ):
+        start, end = match.start(), match.end()
+        section_starts = [
+            start + heading.start()
+            for heading in _NUMBERED_SECTION_HEADING_LINE.finditer(text[start:end])
+            if heading.start() > 0
+        ]
+        cursor = start
+        for section_start in section_starts:
+            boundary = section_start
+            while boundary > cursor and text[boundary - 1].isspace():
+                boundary -= 1
+            if boundary > cursor:
+                raw_blocks.append((cursor, boundary))
+            cursor = section_start
+        if cursor < end:
+            raw_blocks.append((cursor, end))
+    merged_blocks: list[tuple[int, int]] = []
+    for start, end in raw_blocks:
+        if merged_blocks:
+            prior_start, prior_end = merged_blocks[-1]
+            prior_text = text[prior_start:prior_end].strip()
+            current_text = text[start:end].strip()
+            if (
+                prior_text
+                and current_text
+                and not re.search(r"[.!?][\"')\]]*\s*$", prior_text)
+                and re.match(r"^[\"'(\[]*[a-z]", current_text)
+                and not text[prior_end:start].strip()
+            ):
+                # PDF block/column boundaries sometimes bisect a sentence. The
+                # exact whitespace gap remains part of the merged coordinate
+                # range; completed sentences and uppercase paragraph starts do
+                # not merge.
+                merged_blocks[-1] = (prior_start, end)
+                continue
+        merged_blocks.append((start, end))
+
     blocks: list[tuple[int, int, str]] = []
-    for match in re.finditer(r"\S(?:.*?\S)?(?=\n\s*\n|\s*\Z)", text, re.DOTALL):
-        start, end = match.span()
-        block = match.group(0)
+    for start, end in merged_blocks:
+        block = text[start:end]
         if len(block) <= MAX_PASSAGE_CHARACTERS:
             blocks.append((start, end, block))
             continue
-        cursor = 0
-        while cursor < len(block):
-            chunk_end = min(len(block), cursor + MAX_PASSAGE_CHARACTERS)
-            if chunk_end < len(block):
-                boundary = max(
-                    block.rfind(". ", cursor, chunk_end),
-                    block.rfind("\n", cursor, chunk_end),
-                )
-                if boundary > cursor + MAX_PASSAGE_CHARACTERS // 2:
-                    chunk_end = boundary + 1
-            chunk = block[cursor:chunk_end]
-            blocks.append((start + cursor, start + chunk_end, chunk))
-            cursor = chunk_end
+        windows = _sentence_complete_windows(block)
+        if windows:
+            blocks.extend(
+                (start + window_start, start + window_end, window_text)
+                for window_start, window_end, window_text in windows
+            )
     return blocks
+
+
+def _page_text_blocks(
+    page: _SourcePage,
+) -> list[tuple[int, int, str, str | None]]:
+    """Split body intervals while retaining classified exact structural spans."""
+    output: list[tuple[int, int, str, str | None]] = []
+    cursor = 0
+    for span in sorted(page.structural_spans, key=lambda item: (item.start, item.end)):
+        if span.start < cursor or span.end > len(page.text):
+            continue
+        if cursor < span.start:
+            for start, end, text in _text_blocks(page.text[cursor:span.start]):
+                output.append((cursor + start, cursor + end, text, None))
+        structural_text = page.text[span.start:span.end]
+        if structural_text.strip():
+            output.append((span.start, span.end, structural_text, span.role))
+        cursor = span.end
+    if cursor < len(page.text):
+        for start, end, text in _text_blocks(page.text[cursor:]):
+            output.append((cursor + start, cursor + end, text, None))
+    return output
 
 
 def _source_blocks(
@@ -2637,17 +5044,32 @@ def _source_blocks(
 ) -> list[tuple[_SourcePage, int, int, str, str]]:
     """Return exact blocks with document-aware structural roles.
 
-    Once an explicit reference heading is encountered, later blocks and pages
-    remain reference-list material. This catches reference entries separated by
-    blank lines without treating citation-dense body prose as bibliography.
+    A reference heading starts a reference section only when at least one
+    entry-shaped line follows it on the same page. This prevents a table of
+    contents entry from excluding the rest of a book or report. Continuation is
+    also page-bounded: later pages remain reference material only while they
+    contain entry-shaped lines, so a chapter bibliography cannot swallow the
+    chapters that follow it.
     """
     output = []
     reference_section_started = False
     for page in pages:
         reference_heading = _REFERENCE_HEADING.search(page.text)
-        for start, end, block_text in _text_blocks(page.text):
+        reference_entries = len(_REFERENCE_ENTRY_LINE.findall(page.text))
+        heading_starts_section = bool(
+            reference_heading is not None
+            and _REFERENCE_ENTRY_LINE.search(page.text[reference_heading.end() :])
+        )
+        reference_continuation = bool(
+            reference_section_started and reference_entries >= 1
+        )
+        page_is_reference_section = heading_starts_section or reference_continuation
+        for start, end, block_text, structural_role in _page_text_blocks(page):
+            if structural_role is not None:
+                output.append((page, start, end, block_text, structural_role))
+                continue
             if (
-                not reference_section_started
+                heading_starts_section
                 and reference_heading is not None
                 and start < reference_heading.start() < end
             ):
@@ -2672,15 +5094,14 @@ def _source_blocks(
                     (page, reference_start, end, reference_text, "reference_list")
                 )
                 continue
-            if reference_section_started or (
-                reference_heading is not None and end > reference_heading.start()
+            if page_is_reference_section and (
+                reference_heading is None or end > reference_heading.start()
             ):
                 role = "reference_list"
             else:
                 role = passage_role_from_text(block_text)
             output.append((page, start, end, block_text, role))
-        if reference_heading is not None:
-            reference_section_started = True
+        reference_section_started = page_is_reference_section
     return output
 
 

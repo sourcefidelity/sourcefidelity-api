@@ -366,7 +366,10 @@ def atomize_claim_unit(
     try:
         return _llm_atomization(claim, deterministic)
     except Exception as exc:
-        logger.warning("Claim atomization LLM fallback failed: %s", exc)
+        logger.warning(
+            "Claim atomization LLM fallback failed (type=%s)",
+            type(exc).__name__,
+        )
         return AtomizationArtifact(
             parent_claim_id=claim.claim_id,
             method="safe_fallback",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
@@ -11,10 +12,11 @@ import uuid
 import zipfile
 
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.models.job import Job, JobStage, JobStatus
+from app.services.paper_dispatch import prepare_dispatch, job_execution_lock, WorkflowBusy
 from app.services.file_safety import (
     FileSafetyUnavailable,
     SafetyVerdict,
@@ -26,6 +28,8 @@ from app.services.paper_retention import (
     resolve_paper_retention_policy,
 )
 from app.services.storage.backend import StorageBackend
+from app.services.upload_completion import upload_confirmed, next_check, due_clause
+from app.services.workflow_execution import WorkflowOwnershipLost, stage_execution
 
 
 PAPER_UPLOAD_POLICY_VERSION = "paper-upload-v1"
@@ -49,6 +53,26 @@ class PaperUploadError(ValueError):
         self.code = code
 
 
+@contextmanager
+def _owned_job_session(session, job_id):
+    """Intake and scheduled cleanup must write on their lock connection."""
+    if session.get_bind().dialect.name != "postgresql":
+        yield session
+        return
+    if session.new or session.dirty or session.deleted:
+        raise RuntimeError("Commit pending changes before acquiring a paper input")
+    session.rollback()
+    try:
+        with job_execution_lock(session, str(job_id)) as connection:
+            factory = sessionmaker(bind=connection, class_=type(session),
+                expire_on_commit=session.expire_on_commit, autoflush=session.autoflush)
+            with stage_execution(connection, factory) as owner:
+                with owner.session_factory() as owned:
+                    yield owned
+    finally:
+        session.expire_all()
+
+
 def inspect_paper_upload(content: bytes, *, filename: str, media_type: str) -> dict:
     """Return bounded safety evidence or reject before object storage."""
     expected_suffix = ALLOWED_MEDIA_TYPES.get(media_type)
@@ -65,7 +89,9 @@ def inspect_paper_upload(content: bytes, *, filename: str, media_type: str) -> d
         try:
             report = inspect_uploaded_pdf(content)
         except FileSafetyUnavailable as exc:
-            raise PaperUploadError("malware_scan_unavailable", str(exc)) from exc
+            raise PaperUploadError(
+                "malware_scan_unavailable", "Malware scanner is unavailable"
+            ) from exc
         if report.verdict is SafetyVerdict.REJECTED:
             raise PaperUploadError(
                 "unsafe_pdf",
@@ -83,8 +109,11 @@ def inspect_paper_upload(content: bytes, *, filename: str, media_type: str) -> d
         malware_verdict, scanner_detail = scan_with_clamd(content)
     except FileSafetyUnavailable as exc:
         if settings.MALWARE_SCAN_REQUIRED:
-            raise PaperUploadError("malware_scan_unavailable", str(exc)) from exc
-        malware_verdict, scanner_detail = SafetyVerdict.NOT_ASSESSED, str(exc)
+            raise PaperUploadError(
+                "malware_scan_unavailable", "Malware scanner is unavailable"
+            ) from exc
+        malware_verdict = SafetyVerdict.NOT_ASSESSED
+        scanner_detail = "malware_scanner_unavailable"
     if malware_verdict is SafetyVerdict.REJECTED:
         raise PaperUploadError("malware_rejected", "Malware scanner rejected the paper")
     if malware_verdict is SafetyVerdict.UNAVAILABLE and settings.MALWARE_SCAN_REQUIRED:
@@ -122,6 +151,8 @@ def create_paper_job(
         raise PaperUploadError(exc.code, str(exc)) from exc
     evidence["paper_retention_mode"] = retention_policy.mode.value
     evidence["paper_retention_policy_version"] = "paper-retention-v1"
+    evidence["paper_input_upload_state"] = "pending"
+    evidence["input_upload_confirmed"] = False
     normalized_scope = scope_type.strip().casefold()
     normalized_id = scope_id.strip()
     if normalized_scope not in {
@@ -152,23 +183,33 @@ def create_paper_job(
         created_at=current,
         updated_at=current,
     )
-    session.add(job)
-    session.commit()
     try:
-        backend.upload(content, key)
-    except Exception as exc:
-        job.status = JobStatus.FAILED
-        job.stage = JobStage.FAILED
-        job.error_message = "paper_object_upload_failed"
-        job.updated_at = datetime.now(timezone.utc)
-        session.commit()
-        raise PaperUploadError("storage_unavailable", "Paper storage was unavailable") from exc
-    return job
+        with _owned_job_session(session, job_id) as owned:
+            owned.add(job)
+            owned.commit()
+            try:
+                receipt = backend.upload(content, key)
+            except Exception as exc:
+                job.status = JobStatus.FAILED
+                job.stage = JobStage.FAILED
+                job.error_message = "paper_object_upload_failed"
+                job.updated_at = datetime.now(timezone.utc)
+                owned.commit()
+                raise PaperUploadError("storage_unavailable", "Paper storage was unavailable") from exc
+            job.upload_evidence = {**job.upload_evidence, "input_upload_confirmed": upload_confirmed(receipt)}
+            owned.commit()  # Survives exit before scheduling-intent commit.
+            job.upload_evidence = {**job.upload_evidence, "paper_input_upload_state": "ready"}
+            prepare_dispatch(job)
+            owned.commit()
+    except WorkflowOwnershipLost as exc:
+        raise PaperUploadError("storage_unavailable", "Paper upload was interrupted; it was not queued") from exc
+    return session.get(Job, job_id)
 
 
 def load_paper_job_input(session: Session, backend: StorageBackend, job_id) -> tuple[Job, bytes]:
     job = _job(session, job_id)
-    if not job.input_storage_key or job.input_deleted_at is not None:
+    if (not job.input_storage_key or job.input_deleted_at is not None
+            or (job.upload_evidence or {}).get("input_cleanup_started")):
         raise PaperUploadError("paper_input_unavailable", "Temporary paper input is unavailable")
     try:
         content = backend.download(job.input_storage_key)
@@ -190,6 +231,9 @@ def cleanup_paper_job_input(
     if job.input_deleted_at is not None or not job.input_storage_key:
         return True
     key = job.input_storage_key
+    job.upload_evidence = {**{name: value for name, value in (job.upload_evidence or {}).items()
+        if name != "input_cleanup_next_check_at"}, "input_cleanup_started": True}
+    session.commit()  # A retained watch must never reopen a failed/expired input.
     try:
         deleted = backend.delete(key)
         absent = not backend.exists(key)
@@ -197,6 +241,13 @@ def cleanup_paper_job_input(
         deleted = absent = False
     if not deleted or not absent:
         job.error_message = job.error_message or "paper_input_cleanup_pending"
+        job.updated_at = _as_utc(now or datetime.now(timezone.utc))
+        session.commit()
+        return False
+    if (job.upload_evidence or {}).get("input_upload_confirmed") is not True:
+        job.upload_evidence = {**job.upload_evidence,
+            "input_cleanup_status": "upload_completion_unresolved",
+            "input_cleanup_next_check_at": next_check(job.created_at, now or datetime.now(timezone.utc))}
         job.updated_at = _as_utc(now or datetime.now(timezone.utc))
         session.commit()
         return False
@@ -215,21 +266,40 @@ def cleanup_stale_paper_job_inputs(
     batch_size: int = 100,
 ) -> dict[str, int]:
     current = _as_utc(now or datetime.now(timezone.utc))
-    jobs = session.scalars(
-        select(Job)
+    eligible = (
+        Job.input_storage_key.is_not(None),
+        Job.input_deleted_at.is_(None),
+        or_(Job.status.in_({JobStatus.COMPLETED, JobStatus.FAILED}), Job.input_expires_at <= current),
+        due_clause(Job.upload_evidence["input_cleanup_next_check_at"], current),
+    )
+    job_ids = session.scalars(
+        select(Job.id)
         .where(
-            Job.input_storage_key.is_not(None),
-            Job.input_deleted_at.is_(None),
-            or_(
-                Job.status.in_({JobStatus.COMPLETED, JobStatus.FAILED}),
-                Job.input_expires_at <= current,
-            ),
+            *eligible,
         )
         .order_by(Job.created_at)
         .limit(max(1, min(batch_size, 1_000)))
     ).all()
-    cleaned = sum(cleanup_paper_job_input(session, backend, job.id, now=current) for job in jobs)
-    return {"jobs_cleaned": cleaned, "jobs_pending": len(jobs) - cleaned}
+    cleaned = 0
+    for job_id in job_ids:
+        try:
+            with _owned_job_session(session, job_id) as owned:
+                job = owned.scalar(select(Job).where(Job.id == job_id, *eligible)
+                                     .with_for_update(skip_locked=True)
+                                     .execution_options(populate_existing=True))
+                if job is None:
+                    owned.rollback()
+                    continue
+                if (job.status == JobStatus.PENDING
+                        and (job.upload_evidence or {}).get("paper_input_upload_state") == "pending"):
+                    job.status = JobStatus.FAILED
+                    job.stage = JobStage.FAILED
+                    job.error_message = "paper_upload_interrupted"
+                result = cleanup_paper_job_input(owned, backend, job.id, now=current)
+            cleaned += result
+        except (WorkflowBusy, WorkflowOwnershipLost):
+            session.rollback()
+    return {"jobs_cleaned": cleaned, "jobs_pending": len(job_ids) - cleaned}
 
 
 def _inspect_docx_archive(content: bytes) -> dict:

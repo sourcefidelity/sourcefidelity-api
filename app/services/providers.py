@@ -33,6 +33,8 @@ Usage:
 """
 
 import logging
+
+from app.log_safety import private_value_id
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -185,5 +187,9 @@ def get_provider_config(
     if "ollama" in base_url.lower() or "localhost:11434" in base_url.lower():
         return _PROVIDERS["llama"]  # treat as local, conservative
 
-    logger.debug("Unknown LLM provider for model=%s, base_url=%s — using default", model, base_url)
+    logger.debug(
+        "Unknown LLM provider for model=%s, %s — using default",
+        model,
+        private_value_id("base_url", base_url),
+    )
     return _DEFAULT_CONFIG

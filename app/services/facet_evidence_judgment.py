@@ -52,7 +52,7 @@ from app.services.verification_evidence import (
 
 
 FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v10"
-FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v4"
+FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v5"
 MAX_EVIDENCE_SENTENCES_PER_CANDIDATE = 24
 
 _SYSTEM_PROMPT = """Map fixed student facet IDs to fixed source-sentence IDs.
@@ -64,13 +64,24 @@ or unresolved) and exactly one mapping per facet_id. Each mapping has facet_id,
 direction (supports, contradicts, qualifies, mixed, none, uncertain), confidence
 (high, medium, low, none), evidence_sentence_ids, rationale, and limitations.
 
-Directions: supports establishes the facet; contradicts establishes an
-incompatible proposition; qualifies establishes the same central proposition
-but narrows, conditions, or establishes only a material part; mixed has supplied
-evidence in incompatible directions; none has no evidentiary source sentence;
-uncertain cannot be resolved safely. Mere topical overlap, related examples,
-plausibility, or a different actor/domain are none, not qualifies. Equivalent
-wording can fully support; do not downgrade only because syntax or synonyms differ.
+Directions: supports establishes the facet and every material level of analysis,
+outcome, polarity, modality, quantity, frequency, and condition; contradicts
+establishes an incompatible proposition; qualifies establishes the same central
+proposition but narrows, conditions, or establishes only a material part; mixed
+has supplied evidence in incompatible directions; none has no materially relevant
+evidentiary source sentence; uncertain has materially relevant supplied evidence
+but cannot support a stable direction safely. Mere topical overlap, related
+examples, plausibility, or a different actor/domain are none, not uncertain or
+qualifies. Equivalent wording can fully support; do not downgrade only because
+syntax or synonyms differ.
+
+Do not infer a national result from a global result, one outcome measure from a
+different measure, or cannot/must/always/usually from weaker directional evidence.
+If the central relation is established but one of those material constraints is
+not, use qualifies. If evidence bears on the same material semantic dimension but
+an underspecified term or evidence compatible with multiple relationships prevents
+a stable direction, use uncertain and cite the evidence. Broad subject similarity
+without that material connection is none.
 
 candidate_as_written controls the result and includes every material detail,
 scope, quantity, condition, mechanism, and consequence. If one material part is
@@ -108,9 +119,10 @@ Student citation/context may clarify meaning but is never source evidence. If
 requires_antecedent_context is true, echo resolved only for the supplied exact
 local resolution; otherwise return ambiguous/unresolved and map every facet to
 uncertain with no evidence IDs. If false, context_resolution is not_required.
-supports, contradicts, qualifies, and mixed require supplied evidence IDs; none
-has none. Return no prose outside JSON. Rationale <=240 characters; <=2 short
-limitations per mapping."""
+supports, contradicts, qualifies, mixed, and evidence-related uncertain require
+supplied evidence IDs; none has none. Only unresolved/ambiguous student context may
+use uncertain without evidence IDs. Return no prose outside JSON. Rationale <=240
+characters; <=2 short limitations per mapping."""
 
 
 class _MappingResponse(BaseModel):
@@ -209,6 +221,26 @@ _DOCUMENT_AUTHOR_ASSERTION_CUE = re.compile(
 
 
 def attach_facet_evidence_foundation(
+    artifact: VerificationEvidenceArtifact,
+) -> VerificationEvidenceArtifact:
+    # Optional relationship inputs must not gate the authoritative evidence
+    # package. Do not truncate an over-budget sentence or coalesced span.
+    try:
+        return _build_facet_evidence_foundation(artifact)
+    except _EvidenceSentenceBudgetExceeded:
+        return _foundation_not_assessed(
+            artifact,
+            "source_sentence_budget_exceeded",
+            "An exact source span exceeds the optional facet-analysis text bound; "
+            "retrieved passages remain available without facet assessment.",
+        )
+
+
+class _EvidenceSentenceBudgetExceeded(ValueError):
+    """An exact span cannot enter the bounded optional sentence contract."""
+
+
+def _build_facet_evidence_foundation(
     artifact: VerificationEvidenceArtifact,
 ) -> VerificationEvidenceArtifact:
     """Attach exact facets and sentence-like evidence spans without a model."""
@@ -988,6 +1020,8 @@ def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
     sentences = []
     for start, end in spans:
         exact = text[start:end]
+        if len(exact) > 2_000:
+            raise _EvidenceSentenceBudgetExceeded
         sentence_id = _stable_id(
             FACET_FOUNDATION_VERSION,
             passage.passage_id,
@@ -1048,6 +1082,8 @@ def _bounded_evidence_sentences(
             start = first.passage_start
             end = last.passage_end
             exact = passage.text[start:end]
+            if len(exact) > 2_000:
+                raise _EvidenceSentenceBudgetExceeded
             compacted.append(
                 SourceEvidenceSentence(
                     sentence_id=_stable_id(
@@ -1203,6 +1239,8 @@ def _validated_mappings(bundle, response):
             raise ValueError("evidence sentence ID mismatch")
         if item.direction in {"supports", "contradicts", "qualifies", "mixed"} and not sentence_ids:
             raise ValueError("evidentiary direction omitted evidence")
+        if item.direction == "uncertain" and not sentence_ids:
+            raise ValueError("evidence-related uncertainty omitted evidence")
         if item.direction == "none" and sentence_ids:
             raise ValueError("none direction carried evidence")
         mappings.append(

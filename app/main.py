@@ -4,6 +4,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.log_safety import configure_sensitive_transport_logging
+
+configure_sensitive_transport_logging()
+
 from app.routers import health, check, status, report, sources
 
 app = FastAPI(
@@ -14,11 +18,17 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS – allow Moodle plugin and other origins
+# Cross-origin API access is an explicit deployment allowlist. Moodle deep
+# links are ordinary navigation and do not require permissive CORS.
+allowed_origins = [
+    value.strip()
+    for value in settings.CORS_ALLOWED_ORIGINS.split(",")
+    if value.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

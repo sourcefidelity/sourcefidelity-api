@@ -18,10 +18,11 @@ that plain ``httpx.get(url, follow_redirects=True)`` does not:
    IP check on each ``Location``. This blocks the common "external URL that
    302s to an internal host" attack and prevents redirect loops.
 
-Residual risk: a narrow DNS-rebinding TOCTOU window remains between resolve
-and connect; fully closing it needs connect-time IP pinning, which httpx does
-not expose over TLS. This is consistent with the threat model (untrusted
-student/search URLs, not a network-level adversary on the wire).
+The connected peer is checked before response bytes are consumed. This closes
+the response-disclosure side of DNS rebinding even when the resolver answer
+changes between validation and connection. Production deployments should still
+enforce the same policy at the egress layer because an HTTP request reaches the
+peer before a userspace client can inspect the connected socket.
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ def _validate_host(host: str) -> None:
 
     host = host.lower()
     if host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
-        raise UnsafeUrlError(f"blocked host: {host}")
+        raise UnsafeUrlError("blocked local host")
 
     # IP literal (e.g. http://10.0.0.1/ or http://[::1]/)
     try:
@@ -149,7 +150,7 @@ def _validate_host(host: str) -> None:
         ip = None
     if ip is not None:
         if _is_blocked_ip(ip):
-            raise UnsafeUrlError(f"blocked IP literal: {ip}")
+            raise UnsafeUrlError("blocked non-public IP literal")
         return
 
     # Hostname — resolve and check EVERY returned address. If any is
@@ -157,8 +158,8 @@ def _validate_host(host: str) -> None:
     # is treated as blocked).
     try:
         infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as e:
-        raise UnsafeUrlError(f"cannot resolve host {host}: {e}") from e
+    except socket.gaierror as exc:
+        raise UnsafeUrlError("cannot resolve public host") from exc
 
     checked = 0
     for _family, _type, _proto, _canon, sockaddr in infos:
@@ -169,9 +170,9 @@ def _validate_host(host: str) -> None:
             continue
         checked += 1
         if _is_blocked_ip(ip):
-            raise UnsafeUrlError(f"host {host} resolves to non-public IP {ip}")
+            raise UnsafeUrlError("hostname resolves to a non-public IP")
     if checked == 0:
-        raise UnsafeUrlError(f"host {host} did not resolve to any usable address")
+        raise UnsafeUrlError("hostname did not resolve to a usable address")
 
 
 def _validate_url(url: str) -> None:
@@ -180,7 +181,50 @@ def _validate_url(url: str) -> None:
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
         raise UnsafeUrlError(f"blocked scheme: {scheme!r}")
+    if parsed.userinfo:
+        raise UnsafeUrlError("URL credentials are not permitted")
     _validate_host(parsed.host)
+
+
+def trusted_url_matches_prefix(url: str, trust_prefix: str) -> bool:
+    """Match an operator prefix without allowing userinfo/origin confusion."""
+    try:
+        candidate = httpx.URL(url)
+        trusted = httpx.URL(trust_prefix)
+    except Exception:
+        return False
+    if candidate.userinfo or trusted.userinfo:
+        return False
+    if (
+        candidate.scheme.lower(),
+        candidate.host.lower(),
+        candidate.port,
+    ) != (
+        trusted.scheme.lower(),
+        trusted.host.lower(),
+        trusted.port,
+    ):
+        return False
+    return str(candidate).startswith(str(trusted))
+
+
+def _validate_connected_peer(response: httpx.Response, *, trusted: bool) -> None:
+    """Reject a non-public connected peer before reading its response body."""
+    if trusted:
+        return
+    stream = response.extensions.get("network_stream")
+    if stream is None or not hasattr(stream, "get_extra_info"):
+        return
+    address = stream.get_extra_info("server_addr")
+    if not address:
+        return
+    raw_ip = address[0] if isinstance(address, tuple) else address
+    try:
+        connected_ip = ipaddress.ip_address(str(raw_ip))
+    except ValueError:
+        raise UnsafeUrlError("connected peer address is invalid") from None
+    if _is_blocked_ip(connected_ip):
+        raise UnsafeUrlError("connected peer is a non-public address")
 
 
 # ── Public API ───────────────────────────────────────────────────────────
@@ -241,25 +285,27 @@ def safe_request(
         while True:
             # Only the very first hop may be a trusted operator host; every
             # redirect target is re-validated regardless of trust_prefix.
-            if (
+            trusted_first_hop = bool(
                 redirect_count == 0
                 and meta_refresh_count == 0
                 and trust_prefix
-                and current.startswith(trust_prefix)
-            ):
-                logger.debug("safe_request: trusting operator host for first hop (%s)", current[:60])
+                and trusted_url_matches_prefix(current, trust_prefix)
+            )
+            if trusted_first_hop:
+                logger.debug("safe_request: using trusted operator origin for first hop")
             else:
                 _validate_url(current)
             with client.stream(method, current, headers=merged_headers) as resp:
+                _validate_connected_peer(resp, trusted=trusted_first_hop)
                 if resp.status_code in _REDIRECT_CODES:
                     location = resp.headers.get("location")
                     if not location:
-                        raise UnsafeUrlError(f"redirect with no Location header from {current[:60]}")
+                        raise UnsafeUrlError("redirect response omitted its target")
                     current = str(httpx.URL(current).join(location))
                     redirect_count += 1
                     if redirect_count > max_redirects:
                         raise httpx.TooManyRedirects(
-                            f"exceeded {max_redirects} redirects (last target: {current[:60]})",
+                            f"exceeded the {max_redirects}-redirect safety limit",
                             request=resp.request,
                         )
                     continue
@@ -270,7 +316,7 @@ def safe_request(
                     buf.extend(chunk)
                     if len(buf) > max_bytes:
                         raise ResponseTooLargeError(
-                            f"response exceeded {max_bytes} bytes from {current[:60]}"
+                            f"response exceeded the {max_bytes}-byte safety limit"
                         )
                 if raise_on_status:
                     resp.raise_for_status()
@@ -286,8 +332,7 @@ def safe_request(
                         meta_refresh_count += 1
                         current = refresh_url
                         logger.debug(
-                            "safe_request: following bounded same-session meta refresh (%s)",
-                            current[:60],
+                            "safe_request: following bounded same-session meta refresh",
                         )
                         continue
                 return resp
@@ -320,7 +365,5 @@ def safe_fetch_bytes(
         ct = resp.headers.get("content-type", "").lower()
         allowed = [a.lower() for a in accept_content_types]
         if not (any(a in ct for a in allowed) or "octet-stream" in ct):
-            raise ValueError(
-                f"unexpected content-type {ct!r} (want one of {allowed}) from {url[:60]}"
-            )
+            raise ValueError("response content type is not permitted for this route")
     return resp.content

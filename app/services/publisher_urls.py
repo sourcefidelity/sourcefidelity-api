@@ -18,6 +18,8 @@ import logging
 
 import httpx
 
+from app.log_safety import private_value_id
+
 from app.services.safe_fetch import safe_fetch_bytes
 
 logger = logging.getLogger(__name__)
@@ -131,9 +133,17 @@ def try_download_publisher_pdf(
                 headers=_BROWSER_HEADERS,
             )
             if data.startswith(PDF_MAGIC):
-                logger.info("Downloaded publisher PDF from %s (%d bytes)", url[:60], len(data))
+                logger.info(
+                    "Downloaded publisher PDF from %s (%d bytes)",
+                    private_value_id("url", url),
+                    len(data),
+                )
                 return data
         except Exception as e:
-            logger.debug("Publisher PDF download failed for %s: %s", url[:60], e)
+            logger.debug(
+                "Publisher PDF download failed for %s: %s",
+                private_value_id("url", url),
+                type(e).__name__,
+            )
 
     return None

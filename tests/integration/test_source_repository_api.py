@@ -25,7 +25,7 @@ class MemoryStorage(StorageBackend):
         self.objects: dict[str, bytes] = {}
 
     def upload(self, file_bytes: bytes, key: str) -> str:
-        self.objects.setdefault(key, file_bytes)
+        self.objects[key] = file_bytes
         return key
 
     def download(self, key: str) -> bytes:
@@ -45,6 +45,7 @@ class MemoryStorage(StorageBackend):
 
 
 def test_upload_search_and_delete_use_durable_records(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_local")
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -92,6 +93,7 @@ def test_upload_search_and_delete_use_durable_records(monkeypatch) -> None:
                 "author": "A. Author",
                 "year": "2026",
                 "source_kind": "journal_article",
+                "edition_or_version": "author_accepted_manuscript",
             },
         }
 
@@ -140,14 +142,19 @@ def test_upload_search_and_delete_use_durable_records(monkeypatch) -> None:
         assert document["admission_state"] == "needs_review"
         assert document["cleanliness_verdict"] == "clean"
         assert document["retention_mode"] == "durable"
-        assert document["s3_key"].startswith("commercial_user_upload/")
-        assert document["s3_key"] in storage.objects
+        assert document["edition_or_version"] == "author_accepted_manuscript"
+        assert "s3_key" not in document
+        assert "scope_type" not in document
+        assert "scope_id" not in document
+        assert len(storage.objects) == 1
+        assert next(iter(storage.objects)).startswith("commercial_user_upload/")
         assert upload.json()["source_kind"] == "journal_article"
 
         with sessions() as session:
             persisted = session.scalar(select(SourceRepresentationRecord))
             assert persisted is not None
             assert persisted.scope_id == "test-owner"
+            assert persisted.edition_or_version == "author_accepted_manuscript"
 
         search = client.get("/sources/search", params={"doi": "10.5555/durable-api"})
         assert search.status_code == 200

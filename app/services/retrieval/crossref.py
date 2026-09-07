@@ -10,6 +10,7 @@ import logging
 import httpx
 
 from app.config import settings
+from app.log_safety import safe_exception_code
 from app.services.retrieval.base import (
     AcquisitionLocation,
     RepresentationKind,
@@ -76,8 +77,9 @@ class CrossrefRetriever(RetrievalSource):
             data = resp.json()
             return self._parse_message(data.get("message", {}))
         except Exception as e:
-            logger.warning("Crossref DOI search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("Crossref DOI search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def search_by_title_author(self, title: str, author: str | None = None) -> RetrievalResult:
         try:
@@ -93,8 +95,9 @@ class CrossrefRetriever(RetrievalSource):
                 return RetrievalResult(source_name=self.name, success=False, error="No results")
             return self._parse_message(items[0])
         except Exception as e:
-            logger.warning("Crossref title search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("Crossref title search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def search_by_isbn(self, isbn: str) -> RetrievalResult:
         """Search for a book by ISBN.
@@ -113,8 +116,9 @@ class CrossrefRetriever(RetrievalSource):
                 return RetrievalResult(source_name=self.name, success=False, error="Not found")
             return self._parse_message(items[0])
         except Exception as e:
-            logger.warning("Crossref ISBN search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e))
+            error = safe_exception_code(e)
+            logger.warning("Crossref ISBN search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def _parse_message(self, msg: dict) -> RetrievalResult:
         """Parse a Crossref work message."""

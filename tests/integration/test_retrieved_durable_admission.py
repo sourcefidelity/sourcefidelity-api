@@ -25,7 +25,7 @@ class MemoryStorage(StorageBackend):
         self.objects: dict[str, bytes] = {}
 
     def upload(self, file_bytes: bytes, key: str) -> str:
-        self.objects.setdefault(key, file_bytes)
+        self.objects[key] = file_bytes
         return key
 
     def download(self, key: str) -> bytes:

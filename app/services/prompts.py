@@ -312,9 +312,9 @@ Identify and output FOUR things:
 
 1. PRIMARY SUBJECT — what this paper analyzes (the object of study). This is NOT a citation; \
 it is the thing the paper is about. Examples:
-   - "film: Dracula (1931)"
-   - "law: MRF import restrictions (1990)"
-   - "website: Amazon.com product review system"
+   - "film: Example Film (1931)"
+   - "law: municipal recycling restrictions (2020)"
+   - "website: Example Store product review system"
    - "novel: Pride and Prejudice (Austen, 1813)"
    If the paper has no single primary subject (e.g. a literature review with no focal text), \
 set primary_subject to "" and subject_type to "other".

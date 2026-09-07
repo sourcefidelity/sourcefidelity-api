@@ -53,7 +53,7 @@ def normalize_doi(doi: str) -> str:
 
     # Validate format (basic check)
     if not doi.startswith("10."):
-        logger.warning("Invalid DOI format: %s", doi)
+        logger.warning("Invalid DOI format (value omitted)")
         return ""
 
     return doi
@@ -124,7 +124,7 @@ def get_cached_reference(doi: Optional[str] = None, title: Optional[str] = None)
         normalized_doi = normalize_doi(doi)
         if normalized_doi and normalized_doi in _cache:
             _cache_hits += 1
-            logger.debug("Cache HIT (DOI): %s", normalized_doi)
+            logger.debug("Cache HIT (DOI hash=%s)", hashlib.sha256(normalized_doi.encode()).hexdigest()[:16])
             return _cache[normalized_doi]
 
     # Fallback to title hash
@@ -137,7 +137,7 @@ def get_cached_reference(doi: Optional[str] = None, title: Optional[str] = None)
             return _cache[cache_key]
 
     _cache_misses += 1
-    logger.debug("Cache MISS (DOI: %s, title: %s)", doi, title[:50] if title else None)
+    logger.debug("Cache MISS (doi_present=%s, title_present=%s)", bool(doi), bool(title))
     return None
 
 
@@ -167,7 +167,7 @@ def cache_reference(
         normalized_doi = normalize_doi(doi)
         if normalized_doi:
             _cache[normalized_doi] = data
-            logger.debug("Cached (DOI): %s", normalized_doi)
+            logger.debug("Cached (DOI hash=%s)", hashlib.sha256(normalized_doi.encode()).hexdigest()[:16])
 
     # Cache by title hash
     if title:

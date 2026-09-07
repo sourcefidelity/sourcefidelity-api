@@ -15,7 +15,12 @@ import logging
 
 import httpx
 
-from app.services.search.base import SearchProvider, SearchResult
+from app.services.search.base import (
+    SearchProvider,
+    SearchResult,
+    classify_search_failure,
+    safe_search_failure_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +32,7 @@ class TavilySearch(SearchProvider):
 
     def __init__(self, api_key: str):
         self._api_key = api_key
+        self._circuit_status: str | None = None
 
     @property
     def name(self) -> str:
@@ -34,6 +40,10 @@ class TavilySearch(SearchProvider):
 
     def search(self, query: str, num_results: int = 10) -> list[SearchResult]:
         """Search via Tavily API."""
+        if self._circuit_status is not None:
+            self.last_status = self._circuit_status
+            return []
+        self.last_status = "started"
         payload = {
             "api_key": self._api_key,
             "query": query,
@@ -46,7 +56,18 @@ class TavilySearch(SearchProvider):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning("Tavily search failed for '%s': %s", query[:60], e)
+            self.last_status = classify_search_failure(e)
+            if (
+                isinstance(e, httpx.HTTPStatusError)
+                and e.response.status_code in {401, 403, 429, 432}
+            ):
+                self._circuit_status = self.last_status
+            query_sha256, failure = safe_search_failure_log(query, e)
+            logger.warning(
+                "Tavily search failed query_sha256=%s failure=%s",
+                query_sha256,
+                failure,
+            )
             return []
 
         results = []
@@ -59,4 +80,5 @@ class TavilySearch(SearchProvider):
                 results.append(SearchResult(
                     url=url, title=title, snippet=snippet, is_pdf=is_pdf,
                 ))
+        self.last_status = "completed"
         return results

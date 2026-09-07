@@ -221,6 +221,20 @@ def _parse_clamd_reply(reply: bytes) -> tuple[SafetyVerdict, str]:
     return SafetyVerdict.UNAVAILABLE, detail
 
 
+def check_clamd_health() -> None:
+    """Require one bounded PING/PONG exchange with the configured scanner."""
+    try:
+        with _clamd_socket() as client:
+            client.sendall(b"zPING\0")
+            reply = client.recv(64).rstrip(b"\0\r\n")
+    except FileSafetyUnavailable:
+        raise
+    except (OSError, socket.timeout) as exc:
+        raise FileSafetyUnavailable("clamd health check unavailable") from exc
+    if reply != b"PONG":
+        raise FileSafetyUnavailable("clamd health check returned an invalid response")
+
+
 def scan_with_clamd(content: bytes) -> tuple[SafetyVerdict, str]:
     """Stream bytes using the official clamd INSTREAM framing."""
     try:

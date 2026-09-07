@@ -54,7 +54,11 @@ class WikisourceRetriever(RetrievalSource):
                 if result.success:
                     return result
             except Exception as exc:
-                logger.debug("Wikisource %s search failed: %s", lang, exc)
+                logger.debug(
+                    "Wikisource %s search failed (type=%s)",
+                    lang,
+                    type(exc).__name__,
+                )
         return RetrievalResult(
             source_name=self.name,
             success=False,

@@ -5,16 +5,25 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.database import get_db
 from app.models.job import Job
+from app.security import (
+    AuthenticatedPrincipal,
+    PAPER_STATUS_CAPABILITY,
+    get_authenticated_principal,
+)
 
 
 router = APIRouter()
 
 
 @router.get("/{job_id}")
-async def get_job_status(job_id: str, session: Session = Depends(get_db)):
+def get_job_status(
+    job_id: str,
+    session: Session = Depends(get_db),
+    principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
+):
+    principal.require(PAPER_STATUS_CAPABILITY)
     try:
         parsed = uuid.UUID(job_id)
     except ValueError as exc:
@@ -22,8 +31,8 @@ async def get_job_status(job_id: str, session: Session = Depends(get_db)):
     job = session.get(Job, parsed)
     if (
         job is None
-        or job.scope_type != "personal_owner"
-        or job.scope_id != settings.SOURCE_REPOSITORY_SCOPE_ID
+        or job.scope_type != principal.scope_type
+        or job.scope_id != principal.scope_id
     ):
         raise HTTPException(status_code=404, detail="Paper job not found")
     summary = job.verification_summary or {}

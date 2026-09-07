@@ -18,6 +18,7 @@ from app.services.source_repository import (
     AdmissionError,
     AdmissionRequest,
     WorkIdentity,
+    admit_derived_representation_pair,
     admit_representation,
     delete_representation,
     expire_representations,
@@ -27,6 +28,10 @@ from app.services.source_repository import (
     representation_is_expired,
 )
 from app.services.storage.backend import StorageBackend
+from app.services.verification_evidence import (
+    EvidenceAuthorizationError,
+    authorize_representation,
+)
 
 
 class MemoryStorage(StorageBackend):
@@ -36,7 +41,7 @@ class MemoryStorage(StorageBackend):
 
     def upload(self, file_bytes: bytes, key: str) -> str:
         self.upload_count += 1
-        self.objects.setdefault(key, file_bytes)
+        self.objects[key] = file_bytes
         return key
 
     def download(self, key: str) -> bytes:
@@ -125,7 +130,9 @@ def test_admission_uses_immutable_license_hash_key(session: Session) -> None:
     assert record.admission_state == "accepted"
     assert record.admitted_at is not None
     assert content is not None
-    assert content.storage_key == f"commercial_user_upload/{digest}.pdf"
+    prefix = f"commercial_user_upload/{digest}/"
+    assert content.storage_key.startswith(prefix) and content.storage_key.endswith(".pdf")
+    assert len(content.storage_key.removeprefix(prefix).removesuffix(".pdf")) == 32
     assert storage.objects[content.storage_key].startswith(b"%PDF-")
     assert work is not None
     assert work.doi == "10.1234/example"
@@ -134,6 +141,96 @@ def test_admission_uses_immutable_license_hash_key(session: Session) -> None:
         "type": "personal_owner",
         "id": "owner-1",
     }
+
+
+def test_ocr_pair_retains_parent_but_accepts_only_derivative(session: Session) -> None:
+    storage = MemoryStorage()
+    base = _request()
+    parent_content = b"%PDF-1.7 immutable pure scan parent"
+    derivative_content = b"OCR derivative source text"
+    parent_sha256 = hashlib.sha256(parent_content).hexdigest()
+    derivative_sha256 = hashlib.sha256(derivative_content).hexdigest()
+    parent_request = AdmissionRequest(
+        **{
+            **base.__dict__,
+            "representation": SourceRepresentation(
+                kind=RepresentationKind.PDF,
+                media_type="application/pdf",
+                content=parent_content,
+            ),
+            "provenance": "local_ocr_parent",
+            "text_quality": "pure_scan",
+            "request_acceptance": False,
+        }
+    )
+    derivative_request = AdmissionRequest(
+        **{
+            **base.__dict__,
+            "representation": SourceRepresentation(
+                kind=RepresentationKind.PLAIN_TEXT,
+                media_type="text/plain",
+                content=derivative_content,
+                original_kind=RepresentationKind.PDF,
+                completeness="complete",
+            ),
+            "provenance": "local_ocr_derivative",
+            "identity_confidence": 0.8,
+            "text_quality": "scan_ocr",
+            "validation_evidence": {
+                "ocr_derivative": {
+                    "derivation_method": "local-pdf-ocr-derivative-v1",
+                    "parent_content_sha256": parent_sha256,
+                    "derivative_content_sha256": derivative_sha256,
+                    "derivation_manifest_sha256": "b" * 64,
+                    "page_labels": ["1"],
+                }
+            },
+        }
+    )
+
+    parent, derivative = admit_derived_representation_pair(
+        session,
+        storage,
+        parent_request=parent_request,
+        derivative_request=derivative_request,
+    )
+    session.commit()
+
+    assert parent.admission_state == "needs_review"
+    assert derivative.admission_state == "accepted"
+    assert derivative.original_kind == "pdf"
+    assert (
+        derivative.validation_evidence["ocr_derivative"][
+            "parent_representation_id"
+        ]
+        == str(parent.id)
+    )
+    found = find_accepted_representation(
+        session,
+        scope_type="personal_owner",
+        scope_id="owner-1",
+        doi="10.1234/example",
+    )
+    assert found is not None and found.id == derivative.id
+    authorized = authorize_representation(
+        session,
+        storage,
+        representation_id=derivative.id,
+        scope_type="personal_owner",
+        scope_id="owner-1",
+    )
+    assert authorized.parent_content_sha256 == parent_sha256
+    assert authorized.page_labels == ("1",)
+
+    storage.delete(parent.content_object.storage_key)
+    with pytest.raises(EvidenceAuthorizationError, match="immutable parent"):
+        authorize_representation(
+            session,
+            storage,
+            representation_id=derivative.id,
+            scope_type="personal_owner",
+            scope_id="owner-1",
+        )
 
 
 def test_durable_lookup_does_not_reuse_incompatible_work_type(session: Session) -> None:
@@ -185,7 +282,7 @@ def test_admission_rejects_identifier_collision_across_incompatible_types(
     with pytest.raises(AdmissionError, match="incompatible work type"):
         admit_representation(session, storage, conflicting)
 
-    assert storage.upload_count == 1
+    assert storage.upload_count == 3  # Intent, source, and persisted completion.
 
 
 @pytest.mark.parametrize("scope_type", ["assessment", "course_offering"])
@@ -258,7 +355,7 @@ def test_assessment_and_course_scopes_are_isolated(session: Session) -> None:
 
     assert assessment.id != course.id
     assert assessment.content_object_id == course.content_object_id
-    assert storage.upload_count == 1
+    assert storage.upload_count == 3  # Shared source, intent, and completion.
     assert retention_mode_for_scope(assessment.scope_type).value == "assessment"
     assert retention_mode_for_scope(course.scope_type).value == "course"
     assert assessment.validation_evidence["retention_mode"] == "assessment"
@@ -374,9 +471,26 @@ def test_repeated_admission_deduplicates_object_and_record(session: Session) -> 
     session.commit()
 
     assert first.id == second.id
-    assert storage.upload_count == 1
+    assert storage.upload_count == 3  # Deduplication does not create another intent.
     assert session.scalar(select(func.count(ContentObjectRecord.id))) == 1
     assert session.scalar(select(func.count(SourceRepresentationRecord.id))) == 1
+
+
+def test_retention_keeps_tombstone_when_delete_ack_does_not_remove_bytes(session, monkeypatch):
+    storage = MemoryStorage()
+    record = admit_representation(session, storage, _request())
+    session.commit()
+    object_id = record.content_object_id
+    assert delete_representation(session, record.id)
+    session.commit()
+    monkeypatch.setattr(storage, "delete", lambda _key: True)
+    assert finalize_pending_object_deletions(session, storage) == 0
+    session.commit()
+    pending = session.get(ContentObjectRecord, object_id)
+    assert pending is not None and pending.deletion_pending
+    assert storage.exists(pending.storage_key)
+    assert session.scalar(select(func.count(ContentObjectRecord.id))) == 1
+    assert session.scalar(select(func.count(SourceRepresentationRecord.id))) == 0
 
 
 def test_accepted_lookup_excludes_expired_representation(session: Session) -> None:
@@ -549,6 +663,51 @@ def test_existing_metadata_with_missing_object_fails_closed(session: Session) ->
     with pytest.raises(AdmissionError, match="immutable object is missing"):
         admit_representation(session, storage, _request(scope_id="owner-2"))
     assert first.admission_state == "accepted"
+
+
+def test_detach_and_tombstone_rollback_together(session: Session) -> None:
+    storage = MemoryStorage()
+    record = admit_representation(session, storage, _request())
+    session.commit()
+    record_id, object_id = record.id, record.content_object_id
+    assert delete_representation(session, record_id)
+    assert session.get(ContentObjectRecord, object_id).deletion_pending
+    session.rollback()
+    assert session.get(SourceRepresentationRecord, record_id) is not None
+    assert not session.get(ContentObjectRecord, object_id).deletion_pending
+    assert finalize_pending_object_deletions(session, storage) == 0
+
+
+def test_expiry_rechecks_renewal_after_candidate_scan(session: Session, monkeypatch) -> None:
+    from dataclasses import replace
+    from app.services import source_repository as service
+    storage = MemoryStorage()
+    now = datetime.now(timezone.utc)
+    request = _request(expires_at=now - timedelta(seconds=1))
+    record = admit_representation(session, storage, request)
+    session.commit()
+    original = service.delete_representation
+    def renew_before_delete(db, record_id, **kwargs):
+        admit_representation(db, storage, replace(request, expires_at=now + timedelta(days=1)))
+        db.commit()
+        return original(db, record_id, **kwargs)
+    monkeypatch.setattr(service, "delete_representation", renew_before_delete)
+    assert expire_representations(session, now=now) == 0
+    assert session.get(SourceRepresentationRecord, record.id) is not None
+    assert not record.content_object.deletion_pending
+
+
+def test_expiry_defers_busy_content_without_mutation(session: Session, monkeypatch) -> None:
+    from app.services import source_repository as service
+    storage = MemoryStorage()
+    now = datetime.now(timezone.utc)
+    record = admit_representation(session, storage, _request(expires_at=now - timedelta(seconds=1)))
+    session.commit()
+    monkeypatch.setattr(service, "_try_content_lock", lambda *args: False)
+    assert expire_representations(session, now=now) == 0
+    assert session.get(SourceRepresentationRecord, record.id) is not None
+    assert not record.content_object.deletion_pending
+    assert storage.exists(record.content_object.storage_key)
 
 
 def test_abstract_cannot_enter_durable_content_store(session: Session) -> None:

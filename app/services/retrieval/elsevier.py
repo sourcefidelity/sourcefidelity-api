@@ -26,6 +26,7 @@ import re
 import httpx
 
 from app.config import settings
+from app.log_safety import private_value_id, safe_exception_code
 from app.services.retrieval.base import (
     RepresentationKind,
     RetrievalResult,
@@ -50,6 +51,7 @@ def _is_elsevier_doi(doi: str) -> bool:
 
 
 class ElsevierRetriever(RetrievalSource):
+    capabilities = frozenset({"doi", "metadata", "abstract", "locations"})
     """Retrieves articles from Elsevier via the Article Retrieval API."""
 
     name = "elsevier"
@@ -65,17 +67,16 @@ class ElsevierRetriever(RetrievalSource):
         return headers
 
     def search_by_doi(self, doi: str) -> RetrievalResult:
+        if not _is_elsevier_doi(doi):
+            return RetrievalResult(
+                source_name=self.name, success=False,
+                error="Not an Elsevier-owned DOI prefix; Article Retrieval skipped",
+                metadata={"lookup_applicable": False},
+            )
         if not settings.ELSEVIER_API_KEY:
             return RetrievalResult(
                 source_name=self.name, success=False, error="No ELSEVIER_API_KEY configured"
             )
-        if not _is_elsevier_doi(doi):
-            return RetrievalResult(
-                source_name=self.name,
-                success=False,
-                error="Not an Elsevier-owned DOI prefix; Article Retrieval skipped",
-            )
-
         try:
             # Step 1: Fetch metadata + abstract to check OA status
             resp = httpx.get(
@@ -158,11 +159,13 @@ class ElsevierRetriever(RetrievalSource):
                 },
             )
         except httpx.HTTPStatusError as e:
-            logger.warning("Elsevier DOI search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e)[:100])
+            error = safe_exception_code(e)
+            logger.warning("Elsevier DOI search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
         except Exception as e:
-            logger.warning("Elsevier DOI search failed: %s", e)
-            return RetrievalResult(source_name=self.name, success=False, error=str(e)[:100])
+            error = safe_exception_code(e)
+            logger.warning("Elsevier DOI search failed (type=%s)", type(e).__name__)
+            return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def search_by_title_author(
         self, title: str, author: str | None = None
@@ -190,7 +193,11 @@ class ElsevierRetriever(RetrievalSource):
                 timeout=30,
             )
             if resp.status_code in (401, 403):
-                logger.info("Elsevier FULL view not entitled for %s (status %d)", doi, resp.status_code)
+                logger.info(
+                    "Elsevier FULL view not entitled for %s (status %d)",
+                    private_value_id("doi", doi),
+                    resp.status_code,
+                )
                 return None
             resp.raise_for_status()
 
@@ -199,7 +206,11 @@ class ElsevierRetriever(RetrievalSource):
             text = _extract_article_text(resp.text)
             return text if text and len(text) > 100 else None
         except Exception as e:
-            logger.debug("Elsevier full text fetch failed for %s: %s", doi, e)
+            logger.debug(
+                "Elsevier full text fetch failed for %s (type=%s)",
+                private_value_id("doi", doi),
+                type(e).__name__,
+            )
             return None
 
     def _xml_headers(self) -> dict:

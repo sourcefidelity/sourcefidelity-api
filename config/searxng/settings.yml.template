@@ -3,6 +3,12 @@
 # and writes the resulting untracked settings file into a persistent volume.
 use_default_settings: true
 
+# Keep the baseline at 3s. An explicit bounded timeout_limit may request up to
+# 6s; without max_request_timeout, SearXNG silently caps such requests at 3s.
+outgoing:
+  request_timeout: 3.0
+  max_request_timeout: 6.0
+
 server:
   secret_key: "__SEARXNG_SECRET__"
   image_proxy: false

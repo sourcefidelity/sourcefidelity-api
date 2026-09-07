@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass
 
 import httpx
+
+from app.log_safety import private_value_id
 import trafilatura
 
 from app.services.safe_fetch import safe_request
@@ -99,11 +101,15 @@ def verify_citation_against_webpage(
             timeout=timeout,
         )
     except Exception as e:
-        logger.warning("Web fetch failed for %s: %s", url, e)
+        logger.warning(
+            "Web fetch failed for %s: %s",
+            private_value_id("url", url),
+            type(e).__name__,
+        )
         return WebVerificationResult(
             verdict="fetch_failed",
             confidence="low",
-            explanation=f"Could not fetch the page: {str(e)[:80]}",
+            explanation=f"Could not fetch the page ({type(e).__name__})",
             url=url,
         )
 

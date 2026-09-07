@@ -280,7 +280,9 @@ def _extract_fields_with_llm(
         from app.services.ref_field_extractor import extract_fields_from_llm_response
         return extract_fields_from_llm_response(response, ref)
     except Exception as e:
-        logger.warning("LLM per-reference fallback failed: %s", str(e)[:80])
+        logger.warning(
+            "LLM per-reference fallback failed (type=%s)", type(e).__name__
+        )
         return ParsedReference(
             raw_ref=ref, needs_review=True, extraction_method="fallback"
         )
@@ -445,7 +447,10 @@ def _mla_cleanup_split(raw_text: str) -> List[str]:
         logger.warning("MLA cleanup returned empty after %d attempts — falling back to line split",
                        MAX_EMPTY_RETRIES + 1)
     except Exception as e:
-        logger.warning("MLA cleanup-split failed (%s) — falling back to line split", str(e)[:60])
+        logger.warning(
+            "MLA cleanup-split failed (type=%s) — falling back to line split",
+            type(e).__name__,
+        )
 
     # MLA's split_references() raises NotImplementedError, so fall back to
     # simple line-splitting: split on blank lines and numbered entries.
@@ -540,9 +545,9 @@ If a reference spans multiple lines, merge them into one."""
         # hand. The paper still gets processed for retrieval/verification; only
         # the structured-field extraction is marked unreliable.
         logger.warning(
-            "LLM reference parsing failed (%s); falling back to regex split with "
+            "LLM reference parsing failed (type=%s); falling back to regex split with "
             "needs_review flag on all %d-char reference section",
-            str(e)[:120],
+            type(e).__name__,
             len(raw_text),
         )
         return _regex_fallback_references(raw_text, format_hint)
@@ -582,7 +587,7 @@ If a reference spans multiple lines, merge them into one."""
         try:
             parsed = ParsedReference(**ref_data)
         except Exception as e:
-            logger.warning("Failed to validate ref %d: %s", i, e)
+            logger.warning("Failed to validate ref %d (type=%s)", i, type(e).__name__)
             parsed = ParsedReference(
                 raw_ref=ref_data.get("raw_ref", ""),
                 author=ref_data.get("author", ""),
@@ -680,7 +685,11 @@ def parse_reference_batch(
                     results[i] = ParsedReference(**cached_data)
                     cached_count += 1
                 except Exception as e:
-                    logger.warning("Cached data invalid for ref %d: %s", i, e)
+                    logger.warning(
+                        "Cached data invalid for ref %d (type=%s)",
+                        i,
+                        type(e).__name__,
+                    )
                     uncached_indices.append(i)
             else:
                 uncached_indices.append(i)
@@ -719,7 +728,7 @@ def parse_reference_batch(
             parsed = _parse_batch_with_llm(batch_refs, format_hint=format_hint)
             return batch_indices, parsed, None
         except Exception as e:
-            return batch_indices, [], str(e)
+            return batch_indices, [], type(e).__name__
 
     # Run batches concurrently. Cap workers at the number of batches — no point
     # spinning up more threads than there are batches.
@@ -736,9 +745,9 @@ def parse_reference_batch(
             batch_end = batch_indices[-1] + 1
 
             if err is not None:
-                error_msg = f"Batch {batch_start}-{batch_end} failed: {err}"
+                error_msg = f"Batch {batch_start}-{batch_end} failed ({err})"
                 errors.append(error_msg)
-                logger.error(error_msg)
+                logger.error("Reference batch %d-%d failed", batch_start, batch_end)
                 # Mark failed references with empty data
                 for idx in batch_indices:
                     results[idx] = ParsedReference(
@@ -774,7 +783,7 @@ def parse_reference_batch(
     )
 
     if errors:
-        logger.warning("Parsing errors: %s", "; ".join(errors))
+        logger.warning("Reference parsing had %d failed batches", len(errors))
 
     # Return all results (None becomes empty ParsedReference)
     return [r or ParsedReference(raw_ref=refs[i]) for i, r in enumerate(results)]
@@ -851,7 +860,7 @@ def _parse_batch_with_llm(
         try:
             parsed = ParsedReference(**ref_data)
         except Exception as e:
-            logger.warning("Failed to validate ref %d: %s", i, e)
+            logger.warning("Failed to validate ref %d (type=%s)", i, type(e).__name__)
             # Fallback with raw_ref preserved
             parsed = ParsedReference(
                 raw_ref=refs[i] if i < len(refs) else "",

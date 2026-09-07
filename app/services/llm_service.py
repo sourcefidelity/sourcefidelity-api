@@ -15,6 +15,7 @@ from openai import OpenAI
 
 from app.config import settings
 from app.services.providers import get_provider_config
+from app.services.processing_metrics import record_llm_attempt, record_llm_usage
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,9 @@ def chat_completion(
         kwargs["extra_body"] = extra_body
 
     try:
+        record_llm_attempt()
         response = client.chat.completions.create(**kwargs)
+        record_llm_usage(response.usage)
         content = response.choices[0].message.content
         logger.debug(
             "LLM response: model=%s, tokens=%d",
@@ -141,11 +144,11 @@ def chat_completion(
         )
         return content
     except Exception as e:
-        logger.error("LLM request failed: %s", e)
-        raise RuntimeError(f"LLM request failed: {e}") from e
+        logger.error("LLM request failed (type=%s)", type(e).__name__)
+        raise RuntimeError("LLM request failed") from e
 
 
-def _salvage_truncated_json(text: str) -> Optional[Dict[str, Any]]:
+def _salvage_truncated_json(text: str) -> Any | None:
     """Attempt to recover complete data from truncated JSON output.
 
     When an LLM stops mid-generation (finish_reason='length' or a network cut),
@@ -214,6 +217,7 @@ def chat_completion_json(
     max_retries: int = 2,
     disable_thinking: bool = False,
     reasoning_effort: Optional[str] = None,
+    allow_partial: bool = False,
 ) -> Dict[str, Any]:
     """Send a chat completion request expecting JSON output.
 
@@ -222,8 +226,8 @@ def chat_completion_json(
     will fail identically):
 
       1. Truncated JSON (partial output, e.g. model stopped mid-generation) —
-         SALVAGE IMMEDIATELY. Retrying truncates identically; the complete objects
-         before the cut are valid, so recover them and return on the first occurrence.
+         RETRY and fail closed by default. A caller must explicitly opt into a
+         visibly partial result with ``allow_partial=True``.
       2. Empty response (model returned nothing) — RETRY ONCE. Empty responses are
          often transient (rate-limit, momentary glitch); a single retry usually
          succeeds. Don't burn all max_retries on them.
@@ -243,7 +247,8 @@ def chat_completion_json(
             Ignored when disable_thinking=True.
 
     Returns:
-        Parsed JSON dictionary (complete or salvaged-partial).
+        Parsed JSON dictionary. Partial salvage is returned only when explicitly
+        requested with ``allow_partial=True``.
 
     Raises:
         RuntimeError: If LLM is not configured or all retries + salvage fail.
@@ -274,17 +279,16 @@ def chat_completion_json(
             last_error = e
             is_empty = not (response_text and response_text.strip())
             logger.warning(
-                "JSON parse failed (attempt %d/%d, %s): %s\nResponse: %s",
+                "JSON parse failed (attempt %d/%d, %s; response_chars=%d)",
                 attempt + 1,
                 max_retries + 1,
                 "empty" if is_empty else "truncated/malformed",
-                e,
-                response_text[:500] if response_text else "N/A",
+                len(response_text or ""),
             )
 
-            # Truncated/malformed (has content) — try salvage IMMEDIATELY.
-            # Retrying a truncation produces the same truncation; the partial
-            # data is already valid, so recover it now instead of wasting calls.
+            # A partial response is not a complete structured judgment. Keep it
+            # only for an explicitly partial-tolerant caller, and only after the
+            # configured complete-response attempts are exhausted.
             if not is_empty:
                 salvaged = _salvage_truncated_json(response_text)
                 # salvaged may be a dict ({"references": [...]}) or a bare list
@@ -303,17 +307,12 @@ def chat_completion_json(
                     has_content = False
                     n_items = 0
 
-                if has_content:
+                if has_content and allow_partial and attempt == max_retries:
                     logger.info(
-                        "Salvaged %d items from truncated JSON (attempt %d/%d) — "
-                        "partial result returned, caller may flag for review.",
+                        "Returning explicitly permitted partial JSON (%d items)",
                         n_items,
-                        attempt + 1,
-                        max_retries + 1,
                     )
                     return salvaged
-                # Salvage failed (genuinely malformed, not truncation) — retry once
-                # with a JSON-only hint, then give up.
                 if attempt < max_retries:
                     user_prompt = (
                         f"{user_prompt}\n\nIMPORTANT: Output valid JSON only. "
@@ -333,11 +332,11 @@ def chat_completion_json(
                     break
 
         except Exception as e:
-            raise RuntimeError(f"LLM request failed: {e}") from e
+            raise RuntimeError("LLM request failed") from e
 
     raise RuntimeError(
-        f"Failed to get valid JSON after {attempt + 1} attempts: {last_error}"
-    )
+        f"Failed to get valid JSON after {attempt + 1} attempts"
+    ) from last_error
 
 
 def _supports_json_mode(model: Optional[str] = None) -> bool:

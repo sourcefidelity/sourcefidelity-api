@@ -3,12 +3,16 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
+import pytest
+
 from app.services.retrieval.base import RetrievalResult
 from app.services.retrieval_lookup_cache import (
     LookupCacheRecord,
     RetrievalLookupCache,
 )
 from app.services.source_resolver import SourceResolver
+from app.services.source_resolver import SourceResolutionError
+from app.services.schemas import ParsedReference
 
 
 class _FakeRedis:
@@ -155,6 +159,48 @@ def test_resolver_returns_fresh_cached_abstract_without_adapter_calls() -> None:
 
     assert result.abstract == "A reusable canonical abstract."
     cache.put_abstract.assert_not_called()
+
+
+def test_resolve_reference_bypasses_unbound_fresh_cache_for_discovery_trace() -> None:
+    now = datetime.now(timezone.utc)
+    cached = LookupCacheRecord(
+        outcome="abstract",
+        stored_at=now,
+        refresh_after=now + timedelta(days=1),
+        policy_signature="policy-a",
+        student_url_hash=None,
+        result=_abstract_result(),
+    )
+    cache = Mock()
+    cache.get.return_value = cached
+    resolver = SourceResolver.__new__(SourceResolver)
+    resolver._backend = None
+    resolver._retrieval_sources = []
+    resolver._acquisition_capabilities = None
+    resolver._lookup_cache = cache
+    resolver._check_local_cache = Mock(
+        return_value=RetrievalResult(source_name="local_cache", success=False)
+    )
+    resolver._lookup_policy_signature = Mock(return_value="policy-a")
+
+    with pytest.raises(SourceResolutionError) as raised:
+        resolver.resolve_reference(
+            ParsedReference(
+                reference_id="ref-cache-provenance",
+                author="Rivera, Alex",
+                year="2024",
+                title="Example Work",
+                doi="10.1234/example",
+            )
+        )
+
+    trace = raised.value.reference_discovery_trace
+    assert trace is not None
+    assert any(
+        "unbound lookup-cache result was bypassed" in limitation
+        for limitation in trace["limitations"]
+    )
+    cache.put_miss.assert_called_once()
 
 
 def test_resolver_uses_stale_abstract_if_refresh_finds_nothing() -> None:

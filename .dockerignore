@@ -1,4 +1,5 @@
 .git
+.git-rewrite/
 .env
 .env.*
 !.env.example
@@ -13,6 +14,10 @@ __pycache__/
 .ruff_cache/
 
 tests/
+outputs/
+output/
+tmp/
+mocks/
 test_data/
 test_data_synthetic/
 test_*.py
@@ -28,5 +33,24 @@ ARCHITECTURE.md
 ROADMAP.md
 RESEARCH.md
 REVIEW*.md
+Review*.md
+private_guiding_history/
+AGENTS.md
+SYSTEM_PROMPT.md
+COSTS.md
+HPC_SURVEY_ANSWERS.md
+CAMPUS_TEST_INSTRUCTIONS.md
+PHASE_3_5_IMPLEMENTATION.md
+campus_test.py
+run_retrieval_profile_test.sh
+.last_retrieval_run
+url_web_results.json
+HiAgent YAML/
+.sourcefidelity/
+.continue/
+.zcode/
+.vscode/
 
 .DS_Store
+Users/
+Development

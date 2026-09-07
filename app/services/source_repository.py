@@ -1,13 +1,13 @@
 """Durable admission service for academic source representations."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import re
 import uuid
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.models.source_repository import (
@@ -17,6 +17,10 @@ from app.models.source_repository import (
 )
 from app.services.retrieval.base import RepresentationKind, SourceRepresentation
 from app.services.storage.backend import StorageBackend
+from app.services.source_upload_recovery import (
+    persist_upload_intent, persist_retirement_intent, confirm_upload_intent,
+    settle_session_upload_intents, _try_content_lock,
+)
 from app.services.source_type import (
     SourceKindAssessment,
     compare_source_kinds,
@@ -142,6 +146,18 @@ def _normalize_title(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
+def _advisory_transaction_lock(session: Session, namespace: str, value: str) -> None:
+    """Serialize a content/identity admission key for this DB transaction."""
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    seed = hashlib.sha256(f"{namespace}:{value}".encode("utf-8")).digest()
+    lock_id = int.from_bytes(seed[:8], byteorder="big", signed=True)
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id}
+    )
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -245,14 +261,18 @@ def _object_key(
     license_class: str,
     digest: str,
     kind: RepresentationKind,
+    generation: str | None = None,
 ) -> str:
-    return f"{license_class}/{digest}.{EXTENSIONS[kind]}"
+    suffix = f"/{generation}" if generation is not None else ""
+    return f"{license_class}/{digest}{suffix}.{EXTENSIONS[kind]}"
 
 
 def _canonical_work(session: Session, identity: WorkIdentity) -> CanonicalWorkRecord:
     doi = _normalize_doi(identity.doi)
     isbn = _normalize_isbn(identity.isbn)
     normalized_title = _normalize_title(identity.title)
+    identity_key = doi or isbn or f"{normalized_title}\0{identity.author}\0{identity.year}"
+    _advisory_transaction_lock(session, "canonical-work", identity_key)
     existing = None
     if doi:
         existing = session.scalar(
@@ -346,35 +366,54 @@ def admit_representation(
     # conflict cannot leave an unreferenced immutable object behind.
     work = _canonical_work(session, request.work)
     digest = hashlib.sha256(request.representation.content).hexdigest()
+    _advisory_transaction_lock(
+        session, "content-object", f"{request.license_class}:{digest}"
+    )
     content_object = session.scalar(
         select(ContentObjectRecord).where(
             ContentObjectRecord.license_class == request.license_class,
             ContentObjectRecord.content_sha256 == digest,
-        )
+        ).execution_options(populate_existing=True)
     )
-    if content_object is None:
-        key = _object_key(request.license_class, digest, request.representation.kind)
-        backend.upload(request.representation.content, key)
-        content_object = ContentObjectRecord(
-            content_sha256=digest,
-            license_class=request.license_class,
-            storage_key=key,
-            media_type=request.representation.media_type,
-            byte_size=len(request.representation.content),
-        )
-        session.add(content_object)
+    if content_object is None or content_object.deletion_pending:
+        if content_object is not None:
+            if session.scalar(select(func.count(SourceRepresentationRecord.id)).where(
+                SourceRepresentationRecord.content_object_id == content_object.id
+            )):
+                raise AdmissionError("Deletion-pending content still has references")
+            # Retain the old target before changing its database locator. An
+            # old DELETE may still complete after this transaction commits.
+            old_kind = next(kind for kind, extension in EXTENSIONS.items()
+                            if content_object.storage_key.endswith("." + extension))
+            persist_retirement_intent(session, backend,
+                storage_key=content_object.storage_key,
+                license_class=request.license_class, digest=digest, kind=old_kind)
+        generation = uuid.uuid4().hex
+        key = _object_key(request.license_class, digest, request.representation.kind, generation)
+        intent = persist_upload_intent(session, backend, storage_key=key,
+                              license_class=request.license_class, digest=digest,
+                              kind=request.representation.kind, generation=generation)
+        receipt = backend.upload(request.representation.content, key)
+        confirm_upload_intent(backend, intent, receipt)
+        if content_object is None:
+            content_object = ContentObjectRecord(content_sha256=digest,
+                license_class=request.license_class)
+            session.add(content_object)
+        content_object.storage_key = key
+        content_object.media_type = request.representation.media_type
+        content_object.byte_size = len(request.representation.content)
+        content_object.deletion_pending = False
         session.flush()
     elif not backend.exists(content_object.storage_key):
         raise AdmissionError(
             "Content metadata exists but the immutable object is missing; "
             "admission failed closed"
         )
-    elif content_object.deletion_pending:
-        # A new authorized reference revives the object before cleanup.
-        content_object.deletion_pending = False
 
     state = _admission_state(request)
     now = datetime.now(timezone.utc)
+    # The content lock serializes renewal, but does not refresh a caller's
+    # cached expiry or validation state after a peer's committed renewal.
     existing = session.scalar(
         select(SourceRepresentationRecord).where(
             SourceRepresentationRecord.canonical_work_id == work.id,
@@ -382,7 +421,7 @@ def admit_representation(
             SourceRepresentationRecord.provenance == request.provenance,
             SourceRepresentationRecord.scope_type == scope_type,
             SourceRepresentationRecord.scope_id == scope_id,
-        )
+        ).execution_options(populate_existing=True)
     )
     if existing is not None:
         was_expired = representation_is_expired(existing, now=now)
@@ -436,6 +475,73 @@ def admit_representation(
     return record
 
 
+def admit_derived_representation_pair(
+    session: Session,
+    backend: StorageBackend,
+    *,
+    parent_request: AdmissionRequest,
+    derivative_request: AdmissionRequest,
+) -> tuple[SourceRepresentationRecord, SourceRepresentationRecord]:
+    """Atomically stage one immutable PDF parent and accepted OCR derivative."""
+    parent = parent_request.representation
+    derivative = derivative_request.representation
+    if parent.kind is not RepresentationKind.PDF:
+        raise AdmissionError("OCR derivative parent must be a PDF")
+    if (
+        derivative.kind is not RepresentationKind.PLAIN_TEXT
+        or derivative.original_kind is not RepresentationKind.PDF
+    ):
+        raise AdmissionError("OCR derivative must be plain text derived from a PDF")
+    if parent_request.request_acceptance:
+        raise AdmissionError("OCR parent must remain a non-evidence representation")
+    if not derivative_request.request_acceptance:
+        raise AdmissionError("OCR derivative admission must request acceptance")
+    comparable_parent = replace(
+        parent_request,
+        representation=derivative_request.representation,
+        provenance=derivative_request.provenance,
+        request_acceptance=derivative_request.request_acceptance,
+        validation_evidence=derivative_request.validation_evidence,
+    )
+    for field_name in (
+        "work",
+        "license_class",
+        "scope_type",
+        "scope_id",
+        "expires_at",
+    ):
+        if getattr(comparable_parent, field_name) != getattr(
+            derivative_request, field_name
+        ):
+            raise AdmissionError("OCR parent and derivative policies do not match")
+    parent_sha256 = hashlib.sha256(parent.content).hexdigest()
+    derivative_sha256 = hashlib.sha256(derivative.content).hexdigest()
+    provenance = derivative_request.validation_evidence.get("ocr_derivative", {})
+    if (
+        provenance.get("parent_content_sha256") != parent_sha256
+        or provenance.get("derivative_content_sha256") != derivative_sha256
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", provenance.get("derivation_manifest_sha256", "")
+        )
+    ):
+        raise AdmissionError("OCR derivative provenance hashes do not match")
+
+    parent_record = admit_representation(session, backend, parent_request)
+    derivative_evidence = dict(derivative_request.validation_evidence)
+    derivative_provenance = dict(derivative_evidence["ocr_derivative"])
+    derivative_provenance["parent_representation_id"] = str(parent_record.id)
+    derivative_evidence["ocr_derivative"] = derivative_provenance
+    derivative_record = admit_representation(
+        session,
+        backend,
+        replace(
+            derivative_request,
+            validation_evidence=derivative_evidence,
+        ),
+    )
+    return parent_record, derivative_record
+
+
 def expire_representations(
     session: Session,
     *,
@@ -462,7 +568,7 @@ def expire_representations(
     ).all()
     expired = 0
     for representation_id in representation_ids:
-        if delete_representation(session, representation_id):
+        if delete_representation(session, representation_id, expired_before=current):
             expired += 1
     return expired
 
@@ -470,17 +576,47 @@ def expire_representations(
 def delete_representation(
     session: Session,
     representation_id: uuid.UUID,
+    *,
+    expired_before: datetime | None = None,
 ) -> bool:
     """Detach one representation and tombstone an unreferenced object.
 
     The caller commits this database change before finalizing object deletion,
     so a failed commit can never leave a live representation pointing at a
-    deleted object.
+    deleted object. Serialize the detach/count/tombstone transaction with
+    admission and cleanup using their shared immutable content key. Scheduled
+    expiry skips busy content and rechecks expiry under the lock; it must not
+    take representation row locks before content locks.
     """
-    record = session.get(SourceRepresentationRecord, representation_id)
+    target = session.execute(
+        select(ContentObjectRecord.id, ContentObjectRecord.license_class,
+               ContentObjectRecord.content_sha256)
+        .join(SourceRepresentationRecord,
+              SourceRepresentationRecord.content_object_id == ContentObjectRecord.id)
+        .where(SourceRepresentationRecord.id == representation_id)
+    ).first()
+    if target is None:
+        return False
+    object_id, license_class, digest = target
+    if expired_before is not None:
+        if not _try_content_lock(session, {
+            "license_class": license_class, "content_sha256": digest,
+        }):
+            return False
+    else:
+        _advisory_transaction_lock(session, "content-object", f"{license_class}:{digest}")
+    query = select(SourceRepresentationRecord).where(
+        SourceRepresentationRecord.id == representation_id,
+        SourceRepresentationRecord.content_object_id == object_id,
+    )
+    if expired_before is not None:
+        query = query.where(SourceRepresentationRecord.expires_at.is_not(None),
+            SourceRepresentationRecord.expires_at <= _as_utc(expired_before))
+    # API authorization may already have loaded this ORM instance. Refresh it
+    # after waiting: another transaction may have deleted or renewed the row.
+    record = session.scalar(query.execution_options(populate_existing=True))
     if record is None:
         return False
-    object_id = record.content_object_id
     session.delete(record)
     session.flush()
     remaining = session.scalar(
@@ -489,7 +625,10 @@ def delete_representation(
         )
     )
     if remaining == 0:
-        content_object = session.get(ContentObjectRecord, object_id)
+        # A peer may have readmitted this logical object at a fresh generation.
+        # Refresh under the content lock so a cached True cannot suppress the
+        # False -> True update that persists current-generation cleanup.
+        content_object = session.get(ContentObjectRecord, object_id, populate_existing=True)
         if content_object is not None:
             content_object.deletion_pending = True
             session.flush()
@@ -499,13 +638,28 @@ def delete_representation(
 def finalize_pending_object_deletions(
     session: Session,
     backend: StorageBackend,
+    *,
+    batch_size: int = 100,
 ) -> int:
     """Delete tombstoned unreferenced objects; retain failures for retry."""
     pending = session.scalars(
-        select(ContentObjectRecord).where(ContentObjectRecord.deletion_pending.is_(True))
+        select(ContentObjectRecord)
+        .where(ContentObjectRecord.deletion_pending.is_(True))
+        .order_by(ContentObjectRecord.created_at, ContentObjectRecord.id)
+        .limit(max(1, min(batch_size, 1_000)))
+        .with_for_update(skip_locked=True)
+        # A logical content row may now name a newer physical generation.
+        # The locked SELECT must replace any caller-cached locator before
+        # deleting bytes and retiring that row's cleanup authority.
+        .execution_options(populate_existing=True)
     ).all()
     deleted = 0
     for content_object in pending:
+        if not _try_content_lock(session, {
+            "license_class": content_object.license_class,
+            "content_sha256": content_object.content_sha256,
+        }):
+            continue
         remaining = session.scalar(
             select(func.count(SourceRepresentationRecord.id)).where(
                 SourceRepresentationRecord.content_object_id == content_object.id
@@ -514,9 +668,24 @@ def finalize_pending_object_deletions(
         if remaining:
             content_object.deletion_pending = False
             continue
-        if not backend.delete(content_object.storage_key):
+        if not backend.delete(content_object.storage_key) or backend.exists(content_object.storage_key):
             continue
         session.delete(content_object)
         deleted += 1
     session.flush()
     return deleted
+
+
+def commit_source_admissions(session: Session) -> None:
+    """Commit admission records and release their object-store compensations."""
+    session.commit()
+    settle_session_upload_intents(session)
+
+
+def rollback_source_admissions(
+    session: Session,
+    backend: StorageBackend,
+) -> int:
+    """Rollback admissions and remove only objects left without durable records."""
+    session.rollback()
+    return settle_session_upload_intents(session)

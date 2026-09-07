@@ -358,8 +358,8 @@ class SubjectIdentification(BaseModel):
     primary_subject: str = Field(
         default="",
         description=(
-            "What the paper analyzes, e.g. 'film: Dracula (1931)' or "
-            "'law: MRF import restrictions (1990)'"
+            "What the paper analyzes, e.g. 'film: Example Film (1931)' or "
+            "'law: municipal recycling restrictions (2020)'"
         ),
     )
     subject_type: str = Field(

@@ -123,14 +123,20 @@ def identify_subject(
             disable_thinking=True,
         )
     except LLMInputBudgetExceeded as e:
-        logger.warning("Subject-identification skipped by input budget: %s", e)
+        logger.warning(
+            "Subject-identification skipped by input budget (type=%s)",
+            type(e).__name__,
+        )
         return _failed_result(paragraph_count, references)
     except Exception as e:
         # chat_completion_json raises RuntimeError on total failure. Degrade
         # to a safe default rather than crashing the caller — the subject-ID
         # pass is pre-analysis, not load-bearing for correctness (downstream
         # stages default to "verify everything" when no subject info exists).
-        logger.warning("Subject-identification LLM call failed: %s", e)
+        logger.warning(
+            "Subject-identification LLM call failed (type=%s)",
+            type(e).__name__,
+        )
         return _failed_result(paragraph_count, references)
 
     if not isinstance(raw, dict) or not raw:

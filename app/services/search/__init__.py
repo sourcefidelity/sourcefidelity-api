@@ -55,7 +55,11 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
             )
             return None
         from app.services.search.searxng import SearXNGSearch
-        return SearXNGSearch(settings.SEARXNG_URL)
+        return SearXNGSearch(
+            settings.SEARXNG_URL,
+            request_timeout_seconds=settings.SEARXNG_REQUEST_TIMEOUT_SECONDS,
+            engine_timeout_seconds=settings.SEARXNG_ENGINE_TIMEOUT_SECONDS,
+        )
 
     if provider_name == "brave":
         if not settings.BRAVE_SEARCH_API_KEY:

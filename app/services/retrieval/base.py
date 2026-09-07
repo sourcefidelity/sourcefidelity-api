@@ -61,6 +61,10 @@ class RetrievalResult:
     full_text: bytes | None = None
     full_text_url: str | None = None
     representation: SourceRepresentation | None = None
+    # A normalized derivative may retain its immutable original separately.
+    # The parent never becomes verification evidence merely because the
+    # derivative was accepted.
+    parent_representation: SourceRepresentation | None = None
     locations: list[AcquisitionLocation] = field(default_factory=list)
     abstract: str | None = None  # abstract text (for paywalled sources)
     doi: str | None = None

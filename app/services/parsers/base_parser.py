@@ -17,6 +17,19 @@ class BaseParser(ABC):
 
     HEADINGS: ClassVar[List[str]] = []
     REF_START_PATTERN: ClassVar[Optional[Pattern]] = None
+    _TRAILING_SECTION_HEADING: ClassVar[Pattern] = re.compile(
+        r"^\s*(?:"
+        r"\u6458\u8981(?:\s*\(\s*chinese\s+abstract\s*\))?"
+        r"|chinese\s+abstract"
+        r"|abstract"
+        r"|\u5173\u952e\u8bcd(?:\s*\(\s*keywords?\s*\))?"
+        r"|keywords?"
+        r"|appendix(?:\s+[a-z0-9]+)?"
+        r"|acknowledg(?:e)?ments?"
+        r"|author\s+(?:biograph(?:y|ies)|information|note)"
+        r")\s*:?\s*$",
+        re.IGNORECASE,
+    )
 
     # ------------------------------------------------------------------
     # Detection
@@ -69,7 +82,7 @@ class BaseParser(ABC):
                     nl = text.find('\n', start)
                     if nl != -1:
                         start = nl + 1
-                section = text[start:].strip()
+                section = cls._trim_trailing_sections(text[start:].strip())
                 if section:
                     return section
 
@@ -92,9 +105,41 @@ class BaseParser(ABC):
                         if check_line and cls.REF_START_PATTERN.match(check_line):
                             refs_found += 1
                     if refs_found >= 2:
-                        return '\n'.join(lines[i:]).strip()
+                        return cls._trim_trailing_sections(
+                            '\n'.join(lines[i:]).strip()
+                        )
 
         return None
+
+    @classmethod
+    def _trim_trailing_sections(cls, section: str) -> str:
+        """Stop a bibliography before a later, explicitly headed section.
+
+        Some journal PDFs place a translated abstract or other front/back
+        matter after the references.  The old EOF-based boundary attached that
+        material to the final reference.  A trailing heading is accepted only
+        after at least one reference-shaped line, so an article title containing
+        the word ``Abstract`` cannot terminate the bibliography.
+        """
+        if not section:
+            return section
+        lines = section.splitlines()
+        reference_lines_seen = 0
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if (
+                cls.REF_START_PATTERN is not None
+                and stripped
+                and cls.REF_START_PATTERN.match(stripped)
+            ):
+                reference_lines_seen += 1
+            if (
+                reference_lines_seen
+                and index > 0
+                and cls._TRAILING_SECTION_HEADING.fullmatch(stripped)
+            ):
+                return "\n".join(lines[:index]).strip()
+        return section.strip()
 
     # ------------------------------------------------------------------
     # Reference splitting
@@ -106,15 +151,11 @@ class BaseParser(ABC):
         strings."""
         ...
 
-    # Lines that are always continuations, never new references
-    # Includes: [Online], Retrieved, website names, continuation-only fragments
+    # Lines that are always continuations, never new references.  Keep this
+    # list structural: title, author, publisher, and work-specific exceptions
+    # make a parser pass one corpus while silently failing on the next one.
     _CONTINUATION_PATTERN: ClassVar[Optional[Pattern]] = re.compile(
-        r'^(?:\[Online\]|\[online\]|Retrieved\s|retrieved\s'
-        r'|Coppola[\'\u2019]?s?\s|Classicmoviehub\.\s'
-        r'|Journal,\s*\d+\s*\(\d+\)'                          # "Journal, 20(5)" continuation
-        r'|Evaluation\s|Business\sInsider,\sInc'              # split continuations
-        r'|Nosferatu\s\(\d{4}\)'                              # "Nosferatu (1922)" in title continuation
-        r')',
+        r'^(?:\[Online\]|Retrieved\s)',
         re.IGNORECASE,
     )
 
@@ -133,10 +174,25 @@ class BaseParser(ABC):
         # Ends with URL or DOI
         if re.search(r'(https?://\S+|doi\s*:\s*\S+|doi\.org/\S+)$', block):
             return True
-        # Ends with a recognizable publisher pattern
-        if re.search(r'(Press|University|Publishing|Routledge|Palgrave|Oxford)$', block, re.IGNORECASE):
+        # Ends with a generic publisher/institution designator.  Do not list
+        # individual publisher names here; that recreates corpus-specific
+        # parsing behavior.
+        if re.search(
+            r'\b(?:Press|University|Publishing|Publishers?|Institute|Institution)$',
+            block,
+            re.IGNORECASE,
+        ):
             return True
         return False
+
+    @classmethod
+    def _starts_new_reference(cls, stripped: str, current: List[str]) -> bool:
+        return bool(
+            cls.REF_START_PATTERN is not None
+            and cls.REF_START_PATTERN.match(stripped)
+            and not cls._CONTINUATION_PATTERN.match(stripped)
+        )
+
     @classmethod
     def _merge_lines(cls, lines: List[str]) -> List[str]:
         """Merge consecutive lines into reference blocks.
@@ -160,11 +216,7 @@ class BaseParser(ABC):
                     current = []
                 continue
 
-            is_new_ref = (
-                cls.REF_START_PATTERN is not None
-                and cls.REF_START_PATTERN.match(stripped)
-                and not cls._CONTINUATION_PATTERN.match(stripped)
-            )
+            is_new_ref = cls._starts_new_reference(stripped, current)
 
             if is_new_ref:
                 if current:

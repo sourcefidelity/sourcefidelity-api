@@ -6,6 +6,8 @@ on PDF completeness.
 """
 
 import logging
+import hashlib
+import json
 from dataclasses import dataclass
 import re
 
@@ -49,12 +51,25 @@ class BookMetadata:
     info_link: str | None
     match_confidence: str
     match_reason: str
+    record_sha256: str = ""
+
+
+@dataclass(frozen=True)
+class BookMetadataSearch:
+    query: str
+    outcome: str
+    candidates: tuple[BookMetadata, ...] = ()
+    error_code: str | None = None
 
 
 class GoogleBooksRetriever:
     """Search Google Books while keeping discovery separate from admission."""
 
-    def search_metadata(
+    def search_metadata(self, **kwargs) -> list[BookMetadata]:
+        """Compatibility interface for existing page-count consumers."""
+        return list(self.search_metadata_result(**kwargs).candidates)
+
+    def search_metadata_result(
         self,
         *,
         isbn: str | None = None,
@@ -63,10 +78,10 @@ class GoogleBooksRetriever:
         publisher: str | None = None,
         year: str | None = None,
         max_results: int = 10,
-    ) -> list[BookMetadata]:
+    ) -> BookMetadataSearch:
         normalized_isbn = normalize_isbn(isbn) if isbn else None
         if isbn and normalized_isbn is None:
-            return []
+            return BookMetadataSearch("", "response_invalid", error_code="invalid_isbn")
         if normalized_isbn:
             query = f"isbn:{normalized_isbn}"
         else:
@@ -78,7 +93,7 @@ class GoogleBooksRetriever:
             if publisher:
                 terms.append(f"inpublisher:{publisher.strip()}")
             if not terms:
-                return []
+                return BookMetadataSearch("", "response_invalid", error_code="insufficient_metadata")
             query = " ".join(terms)
 
         params: dict[str, str | int] = {
@@ -93,12 +108,38 @@ class GoogleBooksRetriever:
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
-            logger.debug("Google Books metadata search failed: %s", exc)
-            return []
+            logger.debug(
+                "Google Books metadata search failed (type=%s)",
+                type(exc).__name__,
+            )
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            outcome = (
+                "rate_limited" if status == 429 else
+                "access_restricted" if status in {401, 403, 451} else
+                "timeout" if isinstance(exc, httpx.TimeoutException) else
+                "response_invalid" if isinstance(exc, ValueError) else
+                "operational_failure"
+            )
+            return BookMetadataSearch(query, outcome, error_code=outcome)
+
+        if (not isinstance(payload, dict) or "error" in payload
+                or not isinstance(payload.get("items", []), list)
+                or (not payload.get("items") and payload.get("totalItems") != 0)):
+            return BookMetadataSearch(query, "response_invalid", error_code="invalid_response")
 
         results: list[BookMetadata] = []
-        for item in payload.get("items") or []:
+        for item in (payload.get("items") or [])[:int(params["maxResults"])]:
+            if (not isinstance(item, dict) or not isinstance(item.get("volumeInfo"), dict)
+                    or not isinstance(item.get("id"), str) or not item["id"]):
+                return BookMetadataSearch(query, "response_invalid", error_code="invalid_volume")
             info = item.get("volumeInfo") or {}
+            if (not all(info.get(key) is None or isinstance(info[key], str)
+                        for key in ("title", "subtitle", "publisher", "publishedDate", "description", "printType", "previewLink", "infoLink"))
+                    or not isinstance(info.get("authors", []), list)
+                    or not all(isinstance(value, str) for value in info.get("authors", []))
+                    or not isinstance(info.get("industryIdentifiers", []), list)
+                    or not all(isinstance(value, dict) for value in info.get("industryIdentifiers", []))):
+                return BookMetadataSearch(query, "response_invalid", error_code="invalid_volume_fields")
             identifiers = tuple(
                 normalized
                 for record in (info.get("industryIdentifiers") or [])
@@ -106,7 +147,9 @@ class GoogleBooksRetriever:
             )
             confidence, reason = _metadata_match(
                 identifiers=identifiers,
-                candidate_title=info.get("title"),
+                candidate_title=": ".join(
+                    value for value in (info.get("title"), info.get("subtitle")) if value
+                ),
                 candidate_authors=info.get("authors") or [],
                 candidate_publisher=info.get("publisher"),
                 candidate_date=info.get("publishedDate"),
@@ -137,10 +180,13 @@ class GoogleBooksRetriever:
                     info_link=info.get("infoLink"),
                     match_confidence=confidence,
                     match_reason=reason,
+                    record_sha256=hashlib.sha256(
+                        json.dumps(item, sort_keys=True, ensure_ascii=False).encode()
+                    ).hexdigest(),
                 )
             )
         rank = {"high": 3, "medium": 2, "low": 1, "none": 0}
-        return sorted(
+        ranked = sorted(
             results,
             key=lambda result: (
                 rank[result.match_confidence],
@@ -148,6 +194,7 @@ class GoogleBooksRetriever:
             ),
             reverse=True,
         )
+        return BookMetadataSearch(query, "results" if ranked else "no_results", tuple(ranked))
 
     def lookup_page_count(
         self,
@@ -239,12 +286,13 @@ def _metadata_match(
         support.append("year")
 
     if expected_isbn:
-        # Google Books occasionally omits ``industryIdentifiers`` from a
-        # result returned by an ``isbn:`` query.  In that case the query itself
-        # is identifier evidence, but cited title agreement is mandatory.
+        # A query is not an observed identifier. Missing ISBNs can establish a
+        # possible work match but never bind an edition or its page count.
         if not identifiers and (title_overlap is None or title_overlap < 0.80):
             return "none", "ISBN-query result omitted identifiers and lacked strong title evidence"
-        detail = "exact ISBN" if identifiers else "exact ISBN query + title confirmation"
+        if not identifiers:
+            return "medium", "ISBN-query result omitted identifiers; edition unresolved"
+        detail = "exact ISBN"
         if title_overlap is not None:
             detail += f" + title overlap {title_overlap:.2f}"
         if support:

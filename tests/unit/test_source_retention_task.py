@@ -85,11 +85,13 @@ def test_retention_task_removes_expired_record_and_object(monkeypatch) -> None:
 
     result = source_retention.cleanup_expired_source_representations.run()
 
-    assert result == {
+    assert {key: result[key] for key in ("status", "representations_expired", "objects_deleted")} == {
         "status": "ok",
         "representations_expired": 1,
         "objects_deleted": 1,
     }
+    assert result["upload_intents_inspected"] == 1
+    assert result["upload_intents_pending"] == 1
     with sessions() as session:
         assert session.scalar(select(func.count(SourceRepresentationRecord.id))) == 0
         assert session.scalar(select(func.count(ContentObjectRecord.id))) == 0

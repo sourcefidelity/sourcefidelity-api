@@ -199,11 +199,13 @@ Judge whether this {claim_type} is consistent with the source's abstract."""
             claim_type=claim_type,
         )
     except Exception as e:
-        logger.warning("Abstract verification LLM call failed: %s", e)
+        logger.warning(
+            "Abstract verification LLM call failed (type=%s)", type(e).__name__
+        )
         return AbstractVerificationResult(
             verdict=INCONCLUSIVE,
             confidence="low",
-            explanation=f"Verification failed: {e}",
+            explanation="Abstract comparison was unavailable.",
             abstract_source=abstract_source,
             claim_type=claim_type,
         )

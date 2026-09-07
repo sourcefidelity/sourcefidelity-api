@@ -18,7 +18,12 @@ import logging
 
 import httpx
 
-from app.services.search.base import SearchProvider, SearchResult
+from app.services.search.base import (
+    SearchProvider,
+    SearchResult,
+    classify_search_failure,
+    safe_search_failure_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,7 @@ class ExaSearch(SearchProvider):
 
     def search(self, query: str, num_results: int = 10) -> list[SearchResult]:
         """Search via Exa neural search API."""
+        self.last_status = "started"
         headers = {
             "x-api-key": self._api_key,
             "Content-Type": "application/json",
@@ -51,7 +57,13 @@ class ExaSearch(SearchProvider):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning("Exa search failed for '%s': %s", query[:60], e)
+            self.last_status = classify_search_failure(e)
+            query_sha256, failure = safe_search_failure_log(query, e)
+            logger.warning(
+                "Exa search failed query_sha256=%s failure=%s",
+                query_sha256,
+                failure,
+            )
             return []
 
         results = []
@@ -66,4 +78,5 @@ class ExaSearch(SearchProvider):
                 results.append(SearchResult(
                     url=url, title=title, snippet=snippet, is_pdf=is_pdf,
                 ))
+        self.last_status = "completed"
         return results

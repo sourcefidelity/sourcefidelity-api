@@ -2,6 +2,7 @@
 
 from app.database import SessionLocal
 from app.services.paper_upload import cleanup_stale_paper_job_inputs
+from app.services.report_paper_artifact import cleanup_expired_report_paper_artifacts
 from app.services.storage.backend import get_storage_backend
 from app.tasks.celery_app import celery_app
 
@@ -13,8 +14,14 @@ from app.tasks.celery_app import celery_app
 )
 def cleanup_stale_paper_job_input_objects() -> dict[str, int]:
     with SessionLocal() as session:
-        return cleanup_stale_paper_job_inputs(
+        inputs = cleanup_stale_paper_job_inputs(
             session,
             get_storage_backend(),
             batch_size=100,
         )
+        artifacts = cleanup_expired_report_paper_artifacts(
+            session,
+            get_storage_backend(),
+            batch_size=100,
+        )
+        return {**inputs, **artifacts}

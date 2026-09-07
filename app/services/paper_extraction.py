@@ -9,6 +9,8 @@ and auditable rejected spans before later pipeline stages are implemented.
 from __future__ import annotations
 
 import re
+import hashlib
+import unicodedata
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -28,6 +30,12 @@ from app.services.reference_parser import (
     extract_and_parse_references,
     extract_reference_section,
 )
+from app.services.reference_consistency import (
+    ReferenceConsistencyAssessment,
+    assess_reference_consistency,
+)
+from app.services.reference_layout import ReferenceLayoutArtifact
+from app.services.reference_formatting import ReferenceFormattingAssessment
 from app.services.schemas import CitationMarkerMember, InTextCitation, ParsedReference
 from app.services.sentence_splitter import split_sentences
 from app.services.verification_evidence import (
@@ -50,6 +58,27 @@ class ClaimBoundaryRejection(BaseModel):
     reason: str
 
 
+class CitationMarkerCensusEntry(BaseModel):
+    """One structurally visible marker that must never disappear from a report."""
+
+    marker_id: str
+    text: str
+    passage_start: int
+    passage_end: int
+    reference_ids: list[str] = Field(default_factory=list)
+    candidate_reference_ids: list[str] = Field(default_factory=list)
+    link_status: str
+    marker_type: str
+    paragraph_index: int = Field(ge=0)
+    member_count: int = Field(ge=1)
+    coverage_status: str = "not_assessed"
+    reason_code: str = "citation_scope_or_member_unresolved"
+    claim_id: str | None = None
+    report_text: str | None = None
+    report_passage_start: int | None = None
+    report_passage_end: int | None = None
+
+
 class PaperExtractionArtifact(BaseModel):
     """Typed, paper-local output consumed by later verification stages.
 
@@ -69,14 +98,25 @@ class PaperExtractionArtifact(BaseModel):
     claim_boundary_rejections: list[ClaimBoundaryRejection] = Field(
         default_factory=list
     )
+    citation_marker_census: list[CitationMarkerCensusEntry] = Field(
+        default_factory=list
+    )
     body_character_count: int = 0
     reference_section_character_count: int = 0
+    total_word_count: int = 0
+    body_word_count: int = 0
+    reference_word_count: int = 0
+    reference_consistency: ReferenceConsistencyAssessment | None = None
+    reference_layout: ReferenceLayoutArtifact | None = None
+    reference_formatting: ReferenceFormattingAssessment | None = None
+    text_extraction: dict = Field(default_factory=dict)
 
 
 def extract_paper_evidence(
     paper_text: str,
     *,
     paper_version_id: str,
+    reference_text: str | None = None,
     format_hint: Optional[str] = None,
     use_llm_boundaries: bool = True,
     use_llm_atomizer: bool = True,
@@ -107,13 +147,17 @@ def extract_paper_evidence(
         raise PaperExtractionError(f"Unsupported citation format: {citation_format}")
     parser = parser or {"apa": ApaParser, "mla": MlaParser}[citation_format]
 
-    reference_section = extract_reference_section(paper_text, citation_format)
+    reference_source_text = reference_text or paper_text
+    reference_section = extract_reference_section(reference_source_text, citation_format)
     if not reference_section:
         raise PaperExtractionError("No reference section found")
 
+    body_reference_section = extract_reference_section(paper_text, citation_format)
+    if not body_reference_section:
+        raise PaperExtractionError("No reference section found in semantic paper text")
     body_text = _body_before_reference_section(
         paper_text,
-        reference_section,
+        body_reference_section,
         parser,
     )
     if not body_text:
@@ -129,13 +173,36 @@ def extract_paper_evidence(
     if not references:
         raise PaperExtractionError("Reference section contained no parseable references")
 
-    extracted = extract_citations(
+    structural_detections = extract_citations(
         body_text,
         references,
         format_hint=citation_format,
-        use_llm_boundaries=use_llm_boundaries,
+        use_llm_boundaries=False,
         signals=signals or SignalConfig.all_off(),
         extractor="cite",
+    )
+    marker_census = _build_marker_census(structural_detections, body_text, references)
+    if use_llm_boundaries:
+        llm_detections = extract_citations(
+            body_text,
+            references,
+            format_hint=citation_format,
+            use_llm_boundaries=True,
+            signals=signals or SignalConfig.all_off(),
+            extractor="cite",
+        )
+        extracted = _merge_additive_llm_recovery(
+            structural_detections,
+            llm_detections,
+            marker_census,
+            body_text,
+        )
+    else:
+        extracted = structural_detections
+    extracted = _recover_linked_sentence_citations(
+        extracted,
+        marker_census,
+        body_text,
     )
     accepted = [citation for citation in extracted if citation.drop_reason is None]
     rejected = [citation for citation in extracted if citation.drop_reason is not None]
@@ -169,6 +236,17 @@ def extract_paper_evidence(
                 )
             )
             continue
+        incomplete_markers = _unrepresented_markers(parent_claim, marker_census)
+        if incomplete_markers:
+            claim_boundary_rejections.append(
+                ClaimBoundaryRejection(
+                    passage_start=citation.passage_start,
+                    passage_end=citation.passage_end,
+                    citation_marker=citation.citation_marker,
+                    reason="citation_marker_membership_incomplete",
+                )
+            )
+            continue
         citation_claims.append(parent_claim)
         atomization = atomize_claim_unit(
             parent_claim,
@@ -180,6 +258,13 @@ def extract_paper_evidence(
             for atom in atomization.eligible_atoms
         )
 
+    marker_census = _bind_marker_census(marker_census, citation_claims)
+    reference_consistency = assess_reference_consistency(
+        paper_version_id=version_id,
+        citation_format=citation_format,
+        references=references,
+        citations=[*accepted, *rejected],
+    )
     return PaperExtractionArtifact(
         paper_version_id=version_id,
         citation_format=citation_format,
@@ -190,8 +275,694 @@ def extract_paper_evidence(
         atomizations=atomizations,
         eligible_atomic_claims=eligible_atomic_claims,
         claim_boundary_rejections=claim_boundary_rejections,
+        citation_marker_census=marker_census,
         body_character_count=len(body_text),
         reference_section_character_count=len(reference_section),
+        total_word_count=_word_count(paper_text),
+        body_word_count=_word_count(body_text),
+        reference_word_count=_word_count(reference_section),
+        reference_consistency=reference_consistency,
+    )
+
+
+def _word_count(value: str) -> int:
+    """Count human-readable word tokens without changing retained text."""
+    return len(re.findall(r"[^\W_]+(?:['’\u2011-][^\W_]+)*", value, re.UNICODE))
+
+
+def _build_marker_census(
+    detections: list[InTextCitation],
+    body_text: str,
+    references: list[ParsedReference],
+) -> list[CitationMarkerCensusEntry]:
+    grouped: dict[tuple[int, int, str], list[InTextCitation]] = {}
+    for citation in detections:
+        marker = citation.citation_marker
+        if not marker or marker == "implicit_continuation" or citation.passage_start < 0:
+            continue
+        local_start = citation.text.find(marker)
+        if local_start < 0:
+            continue
+        start = citation.passage_start + local_start
+        end = start + len(marker)
+        grouped.setdefault((start, end, marker), []).append(citation)
+
+    census: list[CitationMarkerCensusEntry] = []
+    for (start, end, marker), members in sorted(grouped.items()):
+        reference_ids = sorted(
+            {
+                reference_id
+                for citation in members
+                for reference_id in citation.reference_ids
+            }
+        )
+        candidate_ids = sorted(
+            {
+                reference_id
+                for citation in members
+                for reference_id in citation.candidate_reference_ids
+            }
+        )
+        statuses = {citation.link_status for citation in members}
+        link_status = (
+            "linked"
+            if statuses == {"linked"} and reference_ids
+            else "ambiguous"
+            if "ambiguous" in statuses or candidate_ids
+            else "missing_reference"
+        )
+        member_labels = {
+            (citation.marker_member or citation.citation_marker).strip()
+            for citation in members
+        }
+        marker_id = hashlib.sha256(
+            f"citation-marker-v1:{start}:{end}:{marker}".encode("utf-8")
+        ).hexdigest()
+        report_span = _sentence_span_containing(body_text, start, required_end=end)
+        census.append(
+            CitationMarkerCensusEntry(
+                marker_id=marker_id,
+                text=marker,
+                passage_start=start,
+                passage_end=end,
+                reference_ids=reference_ids,
+                candidate_reference_ids=candidate_ids,
+                link_status=link_status,
+                marker_type=members[0].marker_type,
+                paragraph_index=members[0].paragraph_index,
+                member_count=max(1, len(member_labels)),
+                reason_code=(
+                    "citation_scope_or_member_unresolved"
+                    if link_status == "linked"
+                    else "citation_reference_ambiguous"
+                    if link_status == "ambiguous"
+                    else "citation_reference_missing"
+                ),
+                report_passage_start=(report_span[0] if report_span else None),
+                report_passage_end=(report_span[1] if report_span else None),
+                report_text=(report_span[2] if report_span else None),
+            )
+        )
+    broad_parenthetical = re.compile(
+        r"\([^()\n]{0,250}\b(?:19|20)\d{2}[a-z]?\b[^()\n]{0,250}\)",
+        re.IGNORECASE,
+    )
+    for match in broad_parenthetical.finditer(body_text):
+        if any(
+            marker.passage_start <= match.start()
+            and match.end() <= marker.passage_end
+            for marker in census
+        ):
+            continue
+        marker = match.group(0)
+        linked_ids, candidate_ids = _link_broad_parenthetical_marker(
+            marker, references
+        )
+        sentence_span = (
+            _sentence_span_containing(
+                body_text,
+                match.start(),
+                required_end=match.end(),
+            )
+            if linked_ids or candidate_ids
+            else None
+        )
+        marker_id = hashlib.sha256(
+            f"citation-marker-v1:{match.start()}:{match.end()}:{marker}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        census.append(
+            CitationMarkerCensusEntry(
+                marker_id=marker_id,
+                text=marker,
+                passage_start=match.start(),
+                passage_end=match.end(),
+                reference_ids=linked_ids,
+                candidate_reference_ids=candidate_ids,
+                link_status=(
+                    "linked"
+                    if linked_ids
+                    else "ambiguous"
+                    if candidate_ids
+                    else "missing_reference"
+                ),
+                marker_type="parenthetical",
+                paragraph_index=_paragraph_index_at(body_text, match.start()),
+                member_count=max(1, marker.count(";") + 1),
+                reason_code=(
+                    "citation_scope_or_member_unresolved"
+                    if linked_ids
+                    else "citation_reference_ambiguous"
+                    if candidate_ids
+                    else "citation_marker_not_parsed"
+                ),
+                report_passage_start=(sentence_span[0] if sentence_span else None),
+                report_passage_end=(sentence_span[1] if sentence_span else None),
+                report_text=(sentence_span[2] if sentence_span else None),
+            )
+        )
+    census.sort(key=lambda item: (item.passage_start, item.passage_end, item.marker_id))
+    return census
+
+
+def _link_broad_parenthetical_marker(
+    marker: str,
+    references: list[ParsedReference],
+) -> tuple[list[str], list[str]]:
+    """Recover uniquely identifiable author-year members outside strict syntax."""
+    normalized_marker = unicodedata.normalize("NFKD", marker.casefold())
+    marker_author_keys = {
+        re.sub(r"[^a-z0-9]+", "", token.casefold())
+        for token in re.findall(r"[^\W\d_]+(?:[-'’][^\W\d_]+)*", normalized_marker)
+    }
+    years = set(re.findall(r"\b(?:19|20)\d{2}[a-z]?\b", normalized_marker))
+    if not years:
+        return [], []
+    matches = []
+    for reference in references:
+        if reference.year.casefold() not in years:
+            continue
+        author = reference.author.strip()
+        primary = author.split(",", 1)[0].strip()
+        if "," not in author:
+            primary = author.split()[0] if author.split() else ""
+        author_key = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            unicodedata.normalize("NFKD", primary.casefold()),
+        )
+        if len(author_key) < 3:
+            citation_key = re.sub(
+                r"(?:19|20)\d{2}[a-z]?$", "", reference.citation_key.casefold()
+            )
+            author_key = re.sub(r"[^a-z0-9]+", "", citation_key).strip()
+        if author_key and author_key in marker_author_keys:
+            matches.append(reference.reference_id)
+    unique = sorted(set(matches))
+    if not unique:
+        return [], []
+    expected_members = max(1, marker.count(";") + 1)
+    if len(unique) == expected_members:
+        return unique, []
+    return [], unique
+
+
+def _sentence_span_containing(
+    text: str,
+    offset: int,
+    *,
+    required_end: int | None = None,
+) -> tuple[int, int, str] | None:
+    """Return one exact sentence span around a marker without guessing scope."""
+    paragraph_start = 0
+    paragraph_end = len(text)
+    for separator in re.finditer(r"\n\s*\n", text):
+        if separator.end() <= offset:
+            paragraph_start = separator.end()
+            continue
+        paragraph_end = separator.start()
+        break
+    paragraph = text[paragraph_start:paragraph_end]
+    stripped = paragraph.strip()
+    if not stripped:
+        return None
+    local_base = paragraph_start + paragraph.find(stripped)
+    cursor = 0
+    sentence_spans: list[tuple[int, int]] = []
+    for sentence in split_sentences(stripped):
+        local_start = stripped.find(sentence, cursor)
+        if local_start < 0:
+            continue
+        local_end = local_start + len(sentence)
+        cursor = local_end
+        sentence_spans.append((local_base + local_start, local_base + local_end))
+    for index, (start, end) in enumerate(sentence_spans):
+        if start <= offset < end:
+            target_end = max(offset + 1, required_end or offset + 1)
+            extension_index = index + 1
+            while end < target_end and extension_index < len(sentence_spans):
+                end = sentence_spans[extension_index][1]
+                extension_index += 1
+            if end < target_end:
+                return None
+            start = _trim_report_prefix(text, start, end)
+            return start, end, text[start:end]
+    return None
+
+
+def _recover_linked_sentence_citations(
+    citations: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+) -> list[InTextCitation]:
+    """Recover exact sentence units when source membership is deterministic.
+
+    This is the ordinary fallback for a visible, uniquely linked marker that
+    strict extraction or the bounded LLM pass did not turn into a citation
+    unit. Recovery is allowed only when every census marker in the exact
+    sentence is linked; an ambiguous or missing member blocks the sentence.
+    """
+    accepted = [item for item in citations if item.drop_reason is None]
+    uncovered = [
+        marker
+        for marker in census
+        if marker.link_status == "linked"
+        and marker.reference_ids
+        and not set(marker.reference_ids).issubset(
+            {
+                reference_id
+                for citation in accepted
+                if citation.passage_start <= marker.passage_start
+                and marker.passage_end <= citation.passage_end
+                for reference_id in citation.reference_ids
+            }
+        )
+    ]
+    sentence_groups: dict[tuple[int, int, str], list[CitationMarkerCensusEntry]] = {}
+    for marker in uncovered:
+        sentence = _sentence_span_containing(
+            body_text,
+            marker.passage_start,
+            required_end=marker.passage_end,
+        )
+        if sentence is not None:
+            sentence_groups.setdefault(sentence, []).append(marker)
+
+    recovered: list[InTextCitation] = []
+    for (start, end, text), _uncovered_markers in sorted(
+        sentence_groups.items(), key=lambda item: item[0][:2]
+    ):
+        sentence_markers = [
+            marker
+            for marker in census
+            if start <= marker.passage_start and marker.passage_end <= end
+        ]
+        if not sentence_markers or any(
+            marker.link_status != "linked" or not marker.reference_ids
+            for marker in sentence_markers
+        ):
+            continue
+        reference_ids = sorted(
+            {
+                reference_id
+                for marker in sentence_markers
+                for reference_id in marker.reference_ids
+            }
+        )
+        marker_members = [
+            CitationMarkerMember(
+                text=marker.text,
+                local_start=marker.passage_start - start,
+                local_end=marker.passage_end - start,
+                reference_ids=list(marker.reference_ids),
+                marker_type=marker.marker_type,
+            )
+            for marker in sentence_markers
+        ]
+        locator_matches = re.findall(
+            r"\bp{1,2}\.?\s*(\d+(?:\s*[-–—]\s*\d+)?)",
+            " ".join(marker.text for marker in sentence_markers),
+            flags=re.IGNORECASE,
+        )
+        recovered.append(
+            InTextCitation(
+                reference_ids=reference_ids,
+                text=text,
+                claim_type=(
+                    "quotation"
+                    if re.search(r'["“][^"”\n]+["”]', text)
+                    else "paraphrase"
+                ),
+                citation_marker="; ".join(
+                    marker.text for marker in sentence_markers
+                ),
+                citation_markers=marker_members,
+                marker_type=(
+                    sentence_markers[0].marker_type
+                    if len({marker.marker_type for marker in sentence_markers}) == 1
+                    else "parenthetical"
+                ),
+                page_number=(locator_matches[0] if len(locator_matches) == 1 else ""),
+                paragraph_index=sentence_markers[0].paragraph_index,
+                passage_start=start,
+                passage_end=end,
+                confidence="high",
+            )
+        )
+    return [*citations, *recovered]
+
+
+_REPORT_SECTION_HEADING = re.compile(
+    r"^\s*(?:abstract|introduction|background|literature\s+review|"
+    r"method(?:s|ology)?|results?|discussion|conclusion|references?|"
+    r"works\s+cited)\s*(?:\n+|$)",
+    re.IGNORECASE,
+)
+_REPORT_SPEAKER_PREFIX = re.compile(
+    r"^\s*\((?![^)\n]*(?:19|20)\d{2})[^)\n]{1,80}\)\s*\n+",
+    re.IGNORECASE,
+)
+
+
+def _trim_report_prefix(text: str, start: int, end: int) -> int:
+    candidate = text[start:end]
+    while candidate:
+        match = _REPORT_SECTION_HEADING.match(candidate)
+        if match is None:
+            match = _REPORT_SPEAKER_PREFIX.match(candidate)
+        if match is None:
+            break
+        start += match.end()
+        candidate = text[start:end]
+    while start < end and text[start].isspace():
+        start += 1
+    return start
+
+
+def _merge_additive_llm_recovery(
+    structural: list[InTextCitation],
+    llm: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+) -> list[InTextCitation]:
+    """Preserve deterministic detections and admit only bounded LLM additions."""
+    merged = list(structural)
+    structural_marker_ids = {
+        marker.marker_id
+        for marker in census
+        if any(
+            citation.passage_start <= marker.passage_start
+            and marker.passage_end <= citation.passage_end
+            and set(marker.reference_ids).issubset(citation.reference_ids)
+            for citation in structural
+        )
+    }
+    accepted_explicit = list(structural)
+    for citation in llm:
+        if citation.drop_reason is not None:
+            merged.append(citation)
+            continue
+        if citation.citation_marker == "implicit_continuation":
+            if _valid_implicit_continuation(citation, accepted_explicit, census, body_text):
+                merged.append(citation)
+            else:
+                merged.append(
+                    citation.model_copy(
+                        update={"drop_reason": "llm_continuation_not_structurally_anchored"}
+                    )
+                )
+            continue
+
+        represented = [
+            marker
+            for marker in census
+            if citation.passage_start <= marker.passage_start
+            and marker.passage_end <= citation.passage_end
+            and marker.link_status == "linked"
+            and set(marker.reference_ids).issubset(citation.reference_ids)
+        ]
+        new_markers = [
+            marker for marker in represented if marker.marker_id not in structural_marker_ids
+        ]
+        if not new_markers:
+            continue
+        sentence_spans = {
+            _sentence_span_containing(
+                body_text,
+                marker.passage_start,
+                required_end=marker.passage_end,
+            )
+            for marker in new_markers
+        }
+        sentence_spans.discard(None)
+        if len(sentence_spans) != 1:
+            merged.append(
+                citation.model_copy(
+                    update={"drop_reason": "llm_recovery_not_one_deterministic_sentence"}
+                )
+            )
+            continue
+        start, end, text = next(iter(sentence_spans))
+        sentence_markers = [
+            marker
+            for marker in census
+            if start <= marker.passage_start and marker.passage_end <= end
+            and marker.link_status == "linked"
+        ]
+        reference_ids = sorted(
+            {reference_id for marker in sentence_markers for reference_id in marker.reference_ids}
+        )
+        marker_members = [
+            CitationMarkerMember(
+                text=marker.text,
+                local_start=marker.passage_start - start,
+                local_end=marker.passage_end - start,
+                reference_ids=list(marker.reference_ids),
+                marker_type=marker.marker_type,
+            )
+            for marker in sentence_markers
+        ]
+        recovered = citation.model_copy(
+            update={
+                "text": text,
+                "passage_start": start,
+                "passage_end": end,
+                "reference_ids": reference_ids,
+                "citation_markers": marker_members,
+                "citation_marker": "; ".join(marker.text for marker in sentence_markers),
+                "link_status": "linked",
+                "confidence": "medium",
+            }
+        )
+        merged.append(recovered)
+        accepted_explicit.append(recovered)
+        structural_marker_ids.update(marker.marker_id for marker in sentence_markers)
+    return merged
+
+
+def _valid_implicit_continuation(
+    citation: InTextCitation,
+    explicit: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+) -> bool:
+    if (
+        citation.link_status != "linked"
+        or not citation.reference_ids
+        or citation.passage_start < 0
+        or citation.passage_end <= citation.passage_start
+        or body_text[citation.passage_start:citation.passage_end] != citation.text
+    ):
+        return False
+    prior = [
+        item
+        for item in explicit
+        if item.passage_end <= citation.passage_start
+        and item.paragraph_index == citation.paragraph_index
+        and set(citation.reference_ids).issubset(item.reference_ids)
+    ]
+    if not prior:
+        return False
+    nearest = max(prior, key=lambda item: item.passage_end)
+    gap = body_text[nearest.passage_end:citation.passage_start]
+    if len(gap) > 500 or re.search(r"\n\s*\n", gap):
+        return False
+    return not any(
+        nearest.passage_end <= marker.passage_start < citation.passage_start
+        and not set(marker.reference_ids).issubset(citation.reference_ids)
+        for marker in census
+    )
+
+
+def _paragraph_index_at(text: str, offset: int) -> int:
+    return len(re.findall(r"\n\s*\n", text[:offset]))
+
+
+def _claim_marker_keys(claim: ClaimEvidence) -> set[tuple[int, int, str]]:
+    return {
+        (
+            claim.passage_start + marker.local_start,
+            claim.passage_start + marker.local_end,
+            marker.text,
+        )
+        for marker in claim.citation_markers
+    }
+
+
+def _claim_covers_census_marker(
+    claim: ClaimEvidence,
+    marker: CitationMarkerCensusEntry,
+) -> bool:
+    exact = (marker.passage_start, marker.passage_end, marker.text)
+    if exact in _claim_marker_keys(claim):
+        return set(marker.reference_ids).issubset(claim.reference_ids)
+    contained = [
+        item
+        for item in claim.citation_markers
+        if marker.passage_start
+        <= claim.passage_start + item.local_start
+        < claim.passage_start + item.local_end
+        <= marker.passage_end
+    ]
+    represented_ids = {
+        reference_id for item in contained for reference_id in item.reference_ids
+    }
+    return (
+        marker.member_count > 1
+        and len(contained) >= marker.member_count
+        and set(marker.reference_ids).issubset(represented_ids)
+    )
+
+
+def _unrepresented_markers(
+    claim: ClaimEvidence,
+    census: list[CitationMarkerCensusEntry],
+) -> list[str]:
+    missing: list[str] = []
+    for marker in census:
+        if not (
+            claim.passage_start <= marker.passage_start
+            and marker.passage_end <= claim.passage_end
+        ):
+            continue
+        if (
+            not _claim_covers_census_marker(claim, marker)
+            or marker.link_status != "linked"
+            or not set(marker.reference_ids).issubset(claim.reference_ids)
+        ):
+            missing.append(marker.marker_id)
+    return missing
+
+
+def _bind_marker_census(
+    census: list[CitationMarkerCensusEntry],
+    claims: list[ClaimEvidence],
+) -> list[CitationMarkerCensusEntry]:
+    result: list[CitationMarkerCensusEntry] = []
+    for marker in census:
+        matches = [
+            claim
+            for claim in claims
+            if _claim_covers_census_marker(claim, marker)
+        ]
+        if len(matches) == 1 and marker.link_status == "linked":
+            result.append(
+                marker.model_copy(
+                    update={
+                        "coverage_status": "covered",
+                        "reason_code": "citation_member_bound",
+                        "claim_id": matches[0].claim_id,
+                    }
+                )
+            )
+        else:
+            result.append(marker)
+    return result
+
+
+def report_anchor_citations(
+    artifact: PaperExtractionArtifact,
+) -> list[InTextCitation]:
+    """Return only report-safe claim spans plus every unresolved marker span."""
+    claim_keys = {
+        (
+            claim.passage_start,
+            claim.passage_end,
+            claim.text,
+            tuple(sorted(claim.reference_ids)),
+        )
+        for claim in artifact.citation_claims
+    }
+    result = [
+        citation
+        for citation in artifact.citations
+        if (
+            citation.passage_start,
+            citation.passage_end,
+            citation.text,
+            tuple(sorted(citation.reference_ids)),
+        )
+        in claim_keys
+    ]
+    for group in unresolved_marker_report_groups(artifact.citation_marker_census):
+        result.append(
+            InTextCitation(
+                text=group["text"],
+                reference_ids=group["reference_ids"],
+                candidate_reference_ids=group["candidate_reference_ids"],
+                link_status=group["link_status"],
+                citation_marker=group["citation_marker"],
+                marker_type=group["marker_type"],
+                paragraph_index=group["paragraph_index"],
+                passage_start=group["passage_start"],
+                passage_end=group["passage_end"],
+                confidence="low",
+            )
+        )
+    return result
+
+
+def unresolved_marker_report_groups(
+    census: list[CitationMarkerCensusEntry],
+) -> list[dict]:
+    """Group exact structural sentences for neutral report navigation only.
+
+    A strict verification boundary can reject a citation unit even when the
+    deterministic parser knows the sentence containing its marker. Reusing
+    that exact sentence in the report prevents marker-only display without
+    admitting the sentence to source-fidelity verification.
+    """
+    groups: dict[tuple[int, int, str, int], list[CitationMarkerCensusEntry]] = {}
+    for marker in census:
+        if marker.coverage_status == "covered":
+            continue
+        start = marker.report_passage_start
+        end = marker.report_passage_end
+        text = marker.report_text
+        if start is None or end is None or not text:
+            start, end, text = marker.passage_start, marker.passage_end, marker.text
+        groups.setdefault((start, end, text, marker.paragraph_index), []).append(marker)
+
+    result = []
+    for (start, end, text, paragraph_index), markers in groups.items():
+        reference_ids = sorted({value for item in markers for value in item.reference_ids})
+        candidate_ids = sorted(
+            {value for item in markers for value in item.candidate_reference_ids}
+        )
+        statuses = {item.link_status for item in markers}
+        marker_texts = list(dict.fromkeys(item.text for item in markers))
+        marker_types = {item.marker_type for item in markers}
+        result.append(
+            {
+                "group_id": hashlib.sha256(
+                    f"citation-report-group-v1:{start}:{end}:{text}".encode("utf-8")
+                ).hexdigest(),
+                "text": text,
+                "passage_start": start,
+                "passage_end": end,
+                "paragraph_index": paragraph_index,
+                "reference_ids": reference_ids,
+                "candidate_reference_ids": candidate_ids,
+                "link_status": (
+                    "linked"
+                    if statuses == {"linked"} and reference_ids
+                    else "ambiguous"
+                    if "ambiguous" in statuses or candidate_ids
+                    else "missing_reference"
+                ),
+                "citation_marker": "; ".join(marker_texts),
+                "marker_type": next(iter(marker_types)) if len(marker_types) == 1 else "mixed",
+                "reason_codes": list(dict.fromkeys(item.reason_code for item in markers)),
+                "recovered_sentence": any(
+                    item.report_passage_start is not None and item.report_text
+                    for item in markers
+                ),
+            }
+        )
+    return sorted(
+        result,
+        key=lambda item: (item["passage_start"], item["passage_end"], item["group_id"]),
     )
 
 
@@ -228,6 +999,29 @@ def _consolidate_duplicate_citation_units(
                 -item[0],
             ),
         )
+        combined_markers: list[CitationMarkerMember] = []
+        seen_markers: set[tuple[int, int, str]] = set()
+        for _index, citation in detections:
+            marker_items = list(citation.citation_markers)
+            if not marker_items and citation.citation_marker:
+                local_start = citation.text.find(citation.citation_marker)
+                if local_start >= 0:
+                    marker_items = [
+                        CitationMarkerMember(
+                            text=citation.citation_marker,
+                            local_start=local_start,
+                            local_end=local_start + len(citation.citation_marker),
+                            reference_ids=list(citation.reference_ids),
+                            marker_type=citation.marker_type,
+                        )
+                    ]
+            for marker in marker_items:
+                key = (marker.local_start, marker.local_end, marker.text)
+                if key not in seen_markers:
+                    seen_markers.add(key)
+                    combined_markers.append(marker)
+        combined_markers.sort(key=lambda item: (item.local_start, item.local_end))
+        winner = winner.model_copy(update={"citation_markers": combined_markers})
         kept.append((winner_index, winner))
         duplicates.extend(
             (
@@ -290,11 +1084,25 @@ def _group_multi_marker_units(
             )
             for _index, citation in detections
         }
-        if len(reference_ids) <= 1 or len(marker_identities) <= 1:
+        if len(reference_ids) <= 1:
             continue
-        resolved = _split_source_specific_clauses(detections)
+        if len(marker_identities) == 1:
+            if len(detections) == 1:
+                # The extractor already emitted one compound citation with
+                # complete membership.
+                continue
+            resolved = _group_compound_parenthetical_marker(detections)
+        else:
+            prepared = _collapse_compound_parenthetical_blocks(detections)
+            resolved = (
+                _split_source_specific_clauses(prepared)
+                if prepared is not None
+                else None
+            )
         if resolved is None:
             resolved = _group_collective_narrative_markers(detections)
+        if resolved is None:
+            resolved = _group_complete_sentence_markers(detections)
         indexes = {index for index, _citation in detections}
         if resolved is None:
             rejected_indexes.update(indexes)
@@ -319,6 +1127,193 @@ def _group_multi_marker_units(
     return kept, rejected
 
 
+def _group_complete_sentence_markers(
+    detections: list[tuple[int, InTextCitation]],
+) -> list[InTextCitation] | None:
+    """Keep one exact sentence unit while preserving source-specific markers.
+
+    When explicit clause splitting is unavailable, rejecting the complete
+    sentence hides real citations from the evidence-first report. This fallback
+    makes no claim that every source governs every clause: it retains each
+    marker's exact source membership and fans the unchanged citation sentence
+    out for source-specific evidence retrieval.
+    """
+    if not detections or any(
+        citation.link_status != "linked" or not citation.reference_ids
+        for _index, citation in detections
+    ):
+        return None
+    prepared = _collapse_compound_parenthetical_blocks(detections)
+    if prepared is None:
+        return None
+    located = _located_marker_detections(prepared)
+    if located is None or len(located) < 2:
+        return None
+    text = detections[0][1].text
+    reference_ids: list[str] = []
+    candidate_reference_ids: list[str] = []
+    marker_members: list[CitationMarkerMember] = []
+    for marker_start, marker_end, citation in located:
+        for reference_id in citation.reference_ids:
+            if reference_id not in reference_ids:
+                reference_ids.append(reference_id)
+        for reference_id in citation.candidate_reference_ids:
+            if reference_id not in candidate_reference_ids:
+                candidate_reference_ids.append(reference_id)
+        if citation.citation_markers:
+            marker_members.extend(citation.citation_markers)
+        else:
+            marker_members.append(
+                CitationMarkerMember(
+                    text=text[marker_start:marker_end],
+                    local_start=marker_start,
+                    local_end=marker_end,
+                    reference_ids=list(citation.reference_ids),
+                    marker_type=citation.marker_type,
+                )
+            )
+    marker_members.sort(key=lambda item: (item.local_start, item.local_end))
+    first = located[0][2]
+    return [
+        first.model_copy(
+            update={
+                "reference_ids": reference_ids,
+                "candidate_reference_ids": candidate_reference_ids,
+                "citation_key": "|".join(
+                    citation.citation_key
+                    for _start, _end, citation in located
+                    if citation.citation_key
+                ),
+                "citation_marker": "; ".join(
+                    text[start:end] for start, end, _citation in located
+                ),
+                "citation_markers": marker_members,
+                "marker_member": " | ".join(
+                    marker.text for marker in marker_members
+                ),
+                "marker_start": min(
+                    citation.marker_start for _start, _end, citation in located
+                ),
+                "marker_end": max(
+                    citation.marker_end for _start, _end, citation in located
+                ),
+                "confidence": "medium",
+            }
+        )
+    ]
+
+
+def _collapse_compound_parenthetical_blocks(
+    detections: list[tuple[int, InTextCitation]],
+) -> list[tuple[int, InTextCitation]] | None:
+    """Represent each exact compound marker once before clause grouping.
+
+    The citation extractor emits one source-specific detection per member of a
+    compound parenthetical block.  Clause grouping previously treated the
+    semicolons *inside* that block as sentence-level separators and rejected
+    otherwise explicit multi-source sentences.
+    """
+    grouped: dict[tuple[str, int, int], list[tuple[int, InTextCitation]]] = {}
+    for item in detections:
+        citation = item[1]
+        grouped.setdefault(
+            (citation.citation_marker, citation.marker_start, citation.marker_end),
+            [],
+        ).append(item)
+    prepared: list[tuple[int, InTextCitation]] = []
+    for block in grouped.values():
+        if len(block) == 1:
+            prepared.append(block[0])
+            continue
+        merged = _group_compound_parenthetical_marker(block)
+        if merged is None or len(merged) != 1:
+            return None
+        prepared.append((min(index for index, _citation in block), merged[0]))
+    return sorted(prepared, key=lambda item: (item[1].marker_start, item[0]))
+
+
+def _group_compound_parenthetical_marker(
+    detections: list[tuple[int, InTextCitation]],
+) -> list[InTextCitation] | None:
+    """Merge members parsed from one exact parenthetical citation block."""
+    if not detections or any(
+        citation.marker_type != "parenthetical"
+        for _index, citation in detections
+    ):
+        return None
+    raw_marker = detections[0][1].citation_marker
+    text = detections[0][1].text
+    if not raw_marker or any(
+        citation.citation_marker != raw_marker
+        for _index, citation in detections
+    ):
+        return None
+    marker_start = text.find(raw_marker)
+    if marker_start < 0 or text.find(raw_marker, marker_start + 1) >= 0:
+        return None
+
+    ordered = []
+    cursor = 0
+    for _index, citation in detections:
+        member_text = (citation.marker_member or "").strip()
+        if not member_text:
+            return None
+        member_start = raw_marker.find(member_text, cursor)
+        if member_start < 0:
+            return None
+        member_end = member_start + len(member_text)
+        ordered.append((member_start, member_end, citation))
+        cursor = member_end
+    if len({citation.marker_member for _s, _e, citation in ordered}) != len(ordered):
+        return None
+
+    reference_ids: list[str] = []
+    candidate_reference_ids: list[str] = []
+    marker_members: list[CitationMarkerMember] = []
+    for member_start, member_end, citation in ordered:
+        for reference_id in citation.reference_ids:
+            if reference_id not in reference_ids:
+                reference_ids.append(reference_id)
+        for reference_id in citation.candidate_reference_ids:
+            if reference_id not in candidate_reference_ids:
+                candidate_reference_ids.append(reference_id)
+        marker_members.append(
+            CitationMarkerMember(
+                text=raw_marker[member_start:member_end],
+                local_start=marker_start + member_start,
+                local_end=marker_start + member_end,
+                reference_ids=list(citation.reference_ids),
+                marker_type="parenthetical",
+            )
+        )
+    first = detections[0][1]
+    return [
+        first.model_copy(
+            update={
+                "reference_ids": reference_ids,
+                "candidate_reference_ids": candidate_reference_ids,
+                "citation_key": "|".join(
+                    citation.citation_key
+                    for _start, _end, citation in ordered
+                    if citation.citation_key
+                ),
+                "citation_markers": marker_members,
+                "marker_member": " | ".join(
+                    citation.marker_member for _start, _end, citation in ordered
+                ),
+                "page_number": next(
+                    (
+                        citation.page_number
+                        for _start, _end, citation in ordered
+                        if citation.page_number
+                    ),
+                    "",
+                ),
+            }
+        )
+    ]
+
+
 def _split_source_specific_clauses(
     detections: list[tuple[int, InTextCitation]],
 ) -> list[InTextCitation] | None:
@@ -331,7 +1326,10 @@ def _split_source_specific_clauses(
         return None
     raw_clauses: list[tuple[int, int]] = []
     start = 0
+    marker_ranges = [(item[0], item[1]) for item in marker_spans]
     for match in re.finditer(r";", text):
+        if any(left <= match.start() < right for left, right in marker_ranges):
+            continue
         raw_clauses.append((start, match.start()))
         start = match.end()
     raw_clauses.append((start, len(text)))

@@ -171,7 +171,7 @@ def test_google_books_rejects_queried_isbn_record_with_wrong_title(monkeypatch):
     assert result.success is False
 
 
-def test_google_books_accepts_isbn_query_omitting_identifiers_with_title_match(monkeypatch):
+def test_google_books_isbn_query_without_observed_identifiers_cannot_bind_extent(monkeypatch):
     payload = {
         "items": [
             {
@@ -198,6 +198,5 @@ def test_google_books_accepts_isbn_query_omitting_identifiers_with_title_match(m
         author="Rivera, Alex",
     )
 
-    assert result.success is True
-    assert result.expected_pages == 240
-    assert "title confirmation" in (result.match_reason or "")
+    assert result.success is False
+    assert result.expected_pages is None

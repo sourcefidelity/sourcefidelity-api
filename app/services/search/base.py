@@ -8,12 +8,43 @@ Follows the same pluggable pattern as retrieval adapters (retrieval/base.py):
 each provider implements search(), the factory selects based on config.
 """
 
+import hashlib
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+
+def safe_search_failure_log(query: str, exc: Exception) -> tuple[str, str]:
+    """Return non-reversible query and bounded failure identifiers for logs."""
+    query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    if isinstance(exc, httpx.HTTPStatusError):
+        failure = f"HTTP_{exc.response.status_code}"
+    else:
+        failure = type(exc).__name__
+    return query_sha256, failure
+
+
+def classify_search_failure(exc: Exception) -> str:
+    """Return a bounded operational status without retaining error contents."""
+    if isinstance(
+        exc,
+        (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout),
+    ):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in {401, 403}:
+            return "access_restricted"
+        if status in {429, 432}:
+            return "rate_limited"
+    if isinstance(exc, (ValueError, httpx.DecodingError)):
+        return "response_invalid"
+    return "operational_failure"
 
 
 @dataclass
@@ -37,6 +68,8 @@ class SearchProvider(ABC):
     def name(self) -> str:
         """Provider name for logging."""
         ...
+
+    last_status: str = "not_run"
 
     @abstractmethod
     def search(self, query: str, num_results: int = 10) -> list[SearchResult]:

@@ -24,6 +24,7 @@ from app.services.verification_run import (
     cleanup_verification_run,
     execute_verification_run,
     load_verification_run_source,
+    renew_verification_run_lease,
 )
 from app.tasks import verification_run_cleanup
 from app.tasks.celery_app import celery_app
@@ -184,7 +185,7 @@ def test_processor_failure_cleans_source_and_derivatives_without_report(database
         assert session.scalar(select(func.count(VerificationReportRecord.id))) == 0
 
 
-def test_initial_upload_failure_keeps_discoverable_cleaned_audit(database):
+def test_initial_upload_failure_keeps_discoverable_uncertain_cleanup(database):
     storage = MemoryStorage()
 
     def fail_upload(file_bytes, key):
@@ -196,8 +197,9 @@ def test_initial_upload_failure_keeps_discoverable_cleaned_audit(database):
             begin_verification_run(session, storage, _request())
     with database() as session:
         run = session.scalar(select(VerificationRunRecord))
-        assert run.status == "failed_cleaned"
-        assert run.transient_objects == []
+        assert run.status == "cleanup_pending"
+        assert len(run.transient_objects) == 1
+        assert run.last_cleanup_error_code == "upload_completion_unresolved"
         assert run.terminal_outcome == "failed"
 
 
@@ -261,6 +263,74 @@ def test_expired_lease_is_recovered_as_abandoned(database, monkeypatch):
         assert run.status == "abandoned_cleaned"
         assert run.terminal_outcome == "abandoned"
     assert storage.objects == {}
+
+
+def test_scheduled_cleanup_rechecks_a_renewed_lease(database):
+    storage = MemoryStorage()
+    with database() as session:
+        run = begin_verification_run(session, storage, _request())
+        old_expiry = run.lease_expires_at
+        renew_verification_run_lease(session, run.id, scope_type="personal_owner",
+            scope_id="owner-1", lease_seconds=100_000)
+        assert not cleanup_verification_run(session, storage, run.id,
+            outcome="abandoned", now=old_expiry, expired_before=old_expiry)
+        assert run.status == "active" and run.cleanup_attempts == 0
+        assert storage.objects
+
+
+def test_busy_cleanup_does_not_change_run_or_delete_bytes(database, monkeypatch):
+    from contextlib import contextmanager
+    from app.services import verification_run as service
+    storage = MemoryStorage()
+    with database() as session:
+        run = begin_verification_run(session, storage, _request())
+        @contextmanager
+        def busy(*args):
+            raise service.VerificationRunBusy("Synthetic active processor")
+            yield  # pragma: no cover
+        monkeypatch.setattr(service, "_locked_run_session", busy)
+        assert not cleanup_verification_run(session, storage, run.id)
+        assert run.status == "active" and run.cleanup_attempts == 0
+        assert storage.objects
+
+
+def test_lost_standalone_owner_does_not_issue_failure_cleanup(database):
+    from app.services.workflow_execution import WorkflowOwnershipLost
+    storage = MemoryStorage()
+    def lost(*args):
+        raise WorkflowOwnershipLost("Synthetic owner loss")
+    with pytest.raises(WorkflowOwnershipLost):
+        execute_verification_run(database, storage, _request(), lost)
+    with database() as session:
+        run = session.scalar(select(VerificationRunRecord))
+        assert run.status == "active" and run.cleanup_attempts == 0
+        assert cleanup_stale_verification_runs(session, storage,
+            now=run.lease_expires_at + timedelta(seconds=1))["runs_cleaned"] == 1
+    assert storage.objects == {}
+
+
+def test_operation_specific_lease_can_cover_a_bounded_paper_workflow(database):
+    storage = MemoryStorage()
+    started = datetime(2026, 8, 16, tzinfo=timezone.utc)
+    with database() as session:
+        run = begin_verification_run(
+            session,
+            storage,
+            _request(),
+            now=started,
+            lease_seconds=86_400,
+        )
+        assert run.lease_expires_at == started + timedelta(days=1)
+
+        renewed = renew_verification_run_lease(
+            session,
+            run.id,
+            scope_type="personal_owner",
+            scope_id="owner-1",
+            now=started + timedelta(hours=12),
+            lease_seconds=86_400,
+        )
+        assert renewed == started + timedelta(days=1, hours=12)
 
 
 def test_exact_scope_and_active_lease_are_required(database):

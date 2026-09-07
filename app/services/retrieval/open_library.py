@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.log_safety import safe_exception_code
 logger = logging.getLogger(__name__)
 
 OPEN_LIBRARY_READ = "https://openlibrary.org/api/books"
@@ -66,8 +67,8 @@ class OpenLibraryRetriever:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.debug("Open Library Read API failed: %s", e)
-            return PageCountResult(success=False, error=str(e))
+            logger.debug("Open Library Read API failed (type=%s)", type(e).__name__)
+            return PageCountResult(success=False, error=safe_exception_code(e))
 
         record = data.get(bibkey)
         if not record:
