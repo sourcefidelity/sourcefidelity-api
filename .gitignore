@@ -301,3 +301,8 @@ url_web_results.json
 
 # Private rendered report QA and local PDF artifacts.
 /output/pdf/
+
+# All supplied source formats and private current-guidance contracts/tools.
+sources/
+private_guiding_contracts/
+private_guiding_tools/

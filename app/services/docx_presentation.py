@@ -158,9 +158,18 @@ def _reject_renderer_network_dependencies(content: bytes) -> None:
                     root = ET.fromstring(archive.read(name))
                 except ET.ParseError as exc:
                     raise DocxPresentationError("DOCX word-processing XML is invalid") from exc
+                instructions = [node.text or "" for node in
+                                root.findall(f".//{{{_WORD_NS}}}instrText")]
+                instructions += [node.get(f"{{{_WORD_NS}}}instr", "") for node in
+                                 root.findall(f".//{{{_WORD_NS}}}fldSimple")]
+                # A complete plain HTTP hyperlink is not an external-content
+                # command. Do not interpret URL path/host tokens as commands.
+                # Keep all other (including partial or compound) instructions
+                # under the conservative existing rejection check.
                 field_text = " ".join(
-                    node.text or ""
-                    for node in root.findall(f".//{{{_WORD_NS}}}instrText")
+                    instruction for instruction in instructions
+                    if not re.fullmatch(r'\s*HYPERLINK\s+"https?://[^"\s]+"\s*',
+                                        instruction, re.I)
                 )
                 if _UNSAFE_FIELD.search(field_text):
                     raise DocxPresentationError(

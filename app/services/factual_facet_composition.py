@@ -33,8 +33,8 @@ from app.services.verification_evidence import (
 )
 
 
-FACTUAL_FACET_COMPOSITION_VERSION = "complete-proposition-scope-composition-v2"
-FACTUAL_FACET_REPAIR_COMPOSITION_VERSION = "complete-proposition-scope-composition-v3"
+FACTUAL_FACET_COMPOSITION_VERSION = "complete-proposition-scope-composition-v6"
+FACTUAL_FACET_REPAIR_COMPOSITION_VERSION = "complete-proposition-scope-composition-v7"
 MAX_INPUT_TOKENS = 4_000
 _TOKEN = re.compile(r"\S+")
 _LEADING_CONTEXT_REFERENCE = re.compile(
@@ -104,7 +104,28 @@ proposition_form=complete_factual_proposition, checking_gloss,
 gloss_inherits_from_complete_unit, ranges, and constraint_keys. Set that
 inheritance flag when the gloss supplies a subject, predicate, or resolved
 reference from the complete citation unit or bounded context. Shared
-constraints use c001 keys; structural edges use e001 keys. Return no prose
+constraints use c001 keys; structural edges use e001 keys.
+Every range is exactly {"start_id":"t000","end_id":"t003"}, inclusive.
+Use contiguous ranges, not one object per token; never copy token offsets/text.
+Each constraint is exactly {constraint_key, kind, ranges, applies_to, scope}.
+kind: shared_subject, shared_predicate, shared_domain, quantity, modifier,
+negation, modality, frequency, condition, time, comparison, attribution, other_scope.
+applies_to lists pNNN keys; scope is facet_specific, shared_exact, collective,
+distributive or unresolved. Every facet's constraint_keys and each constraint's
+applies_to must link reciprocally.
+Each edge is exactly {edge_key, kind, ranges, connects}; connects lists one or
+more pNNN keys. One key means an internal dependency within that complete
+proposition; several keys mean a dependency across propositions. Edge kind:
+coordination, alternative, contrast, causal, conditional or other.
+Do not manufacture extra propositions to encode an internal dependency.
+Articles, bare infinitives, punctuation and other grammatical glue remain
+inside proposition ranges, not standalone scope constraints. Each constraint
+must contain material wording (actor, qualifier or relationship), not just
+an isolated function word or punctuation.
+Each uncovered range is exactly {start_id, end_id, reason}.
+At most 12 facets, 24 constraints, 12 edges, 12 uncovered ranges;
+1-6 contiguous ranges per facet/constraint and 1-3 per edge.
+Empty arrays are allowed when inapplicable. Return no additional fields or prose
 outside the JSON object."""
 
 _PRESERVATION_SYSTEM_PROMPT = """Audit proposed factual facets against the
@@ -128,7 +149,12 @@ proposition, and do not let one proposition absorb or prove a shared qualifier.
 
 Also return uncovered_status: no_material_factual_wording,
 material_factual_wording_uncovered, or uncertain, plus exactly the supplied
-uncovered_ids that contain material factual wording. Return no rationale,
+uncovered_ids that contain material factual wording.
+Return exactly {candidate_id, reviews, constraint_reviews, uncovered_status,
+material_uncovered_ids}. reviews items contain only facet_id, status, confidence;
+constraint_reviews items contain only constraint_id, status, confidence.
+Use high/medium confidence for decisive statuses and low/none for uncertain.
+Return no rationale,
 rewritten facet, copied input text, or prose outside the JSON object."""
 
 _REPAIR_PROPOSAL_SYSTEM_PROMPT = _PROPOSAL_SYSTEM_PROMPT + """
@@ -211,7 +237,7 @@ class _StructuralEdgeResponse(BaseModel):
         "other",
     ]
     ranges: list[_TokenRange] = Field(min_length=1, max_length=3)
-    connects: list[str] = Field(min_length=2, max_length=12)
+    connects: list[str] = Field(min_length=1, max_length=12)
 
 
 class _UncoveredRangeResponse(_TokenRange):
@@ -416,7 +442,7 @@ class FactualScopeConstraint(BaseModel):
 
 
 class FactualStructuralEdge(BaseModel):
-    """Exact structural wording connecting propositions without becoming one."""
+    """Exact dependency within/across propositions, never itself a proposition."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -432,7 +458,7 @@ class FactualStructuralEdge(BaseModel):
         "other",
     ]
     segments: list[ClaimSourceSegment] = Field(min_length=1, max_length=3)
-    connects_facet_ids: list[str] = Field(min_length=2, max_length=12)
+    connects_facet_ids: list[str] = Field(min_length=1, max_length=12)
     text: str = Field(min_length=1, max_length=50_000)
 
 
@@ -644,6 +670,7 @@ def compose_factual_facets(
     interpretation: StudentStatementInterpretation | None = None,
     max_input_tokens: int = MAX_INPUT_TOKENS,
     processing_boundary: Literal["local", "authorized_remote"] = "local",
+    whole_unit_development: bool = False,
 ) -> FactualFacetCompositionResult:
     """Propose and preserve factual facets without source evidence."""
     if artifact.citation_use_routing.status == "not_run":
@@ -653,7 +680,13 @@ def compose_factual_facets(
     }
     candidate = candidates.get(candidate_id)
     digest = _text_sha256(candidate.text if candidate else candidate_id)
-    if candidate is None or candidate_id not in routed_relationship_candidate_ids(artifact):
+    # A source-blind development comparison may start before deterministic
+    # clause splitting. This does not authorize a relationship judgment on the
+    # whole-unit guard or modify its routing. All normal callers remain gated.
+    whole_guard = bool(whole_unit_development and candidate is not None
+                       and candidate.role == "whole_unit_guard"
+                       and candidate.kind == "whole_unit")
+    if candidate is None or (not whole_guard and candidate_id not in routed_relationship_candidate_ids(artifact)):
         return _failure(candidate_id, digest, "candidate_not_eligible", processing_boundary)
     if candidate.attribution != "cited_source":
         return _failure(candidate_id, digest, "candidate_not_eligible", processing_boundary)

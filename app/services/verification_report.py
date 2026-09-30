@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import hashlib
+
+from app.log_safety import bounded_detail
+import re
 import json
 import uuid
 
@@ -38,18 +43,38 @@ from app.services.verification_evidence import (
     FacetEvidenceMapping,
     VerificationEvidenceArtifact,
     passage_role_from_text,
+    document_metadata_member_admissible,
     _passage_boundary_status,
     passage_matches_page_locator,
+    _is_explanatory_note,
 )
 
 
-REPORT_FORMAT_VERSION = "verification-report-v18"
+REPORT_FORMAT_VERSION = "verification-report-v20"
 MAX_REPORT_CLAIM_CHARACTERS = 5_000
 MAX_REPORT_PASSAGE_CHARACTERS = 1_200
 
 
 class ReportAuthorizationError(ValueError):
-    """The requested report scope does not match its evidence provenance."""
+    """The requested report scope does not match its evidence provenance.
+
+    Every message raised here is a fixed internal literal, never interpolated
+    student, source or network text, so a slug of the message is safe to
+    record. Recording only the class name made distinct causes indistinguishable
+    in job failures and required an offline replay to diagnose.
+    """
+
+    def __init__(self, *args: object, detail: str | None = None) -> None:
+        super().__init__(*args)
+        message = str(args[0]) if args else ""
+        slug = re.sub(r"[^a-z0-9]+", "_", message.casefold()).strip("_")[:80]
+        self.code = slug or "report_authorization_failed"
+        self.reason_code = self.code
+        # One shape for every bounded detail in the application; a second
+        # definition here once accepted less than `safe_exception_detail`
+        # would, so the same failure was diagnosable or not depending on
+        # which class raised it.
+        self.detail = bounded_detail(detail)
 
 
 def persist_verification_report(
@@ -96,6 +121,7 @@ def persist_verification_report(
         and latest.evidence_sha256 == digest
         and latest.verification_run_id == (run.id if run is not None else None)
     ):
+        _store_judgment_reserve(session, artifact, latest)
         if run is not None and mark_run_persisted:
             run.status = "report_persisted"
             run.terminal_outcome = "success"
@@ -117,11 +143,26 @@ def persist_verification_report(
     )
     session.add(record)
     session.flush()
+    _store_judgment_reserve(session, artifact, record)
     if run is not None and mark_run_persisted:
         run.status = "report_persisted"
         run.terminal_outcome = "success"
         session.flush()
     return record
+
+
+def _store_judgment_reserve(session: Session, artifact, record) -> None:
+    """Save the optional Judgment reserve beside its report; never fail the report."""
+    reserve = getattr(artifact, "_judgment_reserve", None)
+    if not reserve:
+        return
+    from app.services.judgment_reserve import store_reserve
+    try:
+        with session.begin_nested():
+            store_reserve(session, record, reserve)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Judgment reserve not stored (type=%s)", type(exc).__name__)
 
 
 def build_inspectable_report_payload(
@@ -134,6 +175,7 @@ def build_inspectable_report_payload(
             "rebuild or explicitly migrate it before current report persistence"
         )
     evidence_package = build_evidence_package(artifact)
+    from app.services.joint_evidence_selection import joint_selection_context
     validate_evidence_package(evidence_package)
     source_navigation = build_source_navigation_descriptor(evidence_package)
     claim_text = artifact.claim.text
@@ -183,6 +225,15 @@ def build_inspectable_report_payload(
         "passages": passages,
         "relationship_signal": artifact.relationship.model_dump(mode="json"),
         "passage_relevance_gate": artifact.passage_relevance.model_dump(mode="json"),
+        # The scope comparison travels with the excerpt it was made against,
+        # bounded by the same limit as any other stored source text. Without
+        # it the report cannot verify the judgment and will not display one.
+        "source_scope_assessment": artifact.source_scope_assessment.model_dump(
+            mode="json"
+        ),
+        "joint_evidence_selection": artifact.joint_evidence_selection.model_dump(mode="json"),
+        "joint_selection_context": joint_selection_context(artifact),
+        "sentence_evidence": artifact.sentence_evidence.model_dump(mode="json"),
         "structured_judgment": artifact.judgment.model_dump(mode="json"),
         "evidence_conditioned_unit_judgment": artifact.unit_judgment.model_dump(
             mode="json"
@@ -250,6 +301,10 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
     _validate_source_binding(artifact)
     _validate_claim_antecedents(artifact.claim)
     _validate_claim_discourse(artifact.claim)
+    if artifact.joint_evidence_selection.status == "complete":
+        from app.services.joint_evidence_selection import validate_joint_selection
+        if not validate_joint_selection(artifact, artifact.joint_evidence_selection):
+            raise ReportAuthorizationError("Joint evidence selection is not bound to current evidence")
     if (
         identity.authorization_scope_type != scope_type
         or identity.authorization_scope_id != scope_id
@@ -284,6 +339,8 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
         )
     passage_by_id = {passage.passage_id: passage for passage in artifact.passages}
     for assessment in relevance.assessments:
+        if assessment.display_observation is not None and assessment.assessed_text_sha256 is None:
+            raise ReportAuthorizationError("Display observation lacks assessed-text binding")
         if assessment.assessed_text_sha256 is None:
             continue
         passage = passage_by_id[assessment.passage_id]
@@ -293,6 +350,7 @@ def _validate_artifact_scope(artifact, scope_type, scope_id):
                 "Passage-relevance assessed-text bounds are invalid"
             )
         excerpt = passage.text[assessment.assessed_text_offset_start:end]
+        _validate_display_observation(assessment, excerpt, artifact.claim.text)
         if hashlib.sha256(excerpt.encode("utf-8")).hexdigest() != (
             assessment.assessed_text_sha256
         ):
@@ -464,6 +522,8 @@ def _validate_obligation_relevance_findings(
                 "An obligation finding's selected passages do not match its assessments"
             )
         for assessment in finding.assessments:
+            if assessment.display_observation is not None and assessment.assessed_text_sha256 is None:
+                raise ReportAuthorizationError("Display observation lacks assessed-text binding")
             if assessment.assessed_text_sha256 is None:
                 continue
             passage = passage_by_id[assessment.passage_id]
@@ -473,6 +533,7 @@ def _validate_obligation_relevance_findings(
                     "An obligation finding has invalid assessed-text bounds"
                 )
             excerpt = passage.text[assessment.assessed_text_offset_start:end]
+            _validate_display_observation(assessment, excerpt, obligation.target_text)
             if hashlib.sha256(excerpt.encode("utf-8")).hexdigest() != (
                 assessment.assessed_text_sha256
             ):
@@ -496,6 +557,13 @@ def _validate_obligation_relevance_findings(
         raise ReportAuthorizationError(
             "Top-level passage relevance is not the exact accuracy-eligible projection"
         )
+
+
+def _validate_display_observation(assessment, excerpt, target):
+    observation = assessment.display_observation
+    if observation is not None and (observation.source_span not in excerpt
+            or any(not span.strip() or span not in target for span in observation.claim_spans)):
+        raise ReportAuthorizationError("Display observation is not bound to supplied source and claim spans")
 
 
 def _validate_unit_judgment_segments(artifact):
@@ -944,19 +1012,55 @@ def _validate_candidate_passage_retrieval(artifact, supplied_ids):
         for item in selection.passages
     }:
         passage = passages[passage_id]
-        if passage.passage_role != passage_role_from_text(passage.text):
+        text_role = passage_role_from_text(passage.text)
+        channels = selected_channels_by_passage.get(passage_id, set())
+        # A single extracted explanatory note need not repeat its source's
+        # Notes heading. Recheck the existing producer's prose rule and typed
+        # retrieval channel; never relabel it as ordinary body evidence.
+        explanatory_note = bool(
+            passage.passage_role == "citation_notes"
+            and passage.retrieval_method == "explanatory_note_context"
+            and "candidate_explanatory_note_context" in channels
+            and text_role in {"body_prose", "unknown", "citation_notes"}
+            and _is_explanatory_note(passage.text)
+        )
+        # Opening-page titles have a geometry-derived role: their bare words
+        # cannot reproduce the title/byline layout when read as plain text.
+        # Preserve the existing explicit aggregate-member channel, not a
+        # general exemption for publication furniture or arbitrary role claims.
+        document_title = bool(
+            passage.passage_role == "document_metadata"
+            and passage.retrieval_method == "document_level_member_evidence"
+            and "candidate_document_metadata" in channels
+            and len(set(artifact.claim.reference_ids)) > 1
+            and document_metadata_member_admissible(
+                page_index=passage.page_index, text=passage.text
+            )
+        )
+        if passage.passage_role != text_role and not (explanatory_note or document_title):
+            # Naming both roles and the producing method is the difference
+            # between a diagnosable defect and an offline replay.
             raise ReportAuthorizationError(
-                "Candidate passage role is not application-derived"
+                "Candidate passage role is not application-derived",
+                detail=(
+                    f"stored={passage.passage_role}; derived={text_role}; "
+                    f"method={passage.retrieval_method}"
+                ),
             )
         if passage.boundary_status != _passage_boundary_status(passage.text):
             raise ReportAuthorizationError(
-                "Candidate passage boundary status is not application-derived"
+                "Candidate passage boundary status is not application-derived",
+                detail=(
+                    f"stored={passage.boundary_status}; "
+                    f"derived={_passage_boundary_status(passage.text)}; "
+                    f"role={passage.passage_role}"
+                ),
             )
         if passage.passage_role in excluded_roles:
             raise ReportAuthorizationError(
                 "Candidate passage retrieval admitted a definite non-body block"
             )
-        if passage.passage_role == "citation_notes" and not (
+        if passage.passage_role == "citation_notes" and not explanatory_note and not (
             selected_channels_by_passage.get(passage_id, set())
             & {"candidate_explicit_note", "candidate_note_fallback"}
         ):
@@ -1796,7 +1900,8 @@ def _validate_claim_antecedents(claim):
         ):
             raise ReportAuthorizationError("Antecedent mention does not match the citation unit")
         if not dependency.method.startswith(
-            ("local-document-antecedent-rescue-v1", "local-document-antecedent-rescue-v2")
+            ("local-document-antecedent-rescue-v1", "local-document-antecedent-rescue-v2",
+             "local-document-antecedent-rescue-v3")
         ):
             continue
         candidate_ids = [candidate.candidate_id for candidate in dependency.candidates]

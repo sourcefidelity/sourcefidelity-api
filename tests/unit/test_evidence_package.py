@@ -62,6 +62,35 @@ def _artifact(source_text: str = "Careful checking improves accuracy."):
     return build_passage_evidence(source, claim=claim)
 
 
+def test_alternate_edition_is_bound_and_does_not_change_checks():
+    from app.services.alternate_edition import AlternateEditionRecord
+    artifact = _artifact()
+    original = build_evidence_package(artifact)
+    relationship = AlternateEditionRecord(
+        submitted_reference_sha256='a'*64,
+        retrieved_representation_sha256=artifact.source_identity.content_sha256)
+    package = build_evidence_package(artifact, alternate_edition=relationship,
+                                    submitted_reference_sha256='a'*64)
+    assert package.alternate_edition == relationship
+    assert package.package_sha256 != original.package_sha256
+    assert package.quotation_check == original.quotation_check
+    assert package.locator_check == original.locator_check
+    validate_evidence_package(package)
+    with pytest.raises(EvidencePackageError):
+        build_evidence_package(artifact, alternate_edition=relationship,
+                               submitted_reference_sha256='b'*64)
+
+
+def test_absent_alternate_edition_preserves_legacy_hash():
+    from app.services.evidence_package import _package_payload_sha256
+    package = build_evidence_package(_artifact())
+    payload = package.model_dump(mode='json')
+    payload.pop('package_sha256')
+    with_optional = _package_payload_sha256(payload)
+    payload.pop('alternate_edition')
+    assert _package_payload_sha256(payload) == with_optional
+
+
 def test_evidence_package_is_source_bound_hashed_and_judgment_free():
     artifact = _artifact()
     package = build_evidence_package(artifact)

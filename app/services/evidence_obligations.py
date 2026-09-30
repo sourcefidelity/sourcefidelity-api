@@ -129,8 +129,11 @@ def attach_evidence_obligations(
 
 def exact_source_attributed_text(artifact: VerificationEvidenceArtifact) -> str:
     """Return only the wording the visible source marker can attribute."""
+    return claim_source_attributed_text(artifact.claim, artifact.source_binding)
 
-    claim = artifact.claim
+
+def claim_source_attributed_text(claim, binding=None) -> str:
+    """Shared source-blind scope projection; preserve the original claim."""
     if claim.source_segments:
         ordered = sorted(claim.source_segments, key=lambda item: item.local_start)
         joined = " ".join(item.text.strip() for item in ordered if item.text.strip())
@@ -138,7 +141,6 @@ def exact_source_attributed_text(artifact: VerificationEvidenceArtifact) -> str:
             return joined
     marker = (claim.citation_marker or "").strip()
     if claim.citation_marker_type == "parenthetical" and marker:
-        binding = artifact.source_binding
         marker_start = -1
         if (
             binding is not None

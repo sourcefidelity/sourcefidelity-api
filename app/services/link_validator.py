@@ -128,6 +128,7 @@ def check_link(
     try:
         resp = safe_request(
             url,
+            usage_label="submitted link check",
             headers=headers,
             timeout=timeout,
             raise_on_status=False,  # we categorize status codes ourselves

@@ -231,8 +231,20 @@ def check_completeness(
         signals.append(start_msg["detail"])
         if start_msg["vote"] == INCOMPLETE:
             incomplete_votes.append(start_msg["detail"])
+        gap_msg = _signal_book_pagination_gap(file_bytes)
+        signals.append(gap_msg["detail"])
+        if gap_msg["vote"] == INCOMPLETE:
+            incomplete_votes.append(gap_msg["detail"])
+            # A preview may copy the original index/notes after omitting the
+            # intervening chapters. That back matter cannot rebut a directly
+            # observed gap in the work's printed pagination.
+            complete_votes = [vote for vote in complete_votes if vote != back_msg["detail"]]
     else:
         signals.append(f"Book pagination-start check: skipped ({kind})")
+        run_msg = _signal_article_continuous_run(file_bytes, logical_pages, title)
+        signals.append(run_msg["detail"])
+        if run_msg["vote"] == COMPLETE:
+            complete_votes.append(run_msg["detail"])
 
     # Length without affirmative edition/terminal evidence is not a verdict.
     # Short articles, reports, pamphlets, chapters and monographs are common.
@@ -384,6 +396,18 @@ def _signal_back_matter(
 
     lines = [line.strip() for line in tail_text.splitlines() if line.strip()]
     found = [line for line in lines if _TERMINAL_HEADING_RE.fullmatch(line)]
+    # Some journal articles use bibliographic endnotes instead of a separate
+    # References heading. A bare "Notes" label is not sufficient: require
+    # multiple numbered entries and bibliographic years after that heading.
+    if not found and document_kind == "article":
+        for index, line in enumerate(lines):
+            if re.fullmatch(r"(?:endnotes|notes)", line, re.IGNORECASE):
+                following = "\n".join(lines[index + 1:])
+                entries = re.findall(r"(?m)^\d{1,3}\.\s+", following)
+                years = re.findall(r"\b(?:18|19|20)\d{2}\b", following)
+                if len(entries) >= 3 and len(years) >= 3:
+                    found = [line]
+                    break
     if found:
         return {
             "vote": COMPLETE,
@@ -482,6 +506,18 @@ def _signal_rendered_raster_coverage(file_bytes: bytes) -> dict:
 
             for page_index in sampled:
                 page = doc[page_index]
+                # Placement metadata is sufficient to rule out horizontal
+                # cropping. Avoid hashing/decoding every source raster merely
+                # to identify xrefs when none extends past the visible page.
+                # Ambiguous/rotated layouts retain the original inspection.
+                if not page.rotation:
+                    placements = page.get_image_info(hashes=False, xrefs=False)
+                    if all(
+                        fitz.Rect(item['bbox']).x0 >= 0
+                        and fitz.Rect(item['bbox']).x1 <= page.rect.width
+                        for item in placements
+                    ):
+                        continue
                 candidates: list[tuple[float, int, fitz.Rect, fitz.Matrix]] = []
                 for image in page.get_images(full=True):
                     xref = image[0]
@@ -664,6 +700,79 @@ def _margin_page_numbers(page: fitz.Page) -> set[int]:
     return numbers
 
 
+def _signal_article_continuous_run(
+    file_bytes: bytes, logical_pages: int, title: str | None
+) -> dict:
+    """Affirmative completeness for an article that carries its own pagination.
+
+    A journal or law-review article usually has no index or reference section
+    for the back-matter signal to find, and an unresolved reference supplies no
+    advertised page range. Such an article then collects no positive signal at
+    all and is reported as limited text although every page was retrieved.
+
+    The affirmative evidence used here is the work's own printed pagination: an
+    unbroken run whose span equals the captured page count, beginning on a page
+    that carries the expected title, and ending on a page that is not full.
+    Requiring the title rejects an excerpt lifted from the middle; requiring a
+    short final page rejects a head excerpt cut at a page boundary.
+    """
+    if not title or logical_pages < 4:
+        return {"vote": None, "detail": "Article continuous-run check: not applicable"}
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        try:
+            if len(doc) != logical_pages:  # n-up or reconstructed layout
+                return {
+                    "vote": None,
+                    "detail": "Article continuous-run check: skipped (reconstructed layout)",
+                }
+            printed = [_margin_page_numbers(doc[i]) for i in range(len(doc))]
+            lengths = [len(doc[i].get_text()) for i in range(len(doc))]
+            opening = doc[0].get_text()
+        finally:
+            doc.close()
+    except Exception as exc:
+        return {
+            "vote": None,
+            "detail": f"Article continuous-run check unavailable ({type(exc).__name__})",
+        }
+
+    first = sorted(printed[0])
+    if not first:
+        return {"vote": None, "detail": "Article continuous-run check: no printed first-page number"}
+    start = first[0]
+    expected_run = list(range(start, start + logical_pages))
+    if not all(value in labels for value, labels in zip(expected_run, printed)):
+        return {
+            "vote": None,
+            "detail": "Article continuous-run check: printed pagination is not an unbroken run",
+        }
+
+    words = {word for word in re.findall(r"[a-z0-9]+", title.casefold()) if len(word) > 3}
+    opening_words = set(re.findall(r"[a-z0-9]+", opening.casefold()))
+    if not words or len(words & opening_words) < max(2, round(0.7 * len(words))):
+        return {
+            "vote": None,
+            "detail": "Article continuous-run check: opening page does not carry the expected title",
+        }
+
+    body = sorted(lengths[1:-1])
+    median = body[len(body) // 2] if body else 0
+    if not median or lengths[-1] >= 0.85 * median:
+        return {
+            "vote": None,
+            "detail": "Article continuous-run check: final page is full, so an end cannot be established",
+        }
+    return {
+        "vote": COMPLETE,
+        "detail": (
+            f"Article continuous-run check: COMPLETE — printed pages {start}-"
+            f"{start + logical_pages - 1} form an unbroken run of {logical_pages} pages "
+            "from the titled opening page to a short final page"
+        ),
+    }
+
+
 def _signal_book_pagination_start(file_bytes: bytes) -> dict:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -706,6 +815,43 @@ def _signal_book_pagination_start(file_bytes: bytes) -> dict:
             "front matter plus page 1"
         ),
     }
+
+
+def _signal_book_pagination_gap(file_bytes: bytes) -> dict:
+    """Detect missing interior leaves, not bookmark/embedded-label jumps.
+
+    Require three uniquely observed consecutive margin numbers on each side
+    and at most two intervening unnumbered leaves. Numbering resets, isolated
+    numbers, years and ambiguous margins abstain. This is book-only: collected
+    article/chapter pagination cannot establish missing whole-book pages.
+    """
+    try:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            samples = [_margin_page_numbers(page) for page in doc]
+    except Exception as exc:
+        return {"vote": None, "detail": f"Book pagination-gap check unavailable ({type(exc).__name__})"}
+    runs = []
+    for index in range(len(samples) - 2):
+        window = samples[index:index + 3]
+        if all(len(values) == 1 for values in window):
+            numbers = [next(iter(values)) for values in window]
+            if numbers == list(range(numbers[0], numbers[0] + 3)):
+                runs.append((index, numbers[0]))
+    for (left_index, left_number), (right_index, right_number) in zip(runs, runs[1:]):
+        distance = right_index - left_index
+        if 3 <= distance <= 5 and right_number - left_number - distance >= 5:
+            between = samples[left_index + 3:right_index]
+            if any(between):
+                continue
+            return {
+                "vote": INCOMPLETE,
+                "detail": (
+                    "Book pagination-gap check: INCOMPLETE — corroborated printed "
+                    f"pagination jumps from {left_number + 2} to {right_number} "
+                    f"across {distance - 3} unnumbered leaves"
+                ),
+            }
+    return {"vote": None, "detail": "Book pagination-gap check: no corroborated interior gap"}
 
 
 def _lookup_expected_pages(

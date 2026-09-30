@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report mockup 04 — relevance / coverage grid</title>
+  <style>
+    :root {
+      --blue: #1e67ff;
+      --teal: #0aa2a7;
+      --amber: #cc7e00;
+      --brown: #8e5a2c;
+      --line: #d8e0ef;
+      --muted: #64748b;
+      --shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+      --font: "Nunito Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--font); background: #f4f6fb; color: #111827; }
+    .page { max-width: 1540px; margin: 14px auto; padding: 0 14px 14px; display: grid; gap: 10px; }
+    .panel, .paper, .grid { border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: var(--shadow); }
+    .header { border-radius: 12px; border: 1px solid var(--line); background: #fff; padding: 11px; display: grid; gap: 8px; }
+    .header h1 { margin: 0; font-size: 1.05rem; }
+    .header .meta { color: var(--muted); font-size: .92rem; }
+    .rowchips { display: flex; gap: 8px; flex-wrap: wrap; }
+    .rowchip { border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; background: #fff; font-weight: 700; }
+    .rowchip.active { color: #1d4ed8; border-color: #bfdbfe; background: #eff6ff; }
+    .split { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 10px; }
+    .left, .right { display: flex; flex-direction: column; }
+    .toolbar { position: sticky; top: 0; z-index: 2; background: #f8fafc; border-bottom: 1px solid var(--line); padding: 10px 12px; display: flex; justify-content: space-between; gap: 10px; }
+    .bodyscroll { padding: 10px; overflow: auto; }
+    .paper-page { border: 1px solid #e5e7eb; border-radius: 10px; margin-bottom: 9px; padding: 10px; }
+    .paper-page h2 { margin: 0 0 8px; font-size: 1.03rem; }
+    .inline { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 0 8px; border: 1px solid #d1d5db; font-size: .72rem; font-weight: 700; margin-left: 6px; }
+    .author { background: rgba(30, 103, 255, .14); }
+    .year { background: rgba(10, 162, 167, .15); }
+    .page-no { background: rgba(204, 126, 0, .16); }
+    .gridarea { display: grid; grid-template-columns: 1fr; gap: 10px; }
+    .summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .summary .box { border: 1px solid var(--line); border-radius: 10px; padding: 8px; background: #f8fbff; }
+    .summary .label { font-size: .72rem; color: var(--muted); text-transform: uppercase; font-weight: 700; }
+    .summary .value { font-size: 1.15rem; font-weight: 700; margin-top: 4px; }
+    .table-wrap { border: 1px solid #e5e7eb; border-radius: 10px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th { position: sticky; top: 0; background: #f8fafc; text-align: left; font-size: .8rem; border-bottom: 1px solid var(--line); }
+    th, td { padding: 8px; border-bottom: 1px solid #edf1f7; font-size: .84rem; }
+    .source-name { width: 24%; font-weight: 700; }
+    .claim-id { width: 18%; font-weight: 600; }
+    .rel { width: 20%; }
+    .cov { width: 16%; }
+    .route { width: 22%; }
+    .status {
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: .72rem;
+      border: 1px solid #d1d5db;
+    }
+    .full { color: #1d4ed8; background: #dbeafe; }
+    .limited { color: #0f766e; background: #ccfbf1; }
+    .attn { color: #92400e; background: #fde68a; }
+    .none { color: #4b5563; background: #f1f5f9; }
+    .bar { width: 74px; height: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; display: inline-block; }
+    .bar span { display: block; height: 100%; }
+    .legend { display: grid; grid-template-columns: repeat(4, minmax(130px,1fr)); gap: 8px; }
+    .key { border: 1px solid var(--line); border-radius: 999px; padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; }
+    @media (max-width: 1200px) {
+      .split, .summary, .legend { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="header">
+      <h1>Student paper report mockup 04</h1>
+      <div class="meta">Paper: “Adaptive infrastructure priorities in transit-dependent cities” · Grid-based relevance and coverage mapping</div>
+      <div class="rowchips">
+        <span class="rowchip active">Split</span>
+        <span class="rowchip">Paper-only</span>
+        <span class="rowchip">Panel-only</span>
+        <span class="rowchip">Student</span>
+        <span class="rowchip">Instructor</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="summary" style="padding: 10px;">
+        <div class="box"><div class="label">Mapped citations</div><div class="value">12</div></div>
+        <div class="box"><div class="label">Rows needing attention</div><div class="value">3</div></div>
+        <div class="box"><div class="label">Coverage</div><div class="value">74%</div></div>
+      </div>
+      <div class="split" style="padding: 10px; padding-top: 0;">
+        <section class="left">
+          <div class="toolbar"><strong>Paper</strong><span class="muted">Grid supports direct traceability</span></div>
+          <div class="bodyscroll" style="padding-top: 10px;">
+            <div class="paper-page">
+              <h2>Introduction</h2>
+              <p>
+                Sustainable planning evidence highlights stronger governance and continuity of funding.
+                <span class="inline author">Baker</span>
+                <span class="inline year">2019</span>
+                <span class="inline page-no">p.24</span>
+              </p>
+            </div>
+            <div class="paper-page">
+              <h2>Methods and measures</h2>
+              <p>
+                The claim that contracts universally improve outcomes is only partially supported by source language.
+                <span class="inline author">Diaz</span><span class="inline year">2020</span><span class="inline page-no">pp.85-87</span>
+              </p>
+            </div>
+            <div class="paper-page">
+              <h2>Results</h2>
+              <p>
+                One locator could not be traced in the approved source set.
+                <span class="inline author">Wang</span><span class="inline year">2022</span><span class="inline page-no">missing</span>
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="right">
+          <div class="toolbar"><strong>Relevance & coverage grid</strong><span class="muted">Citation-level evidence matrix</span></div>
+          <div class="bodyscroll">
+            <div class="table-wrap" style="margin-top: 10px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="source-name">Source</th>
+                    <th class="claim-id">Claim / sentence</th>
+                    <th class="rel">Relevance</th>
+                    <th class="cov">Coverage</th>
+                    <th class="route">Route status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>Baker (2019)</td><td>C1</td><td><span class="status full">Full</span></td><td><span class="bar"><span style="width:94%; background:#1e67ff"></span></span> 94%</td><td>Search route complete</td></tr>
+                  <tr><td>Baker (2019)</td><td>C2</td><td><span class="status full">Full</span></td><td><span class="bar"><span style="width:87%; background:#1e67ff"></span></span> 87%</td><td>Search route complete</td></tr>
+                  <tr><td>Chen (2021)</td><td>C3</td><td><span class="status full">Full</span></td><td><span class="bar"><span style="width:88%; background:#1e67ff"></span></span> 88%</td><td>Search route complete</td></tr>
+                  <tr><td>Chen (2021)</td><td>C4</td><td><span class="status full">Full</span></td><td><span class="bar"><span style="width:80%; background:#1e67ff"></span></span> 80%</td><td>Search route complete</td></tr>
+                  <tr><td>Diaz (2020)</td><td>C5</td><td><span class="status limited">Limited</span></td><td><span class="bar"><span style="width:43%; background:#0aa2a7"></span></span> 43%</td><td>Search route complete</td></tr>
+                  <tr><td>Diaz (2020)</td><td>C6</td><td><span class="status limited">Limited</span></td><td><span class="bar"><span style="width:52%; background:#0aa2a7"></span></span> 52%</td><td>Search route complete</td></tr>
+                  <tr><td>Wang (2022)</td><td>C7</td><td><span class="status attn">Attention</span></td><td><span class="bar"><span style="width:28%; background:#cc7e00"></span></span> 28%</td><td>Locator incomplete</td></tr>
+                  <tr><td>Rossi (2024)</td><td>C8</td><td><span class="status none">Unavailable</span></td><td><span class="bar"><span style="width:0%; background:#9ca3af"></span></span> 0%</td><td>Source unavailable</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="legend" style="margin-top: 10px;">
+              <div class="key"><span class="dot" style="background:var(--blue)"></span>Full-reference</div>
+              <div class="key"><span class="dot" style="background:var(--teal)"></span>Coverage-limited</div>
+              <div class="key"><span class="dot" style="background:var(--amber)"></span>Needs attention</div>
+              <div class="key"><span class="dot" style="background:var(--brown)"></span>Unavailable</div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

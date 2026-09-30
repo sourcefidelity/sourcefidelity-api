@@ -30,8 +30,15 @@ _APA_AUTHOR_ONLY_START = re.compile(
     r'[^\W\d_][^,\n]{1,80},\s*(?:[A-Z]\.?){1,6}(?:\s*,|\s*$)'
 )
 
+# A mixed full-name/initials author list can wrap before its date. Require a
+# subsequent surname/initial pair, not just arbitrary comma-separated prose.
+_APA_MIXED_AUTHOR_START = re.compile(
+    r"^\s*[^\W\d_][\w'’\-]+\s+[^\W\d_][\w'’\-]+,\s*"
+    r"[^\W\d_][\w'’\-]+,\s*[A-Z]\.(?:\s*,|\s*$)"
+)
+
 _APA_DATE = re.compile(
-    r"(?<!\d)(?:(?:19|20)\d{2}[a-z]?|n\.d\.)(?!\d)",
+    r"(?<!\d)(?:(?:19|20)\d{2}[a-z]?(?:\s*[-–—]\s*(?:19|20)\d{2})?|n\.d\.)(?!\d)",
     re.IGNORECASE,
 )
 
@@ -41,11 +48,12 @@ _APA_PERSONAL_AUTHOR_CUE = re.compile(
 
 _APA_START = re.compile(
     r'^\s*'
-    r'(?:\d+[\.\)]?\s+)?'                                 # optional number
+    r'(?:\d+[\.\)]?\s+|[-•]\s+)?'                         # optional list marker
     r'(?:'
-    r'(?:[A-Z]|\[|[\u4e00-\u9fff\u3400-\u4dbf])'          # ordinary complete first line
+    r'(?:[A-Z]|\[|[\u4e00-\u9fff\u3400-\u4dbf]|'
+    r'(?:von|van|de|del|der|den|di|da)\s+(?=[A-Z][^,\n]{1,60},\s*[A-Z]\.))'
     r'[^\n]{0,400}?'
-    r'[.,]?\s*\(?(?:(?:19|20)\d{2}[a-z]?|n\.d\.)\)?[.,\s]'
+    r'[.,]?\s*\(?(?:(?:19|20)\d{2}[a-z]?(?:\s*[-–—]\s*(?:19|20)\d{2})?|n\.d\.)\)?[.,\s]'
     r'|'
     # A long author list may wrap before its year.  A leading surname plus
     # initials is still a safe new-entry boundary even on that first line.
@@ -67,9 +75,15 @@ class ApaParser(BaseParser):
 
     @classmethod
     def _starts_new_reference(cls, stripped: str, current: List[str]) -> bool:
-        if not super()._starts_new_reference(stripped, current):
+        # A date embedded in a URL/DOI is not a bibliographic date field.
+        # Trim only the boundary probe; retain the complete original entry.
+        stripped = re.split(r'https?://|www\.|\b10\.\d{4,9}/', stripped, maxsplit=1, flags=re.I)[0].rstrip()
+        if not (super()._starts_new_reference(stripped, current)
+                or _APA_MIXED_AUTHOR_START.match(stripped)):
             return False
-        if current and not _APA_DATE.search(" ".join(current)):
+        if (current and not _APA_DATE.search(" ".join(current))
+                and (_APA_AUTHOR_ONLY_START.match(current[0])
+                     or _APA_MIXED_AUTHOR_START.match(current[0]))):
             # A wrapped APA author list can occupy several extracted lines
             # before the publication date appears.  Until that required date
             # has been seen, another author-shaped line completes the current
@@ -77,6 +91,12 @@ class ApaParser(BaseParser):
             return False
         date_match = _APA_DATE.search(stripped)
         if date_match:
+            # A date inside a volume/title parenthesis is not the APA date
+            # element. Preserve ordinary (year, month) fields and bare dates.
+            before_date = stripped[:date_match.start()]
+            opening = before_date.rfind('(')
+            if opening > before_date.rfind(')') and opening != date_match.start()-1:
+                return False
             prefix = re.sub(
                 r"^\s*\d+[.)]?\s+", "", stripped[: date_match.start()]
             ).strip().rstrip("(").rstrip()
@@ -96,7 +116,7 @@ class ApaParser(BaseParser):
                 # long institutional author.  A long leading identity phrase
                 # is materially different from a short work-title/year
                 # continuation and remains an admissible entry boundary.
-                or len(prefix) >= 60
+                or (len(prefix) >= 60 and date_is_apa_field)
             )
             if (
                 current
@@ -186,7 +206,19 @@ class ApaParser(BaseParser):
             if not ref:
                 continue
 
-            if cleaned and (
+            # Preserve a separately extracted incomplete block when the prior
+            # entry terminates in its own link and this block supplies another
+            # link after substantive text. Do not mistake a URL-only wrapped
+            # line for a new entry. This establishes boundaries, not authorship.
+            independently_linked_block = bool(
+                cleaned
+                and re.search(r'https?://\S+[.)]?$', cleaned[-1])
+                and not re.match(r'(?i)^(?:https?://|www\.|doi\s*:|retrieved\b)', ref)
+                and re.search(r'https?://', ref)
+                and len(re.split(r'https?://', ref, maxsplit=1)[0].split()) >= 6
+                and re.search(r'[.!?]\s', re.split(r'https?://', ref, maxsplit=1)[0])
+            )
+            if cleaned and not independently_linked_block and (
                 not _APA_DATE.search(ref)
                 or not cls._starts_new_reference(ref, [])
             ):

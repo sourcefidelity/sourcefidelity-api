@@ -8,6 +8,7 @@ import io
 import hashlib
 import logging
 import math
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -24,7 +25,7 @@ class TextExtractionError(Exception):
     """Raised when text extraction fails."""
 
 
-TEXT_EXTRACTION_QUALIFICATION_VERSION = "paper-text-qualification-v1"
+TEXT_EXTRACTION_QUALIFICATION_VERSION = "paper-text-qualification-v2"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,8 @@ class TextCandidate:
     suspicious_unbroken_token_count: int
     max_unbroken_token_length: int
     replacement_character_count: int
+    # Native line boundaries, separate from authoritative semantic text.
+    layout_text: str = ""
 
     @property
     def suspicious_rate(self) -> float:
@@ -61,6 +64,7 @@ class QualifiedTextExtraction:
                 {
                     "backend": item.backend,
                     "sha256": item.sha256,
+                    "layout_sha256": hashlib.sha256(item.layout_text.encode()).hexdigest() if item.layout_text else None,
                     "character_count": len(item.text),
                     "word_count": item.word_count,
                     "suspicious_unbroken_token_count": item.suspicious_unbroken_token_count,
@@ -121,7 +125,7 @@ def _clean_text(text: str) -> str:
     # authoritative paper wording; retrieval/quotation normalization owns
     # any explicitly labelled dehyphenated comparison alternative.
     text = re.sub(r"-\n[ \t]*(?=[a-z])", "-", text)
-    text = re.sub(r"(?<=[a-z])\s*\n\s*(?=[a-z])", " ", text)        # join mid-sentence wraps only
+    text = re.sub(r"(?<=[a-z])[^\S\r\n]*\n[^\S\r\n]*(?=[a-z])", " ", text)
     # Tidy any double spaces introduced by the join
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
@@ -251,9 +255,10 @@ def extract_qualified_text_from_bytes(
     )
     for backend, extractor in extractors:
         try:
-            text = _clean_text(extractor(content))
+            layout_text = extractor(content)
+            text = _clean_text(layout_text)
             if text.strip():
-                candidates.append(_text_candidate(backend, text))
+                candidates.append(_text_candidate(backend, text, layout_text=layout_text))
             else:
                 failures.append(f"{backend}: empty")
         except Exception as exc:
@@ -288,11 +293,34 @@ def extract_qualified_text_from_bytes(
         if preferred_bad and materially_cleaner:
             selected = best
             reason = "alternate_materially_cleaner_than_preferred"
+        elif _native_spacing_recovery(preferred, best):
+            selected = best
+            reason = "alternate_recovers_native_word_boundaries"
     return QualifiedTextExtraction(
         selected=selected,
         candidates=tuple(candidates),
         selection_reason=reason,
     )
+
+
+def _native_spacing_recovery(preferred: TextCandidate, alternate: TextCandidate) -> bool:
+    """Select a native transcription, never guess spaces inside student words.
+
+    Long shared URLs can mask spacing damage in the older maximum-token test.
+    Require near-complete agreement of physical lines without whitespace and a
+    substantial recovery of word boundaries, not simply more extracted text.
+    """
+    if not preferred.layout_text or not alternate.layout_text:
+        return False
+    if alternate.word_count < preferred.word_count * 1.25:
+        return False
+    if alternate.replacement_character_count > preferred.replacement_character_count:
+        return False
+    lines = [Counter(re.sub(r"\s+", "", line) for line in item.layout_text.splitlines())
+             for item in (preferred, alternate)]
+    shared = sum(len(line) * count for line, count in (lines[0] & lines[1]).items())
+    totals = [sum(len(line) * count for line, count in counts.items()) for counts in lines]
+    return min(totals) >= 200 and shared >= .95 * max(totals)
 
 
 def extract_text_from_bytes(
@@ -384,7 +412,7 @@ def _marginal_signature(line: str) -> str:
     return normalized
 
 
-def _text_candidate(backend: str, text: str) -> TextCandidate:
+def _text_candidate(backend: str, text: str, *, layout_text: str = "") -> TextCandidate:
     words = text.split()
     lengths = [len(word) for word in words]
     return TextCandidate(
@@ -395,6 +423,7 @@ def _text_candidate(backend: str, text: str) -> TextCandidate:
         suspicious_unbroken_token_count=sum(length > 40 for length in lengths),
         max_unbroken_token_length=max(lengths, default=0),
         replacement_character_count=text.count("\ufffd"),
+        layout_text=layout_text,
     )
 
 

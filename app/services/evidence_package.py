@@ -25,10 +25,12 @@ from app.services.verification_evidence import (
     VerificationEvidenceArtifact,
 )
 from app.services.reference_discovery import ReferenceDiscoveryRecord
+from app.services.alternate_edition import AlternateEditionRecord
 
 
 EVIDENCE_PACKAGE_VERSION = "evidence-package-v1"
 MAX_PACKAGE_PASSAGE_CHARACTERS = 1_800
+MAX_PASSAGE_CONTINUATIONS = 8
 MAX_PACKAGE_STUDENT_CHARACTERS = 5_000
 
 
@@ -47,6 +49,7 @@ class EvidencePackageWorkflowResult(BaseModel):
 
 class EvidencePackagePassage(BaseModel):
     passage_id: str = Field(min_length=1, max_length=128)
+    parent_passage_id: str | None = None
     representation_id: str = Field(min_length=1, max_length=255)
     content_sha256: str = Field(min_length=64, max_length=64)
     page_index: int | None = None
@@ -79,6 +82,8 @@ class EvidencePackageRetrieval(BaseModel):
     status: Literal["not_run", "complete", "incomplete", "not_assessable"]
     method: str = Field(min_length=1, max_length=200)
     retrieval_version: str | None = Field(default=None, max_length=100)
+    evidence_only_passage_ids: list[str] = Field(default_factory=list, max_length=10)
+    evidence_only_query_sha256: str | None = None
     whole_citation_passage_ids: list[str] = Field(default_factory=list)
     displayed_passage_ids: list[str] = Field(default_factory=list)
     display_consolidations: dict[str, list[str]] = Field(default_factory=dict)
@@ -119,6 +124,7 @@ class EvidencePackageV1(BaseModel):
     paper_character_end: int
     source_binding: CitationSourceBinding
     source_identity: SourceIdentityEvidence
+    alternate_edition: AlternateEditionRecord | None = None
     coverage: CoverageEvidence
     evidence_obligations: EvidenceObligationSet = Field(
         default_factory=EvidenceObligationSet
@@ -140,6 +146,8 @@ def build_evidence_package(
     artifact: VerificationEvidenceArtifact,
     *,
     reference_discovery: ReferenceDiscoveryRecord | None = None,
+    alternate_edition: AlternateEditionRecord | None = None,
+    submitted_reference_sha256: str | None = None,
 ) -> EvidencePackageV1:
     """Build one immutable package without importing experimental judgments."""
     binding = artifact.source_binding
@@ -148,6 +156,14 @@ def build_evidence_package(
             "Evidence Package v1 requires one exact citation/reference binding"
         )
     identity = artifact.source_identity
+    if alternate_edition is not None:
+        if (
+            alternate_edition.retrieved_representation_sha256 != identity.content_sha256
+            or alternate_edition.submitted_reference_sha256 != submitted_reference_sha256
+            or (alternate_edition.claim_sha256 is not None and
+                alternate_edition.claim_sha256 != hashlib.sha256(artifact.claim.text.encode()).hexdigest())
+        ):
+            raise EvidencePackageError("Alternate edition does not match source/reference/claim")
     coverage = artifact.coverage
     if len(artifact.claim.text) > MAX_PACKAGE_STUDENT_CHARACTERS:
         raise EvidencePackageError(
@@ -233,6 +249,26 @@ def build_evidence_package(
     displayed_ids, display_consolidations = _display_consolidations(
         ordered_raw_ids, artifact
     )
+    # Continuations are display-only slices of already retrieved text. Preserve
+    # parent selections and full-text hashes; bind each extra slice separately.
+    continuation_ids = []
+    original_by_id = {p.passage_id: p for p in artifact.passages}
+    for parent in list(passages):
+        original = original_by_id[parent.passage_id]
+        for start, end in _continuation_ranges(original.text):
+            text = original.text[start:end]
+            pid = _stable_package_id("passage-continuation-v1", parent.passage_id, str(start), str(end))
+            continuation = parent.model_copy(update={
+                "passage_id": pid, "parent_passage_id": parent.passage_id,
+                "character_start": original.character_start + start,
+                "character_end": original.character_start + end,
+                "excerpt": text, "excerpt_truncated": end < len(original.text),
+                "passage_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "boundary_status": "bounded_fragment_or_nonprose",
+            })
+            passages.append(continuation)
+            continuation_ids.append(pid)
+    displayed_ids.extend(continuation_ids)
 
     retrieval_status = _retrieval_status(candidate_retrieval.status, bool(passages))
     if passages:
@@ -245,6 +281,11 @@ def build_evidence_package(
         candidate_availability = "no_candidates_retrieved"
 
     retrieval_limitations = list(candidate_retrieval.limitations)
+    if any(len(p.text) > MAX_PACKAGE_PASSAGE_CHARACTERS * (1 + MAX_PASSAGE_CONTINUATIONS / 2)
+           for p in artifact.passages):
+        retrieval_limitations.append(
+            "Some retrieved text exceeds the bounded continuation display; open the source for the remaining context."
+        )
     neutral_absence_limit = (
         "An unmatched query or qualifier describes only the recorded retrieval "
         "channels and never establishes absence from the complete source."
@@ -259,6 +300,8 @@ def build_evidence_package(
             else "whole_citation_protected_retrieval_only"
         ),
         retrieval_version=candidate_retrieval.retrieval_version,
+        evidence_only_passage_ids=candidate_retrieval.evidence_only_passage_ids,
+        evidence_only_query_sha256=candidate_retrieval.evidence_only_query_sha256,
         whole_citation_passage_ids=whole_citation_ids,
         displayed_passage_ids=displayed_ids,
         display_consolidations=display_consolidations,
@@ -322,6 +365,7 @@ def build_evidence_package(
         "paper_character_end": artifact.claim.passage_end,
         "source_binding": binding,
         "source_identity": identity,
+        "alternate_edition": alternate_edition,
         "coverage": coverage,
         "evidence_obligations": artifact.evidence_obligations,
         "student_statement_interpretations": (
@@ -403,7 +447,7 @@ def _retrieval_status(
 def _display_consolidations(
     ordered_ids: list[str], artifact: VerificationEvidenceArtifact
 ) -> tuple[list[str], dict[str, list[str]]]:
-    """Keep one visible representative for substantially overlapping windows."""
+    """Collapse overlap only when the retained excerpt shows the hidden text."""
     passages = {passage.passage_id: passage for passage in artifact.passages}
     displayed: list[str] = []
     groups: dict[str, list[str]] = {}
@@ -423,7 +467,22 @@ def _display_consolidations(
                 passage.character_end - passage.character_start,
                 existing.character_end - existing.character_start,
             )
-            if shorter > 0 and overlap / shorter >= 0.50:
+            # Package excerpts retain only a prefix. Full-span overlap does not
+            # imply visible coverage: hiding a later window behind a long page
+            # can discard the very paragraph that window retrieved.
+            existing_visible_end = min(
+                existing.character_end,
+                existing.character_start + MAX_PACKAGE_PASSAGE_CHARACTERS,
+            )
+            passage_visible_end = min(
+                passage.character_end,
+                passage.character_start + MAX_PACKAGE_PASSAGE_CHARACTERS,
+            )
+            visible_covered = (
+                existing.character_start <= passage.character_start
+                and existing_visible_end >= passage_visible_end
+            )
+            if shorter > 0 and overlap / shorter >= 0.50 and visible_covered:
                 representative = displayed_id
                 break
         if representative is None:
@@ -432,6 +491,15 @@ def _display_consolidations(
         elif passage_id not in groups[representative]:
             groups[representative].append(passage_id)
     return displayed, groups
+
+
+def _continuation_ranges(text: str) -> list[tuple[int, int]]:
+    """Bounded overlapping slices; excess context is explicitly reported."""
+    size = MAX_PACKAGE_PASSAGE_CHARACTERS
+    stride = size // 2
+    return [(start, min(start + size, len(text)))
+            for start in range(stride, min(len(text), stride * (MAX_PASSAGE_CONTINUATIONS + 1)), stride)
+            if start + stride < len(text)] if len(text) > size else []
 
 
 def _ordered_retrieval_ids(
@@ -460,6 +528,20 @@ def _stable_package_id(*parts: str) -> str:
 
 def _package_payload_sha256(payload: dict) -> str:
     normalized = to_jsonable_python(payload)
+    if normalized.get("alternate_edition") is None:
+        normalized.pop("alternate_edition", None)
+    elif normalized['alternate_edition'].get('human_review') is None:
+        normalized['alternate_edition'].pop('human_review', None)
+    # Additive optional provenance must not invalidate historical v1 hashes.
+    # Nonempty continuation/fallback bindings remain fully content-addressed.
+    for passage in normalized.get("passages", []):
+        if passage.get("parent_passage_id") is None:
+            passage.pop("parent_passage_id", None)
+    retrieval = normalized.get("retrieval", {})
+    if not retrieval.get("evidence_only_passage_ids"):
+        retrieval.pop("evidence_only_passage_ids", None)
+    if retrieval.get("evidence_only_query_sha256") is None:
+        retrieval.pop("evidence_only_query_sha256", None)
     canonical = json.dumps(
         normalized,
         sort_keys=True,

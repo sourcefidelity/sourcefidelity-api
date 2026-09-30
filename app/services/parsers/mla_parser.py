@@ -77,6 +77,21 @@ class MlaParser(BaseParser):
                 break
         lines = lines[start_idx:]
 
+        # An explicit consecutive numbered list establishes boundaries before
+        # author heuristics. Preserve the unnumbered fallback for partial,
+        # duplicated or nonconsecutive numbering rather than guessing.
+        numbered = re.compile(r'^\s*(\d{1,3})[.)]\s*(\D.+)')
+        markers = [(i, numbered.match(line)) for i, line in enumerate(lines)
+                   if numbered.match(line)]
+        if (len(markers) >= 2
+                and [int(m.group(1)) for _, m in markers] == list(range(1, len(markers) + 1))
+                and not any(line.strip() for line in lines[:markers[0][0]])):
+            result = []
+            for offset, (start, marker) in enumerate(markers):
+                end = markers[offset + 1][0] if offset + 1 < len(markers) else len(lines)
+                result.append(re.sub(r'\s+', ' ', ' '.join([marker.group(2), *lines[start+1:end]])).strip())
+            return result
+
         # NOTE: MLA student papers often have double-spacing (blank lines between
         # every line, including continuation lines). The _merge_lines blank-line
         # splitter fragments these, producing over-counts. Attempting to collapse

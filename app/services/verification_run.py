@@ -53,6 +53,10 @@ class VerificationRunError(RuntimeError):
     """The transient execution boundary could not proceed safely."""
 
 
+class TransientSourceTextUnusable(VerificationRunError):
+    """The transient source's damaged pages could not be repaired; its text is not used."""
+
+
 class VerificationRunAuthorizationError(VerificationRunError):
     """The run is absent, expired, inactive, or outside the requested scope."""
 
@@ -178,8 +182,10 @@ def begin_verification_run(
         raise VerificationRunError("Transient verification source cannot be empty")
     identity_verdict = request.identity_verdict.strip().casefold()
     cleanliness_verdict = request.cleanliness_verdict.strip().casefold()
-    if identity_verdict not in {"match", "verified"}:
+    if identity_verdict not in {"match", "verified", "possible_match"}:
         raise VerificationRunError("Transient source identity is not verified")
+    if identity_verdict == 'possible_match' and request.text_quality not in {'digital', 'born_digital', 'scan_ocr'}:
+        raise VerificationRunError("Possible source match requires readable source text")
     if cleanliness_verdict != "clean":
         raise VerificationRunError("Transient source did not pass the cleanliness gate")
     max_bytes = settings.VERIFICATION_RUN_MAX_TRANSIENT_MB * 1024 * 1024
@@ -288,6 +294,19 @@ def load_verification_run_source(
     digest = hashlib.sha256(content).hexdigest()
     if digest != run.content_sha256 or len(content) != run.source_byte_size:
         raise VerificationRunError("Transient source failed immutable-byte verification")
+    repairs = None
+    from app.config import settings
+    if run.representation_kind == "pdf" and settings.SOURCE_TEXT_QUALITY_CHECK_ENABLED:
+        # The same page check as stored sources (owner decision 2026-09-28).
+        from app.services.page_ocr_repair import transient_receipt, validated_repairs
+        from app.services.text_quality import WordListUnavailable
+        try:
+            receipt = transient_receipt(content, digest)
+        except WordListUnavailable as exc:
+            raise VerificationRunError("Source text quality cannot be checked") from exc
+        if receipt.get("status") == "unusable":
+            raise TransientSourceTextUnusable("Transient source text is damaged and could not be repaired")
+        repairs = validated_repairs(receipt, digest)
     return AuthorizedRepresentation(
         representation_id=f"verification-run:{run.id}",
         canonical_work_id=run.canonical_work_id,
@@ -307,6 +326,8 @@ def load_verification_run_source(
         created_at=run.started_at,
         admitted_at=None,
         verification_run_id=str(run.id),
+        page_repairs=tuple(sorted(repairs.texts.items())) if repairs else (),
+        page_repair_manifest_sha256=repairs.manifest_sha256 if repairs else None,
     )
 
 

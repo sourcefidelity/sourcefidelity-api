@@ -25,7 +25,8 @@ from app.services.docx_presentation import (
 )
 from app.services.paper_upload import DOCX_MEDIA_TYPE, PDF_MEDIA_TYPE
 from app.services.presentation_anchors import bind_citations_to_pdf
-from app.services.schemas import InTextCitation
+from app.services.schemas import InTextCitation, ParsedReference
+from app.services.reference_layout import extract_reference_layout_from_bytes
 from app.services.storage.backend import StorageBackend
 from app.services.text_extractor import extract_qualified_text_from_bytes
 
@@ -59,6 +60,8 @@ def ensure_report_paper_artifact(
     job: Job,
     content: bytes,
     citations: list[InTextCitation] | None = None,
+    references: list[ParsedReference] | None = None,
+    citation_format: str = "apa",
     now: datetime | None = None,
 ) -> ReportPaperArtifactRecord | None:
     """Create one separately hashed pending marking copy before input cleanup."""
@@ -116,6 +119,19 @@ def ensure_report_paper_artifact(
     prepared = _with_anchors(
         _prepare_artifact(job, content), citations, job.input_media_type
     )
+    if references and prepared.presentation_bytes is not None and job.input_media_type == DOCX_MEDIA_TYPE:
+        # Reuse the exact retained rendering, not a second conversion. This is
+        # navigation only; original-submission counts never consume this PDF.
+        try:
+            layout = extract_reference_layout_from_bytes(
+                prepared.presentation_bytes, 'presentation.pdf', references=references,
+                citation_format=citation_format)
+            prepared.presentation_evidence['submitted_reference_navigation'] = {
+                'input_sha256': hashlib.sha256(content).hexdigest(),
+                'layout': layout.model_dump(mode='json'),
+            }
+        except ValueError:
+            pass  # No speculative location if the optional layout is unavailable.
     current = _as_utc(now or datetime.now(timezone.utc))
     artifact_id = uuid.uuid4()
     key = f"report-paper-artifacts/{artifact_id}/semantic-source{prepared.source_suffix}"
@@ -271,6 +287,8 @@ def paper_surface_descriptor(record: ReportPaperArtifactRecord | None) -> dict:
             else 0
         ),
         "citation_anchors": anchors,
+        "presentation_sha256": record.presentation_sha256,
+        "submitted_reference_navigation": (record.presentation_evidence or {}).get('submitted_reference_navigation'),
         "message": (
             "A sanitized page-faithful marking copy is retained with this report."
             if record.presentation_status == "page_faithful_ready"

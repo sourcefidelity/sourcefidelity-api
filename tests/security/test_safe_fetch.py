@@ -15,6 +15,25 @@ from app.services.safe_fetch import (
 
 
 @pytest.mark.security
+@pytest.mark.parametrize('media_type',['application/pdf','application/octet-stream',''])
+def test_metadata_allowlist_rejects_before_reading_body(monkeypatch,media_type):
+    class Unreadable(httpx.SyncByteStream):
+        def __iter__(self):
+            raise AssertionError('File body must not be consumed')
+    def handler(request):
+        if request.url.path=='/start':
+            return httpx.Response(302,headers={'location':'/file'},request=request)
+        return httpx.Response(200,headers={'content-type':media_type},stream=Unreadable(),request=request)
+    client=httpx.Client(transport=httpx.MockTransport(handler))
+    visited=[]
+    monkeypatch.setattr('app.services.safe_fetch.httpx.Client',lambda **kwargs:client)
+    monkeypatch.setattr('app.services.safe_fetch._validate_url',visited.append)
+    with pytest.raises(ValueError,match='response_media_type_not_permitted'):
+        safe_request('https://publisher.example/start',allowed_media_types=frozenset({'text/html'}))
+    assert visited==['https://publisher.example/start','https://publisher.example/file']
+
+
+@pytest.mark.security
 def test_trusted_prefix_requires_the_exact_origin() -> None:
     prefix = "https://resolver.example/proxy/"
 

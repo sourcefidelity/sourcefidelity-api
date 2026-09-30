@@ -19,6 +19,28 @@ def _reference(reference_id: str, raw_ref: str) -> ParsedReference:
     )
 
 
+def test_exact_reference_wins_over_near_identical_different_date():
+    raw='Magazine Archive. (2017, May 21). An actor in a magazine. https://example.org/a-long-shared-address'
+    other=raw.replace('2017, May 21','2017b, May 5')
+    doc=Document();doc.add_paragraph('References')
+    doc.add_paragraph(raw);doc.add_paragraph(other)
+    stream=io.BytesIO();doc.save(stream)
+    result=extract_reference_layout_from_bytes(stream.getvalue(),'paper.docx',
+        references=[_reference('first',raw),_reference('second',other)],citation_format='apa')
+    assert [e.mapping_status for e in result.entries]==['matched','matched']
+    assert [e.location_indexes for e in result.entries]==[[1],[2]]
+
+
+def test_duplicate_exact_reference_locations_stay_ambiguous():
+    raw='Writer, W. (2020). An identical reference. Publisher.'
+    doc=Document();doc.add_paragraph('References')
+    doc.add_paragraph(raw);doc.add_paragraph(raw)
+    stream=io.BytesIO();doc.save(stream)
+    result=extract_reference_layout_from_bytes(stream.getvalue(),'paper.docx',
+        references=[_reference('first',raw)],citation_format='apa')
+    assert result.entries[0].mapping_status=='ambiguous'
+
+
 def test_docx_reference_layout_binds_entry_and_preserves_hanging_indent():
     raw_ref = "Smith, J. (2020). Bounded title. Journal Name, 2(1), 1-9."
     document = Document()

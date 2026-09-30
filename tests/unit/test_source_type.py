@@ -122,6 +122,32 @@ def test_bare_url_remains_low_confidence_generic_webpage() -> None:
     assert assessment.confidence == "low"
 
 
+@pytest.mark.parametrize('container',[
+    '*Policy Studies, 12*(3), 45-67.',
+    '*Policy Studies*, 12, 45-67.',
+    '*Policy Studies*, 12(3), 45-67.',
+])
+def test_literal_emphasis_does_not_hide_journal_structure(container):
+    raw=f'Writer, A. (2020). An article title. {container} https://example.org/article'
+    result=classify_reference_source_kind(raw)
+    assert result.kind=='journal_article'
+    assert result.confidence=='high'
+
+
+@pytest.mark.parametrize('tail',[
+    '*An emphasized phrase*', '*A journal, 12*',
+    '*A broken marker, 12(3), 45-67.',
+])
+def test_marked_journal_cue_requires_complete_structure(tail):
+    from app.services.source_type import _MARKED_JOURNAL_STRUCTURE_RE
+    assert _MARKED_JOURNAL_STRUCTURE_RE.search(tail) is None
+
+
+def test_marked_journal_cue_does_not_override_explicit_media_role():
+    raw='Writer, A. (Director). (2020). An unusual title [Film]. *Media Studies, 12*(3), 45-67.'
+    assert classify_reference_source_kind(raw).kind=='traditional_media'
+
+
 def test_provider_type_conflict_rejects_book_review_as_book() -> None:
     observed = classify_provider_source_kind({"message": {"type": "journal-article"}})
     compatibility = compare_source_kinds(
@@ -184,3 +210,164 @@ def test_html_structured_metadata_distinguishes_news_from_generic_page() -> None
 
     assert assessment.kind == "news_article"
     assert assessment.confidence == "high"
+def test_media_role_word_in_article_title_is_not_a_credit():
+    from app.services.source_type import is_traditional_media
+    assert not is_traditional_media("Writer, A. (2020). Creator's perspective. Journal, 6(9), 12–19.")
+    assert is_traditional_media('Writer, A. (Director). (2020). A film.')
+
+
+def test_marked_journal_title_can_contain_commas():
+    from app.services.ref_field_extractor import _apa_title
+    assert _apa_title('A complete article title. *Media, Language & Society*, 42(4), 637-654.') == 'A complete article title'
+    assert _apa_title('A title with *emphasis, and punctuation*.') == 'A title with *emphasis, and punctuation*'
+
+
+def test_unclassified_reference_is_searchable_but_media_is_not():
+    """The review gate turns on this predicate.  An unclassified reference must
+    reach a search, because author/title/year settle identity without a kind;
+    a film or a tweet must not, because an absent index match is silence."""
+    from app.services.source_type import (
+        BOOK_CATALOGUE_KINDS,
+        is_bibliographically_searchable,
+    )
+    for kind in ("unknown", None, "", "journal_article", "monograph",
+                 "edited_collection", "book_section", "thesis", "report",
+                 "conference_paper", "book_review"):
+        assert is_bibliographically_searchable(kind), kind
+    for kind in ("film", "television_series", "webpage", "news_article",
+                 "blog_post", "social_media_post", "video", "podcast_episode",
+                 "traditional_media", "archival_source", "personal_communication",
+                 "interview", "artwork", "album"):
+        assert not is_bibliographically_searchable(kind), kind
+    # An unclassified reference must not inherit a book's evidence requirement
+    # on a guess; only named book kinds carry the catalogue obligation.
+    assert "unknown" not in BOOK_CATALOGUE_KINDS
+    assert BOOK_CATALOGUE_KINDS == {"monograph", "edited_collection", "book_section"}
+
+
+class TestInstitutionalAndIdentifierBearingReferences:
+    """Two classifier gaps found on the owner's own paper (job `17e3b5a8`).
+
+    A university language policy was left `unknown`, which
+    `bounded-reference-review-v9` reviews, and it drew a
+    `potentially_fabricated_reference` finding. A body publishing a document
+    about itself is not deposited in a bibliographic index, so an absent match
+    is silence. Whether the document is still reachable online does not change
+    that: going offline does not make it newly searchable.
+
+    The converse gap ran the other way. A reference whose only web marker was a
+    `doi.org` link classified as `webpage`, which is excluded from review
+    entirely - so a fabricated reference carrying an invented DOI was never
+    reviewed at all. A DOI says the work is registered and resolvable; it is a
+    more specific marker than a bare URL, not a weaker one.
+    """
+
+    def test_a_self_published_institutional_document_is_not_searchable(self):
+        from app.services.source_type import (
+            classify_reference_source_kind,
+            is_bibliographically_searchable,
+        )
+
+        for raw in (
+            "Northfield State University (2015). NSU language policy.",
+            "Ministry of Education (2019). National curriculum framework.",
+            "UNESCO Institute for Statistics (2020). Global education monitoring.",
+        ):
+            assessment = classify_reference_source_kind(raw)
+            assert assessment.kind == "webpage", raw
+            assert not is_bibliographically_searchable(assessment.kind), raw
+
+    def test_an_organizational_author_does_not_override_a_real_work_type(self):
+        """The rule requires the absence of every stronger marker."""
+        from app.services.source_type import classify_reference_source_kind
+
+        cases = {
+            "American Psychiatric Association (2013). Diagnostic and statistical "
+            "manual of mental disorders (5th ed.). American Psychiatric Publishing.": "monograph",
+            "OECD (2020). Education at a glance 2020: OECD indicators.": "report",
+            "University of Oxford committee member. (2001). A study. "
+            "Journal of Things, 4(2), 1-20.": "journal_article",
+        }
+        for raw, expected in cases.items():
+            assert classify_reference_source_kind(raw).kind == expected, raw
+
+    def test_a_personal_author_is_never_institutional(self):
+        from app.services.source_type import _institutional_self_published
+
+        assert not _institutional_self_published(
+            "Berg, S. V., & Forsyth, P. (2007). The economic analysis of regulation."
+        )
+        assert not _institutional_self_published(
+            "Khan, L. (2017). Amazon's antitrust paradox."
+        )
+
+    def test_a_doi_link_is_not_a_bare_webpage_url(self):
+        from app.services.source_type import (
+            classify_reference_source_kind,
+            is_bibliographically_searchable,
+        )
+
+        raw = "Smith, J. (2020). Invented title. https://doi.org/10.9999/fake.2020"
+        assessment = classify_reference_source_kind(raw)
+        assert assessment.kind != "webpage"
+        # The point of the change: it must reach the review rather than be
+        # silently excluded.
+        assert is_bibliographically_searchable(assessment.kind)
+
+    def test_an_ordinary_web_resource_is_still_a_webpage(self):
+        from app.services.source_type import classify_reference_source_kind
+
+        assert (
+            classify_reference_source_kind(
+                "Someone, A. (2022). A page about things. https://example.org/page"
+            ).kind
+            == "webpage"
+        )
+
+
+def test_a_book_reference_keeps_its_type_despite_a_trailing_file_share_url() -> None:
+    """A link to a copy does not turn a book into a web page.
+
+    A canonical work record created 2026-09-05 carries `work_type='webpage'`
+    for "Belton, J. (2013). American cinema/American culture. New York:
+    McGraw-Hill. Retrieved from https://pan.baidu.com/..." — a monograph filed
+    as a web page because the reference ends in a URL. The classifier was
+    repaired afterwards and the terminal publisher clause now decides, but
+    nothing pinned that, so this fixes the behaviour in place. The stored
+    record is deliberately left alone: `_canonical_work` restricts its
+    title/author/year fallback to book kinds precisely so old webpage
+    classifications are not mutated.
+    """
+    assessment = classify_reference_source_kind(
+        "Belton, J. (2013). American cinema/American culture. New York: "
+        "McGraw-Hill. Retrieved from https://pan.baidu.com/s/1h7JvFLwr?pwd=1111",
+        title="American cinema/American culture",
+        url="https://pan.baidu.com/s/1h7JvFLwr?pwd=1111",
+    )
+
+    assert assessment.kind == "monograph"
+    assert assessment.confidence == "high"
+
+
+def test_a_publisher_clause_outranks_a_trailing_url_for_any_imprint() -> None:
+    assessment = classify_reference_source_kind(
+        "Bordwell, D. (1985). The Classical Hollywood Cinema. London: Routledge. "
+        "Retrieved from https://example.org/copy.pdf",
+        title="The Classical Hollywood Cinema",
+        url="https://example.org/copy.pdf",
+    )
+
+    assert assessment.kind == "monograph"
+
+
+def test_a_url_still_decides_when_no_publisher_clause_supports_a_book() -> None:
+    """Without the structure, a trailing URL is the only evidence there is."""
+    assessment = classify_reference_source_kind(
+        "CRTC. (2016). Communications Monitoring Report. "
+        "Retrieved from https://www.crtc.gc.ca",
+        title="Communications Monitoring Report",
+        url="https://www.crtc.gc.ca",
+    )
+
+    assert assessment.kind == "webpage"
+    assert assessment.confidence == "low"

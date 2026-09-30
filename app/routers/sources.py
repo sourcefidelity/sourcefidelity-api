@@ -46,7 +46,13 @@ from app.services.completeness_checker import check_completeness, INCOMPLETE, UN
 from app.services.file_safety import (
     FileSafetyUnavailable,
     SafetyVerdict,
+    inspect_uploaded_html,
     inspect_uploaded_pdf,
+)
+from app.services.supplied_html_source import (
+    SuppliedHtmlRejected,
+    looks_like_html_document,
+    qualify_supplied_html,
 )
 from app.services.page_layout import classify_text_quality, PURE_SCAN, SCAN_OCR
 
@@ -155,6 +161,15 @@ def upload_source(
             detail=f"Source exceeds the {settings.MAX_FILE_SIZE_MB} MB upload limit",
         )
 
+    if looks_like_html_document(file_bytes, file.content_type):
+        return _admit_supplied_html(
+            db, backend,
+            content=file_bytes, principal=principal,
+            doi=doi, isbn=isbn, title=title, author=author, year=year,
+            source_kind=resolved_source_kind,
+            edition_or_version=edition_or_version,
+        )
+
     # Safety precedes every metadata, text-quality, and completeness parser.
     try:
         safety_report = inspect_uploaded_pdf(file_bytes)
@@ -184,6 +199,18 @@ def upload_source(
         provided_year=year,
         provided_isbn=isbn,
     )
+    upload_inspection = None
+    if not verified:
+        fallback = _inspect_uncorroborated_personal_upload(
+            file_bytes, principal=principal, safety_report=safety_report,
+            messages=messages, title=title, author=author, year=year,
+            doi=doi, isbn=isbn, edition_or_version=edition_or_version,
+            source_kind=resolved_source_kind, document_kind=resolved_document_kind,
+            expected_page_range=expected_page_range)
+        if fallback is not None:
+            verified = True
+            upload_inspection = fallback.source_inspection
+            messages = [*messages, 'single_title_typo_reconciled']
     if not verified:
         raise HTTPException(
             status_code=422,
@@ -217,9 +244,11 @@ def upload_source(
         )
 
     # ── Completeness check ────────────────────────────────────────────
-    completeness_verdict: str | None = None
+    completeness_verdict: str | None = (
+        fallback.completeness.upper() if upload_inspection else None
+    )
     review_status = "accepted"
-    logical_pages: int | None = None
+    logical_pages: int | None = (fallback.page_count or None) if upload_inspection else None
 
     if settings.COMPLETENESS_CHECK_ENABLED:
         report = check_completeness(
@@ -347,6 +376,7 @@ def upload_source(
                         },
                         "logical_pages": logical_pages,
                         "source_kind": resolved_source_kind,
+                        **({'source_inspection': upload_inspection} if upload_inspection else {}),
                         **item_evidence,
                     },
                     request_acceptance=(review_status == "accepted"),
@@ -540,6 +570,8 @@ def _representation_dict(record: SourceRepresentationRecord) -> dict:
 
 def _upload_identity_confidence(messages: list[str]) -> float:
     evidence = set(messages)
+    if 'single_title_typo_reconciled' in evidence:
+        return 0.9
     if evidence & {"doi_match", "isbn_match"}:
         return 1.0
     if {"title_match", "author_match"} <= evidence:
@@ -549,3 +581,192 @@ def _upload_identity_confidence(messages: list[str]) -> float:
     if "distinctive_title_match" in evidence:
         return 0.8
     return 0.0
+
+
+def _inspect_uncorroborated_personal_upload(content, *, principal, safety_report,
+        messages, title, author, year, doi, isbn, edition_or_version,
+        source_kind, document_kind, expected_page_range):
+    """Reuse the bounded retrieval verifier after ordinary upload uncertainty.
+
+    This is not Institutional source-processing authorization or a replacement
+    upload gate. Existing identifier conflicts, versions, unsafe inputs and
+    chapter splitting cannot be overridden by the narrow title-typo fallback.
+    """
+    if (not settings.SOURCE_INSPECTION_ENABLED
+            or principal.scope_type != 'personal_owner'
+            or settings.REPORT_AUTH_MODE not in {'personal_local', 'personal_bearer'}
+            or any(v is not SafetyVerdict.CLEAN for v in
+                (safety_report.verdict, safety_report.structural_verdict, safety_report.malware_verdict))
+            or doi or isbn or edition_or_version or source_kind == 'edited_collection'
+            or not all((title, author, year))
+            or 'insufficient_identity_evidence' not in messages
+            or set(messages) & {'doi_conflict', 'isbn_conflict', 'pdf_identity_extraction_failed'}):
+        return None
+    principal.require(SOURCE_REPOSITORY_WRITE_CAPABILITY)
+    from app.services.source_resolver import SourceResolver
+    from app.services.source_validator import validate_retrieved_pdf
+    resolver = SourceResolver()
+    validation = validate_retrieved_pdf(content,
+        expected_title=title, expected_author=author, expected_year=year,
+        expected_source_kind=source_kind, document_kind=document_kind,
+        expected_page_range=expected_page_range,
+        inspection_reconciliation=True,
+        inspection_provider=lambda data, _: resolver._inspect_candidate(data,
+            title=title, author=author, year=year, source_kind=source_kind, pdf=True))
+    finding = validation.source_inspection or {}
+    if (validation.accept and validation.identity_confidence == 'high'
+            and validation.completeness == 'complete'
+            and finding.get('decision_applied') is True
+            and finding.get('reconciliation_version') == 'single-title-typo-v1'):
+        return validation
+    return None
+
+
+def _admit_supplied_html(
+    db: Session,
+    backend: StorageBackend,
+    *,
+    content: bytes,
+    principal: AuthenticatedPrincipal,
+    doi: str | None,
+    isbn: str | None,
+    title: str | None,
+    author: str | None,
+    year: str | None,
+    source_kind: str,
+    edition_or_version: str | None,
+) -> dict:
+    """Admit a supplied saved page through the ordinary web-source checks.
+
+    The page is qualified offline and only its extracted article text becomes
+    a representation, so nothing here fetches, renders or stores active
+    content. The representation carries no source URL: these bytes are an
+    operator-supplied document, not a response this application received from
+    a publisher, and the admission evidence says so.
+    """
+    if not settings.SUPPLIED_HTML_SOURCE_INTAKE_ENABLED:
+        raise HTTPException(
+            status_code=415,
+            detail="Supplied HTML source intake is disabled; upload a PDF",
+        )
+    if isbn:
+        raise HTTPException(
+            status_code=400,
+            detail="A supplied page cannot establish an ISBN edition",
+        )
+
+    try:
+        safety_report = inspect_uploaded_html(content)
+    except FileSafetyUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Required malware inspection is unavailable",
+                "retryable": True,
+            },
+        ) from exc
+    if safety_report.verdict is SafetyVerdict.REJECTED:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "Upload rejected by hostile-file inspection",
+                "findings": list(safety_report.findings),
+            },
+        )
+
+    from app.services.source_type import SourceKindAssessment
+
+    try:
+        qualified = qualify_supplied_html(
+            content,
+            expected_title=title,
+            expected_author=author,
+            expected_year=year,
+            expected_doi=doi,
+            expected_source_kind=SourceKindAssessment(
+                kind=source_kind, confidence="high" if source_kind != "unknown" else "unknown",
+            ),
+        )
+    except SuppliedHtmlRejected as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": str(exc),
+                "reason_code": exc.reason_code,
+                **exc.evidence,
+            },
+        ) from exc
+
+    evidence = qualified.as_evidence()
+    try:
+        record = admit_representation(
+            db,
+            backend,
+            AdmissionRequest(
+                work=WorkIdentity(
+                    work_type=source_kind,
+                    title=title or doi or "",
+                    author=author,
+                    year=year,
+                    doi=doi,
+                ),
+                representation=SourceRepresentation(
+                    kind=RepresentationKind.PLAIN_TEXT,
+                    media_type="text/plain",
+                    content=qualified.article_text.encode("utf-8"),
+                    original_kind=RepresentationKind.HTML,
+                    charset="utf-8",
+                    completeness=qualified.completeness["verdict"],
+                    metadata={
+                        "observed_source_kind": qualified.observed_source_kind,
+                        "observed_source_kind_confidence": (
+                            qualified.observed_source_kind_confidence
+                        ),
+                        "web_completeness": qualified.completeness,
+                    },
+                ),
+                provenance="instructor_upload",
+                license_class="commercial_user_upload",
+                scope_type=principal.scope_type,
+                scope_id=principal.scope_id,
+                identity_verdict="verified",
+                identity_confidence=1.0 if doi else 0.9,
+                completeness_verdict=qualified.completeness["verdict"].casefold(),
+                cleanliness_verdict=safety_report.verdict.value,
+                text_quality="digital",
+                edition_or_version=(edition_or_version or None),
+                admitted_by=None,
+                validation_evidence={
+                    "supplied_html": evidence,
+                    "file_safety": {
+                        "structural_verdict": safety_report.structural_verdict.value,
+                        "malware_verdict": safety_report.malware_verdict.value,
+                    },
+                    "source_kind": source_kind,
+                },
+                request_acceptance=True,
+            ),
+        )
+        results = [_representation_dict(record)]
+        commit_source_admissions(db)
+    except AdmissionError as exc:
+        rollback_source_admissions(db, backend)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        rollback_source_admissions(db, backend)
+        raise
+
+    return {
+        "status": "ok",
+        "verification": ["supplied_html_identity_confirmed"],
+        "text_quality": "digital",
+        "completeness_verdict": qualified.completeness["verdict"],
+        "review_status": (
+            "accepted" if results[0]["admission_state"] == "accepted" else "needs_review"
+        ),
+        "warnings": [],
+        "split_detected": False,
+        "source_kind": source_kind,
+        "supplied_html": evidence,
+        "documents": results,
+    }

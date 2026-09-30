@@ -1349,6 +1349,15 @@ def test_bm25_concept_channel_ranks_rare_relationship_terms_without_noise():
 
 
 def test_document_title_is_retrievable_without_reintroducing_byline_metadata():
+    """Superseded retrieval rule, narrowed 2026-09-20.
+
+    This previously asserted that a title block is retrievable through ordinary
+    channels for any claim. Report persistence rejects such a passage unless it
+    arrives on the dedicated document-metadata channel, so an ordinary-channel
+    title block failed the whole job (STATE: Regulation 3). The title block is
+    now admitted only through that channel; the byline exclusion this test also
+    guards is unchanged.
+    """
     title = "Strategic Machine Translation Use in Multilingual Classrooms"
     byline = "Morgan Scholar\nExample University"
     body = "The article reports classroom observations and participant interviews."
@@ -1366,19 +1375,32 @@ def test_document_title_is_retrievable_without_reintroducing_byline_metadata():
         ),
     )
 
-    ranked, _rescue, _facets = _candidate_union_candidates(
-        [page],
-        query_text="The study concerns strategic machine translation use.",
-        page_locator="",
-        broad_passages=[],
-        top_k=5,
-    )
+    def ranked_for(include_document_metadata: bool):
+        ranked, _rescue, _facets = _candidate_union_candidates(
+            [page],
+            query_text="The study concerns strategic machine translation use.",
+            page_locator="",
+            broad_passages=[],
+            top_k=5,
+            include_document_metadata=include_document_metadata,
+        )
+        return ranked
 
-    assert any(
-        candidate.passage_role == "document_metadata" and title in candidate.text
-        for candidate, _channels in ranked
+    ordinary = ranked_for(False)
+    assert all(
+        candidate.passage_role != "document_metadata"
+        for candidate, _channels in ordinary
     )
-    assert all(byline not in candidate.text for candidate, _channels in ranked)
+    assert all(byline not in candidate.text for candidate, _channels in ordinary)
+
+    member = ranked_for(True)
+    assert any(
+        candidate.passage_role == "document_metadata"
+        and title in candidate.text
+        and "candidate_document_metadata" in channels
+        for candidate, channels in member
+    )
+    assert all(byline not in candidate.text for candidate, _channels in member)
 
 
 def test_multi_source_member_title_has_explicit_document_level_channel():
@@ -2375,3 +2397,69 @@ def test_collective_claim_requires_and_preserves_source_specific_binding(
     assert jones.source_binding.marker_text == jones_text
     assert jones.source_binding.cited_author_label == "Jones"
     assert smith.verification_id != jones.verification_id
+
+
+def _title_block_page(title: str, body: str) -> _SourcePage:
+    """A source whose opening title block repeats the cited work's title."""
+    text = f"{title}\n{body}"
+    return _SourcePage(
+        index=0,
+        label="1",
+        text=text,
+        structural_spans=(_SourceStructuralSpan(0, len(title), "document_metadata"),),
+    )
+
+
+def test_single_reference_claim_excludes_the_title_block_from_every_channel():
+    """A title block must not enter through lexical or BM25 retrieval.
+
+    Its bare words cannot reproduce the title layout, so its role is not
+    text-derivable and report persistence rejects it. Lexical channels rank it
+    highly precisely because it repeats the cited title.
+    """
+    title = "The Heckscher-Ohlin Model in Theory and Practice"
+    body = (
+        "The paper reviews empirical tests of the Heckscher-Ohlin model in "
+        "theory and practice, and reports factor content estimates."
+    )
+    ranked, _rescue, _facets = _candidate_union_candidates(
+        [_title_block_page(title, body)],
+        query_text="The Heckscher-Ohlin model in theory and practice",
+        page_locator="",
+        broad_passages=[],
+        top_k=5,
+        include_document_metadata=False,
+    )
+    assert ranked, "ordinary body evidence must still be retrieved"
+    assert all(
+        candidate.passage_role != "document_metadata"
+        for candidate, _channels in ranked
+    )
+
+
+def test_multi_reference_title_block_keeps_its_dedicated_channel_and_method():
+    """The document-metadata channel remains the only admitting route."""
+    title = "The Heckscher-Ohlin Model in Theory and Practice"
+    body = (
+        "The paper reviews empirical tests of the Heckscher-Ohlin model in "
+        "theory and practice, and reports factor content estimates."
+    )
+    ranked, _rescue, _facets = _candidate_union_candidates(
+        [_title_block_page(title, body)],
+        query_text="The Heckscher-Ohlin model in theory and practice",
+        page_locator="",
+        broad_passages=[],
+        top_k=5,
+        include_document_metadata=True,
+    )
+    metadata = [
+        (candidate, channels)
+        for candidate, channels in ranked
+        if candidate.passage_role == "document_metadata"
+    ]
+    assert len(metadata) == 1
+    candidate, channels = metadata[0]
+    # A higher lexical score must not overwrite the dedicated channel's method,
+    # which the report validator requires for the title-block exemption.
+    assert candidate.method == "document_level_member_evidence"
+    assert "candidate_document_metadata" in channels

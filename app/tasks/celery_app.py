@@ -18,7 +18,9 @@ celery_app = Celery(
         "app.tasks.verification_run_cleanup",
         "app.tasks.paper_job_cleanup",
         "app.tasks.provider_recovery",
+        "app.tasks.incomplete_search_retry",
         "app.tasks.source_reanalysis",
+        "app.tasks.judgment",
     ],
 )
 
@@ -73,6 +75,10 @@ celery_app.conf.update(
         "probe-retrieval-provider-recovery": {
             "task": "probe_retrieval_provider_recovery",
             "schedule": max(60, settings.PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS),
+        },
+        "retry-incomplete-searches": {
+            "task": "retry_incomplete_searches",
+            "schedule": max(60, settings.INCOMPLETE_SEARCH_RETRY_SCAN_SECONDS),
         },
     },
 )

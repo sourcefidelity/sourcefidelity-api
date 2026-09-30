@@ -535,7 +535,7 @@ def test_bounded_web_discovery_trace_preserves_unattempted_bounded_location() ->
     assert candidate.acquisition_outcome == "metadata_only"
 
 
-def test_structured_trace_deduplicates_doi_enrichment_and_binds_disposition() -> None:
+def test_structured_trace_preserves_doi_enrichment_attempts_and_shared_disposition() -> None:
     resolver = _resolver()
     trace = {
         "reference_id": "ref-structured",
@@ -587,12 +587,14 @@ def test_structured_trace_deduplicates_doi_enrichment_and_binds_disposition() ->
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 
-    assert len(trace["candidates"]) == 1
-    candidate = trace["candidates"][0]
-    assert candidate.location_rank == 1
-    assert candidate.origin_providers == ["core", "openalex"]
-    assert candidate.acquisition_outcome == "not_attempted"
-    assert candidate.disposition_reason_code == "accepted_candidate_found"
+    assert len(trace["candidates"]) == 2
+    assert {c.attempt_id for c in trace["candidates"]} == {a.attempt_id for a in trace["attempts"]}
+    assert len({c.location_sha256 for c in trace["candidates"]}) == 1
+    for candidate in trace["candidates"]:
+        assert candidate.location_rank == 1
+        assert candidate.origin_providers == ["core", "openalex"]
+        assert candidate.acquisition_outcome == "not_attempted"
+        assert candidate.disposition_reason_code == "accepted_candidate_found"
 
 
 def test_explicit_full_text_html_is_acquired_as_typed_text(monkeypatch) -> None:

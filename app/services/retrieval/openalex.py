@@ -6,7 +6,7 @@ import re
 
 import httpx
 
-from app.config import settings
+from app.config import secret_value, settings
 from app.log_safety import safe_exception_code
 from app.services.retrieval.base import (
     AcquisitionLocation,
@@ -15,6 +15,7 @@ from app.services.retrieval.base import (
     RetrievalSource,
 )
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
+from app.services.processing_metrics import record_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ class OpenAlexRequestError(RuntimeError):
 
 
 class OpenAlexRetriever(RetrievalSource):
+    # A principal scholarly index, as for Crossref.
+    required_for_search_completion = True
     name = "openalex"
     capabilities = frozenset(
         {
@@ -41,6 +44,7 @@ class OpenAlexRetriever(RetrievalSource):
             "title_author",
             "batch_title_candidates",
             "metadata",
+            "metadata_only_search",
             "abstract",
             "locations",
         }
@@ -80,7 +84,7 @@ class OpenAlexRetriever(RetrievalSource):
         # "api_key" query parameter (NOT an Authorization header).
         # See https://developers.openalex.org/api-reference/authentication
         if settings.OPENALEX_API_KEY:
-            return {"api_key": settings.OPENALEX_API_KEY.strip()}
+            return {"api_key": secret_value(settings.OPENALEX_API_KEY).strip()}
         return {}
 
     def _get(self, url: str, params: dict | None = None) -> httpx.Response:
@@ -93,6 +97,7 @@ class OpenAlexRetriever(RetrievalSource):
             )
         try:
             self.provider_metrics["calls"] += 1
+            record_provider_request("openalex")
             response = httpx.get(
                 url,
                 headers=self._headers(),
@@ -353,14 +358,21 @@ class OpenAlexRetriever(RetrievalSource):
             url = f"{OPENALEX_BASE}/works"
             resp = self._get(url, params=params)
             data = resp.json()
-            results = data.get("results", [])
+            results = data.get("results")
+            if not isinstance(results, list) or any(not isinstance(work, dict) for work in results):
+                raise ValueError("Invalid OpenAlex result list")
             if not results:
-                return RetrievalResult(source_name=self.name, success=False, error="No results")
+                return RetrievalResult(source_name=self.name, success=False, error="No results",
+                    metadata={"identity_search_result_count": 0} if isinstance(data.get("meta"), dict)
+                        and type(data["meta"].get("count")) is int and data["meta"]["count"] == 0 else
+                        {"identity_search_reason_code": "metadata_empty_response_unqualified"})
 
             from app.services.relevance import score_relevance
-
-            for work in results:
-                result = self._parse_work(work)
+            from app.services.reference_review_scope import screen_metadata
+            parsed_results = [self._parse_work(work) for work in results]
+            review_screen = screen_metadata(title, author, parsed_results)
+            for result in parsed_results:
+                result.metadata = {**(result.metadata or {}), 'bounded_review_screen': review_screen}
                 matched_title = result.title or ""
                 matched_authors = result.authors or []
                 rel = score_relevance(title, matched_title, author, matched_authors)
@@ -375,6 +387,9 @@ class OpenAlexRetriever(RetrievalSource):
                 source_name=self.name,
                 success=False,
                 error=f"No relevant match (top {len(results)} results were keyword coincidences)",
+                metadata={"identity_search_result_count": len(results),
+                          "bounded_review_screen": review_screen,
+                          "identity_search_reason_code": "metadata_candidates_filtered"},
             )
             self._title_cache[key] = copy.deepcopy(result)
             return result

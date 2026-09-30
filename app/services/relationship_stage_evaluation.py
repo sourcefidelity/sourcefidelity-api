@@ -20,7 +20,9 @@ import json
 import re
 from typing import Literal, Protocol, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.services.schemas import BoundedFieldsMixin, note_bounded
 
 from app.services.relationship_signal import NLIScore
 from app.services.source_attribution import source_voice_fields
@@ -72,14 +74,35 @@ class StageFacetCase(BaseModel):
     proposition_holder_eligible: bool
 
 
-class StageCandidateCase(BaseModel):
+CITED_AUTHOR_LABEL_LIMIT = 200
+
+
+class StageCandidateCase(BoundedFieldsMixin):
     model_config = ConfigDict(extra="forbid")
 
     unit_alias: str = Field(min_length=1, max_length=200)
     candidate_id: str = Field(min_length=1, max_length=128)
     candidate_text: str = Field(min_length=1, max_length=50_000)
     complete_citation_unit: str = Field(min_length=1, max_length=50_000)
-    cited_author_label: str = Field(default="", max_length=200)
+    cited_author_label: str = Field(default="", max_length=CITED_AUTHOR_LABEL_LIMIT)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_author_label(cls, data):
+        """`_citation_author_label` already truncates, so this is not reachable
+        through the current producer. It is here because that is precisely the
+        fragile arrangement: the bound lived at one call site and the limit was
+        written twice. A marker of 328 characters exists in the corpus, so a
+        second construction path would fail the run rather than the field. An
+        alteration is recorded in `bounded_fields`."""
+        if not isinstance(data, dict):
+            return data
+        value = data.get("cited_author_label")
+        if isinstance(value, str) and len(value) > CITED_AUTHOR_LABEL_LIMIT:
+            data = dict(data)
+            data["cited_author_label"] = value[:CITED_AUTHOR_LABEL_LIMIT]
+            note_bounded(data, "cited_author_label")
+        return data
     accepted_candidate_relationship: Literal[
         "supports",
         "contradicts",
@@ -666,7 +689,7 @@ def _citation_author_label(marker):
     value = (marker or "").strip().strip("()[]")
     value = value.split(";", 1)[0]
     value = re.split(r",?\s+(?:19|20)\d{2}[a-z]?\b", value, maxsplit=1)[0]
-    return re.sub(r"\s+", " ", value.strip(" ,"))[:200]
+    return re.sub(r"\s+", " ", value.strip(" ,"))[:CITED_AUTHOR_LABEL_LIMIT]
 
 
 def _actor_matches_cited_author(actor, cited_author_label):

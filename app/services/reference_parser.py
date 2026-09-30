@@ -7,6 +7,7 @@ appropriate format-specific parser.
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from typing import List, Optional
 
 from app.config import settings
@@ -94,6 +95,18 @@ def split_references(
     return refs
 
 
+def _apply_identifier_normalization(references):
+    """Normalize carried identifiers on every extraction path.
+
+    `extract_and_parse_references` has three exits - the regex-first path, the
+    LLM-split legacy path and the batch legacy path - and applying this at one
+    of them silently missed the live path. Every exit converges here.
+    """
+    from app.services.preprint_identifiers import apply_preprint_identity
+
+    return [apply_preprint_identity(reference) for reference in references]
+
+
 def extract_and_parse_references(
     raw_text: str,
     format_hint: Optional[str] = None,
@@ -169,10 +182,12 @@ def extract_and_parse_references(
 
         from app.services.reference_identity import assign_reference_ids
         return assign_reference_ids(
-            _extract_fields_regex_first(
-                raw_refs,
-                format_hint,
-                use_llm_fallback=use_llm_fallback,
+            _apply_identifier_normalization(
+                _extract_fields_regex_first(
+                    raw_refs,
+                    format_hint,
+                    use_llm_fallback=use_llm_fallback,
+                )
             ),
             paper_version_id=paper_version_id,
         )
@@ -185,7 +200,9 @@ def extract_and_parse_references(
         parsed = parse_reference_batch(refs, format_hint=format_hint)
 
     from app.services.reference_identity import assign_reference_ids
-    return assign_reference_ids(parsed, paper_version_id=paper_version_id)
+    return assign_reference_ids(
+        _apply_identifier_normalization(parsed), paper_version_id=paper_version_id
+    )
 
 
 def _regex_fallback_references(
@@ -346,7 +363,9 @@ def _extract_fields_regex_first(
 
         max_workers = min(len(failed_indices), 4)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_fallback_one, i) for i in failed_indices]
+            # A per-task context copy taken here carries the stage metrics
+            # into worker threads; plain threads would drop their LLM usage.
+            futures = [pool.submit(copy_context().run, _fallback_one, i) for i in failed_indices]
             for fut in as_completed(futures):
                 idx, parsed = fut.result()
                 results[idx] = parsed
@@ -357,10 +376,28 @@ def _extract_fields_regex_first(
                 raw_ref=raw_refs[i], needs_review=True, extraction_method="fallback"
             )
 
+    # Recover only visible chapter fields after the existing fallback. Never
+    # replace successful parsing or turn review-only observations into cache truth.
+    if fmt == 'apa':
+        from app.services.ref_field_extractor import extract_incomplete_apa_chapter, extract_authorless_apa_fields, extract_authorless_apa_journal
+        for i, parsed in enumerate(results):
+            if parsed and parsed.needs_review and not parsed.title and not parsed.author:
+                recovered = (extract_authorless_apa_journal(raw_refs[i])
+                             or extract_incomplete_apa_chapter(raw_refs[i])
+                             or extract_authorless_apa_fields(raw_refs[i]))
+                if recovered is not None:
+                    results[i] = recovered
+
+    # Carried identifiers move into their own fields before anything is cached,
+    # so the cache holds the corrected form. Written after this point it held
+    # the polluted title and an empty DOI, and every later paper citing the
+    # same preprint re-did the repair on a cache hit that never carried it.
+    results = _apply_identifier_normalization(results)
+
     # Cache successful results
     if settings.CACHE_ENABLED:
         for parsed in results:
-            if parsed and (parsed.doi or parsed.title):
+            if parsed and parsed.extraction_method not in {'partial_regex', 'authorless_journal_regex'} and (parsed.doi or parsed.title):
                 doi_cache.cache_reference(
                     data=parsed.model_dump(),
                     doi=parsed.doi,
@@ -735,7 +772,7 @@ def parse_reference_batch(
     max_workers = min(len(batch_jobs), 4) if batch_jobs else 1
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
-            pool.submit(_process_batch, indices, refs_list)
+            pool.submit(copy_context().run, _process_batch, indices, refs_list)
             for indices, refs_list in batch_jobs
         ]
         for fut in as_completed(futures):

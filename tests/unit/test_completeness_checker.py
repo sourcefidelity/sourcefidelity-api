@@ -11,6 +11,33 @@ from app.services.completeness_checker import (
 from app.services.source_validator import _check_completeness
 
 
+def test_uncropped_raster_avoids_image_hash_and_xref_work(monkeypatch):
+    from app.services.completeness_checker import _signal_rendered_raster_coverage
+    with fitz.open(stream=_raster_pdf_with_horizontal_crop(ink_in_hidden_bands=True),filetype='pdf') as doc:
+        for page in doc:
+            page.set_cropbox(page.mediabox)
+        data=doc.tobytes()
+    def forbidden(*a,**k):
+        raise AssertionError('Uncropped page must not request image xref hashes')
+    monkeypatch.setattr(fitz.Page,'get_image_rects',forbidden)
+    result=_signal_rendered_raster_coverage(data)
+    assert result['vote'] is None
+    assert result['detail']=='Rendered raster coverage: no material ink-bearing crop found'
+
+
+def test_cropped_raster_still_uses_original_pixel_check(monkeypatch):
+    from app.services.completeness_checker import _signal_rendered_raster_coverage
+    data=_raster_pdf_with_horizontal_crop(ink_in_hidden_bands=True)
+    original=fitz.Page.get_image_rects
+    calls=[]
+    def observed(*a,**k):
+        calls.append(True)
+        return original(*a,**k)
+    monkeypatch.setattr(fitz.Page,'get_image_rects',observed)
+    result=_signal_rendered_raster_coverage(data)
+    assert calls and result['vote']==INCOMPLETE
+
+
 def _pdf(pages: list[str], *, page_numbers: list[int] | None = None) -> bytes:
     document = fitz.open()
     for index, text in enumerate(pages):
@@ -56,6 +83,22 @@ def _raster_pdf_with_horizontal_crop(*, ink_in_hidden_bands: bool) -> bytes:
     raster.close()
     source.close()
     return payload
+
+
+def test_article_bibliographic_endnotes_are_terminal_evidence():
+    from app.services.completeness_checker import _signal_back_matter
+    notes = "Notes\n1. A. Author (1998). First work.\n2. B. Author (2001). Second work.\n3. C. Author (2010). Third work."
+    payload = _pdf(["Article opening", "Article body", notes])
+    assert _signal_back_matter(payload, 3, document_kind="article")["vote"] == COMPLETE
+    assert _signal_back_matter(payload, 3, document_kind="book")["vote"] is None
+    partial = _pdf(["Selected pages", "Article body", notes])
+    assert check_completeness(partial, document_kind="article").verdict != COMPLETE
+
+
+def test_bare_or_nonbibliographic_notes_do_not_establish_completeness():
+    from app.services.completeness_checker import _signal_back_matter
+    for notes in ["Notes", "Notes\n1. First observation\n2. Second observation\n3. Third observation"]:
+        assert _signal_back_matter(_pdf([notes]), 1, document_kind="article")["vote"] is None
 
 
 def test_article_advertised_range_detects_two_page_excerpt():

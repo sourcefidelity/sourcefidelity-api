@@ -25,7 +25,7 @@ _ABBREVIATIONS = re.compile(
 )
 
 # Sentence-ending pattern: . ! ? (optionally followed by closing quote/paren)
-_SENTENCE_END = re.compile(r"([.!?]+[\"'\u201d\u2019\)]*)\s+")
+_SENTENCE_END = re.compile(r"([.!?]+[\"'\u201d\u2019\)]*)(?:\s+|(?<=\)\.)(?=[A-Z]))")
 
 
 def split_sentences(text: str) -> list[str]:
@@ -45,6 +45,17 @@ def split_sentences(text: str) -> list[str]:
 
     # Protect ellipses
     protected = protected.replace("...", "\x02")
+    # Question/exclamation punctuation inside a title or quoted clause is
+    # not a sentence boundary when the same sentence explicitly continues.
+    protected = re.sub(
+        r'([?!])(?=(?:[”"]\s+(?:and|but|while)\b|[ \t]+\([^()\n]{1,120}(?:19|20)\d{2}[^()\n]*\)[ \t]+[a-z]))',
+        lambda m: '\x03' if m[1] == '?' else '\x04', protected)
+    # A trailing secondary citation belongs to the preceding question or
+    # exclamation, even when the student omitted quotation marks. Do not
+    # attach a new parenthetical sentence or cross a paragraph boundary.
+    protected = re.sub(
+        r'([?!])(?=(?![ \t\n]*\n[ \t]*\n)[ \t\n]+\(as cited in [^()\n]{1,120},\s*(?:18|19|20)\d{2}[a-z]?\)\.)',
+        lambda m: '\x03' if m[1] == '?' else '\x04', protected, flags=re.I)
 
     # Protect "et al." — it's followed by a parenthetical, not a sentence end
     protected = re.sub(r"(et al)\.(?=\s*\()", lambda m: m.group(1) + "\x00", protected, flags=re.IGNORECASE)
@@ -74,6 +85,7 @@ def split_sentences(text: str) -> list[str]:
 
         # Restore placeholders
         chunk = chunk.replace("\x00", ".").replace("\x01", ".").replace("\x02", "...")
+        chunk = chunk.replace('\x03', '?').replace('\x04', '!')
         chunk = chunk.strip()
         if chunk:
             sentences.append(chunk)

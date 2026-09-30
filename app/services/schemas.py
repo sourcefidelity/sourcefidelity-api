@@ -6,11 +6,96 @@ ensuring type safety and catching malformed output.
 
 from enum import Enum
 import re
-from typing import List, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Optional, Literal
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
-class ParsedReference(BaseModel):
+def declared_max_length(model, field_name):
+    """Read a field's own ``max_length`` so a limit is never written twice.
+
+    Bounding logic that repeats the number drifts from the field it guards.
+    Reading the declaration keeps one source of truth per field.
+    """
+    field = model.model_fields.get(field_name)
+    for item in getattr(field, "metadata", ()) or ():
+        limit = getattr(item, "max_length", None)
+        if isinstance(limit, int):
+            return limit
+    return None
+
+
+def note_bounded(data: dict, field_name: str) -> None:
+    """Record that the application altered a field, on the record itself."""
+    noted = list(data.get("bounded_fields") or [])
+    if field_name not in noted:
+        noted.append(field_name)
+    data["bounded_fields"] = noted
+
+
+def bound_text_fields(model, data, field_names) -> dict:
+    """Truncate each named text field at its own declared limit and say so.
+
+    Used from a model-level ``mode="before"`` validator, because only there
+    can the alteration be written back onto the record: a field validator
+    sees one value and cannot annotate its neighbours. The owner's rule is
+    that an unexpectedly long field must not crash a run; the project's rule
+    is that findings expose their limitations. Both hold only if the
+    truncation is recorded where a reviewer will see it.
+    """
+    if not isinstance(data, dict):
+        return data
+    out = None
+    for name in field_names:
+        value = data.get(name)
+        limit = declared_max_length(model, name)
+        if isinstance(value, str) and limit and len(value) > limit:
+            if out is None:
+                out = dict(data)
+            out[name] = value[:limit]
+            note_bounded(out, name)
+    return out if out is not None else data
+
+
+class BoundedFieldsMixin(BaseModel):
+    """Names of fields the application truncated or degraded on this record.
+
+    Serialized only when non-empty, so an untouched record dumps exactly as it
+    did before and every stored hash of one is unchanged; a record that was
+    altered carries the fact, and its hash changes with it, as it should.
+    """
+
+    bounded_fields: list[str] = Field(default_factory=list, max_length=32)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_bounded_fields(self, handler):
+        payload = handler(self)
+        if isinstance(payload, dict) and not self.bounded_fields:
+            payload.pop("bounded_fields", None)
+        return payload
+
+
+class ReferenceURLRepair(BaseModel):
+    """Auditable, extraction-bound locator reconstruction; not source admission."""
+
+    version: str = "reference-url-lines-v1"
+    layout_sha256: str
+    raw_reference_sha256: str
+    original_url: str
+    observed_span: str
+    span_start: int
+    span_end: int
+
+
+class SubmittedHyperlinkBinding(BaseModel):
+    """Original-document locator provenance, never source identity evidence."""
+
+    version: Literal["submitted-hyperlink-binding-v1"] = "submitted-hyperlink-binding-v1"
+    paper_sha256: str
+    reference_text_sha256: str
+    paragraph_indexes: list[int]
+
+
+class ParsedReference(BoundedFieldsMixin):
     """A single parsed reference from the LLM.
 
     This is the canonical parsed reference format used across the system.
@@ -48,6 +133,36 @@ class ParsedReference(BaseModel):
         default="",
         description="Original input reference string",
     )
+    container_title: str = Field(default="", max_length=1000)
+    # The fourth identity field alongside title, author and year: a book
+    # naming the same publisher is unlikely to be a different book.
+    publisher: str = Field(default="", max_length=300)
+    # An article's volume and issue distinguish it the way a book's publisher
+    # does. They were absent here while `ExpectedBibliographicFields` already
+    # carried them, so every volume and issue comparison resolved `unknown`
+    # for want of a submitted value, and a wrong volume could not be seen.
+    volume: str = Field(default="", max_length=80)
+    issue: str = Field(default="", max_length=80)
+    pages: str = Field(default="", max_length=100)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_text(cls, data):
+        """A malformed parse must not crash the run, and must say what it lost.
+
+        These carry whatever the parser recovered from the reference string, so
+        a mis-split entry can put an entire paragraph into `container_title`.
+        Owner decision, 2026-09-23: an unexpectedly long field must not crash a
+        paper run - losing detail on one reference is acceptable where losing
+        the whole submission is not. A prefix keeps what matching uses, since
+        these are compared by token overlap rather than equality. The altered
+        field names are recorded in `bounded_fields`.
+        """
+        return bound_text_fields(
+            cls, data, ("container_title", "publisher", "volume", "issue", "pages")
+        )
+    url_repair: Optional[ReferenceURLRepair] = None
+    submitted_hyperlink_binding: Optional[SubmittedHyperlinkBinding] = None
     citation_key: str = Field(
         default="",
         description="First author surname plus year, e.g. 'Smith2020'",
@@ -121,18 +236,25 @@ class ParsedReference(BaseModel):
     @field_validator("doi", mode="before")
     @classmethod
     def clean_doi(cls, v: str) -> str:
-        """Remove https://doi.org/ prefix if present."""
-        if isinstance(v, str) and v.startswith("https://doi.org/"):
-            return v.replace("https://doi.org/", "")
+        """Remove a doi.org prefix and decode a percent-encoded DOI."""
+        from app.services.ref_field_extractor import decode_doi
+        if isinstance(v, str):
+            for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/"):
+                if v.startswith(prefix):
+                    v = v[len(prefix):]
+                    break
+            return decode_doi(v)
         return v or ""
 
     @field_validator("year", mode="before")
     @classmethod
     def clean_year(cls, v: str) -> str:
-        """Ensure year is four digits plus an optional citation suffix."""
+        """Preserve an explicit year range or year with citation suffix."""
         if not v:
             return "n.d."
         v = str(v).strip()
+        if re.fullmatch(r"(?:19|20)\d{2}\s*[-–—]\s*(?:19|20)\d{2}", v):
+            return v
         if re.fullmatch(r"(?:19|20)\d{2}[a-z]?", v, re.IGNORECASE):
             return v.lower()
         # Preserve APA/Harvard disambiguation suffixes such as 2020a.
@@ -142,7 +264,7 @@ class ParsedReference(BaseModel):
         return "n.d."
 
 
-class CitationMarkerMember(BaseModel):
+class CitationMarkerMember(BoundedFieldsMixin):
     """One exact source marker inside a possibly grouped citation unit."""
 
     text: str = Field(min_length=1, max_length=2_000)
@@ -150,6 +272,35 @@ class CitationMarkerMember(BaseModel):
     local_end: int = Field(gt=0)
     reference_ids: List[str] = Field(default_factory=list)
     marker_type: str = Field(default="unknown")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_text_with_its_span(cls, data):
+        """Keep the marker's leading text and shorten its span to match.
+
+        The text and the offsets must agree, so this clamps both together: the
+        highlight then covers a real prefix of the citation rather than a span
+        the text cannot support. Unlike `CitationSourceBinding`, this model has
+        no unresolved state to fall back to, and a partial highlight of a real
+        marker is honest - it starts in the right place and simply ends early.
+
+        Owner decision, 2026-09-23: an unexpectedly long field must not crash a
+        paper run. Observed markers reach 328 characters against this 2,000
+        limit, so this is a guard rather than a live repair.
+        """
+        if not isinstance(data, dict):
+            return data
+        text = data.get("text")
+        limit = declared_max_length(cls, "text")
+        if not (isinstance(text, str) and limit and len(text) > limit):
+            return data
+        data = dict(data)
+        data["text"] = text[:limit]
+        start = data.get("local_start")
+        if isinstance(start, int):
+            data["local_end"] = start + limit
+        note_bounded(data, "text")
+        return data
 
     @model_validator(mode="after")
     def validate_local_span(self):
@@ -346,6 +497,49 @@ PRIMARY_SUBJECT_TYPES = {
 }
 
 
+class FilmAnalysisCandidate(BaseModel):
+    """Bound model proposal, not an accepted analysis or omission finding."""
+    model_config = {'extra': 'forbid'}
+    title: str
+    title_start: int
+    title_end: int
+    passage_start: int
+    passage_end: int
+    passage_sha256: str
+    proposed_role: Literal['substantive_analysis', 'incidental_mention', 'uncertain']
+
+
+class FilmAnalysisPreflight(BaseModel):
+    version: Literal['film-analysis-candidates-v1'] = 'film-analysis-candidates-v1'
+    status: Literal['not_requested', 'unavailable', 'invalid', 'bound_candidates', 'no_candidates'] = 'not_requested'
+    body_sha256: str = ''
+    reference_inventory_sha256: str = ''
+    candidates: List[FilmAnalysisCandidate] = Field(default_factory=list)
+    rejected_count: int = 0
+    # Binding is mechanical; semantic scope and reference absence remain unassessed.
+    automatic_findings_enabled: Literal[False] = False
+
+
+class MediaAnalysisCandidate(FilmAnalysisCandidate):
+    title_occurrences: List[tuple[int, int]] = Field(default_factory=list)
+    # Legacy observations have no accepted bibliographic role.
+    title_role: Literal['work_title', 'publication_title', 'uncertain'] = 'uncertain'
+    media_type: Literal['film', 'tv_series', 'tv_episode', 'book', 'album', 'song',
+                        'radio_program', 'radio_episode', 'podcast', 'podcast_episode',
+                        'play', 'poem', 'video', 'video_game', 'article', 'periodical', 'other', 'unknown']
+
+    @model_validator(mode='after')
+    def validate_publication_role(self):
+        if self.title_role == 'publication_title' and self.media_type not in {'periodical', 'unknown'}:
+            raise ValueError('Publication titles cannot identify an article or another component')
+        return self
+
+
+class MediaAnalysisPreflight(FilmAnalysisPreflight):
+    version: Literal['media-analysis-candidates-v1', 'media-analysis-candidates-v2', 'media-analysis-candidates-v3'] = 'media-analysis-candidates-v2'
+    candidates: List[MediaAnalysisCandidate] = Field(default_factory=list)
+
+
 class SubjectIdentification(BaseModel):
     """Top-level result of the subject-identification pass.
 
@@ -362,6 +556,8 @@ class SubjectIdentification(BaseModel):
             "'law: municipal recycling restrictions (2020)'"
         ),
     )
+    film_analysis_preflight: FilmAnalysisPreflight = Field(default_factory=FilmAnalysisPreflight)
+    media_analysis_preflight: MediaAnalysisPreflight = Field(default_factory=MediaAnalysisPreflight)
     subject_type: str = Field(
         default="other",
         description=(

@@ -1,7 +1,7 @@
 """Format-neutral discovery and extraction from scholarly landing pages."""
 
 import json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -80,7 +80,11 @@ def discover_scholarly_locations(
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"]
         text = anchor.get_text(" ", strip=True).lower()
-        if href.lower().endswith(".pdf") or "download pdf" in text or text == "pdf":
+        try:
+            pdf_path = urlsplit(href).path.lower().endswith(".pdf")
+        except ValueError:
+            continue
+        if pdf_path or "download pdf" in text or text in {"pdf", "view pdf"}:
             add(href, RepresentationKind.PDF, "application/pdf", "anchor_pdf")
     return locations
 
@@ -89,7 +93,7 @@ def _kind_for_media_type(media_type: str | None) -> RepresentationKind | None:
     value = (media_type or "").lower()
     # oEmbed XML/JSON describes an embeddable card for a page. It is metadata,
     # not the scholarly work represented by that page.
-    if "oembed" in value:
+    if "oembed" in value or value in {"application/rss+xml", "application/atom+xml", "application/rdf+xml"}:
         return None
     if "pdf" in value:
         return RepresentationKind.PDF

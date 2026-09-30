@@ -17,7 +17,7 @@ from app.services.verification_evidence import (
 )
 
 
-ANTECEDENT_RESOLVER_VERSION = "local-document-antecedent-rescue-v2"
+ANTECEDENT_RESOLVER_VERSION = "local-document-antecedent-rescue-v3"
 MAX_DOCUMENT_SEARCH_CHARACTERS = 100_000
 
 _TYPED_HEADS = (
@@ -170,8 +170,14 @@ def _dependency_mention(claim):
     elif demonstrative:
         words = list(re.finditer(r"[A-Za-z][\w'’\-]*", demonstrative))
         kept = []
+        singular = match.group("mention").split(None, 1)[0].casefold() in {"this", "that"}
         for word in words:
-            if word.group().casefold() in _MENTION_BOUNDARY_WORDS:
+            value = word.group().casefold()
+            if value in _MENTION_BOUNDARY_WORDS:
+                break
+            # After a singular demonstrative and its noun, a word in -s is the
+            # verb: "This portrayal reflects" ends at "portrayal" (v3).
+            if singular and kept and re.fullmatch(r"[a-z]+[^su]s", value):
                 break
             kept.append(word)
         if kept:
@@ -278,6 +284,11 @@ def _candidates_for_ranges(
                 re.IGNORECASE,
             )
             matches = list(pattern.finditer(text))
+            derived = _derived_verb_pattern(head) if not matches and tier == "immediate_context" else None
+            if derived is not None:
+                # "This portrayal" after "…, portraying Alice as a naive child":
+                # the verb phrase, to the end of its clause, is the antecedent (v3).
+                matches = list(derived.finditer(text))
         for match in matches:
             candidate_start = start + match.start()
             candidate_end = start + match.end()
@@ -294,7 +305,10 @@ def _candidates_for_ranges(
             ):
                 continue
             match_kind = (
-                "compatible_group_phrase"
+                "derived_verb_phrase"
+                if derived_head(head) and not typed and not compatible_group
+                and not re.search(rf"\b{re.escape(head)}\b", exact, re.IGNORECASE)
+                else "compatible_group_phrase"
                 if compatible_group
                 else "coordinated_named_group"
                 if _typed_head_count(exact) >= 2
@@ -331,6 +345,12 @@ def _candidates_for_ranges(
             for right in ordered[left_index + 1:]:
                 if right.paper_end - left.paper_start > 300:
                     break
+                # A coordinated phrase must belong to one searched context.
+                # Joining separate context sentences can create an anchor for
+                # which no exact antecedent_context_index exists.
+                if not any(start <= left.paper_start and right.paper_end <= end
+                           for start, end in ranges):
+                    continue
                 exact = body_text[left.paper_start:right.paper_end]
                 if _typed_head_count(exact) < 2 or not re.search(
                     r"\b(?:and|or)\b|,", exact, re.IGNORECASE
@@ -461,6 +481,24 @@ def _plural_phrase(text):
 
 def _typed_head_count(text):
     return len(re.findall(rf"\b(?:{_TYPE_PATTERN})\b", text, re.IGNORECASE))
+
+
+_NOMINAL_SUFFIXES = ("ation", "ition", "ment", "ance", "ence", "al", "ion")
+
+
+def derived_head(head: str) -> str | None:
+    """The verb stem of a noun formed from a verb (portrayal -> portray), or None."""
+    for suffix in _NOMINAL_SUFFIXES:
+        if head.endswith(suffix) and len(head) - len(suffix) >= 4:
+            return head[: -len(suffix)]
+    return None
+
+
+def _derived_verb_pattern(head: str):
+    stem = derived_head(head or "")
+    if stem is None:
+        return None
+    return re.compile(rf"\b{re.escape(stem)}(?:s|ed|ing|es)?\b[^.;:!?,]{{3,160}}", re.IGNORECASE)
 
 
 def _uninformative(text, head):

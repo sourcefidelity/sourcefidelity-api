@@ -48,6 +48,8 @@ class ValidationResult:
     page_count: int = 0        # detected page count (for logging)
     observed_source_kind: str = "unknown"
     source_kind_verdict: str = "unknown"
+    source_inspection: dict | None = None
+    reason_code: str | None = None
 
 
 def validate_ocr_derivative_text(
@@ -62,13 +64,16 @@ def validate_ocr_derivative_text(
     expected_source_kind_evidence: tuple[str, ...] = (),
     completeness: str = "uncertain",
     page_count: int = 0,
+    _layout_spans: list[dict] | None = None,
+    _layout_lines: list[tuple[str, float]] | None = None,
+    _layout_height: float = 0,
+    _layout_pages: list[tuple[list[dict], float]] | None = None,
 ) -> ValidationResult:
     """Revalidate identity/type against bounded OCR text without PDF metadata.
 
-    OCR cannot preserve font prominence or embedded metadata. Automatic high
-    confidence therefore requires two visible bibliographic fields, including
-    an exact normalized title or DOI, and completeness must be established
-    independently from the immutable parent PDF.
+    Uses the same identity rules as native PDF validation. Plain OCR text has
+    no font/position or embedded-metadata observations: do not manufacture title
+    prominence from occurrence alone. Completeness is independently established.
     """
     if not text.strip() or len(text) > 20_000_000:
         return ValidationResult(
@@ -110,33 +115,18 @@ def validate_ocr_derivative_text(
             source_kind_verdict=compatibility.verdict,
         )
 
-    normalized = _normalize_identity_text(front_text)
-    normalized_title = _normalize_identity_text(expected_title or "")
-    title_match = bool(
-        len(normalized_title) >= 10 and normalized_title in normalized
-    )
-    author_value = (expected_author or "").strip()
-    if "," in author_value:
-        surname_value = author_value.split(",", 1)[0].strip()
-    else:
-        author_tokens = author_value.split()
-        surname_value = author_tokens[-1] if author_tokens else ""
-    surname = _normalize_identity_text(surname_value)
-    author_match = bool(len(surname) >= 3 and surname in normalized)
-    year_match = bool(expected_year and expected_year in front_text)
-    normalized_doi = (expected_doi or "").strip().casefold()
-    doi_match = bool(normalized_doi and normalized_doi in front_text.casefold())
-    identity = (
-        "high"
-        if (doi_match and (title_match or author_match))
-        or (title_match and author_match)
-        else "medium"
-        if doi_match or title_match or (author_match and year_match)
-        else "low"
-        if author_match or year_match
-        else "rejected"
+    identity = _check_identity_observations(
+        front_text, "", expected_doi, expected_title, expected_author,
+        expected_year,
+        prominent_title=any(_title_in_layout_spans(spans, height, expected_title or "")
+                            for spans, height in (_layout_pages if _layout_pages is not None
+                                                  else [(_layout_spans or [], _layout_height)])[:3]),
+        prominent_years=_document_years_in_lines(_layout_lines or [], _layout_height),
     )
     accept = identity == "high" and completeness == "complete"
+    has_layout = _layout_spans is not None or bool(
+        _layout_pages and any(spans for spans, _ in _layout_pages[:3])
+    )
     return ValidationResult(
         accept=accept,
         identity_confidence=identity,
@@ -145,14 +135,112 @@ def validate_ocr_derivative_text(
         reason=("Accepted" if accept else "Needs review")
         + ": OCR derivative identity="
         + identity
-        + f", completeness={completeness}",
+        + f", completeness={completeness}"
+        + ("; OCR text has no title-layout observations" if not has_layout else
+           "; bounded OCR positions available; font and embedded metadata unavailable"),
         page_count=page_count,
         observed_source_kind=observed_kind.kind,
         source_kind_verdict=compatibility.verdict,
     )
 
 
-def validate_retrieved_pdf(
+def validate_retrieved_pdf(pdf_bytes, *args, inspection_provider=None,
+                           inspection_reconciliation=False, **kwargs) -> ValidationResult:
+    """Existing deterministic verifier with an optional shared observation hook.
+
+    The authorized caller supplies the hook after file safety checks. Inspection
+    cannot change admission or completeness until its quality gate is accepted.
+    """
+    validation = _validate_retrieved_pdf_deterministic(pdf_bytes, *args, **kwargs)
+    if (inspection_provider is not None and (validation.identity_confidence != 'rejected'
+            or validation.reason_code == 'identity_insufficient_observations')
+            and (validation.identity_confidence != 'high' or validation.completeness not in {'complete', 'skipped'})):
+        try:
+            validation.source_inspection = inspection_provider(pdf_bytes, validation)
+            if inspection_reconciliation and not args:
+                validation = _reconcile_inspected_title(pdf_bytes, validation, kwargs)
+        except Exception:
+            validation.source_inspection = {'status': 'incomplete', 'decision_applied': False,
+                                            'reason_code': 'inspection_unavailable'}
+    return validation
+
+
+def _reconcile_inspected_title(pdf_bytes, validation, expected):
+    """Narrow typo proposal, independently checked by the original validator.
+
+    Never substitute model confidence for bibliographic or admission checks.
+    Only one alphabetic edit in a sufficiently long title is eligible; numeric
+    changes, short titles and all other reported differences abstain.
+    """
+    import hashlib
+    from difflib import SequenceMatcher
+    finding = validation.source_inspection
+    if not isinstance(finding, dict):
+        return validation
+    if (finding.get('version') != 'source-inspection-v3'
+            or finding.get('status') != 'complete'
+            or finding.get('identity') != 'same_work'
+            or finding.get('representation_role') != 'source_text'
+            or finding.get('completeness') != 'not_established'
+            or finding.get('content_sha256') != hashlib.sha256(pdf_bytes).hexdigest()
+            or (validation.identity_confidence not in {'low', 'medium'}
+                and validation.reason_code != 'identity_insufficient_observations')
+            or expected.get('expected_doi') or expected.get('expected_isbn')
+            or not expected.get('expected_author') or not expected.get('expected_year')):
+        return validation
+    differences = finding.get('differences', [])
+    if not any(d.get('field') == 'title' and d.get('kind') == 'typographic' for d in differences):
+        return validation
+    for difference in differences:
+        field = difference.get('field')
+        if difference.get('kind') != 'typographic' or field not in {'title', 'author', 'year'}:
+            return validation
+        if field != 'title':
+            # Models sometimes label identical author/date wording as a
+            # difference. Independently identical fields require no repair;
+            # retain the model record without letting it rewrite these fields.
+            values = {_normalize_identity_text(o.get('quote', ''))
+                      for o in finding.get('observations', []) if o.get('field') == field}
+            if values != {_normalize_identity_text(expected.get('expected_'+field) or '')}:
+                return validation
+    titles = {o.get('quote') for o in finding.get('observations', [])
+              if o.get('field') == 'title' and isinstance(o.get('quote'), str)}
+    if len(titles) != 1:
+        return validation
+    observed = titles.pop()
+    original = expected.get('expected_title') or ''
+    a, b = _normalize_identity_text(original), _normalize_identity_text(observed)
+    edits = [(a[i:j], b[k:l]) for op, i, j, k, l in SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+             if op != 'equal']
+    if (min(len(a), len(b)) < 20 or len(edits) != 1
+            or max(map(len, edits[0])) != 1
+            or not all(not part or part.isalpha() for part in edits[0])):
+        return validation
+    prominent = _has_prominent_front_title_support(pdf_bytes, observed)
+    if not prominent and expected.get('expected_source_kind') in {'monograph', 'edited_collection'}:
+        prominent = _late_book_title_identity(pdf_bytes, observed,
+            expected['expected_author'], expected['expected_year'])
+    if not prominent:
+        return validation
+    checked = _validate_retrieved_pdf_deterministic(
+        pdf_bytes, **{**expected, 'expected_title': observed})
+    if (checked.identity_confidence != 'high'
+            or checked.source_kind_verdict == 'incompatible'
+            or (validation.completeness != 'skipped'
+                and checked.completeness != validation.completeness)
+            or checked.text_quality != validation.text_quality):
+        return validation
+    if checked.completeness != 'complete' or checked.text_quality not in {'digital', 'scan_ocr'}:
+        checked.accept = False
+    checked.source_inspection = {**finding, 'decision_applied': True,
+        'reconciliation_version': 'single-title-typo-v1',
+        'original_identity_confidence': validation.identity_confidence,
+        'bibliographic_identity': 'confirmed_with_minor_differences',
+        'original_expected_title': original, 'observed_title': observed}
+    return checked
+
+
+def _validate_retrieved_pdf_deterministic(
     pdf_bytes: bytes,
     expected_doi: Optional[str] = None,
     expected_title: Optional[str] = None,
@@ -254,12 +342,16 @@ def validate_retrieved_pdf(
     # (Now safe to run — text quality check confirmed text is extractable.)
     identity = _check_identity(pdf_bytes, expected_doi, expected_title,
                                 expected_author, expected_year)
+    if identity != "high" and expected_kind.kind in {"monograph", "edited_collection"}:
+        if _late_book_title_identity(pdf_bytes, expected_title, expected_author, expected_year):
+            identity = "high"
     if identity == "rejected":
         return ValidationResult(
             accept=False, identity_confidence="rejected",
             completeness="skipped", text_quality=text_quality,
-            reason="Identity check failed — PDF does not match the cited reference "
-                   "(no DOI match and title overlap too low). Likely wrong source.",
+            reason="The inspected front matter does not provide enough information "
+                   "to establish this source's identity.",
+            reason_code="identity_insufficient_observations",
         )
 
     # Layer 3: Completeness — is this a full document?
@@ -308,6 +400,53 @@ def validate_retrieved_pdf(
 
 # ── Layer 1: Identity check ─────────────────────────────────────────────
 
+def _late_book_title_identity(pdf_bytes, title, author, year) -> bool:
+    """Conservative pages 4–6 fallback, never whole-book title occurrence.
+
+    Require a short, prominent title page with its author and adjacent
+    publication-year evidence. Reissues/conflicting copyright dates abstain.
+    Existing representation/type checks have already run before this fallback.
+    """
+    if not title or not author or not year:
+        return False
+    wanted = _normalize_identity_text(title)
+    surname = _normalize_identity_text(author.split(",")[0])
+    if len(wanted) < 10 or len(surname) < 3:
+        return False
+    try:
+        import fitz
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            texts = [doc[i].get_text() for i in range(min(6, len(doc)))]
+            sample = "\n".join(texts)[:20000]
+            if _detect_nonwork_listing(sample, title):
+                return False
+            if classify_content_source_kind(sample).kind in {"book_review", "journal_article", "book_section"}:
+                return False
+            if _explicit_first_page_document_years(pdf_bytes) - {year}:
+                return False
+            for index in range(3, len(texts)):
+                text = texts[index]
+                if len(text.split()) > 160 or surname not in _normalize_identity_text(text):
+                    continue
+                # Reuse the established geometric title check on this page only.
+                with fitz.open() as single:
+                    single.insert_pdf(doc, from_page=index, to_page=index)
+                    if not _has_prominent_front_title_support(single.tobytes(), title, title_zone=0.60):
+                        continue
+                adjacent = "\n".join(texts[index:min(index + 2, 6)])
+                if not re.search(r"\b" + re.escape(year) + r"\b", adjacent):
+                    continue
+                dated_lines = [line for line in adjacent.splitlines()
+                               if re.search(r"copyright|©|published|reprint|edition", line, re.I)]
+                dates = set(re.findall(r"\b(?:19|20)\d{2}\b", "\n".join(dated_lines)))
+                if dates - {year}:
+                    continue
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _extract_pdf_front_text(pdf_bytes: bytes) -> str:
     """Extract a bounded front-matter sample for identity/type checks."""
     import fitz
@@ -346,6 +485,7 @@ def _extract_pdf_identity_metadata(pdf_bytes: bytes) -> str:
 def _has_prominent_front_title_support(
     pdf_bytes: bytes,
     expected_title: str | None,
+    *, title_zone: float = 0.30,
 ) -> bool:
     """Return whether the expected title appears as visible front matter.
 
@@ -367,35 +507,37 @@ def _has_prominent_front_title_support(
                 page = document[index]
                 spans = [
                     span
-                    for block in page.get_text("dict").get("blocks", [])
+                    for block in page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES).get("blocks", [])
                     for line in block.get("lines", [])
                     for span in line.get("spans", [])
                     if span.get("text", "").strip()
                 ]
                 if not spans:
                     continue
-                max_size = max(float(span.get("size", 0.0)) for span in spans)
-                median_size = statistics.median(
-                    float(span.get("size", 0.0)) for span in spans
-                )
-                upper_limit = float(page.rect.height) * 0.30
-                has_distinct_display_type = max_size >= median_size + 1.5
-                prominent = " ".join(
-                    span["text"]
-                    for span in spans
-                    if float(span["bbox"][1]) <= upper_limit
-                    or (
-                        has_distinct_display_type
-                        and float(span.get("size", 0.0)) >= max_size - 0.1
-                    )
-                )
-                if title in _normalize_identity_text(prominent):
+                if _title_in_layout_spans(spans, float(page.rect.height), title,
+                                          title_zone=title_zone):
                     return True
         finally:
             document.close()
     except Exception:
         return False
     return False
+
+
+def _title_in_layout_spans(spans: list[dict], height: float, title: str,
+                           *, title_zone: float = 0.30) -> bool:
+    """Use actual positions; OCR word-box height is NOT a font-size estimate."""
+    if not spans or len(_normalize_identity_text(title)) < 10:
+        return False
+    sizes = [float(span.get("size", 0.0)) for span in spans]
+    max_size = max(sizes)
+    display_type = max_size >= statistics.median(sizes) + 1.5
+    prominent = " ".join(
+        span["text"] for span in spans
+        if float(span["bbox"][1]) <= height * title_zone
+        or (display_type and float(span.get("size", 0.0)) >= max_size - 0.1)
+    )
+    return _normalize_identity_text(title) in _normalize_identity_text(prominent)
 
 
 def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
@@ -410,7 +552,7 @@ def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
             page = document[0]
             lines = [
                 line
-                for block in page.get_text("dict").get("blocks", [])
+                for block in page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES).get("blocks", [])
                 for line in block.get("lines", [])
                 if line.get("spans")
             ]
@@ -422,17 +564,7 @@ def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
             ]
             if not spans:
                 return set()
-            explicit_date_years: set[str] = set()
-            document_date_cues = re.compile(
-                r"\b(?:working paper|draft|version|revised|dated)\b",
-                re.IGNORECASE,
-            )
-            month_date = re.compile(
-                r"\b(?:january|february|march|april|(?-i:May)|june|july|august|"
-                r"september|october|november|december)\b.{0,24}"
-                r"\b(?:18|19|20)\d{2}\b",
-                re.IGNORECASE,
-            )
+            positioned_lines = []
             for line in lines:
                 line_text = " ".join(
                     span.get("text", "") for span in line.get("spans", [])
@@ -440,18 +572,76 @@ def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
                 line_top = min(
                     float(span["bbox"][1]) for span in line.get("spans", [])
                 )
-                if line_top <= float(page.rect.height) * 0.55 and (
-                    document_date_cues.search(line_text)
-                    or month_date.search(line_text)
-                ):
-                    explicit_date_years.update(
-                        re.findall(r"\b(?:18|19|20)\d{2}\b", line_text)
-                    )
-            return explicit_date_years
+                positioned_lines.append((line_text, line_top))
+            return _document_years_in_lines(positioned_lines, float(page.rect.height))
         finally:
             document.close()
     except Exception:
         return set()
+
+
+def _document_years_in_lines(lines: list[tuple[str, float]], height: float) -> set[str]:
+    """Shared explicit document-version date rule over positioned first-page lines."""
+    cues = re.compile(r"\b(?:working paper|draft|version|revised|dated)\b", re.I)
+    date = re.compile(
+        r"\b(?:january|february|march|april|(?-i:May)|june|july|august|"
+        r"september|october|november|december)\b.{0,24}\b(?:18|19|20)\d{2}\b", re.I,
+    )
+    return {year for text, top in lines
+            if top <= height * 0.55 and (cues.search(text) or date.search(text))
+            for year in re.findall(r"\b(?:18|19|20)\d{2}\b", text)}
+
+
+# An entry line in a bibliography: a capitalised opening, a four-digit year,
+# and enough text around it to be a reference rather than a heading.
+_CITATION_ENTRY = re.compile(r"(?m)^[A-Z\u2018\u2019\"'][^\n]{8,240}\b(?:19|20)\d{2}[a-z]?\b")
+
+
+# Executable script and markup output are not document text. Two cookie-consent
+# JavaScript bundles and a WordPress RSS feed were admitted as full-text
+# representations on 2026-09-23 because the only check on retrieved text was a
+# 500-character minimum. Densities measured over the stored text objects: the
+# script markers appear 2.20 times per 1,000 characters in the JavaScript and
+# at most 0.05 in every genuine source; tags appear 5.15 times per 1,000 in the
+# feed and at most 0.24 in genuine sources. Both thresholds sit an order of
+# magnitude clear of real prose.
+#
+# The alphabetic-character ratio is deliberately NOT used: a genuine source in
+# the same set sits at 0.67, below the JavaScript's 0.72, so that signal would
+# reject real documents.
+_SCRIPT_MARKER = re.compile(
+    r"(?:\bfunction\s*\(|=>|\bvar\s|\bconst\s|\btypeof\b|\};|===)")
+_MARKUP_TAG = re.compile(r"</?[a-zA-Z][\w:-]*(?:\s[^<>]{0,200})?/?>")
+_FEED_OR_OBJECT_OPENING = re.compile(r"^\s*(?:<\?xml|<rss\b|<feed\b|<!DOCTYPE\s+html|\{\s*\")", re.I)
+_SCRIPT_MARKERS_PER_1K = 1.0
+_MARKUP_TAGS_PER_1K = 2.0
+# Density alone rejects a short work that quotes three tags or one function.
+# The real payloads carry roughly 44 script markers and 103 tags across their
+# first 20,000 characters, so an absolute floor separates them with a wide
+# margin and spares a passing example.
+_MIN_SCRIPT_MARKERS = 8
+_MIN_MARKUP_TAGS = 12
+
+
+def detect_nonprose_payload(text: str) -> str | None:
+    """Say why retrieved text is not a document's prose, or None if it is.
+
+    Fail-closed on strong structural markers only. A work that quotes a line of
+    code or shows an XML example stays far below these densities.
+    """
+    sample = (text or "")[:20000]
+    if len(sample) < 200:
+        return None
+    if _FEED_OR_OBJECT_OPENING.match(sample):
+        return "a feed or structured data payload"
+    per_1k = 1000 / len(sample)
+    scripts = len(_SCRIPT_MARKER.findall(sample))
+    if scripts >= _MIN_SCRIPT_MARKERS and scripts * per_1k >= _SCRIPT_MARKERS_PER_1K:
+        return "executable script rather than document text"
+    tags = len(_MARKUP_TAG.findall(sample))
+    if tags >= _MIN_MARKUP_TAGS and tags * per_1k >= _MARKUP_TAGS_PER_1K:
+        return "markup or feed output rather than document text"
+    return None
 
 
 def _detect_nonwork_listing(
@@ -468,6 +658,50 @@ def _detect_nonwork_listing(
     visible = " ".join(front_text.split())[:12000]
     normalized = _normalize_identity_text(visible)
     leading = normalized[:4000]
+
+    # A download directory can reproduce a book's exact title/authors/ISBN on
+    # page one. Repeated download headings PLUS several book-sized catalog
+    # entries and URLs establish the document role, not merely topic overlap.
+    download_headings = len(re.findall(r'(?im)^\s*DOWNLOAD\s*$', front_text[:12000]))
+    catalog_entries = len(re.findall(r'\b(?:19|20)\d{2},\s*[^.;]{0,80}?\b\d{1,5}\s+pages\b', visible, re.I))
+    if (download_headings >= 2 and catalog_entries >= 4
+            and len(re.findall(r'https?://', front_text[:12000])) >= 3):
+        return "a download/catalog listing"
+
+    # A repository metadata export reproduces a work's exact title and authors
+    # as labelled fields. It is a record about the work, never the work's text.
+    # Require several distinct Dublin Core element labels so that ordinary
+    # prose using one or two of these words is unaffected, and match without
+    # line anchors because callers may supply whitespace-compacted text.
+    metadata_labels = {
+        match.group(1).lower()
+        for match in re.finditer(
+            r"(?i)\b(title|creator|contributor|subject|description|publisher|"
+            r"date|identifier|relation|coverage|rights|language|format)\s*:\s*\S",
+            visible[:12000],
+        )
+    }
+    if len(metadata_labels) >= 5:
+        return "a bibliographic metadata record"
+
+    # A course reading list reproduces dozens of works' exact titles, authors
+    # and years, and is about none of them. One was acquired as the source for
+    # a monograph on 2026-09-23: a 32-page Talis Aspire list whose page one is
+    # a bibliography, from which a naive reader took the first entry's DOI as
+    # the document's own. Talis stamps "readinglists@<institution>" in the page
+    # header; other platforms title the document a reading or resource list.
+    # Either marker could appear in passing inside an ordinary work, so require
+    # it together with a body of citation entries. Measured over the 88 stored
+    # source objects, the marker matches exactly one document -- that list --
+    # and no accepted source.
+    reading_list_marker = bool(
+        re.search(r"\breading\s*lists?\s*@", visible, re.I)
+        or re.search(r"\b(?:rl|readinglists)\.[a-z0-9.-]*talis\b", visible, re.I)
+        or re.search(r"(?im)^[^\n]{0,80}\b(?:reading|resource)\s+list\b[^\n]{0,80}$",
+                     front_text[:2000])
+    )
+    if reading_list_marker and len(_CITATION_ENTRY.findall(front_text[:12000])) >= 8:
+        return "a course reading list"
 
     cv_marker = bool(
         re.search(r"\b(?:curriculum vitae|abridged c v)\b", leading)
@@ -541,7 +775,7 @@ def _visible_identity_support_count(
             matches = sum(token in normalized for token in title_tokens)
             support += int(matches / len(title_tokens) >= 0.6)
     if expected_author:
-        surname = _normalize_identity_text(expected_author.split(",", 1)[0])
+        surname = _normalize_identity_text(_identity_surname(expected_author))
         support += int(bool(surname and len(surname) >= 3 and surname in normalized))
     if expected_year:
         support += int(expected_year in front_text)
@@ -564,6 +798,31 @@ def _check_identity(
     """
     front_text = _extract_pdf_front_text(pdf_bytes)
     identity_metadata = _extract_pdf_identity_metadata(pdf_bytes)
+    return _check_identity_observations(
+        front_text, identity_metadata, expected_doi, expected_title,
+        expected_author, expected_year,
+        prominent_title=_has_prominent_front_title_support(pdf_bytes, expected_title),
+        prominent_years=_explicit_first_page_document_years(pdf_bytes),
+    )
+
+
+def _check_identity_observations(
+    front_text: str,
+    identity_metadata: str,
+    expected_doi: Optional[str],
+    expected_title: Optional[str],
+    expected_author: Optional[str],
+    expected_year: Optional[str],
+    *,
+    prominent_title: bool,
+    prominent_years: set[str],
+) -> str:
+    """Shared native/OCR identity policy; callers supply only observed signals.
+
+    Layout absence is not title prominence. This internal scorer neither
+    authorizes source access nor decides completeness, readability or admission.
+    Representation-level listing/type guards remain in the consolidated entries.
+    """
     text = f"{front_text}\n{identity_metadata}"[:24000]
 
     if not text.strip():
@@ -606,7 +865,7 @@ def _check_identity(
         # Strong title identity requires title-zone/prominent front matter. A
         # same-author later work may repeat the exact target title and year in
         # its prose or bibliography; that plain occurrence is supporting only.
-        title_exact = _has_prominent_front_title_support(pdf_bytes, expected_title)
+        title_exact = prominent_title
         if (
             not title_exact
             and title_in_metadata
@@ -633,10 +892,8 @@ def _check_identity(
     # Signal 2: Author surname
     author_match = False
     if expected_author:
-        # Extract surname: "Croteau, D." → "croteau"; "Smith J" → "smith"
-        author_raw = expected_author.split(",")[0].strip()
-        if not author_raw:
-            author_raw = expected_author.split()[0]
+        # Shared convention: "Croteau, D." or "Jane Smith" supplies a surname.
+        author_raw = _identity_surname(expected_author)
         surname = _normalize_identity_text(author_raw)
         if surname and len(surname) >= 3 and surname in text_identity:
             author_match = True
@@ -654,7 +911,6 @@ def _check_identity(
     # A prominent conflicting document year distinguishes an earlier/later
     # working paper from the cited publication. The expected year may still
     # occur in prose or references, so title+author overlap cannot override it.
-    prominent_years = _explicit_first_page_document_years(pdf_bytes)
     visible_year_conflict = bool(
         expected_year
         and prominent_years
@@ -669,6 +925,15 @@ def _check_identity(
         return "low"
     else:
         return "rejected"
+
+
+def _identity_surname(author: str) -> str:
+    """Share the existing OCR comma/surname convention with native checking."""
+    value = author.strip()
+    if "," in value:
+        return value.split(",", 1)[0].strip()
+    tokens = value.split()
+    return tokens[-1] if tokens else ""
 
 
 def _normalize_identity_text(value: str) -> str:

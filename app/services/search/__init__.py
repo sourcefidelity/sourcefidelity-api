@@ -10,13 +10,14 @@ Usage:
         results = provider.search('"Some Title" filetype:pdf')
 
 Bing Search API is intentionally absent: Microsoft retired the standalone
-service on August 11, 2025. Consumer-site scraping is not an API replacement.
+service on August 11, 2025. Consumer-site scraping is not an API replacement,
+which is also why the DuckDuckGo adapter was removed on 2026-09-22.
 """
 
 import logging
 from typing import Optional
 
-from app.config import settings
+from app.config import secret_value, settings
 from app.services.search.base import SearchProvider, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -25,9 +26,8 @@ logger = logging.getLogger(__name__)
 def get_search_provider(provider_name: str | None = None) -> Optional[SearchProvider]:
     """Get a named or configured search provider, or None if unavailable.
 
-    Returns None silently (not an error) — web search is an optional fallback.
-    The retrieval chain works without it; search just improves coverage for
-    hard-to-find sources.
+    Missing configuration returns None. The versioned orchestrator records
+    missing required APIs as incomplete; absence of a key is not an empty search.
     """
     provider_name = (provider_name or settings.SEARCH_PROVIDER or "").lower().strip()
 
@@ -43,7 +43,7 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
             return None
         from app.services.search.google import GoogleCustomSearch
         return GoogleCustomSearch(
-            settings.GOOGLE_SEARCH_API_KEY,
+            secret_value(settings.GOOGLE_SEARCH_API_KEY),
             settings.GOOGLE_SEARCH_CSE_ID,
         )
 
@@ -62,32 +62,60 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
         )
 
     if provider_name == "brave":
+        if settings.SEARCH_POLICY_VERSION == "configured-search-v1" and not settings.BRAVE_SEARCH_RETENTION_PERMITTED:
+            logger.warning("Brave transient discovery requires API-first orchestration; legacy retained-output route unavailable")
+            return None
         if not settings.BRAVE_SEARCH_API_KEY:
             logger.warning(
                 "SEARCH_PROVIDER=brave but BRAVE_SEARCH_API_KEY not set — web search disabled"
             )
             return None
         from app.services.search.brave import BraveSearch
-        return BraveSearch(settings.BRAVE_SEARCH_API_KEY)
+        return BraveSearch(secret_value(settings.BRAVE_SEARCH_API_KEY))
+
+    if provider_name == "brightdata":
+        if not settings.BRIGHTDATA_API_TOKEN or not settings.BRIGHTDATA_SERP_ZONE:
+            logger.warning(
+                "SEARCH_PROVIDER=brightdata but BRIGHTDATA_API_TOKEN or "
+                "BRIGHTDATA_SERP_ZONE not set — web search disabled"
+            )
+            return None
+        from app.services.search.brightdata import BrightDataSearch
+        return BrightDataSearch(
+            secret_value(settings.BRIGHTDATA_API_TOKEN),
+            settings.BRIGHTDATA_SERP_ZONE,
+            engine=settings.BRIGHTDATA_SERP_ENGINE,
+            timeout_seconds=settings.BRIGHTDATA_TIMEOUT_SECONDS,
+            language=settings.BRIGHTDATA_SEARCH_LANGUAGE,
+            region=settings.BRIGHTDATA_SEARCH_REGION,
+        )
 
     if provider_name == "duckduckgo":
-        # No API key needed — uses the free HTML endpoint (unofficial)
-        from app.services.search.duckduckgo import DuckDuckGoSearch
-        return DuckDuckGoSearch()
+        # Removed 2026-09-22. The adapter used DuckDuckGo's unofficial HTML
+        # endpoint, which its terms do not permit. The official Instant Answer
+        # API is not a substitute: it returns no ranked results for reference
+        # titles. Refused by name so an existing configuration fails loudly
+        # rather than silently resolving to no provider.
+        logger.warning(
+            "SEARCH_PROVIDER=duckduckgo is no longer supported — the "
+            "unofficial HTML endpoint it used is not permitted by "
+            "DuckDuckGo's terms. Configure brave, exa, brightdata or searxng."
+        )
+        return None
 
     if provider_name == "tavily":
         if not settings.TAVILY_API_KEY:
             logger.warning("SEARCH_PROVIDER=tavily but TAVILY_API_KEY not set — web search disabled")
             return None
         from app.services.search.tavily import TavilySearch
-        return TavilySearch(settings.TAVILY_API_KEY)
+        return TavilySearch(secret_value(settings.TAVILY_API_KEY))
 
     if provider_name == "exa":
         if not settings.EXA_API_KEY:
             logger.warning("SEARCH_PROVIDER=exa but EXA_API_KEY not set — web search disabled")
             return None
         from app.services.search.exa import ExaSearch
-        return ExaSearch(settings.EXA_API_KEY)
+        return ExaSearch(secret_value(settings.EXA_API_KEY))
 
     logger.warning("Unknown SEARCH_PROVIDER=%s — web search disabled", provider_name)
     return None

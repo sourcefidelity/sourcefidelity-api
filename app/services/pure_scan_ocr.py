@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 
 from app.config import settings
 from app.services.ocr_derivative import (
@@ -148,9 +149,16 @@ def prepare_pure_scan_ocr(
         substantive_confidences = [
             page.mean_word_confidence
             for page in derivative.page_results
-            if page.character_count >= 100 and page.mean_word_confidence is not None
+            if page.character_count >= 100
         ]
-        if not substantive_confidences or min(substantive_confidences) < settings.PURE_SCAN_OCR_MIN_MEAN_WORD_CONFIDENCE:
+        if not substantive_confidences or not all(
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and math.isfinite(confidence)
+            and 0 <= confidence <= 100
+            and confidence >= settings.PURE_SCAN_OCR_MIN_MEAN_WORD_CONFIDENCE
+            for confidence in substantive_confidences
+        ):
             raise OcrDerivativeError(
                 "OCR confidence did not satisfy the configured evidence floor."
             )

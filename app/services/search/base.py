@@ -29,8 +29,23 @@ def safe_search_failure_log(query: str, exc: Exception) -> tuple[str, str]:
     return query_sha256, failure
 
 
+# Raised when this application is wrong, not when a provider misbehaved. None of
+# these can be produced by a well-formed call to a remote service, so reporting
+# one as an operational outcome blames the provider for our own defect — and the
+# resulting "no results" is indistinguishable from a genuine empty answer.
+_INTERNAL_ERRORS = (TypeError, AttributeError, NameError, ImportError, IndentationError)
+
+
 def classify_search_failure(exc: Exception) -> str:
     """Return a bounded operational status without retaining error contents."""
+    if isinstance(exc, _INTERNAL_ERRORS):
+        # Deliberately not re-raised: one malformed record already cost a whole
+        # paper its report. The run continues, but the trace says who failed,
+        # and `internal_error` is never a completed observation.
+        logger.error(
+            "Search call failed inside the application (type=%s)", type(exc).__name__
+        )
+        return "internal_error"
     if isinstance(
         exc,
         (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout),
@@ -40,7 +55,7 @@ def classify_search_failure(exc: Exception) -> str:
         status = exc.response.status_code
         if status in {401, 403}:
             return "access_restricted"
-        if status in {429, 432}:
+        if status in {429, 432, 433}:   # Tavily 432/433: plan and spend limits
             return "rate_limited"
     if isinstance(exc, (ValueError, httpx.DecodingError)):
         return "response_invalid"

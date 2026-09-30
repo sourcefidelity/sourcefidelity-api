@@ -21,6 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# English word lists (SCOWL, permissive licence) for the OCR text-quality
+# check. A separate layer, so the cached system and Python layers above stay.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wamerican-large \
+    wbritish-large \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy application code
 COPY . .
 

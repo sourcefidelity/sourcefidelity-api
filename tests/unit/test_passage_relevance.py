@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 
 import pytest
 
@@ -13,6 +14,7 @@ from app.services.passage_relevance import (
     apply_passage_relevance_gate,
     assess_abstract_relevance,
 )
+from app.services.llm_service import LLMCallFailure
 from app.services.candidate_relationship_judgment import attach_verification_candidates
 from app.services.citation_use_router import attach_citation_use_routes
 from app.services.evidence_obligations import attach_evidence_obligations
@@ -76,6 +78,91 @@ def _artifact(*, top_k=3, page_count=4):
         passage_end=100 + len(text),
     )
     return build_passage_evidence(source, claim=claim, top_k=top_k)
+
+
+@pytest.mark.parametrize("category", ["timeout", "connection_failed", "rate_limited",
+    "authentication_failed", "provider_server_error", "empty_response", "invalid_json"])
+def test_operational_failures_remain_distinct_and_unassessed(monkeypatch, category):
+    artifact = _artifact()
+    def fail(*args, **kwargs):
+        raise LLMCallFailure(category)
+    monkeypatch.setattr("app.services.passage_relevance.chat_completion_json", fail)
+    result = apply_passage_relevance_gate(artifact)
+    gate = result.passage_relevance
+    assert gate.method == f"passage_relevance_{category}"
+    assert gate.status == gate.outcome == "not_assessed"
+    assert not gate.assessments and not gate.relevant_passage_ids
+    assert result.passages == artifact.passages
+    assert result.verdict == artifact.verdict
+    abstract = assess_abstract_relevance(artifact.claim, "A complete abstract about competition.")
+    assert abstract["failure_category"] == category
+    assert abstract["status"] == "not_assessed"
+
+
+def test_selection_observations_reuse_call_and_reject_invented_spans(monkeypatch):
+    calls=[]
+    def response(system,prompt,**kwargs):
+        calls.append(1)
+        ps=json.loads(prompt)['passages']
+        return dict(assessments=[dict(passage_id=p['passage_id'], relevance='partially_relevant',
+            confidence='high',evidence_role='source_own_claim_or_finding') for p in ps],
+            display_observations={p['passage_id']:dict(basis='direct_attribution',
+                claim_spans=['Licensing supports competition'], source_sentence_ids=[p['source_sentences'][0]] if i==0 else ['invented'])
+                for i,p in enumerate(ps)})
+    monkeypatch.setattr('app.services.passage_relevance.chat_completion_json',response)
+    result=apply_passage_relevance_gate(_artifact())
+    assert result.passage_relevance.status=='complete'
+    assert len(calls)==result.passage_relevance.batch_count
+    assert sum(a.display_observation is not None for a in result.passage_relevance.assessments)==len(calls)
+
+
+def test_token_ranges_recover_original_claim_without_model_copy(monkeypatch):
+    def response(system,prompt,**kwargs):
+        payload=json.loads(prompt)
+        assert '[t0] Licensing' in payload['source_attributed_text']
+        return dict(assessments=[dict(passage_id=p['passage_id'],relevance='partially_relevant',confidence='high',evidence_role='source_own_claim_or_finding') for p in payload['passages']],
+            display_observations={p['passage_id']:dict(basis='direct_attribution',claim_token_ranges=[[0,2]],source_sentence_ids=['s000']) for p in payload['passages']})
+    monkeypatch.setattr('app.services.passage_relevance.chat_completion_json',response)
+    result=apply_passage_relevance_gate(_artifact())
+    assert result.passage_relevance.status=='complete'
+    assert all(a.display_observation.claim_spans==['Licensing supports competition'] for a in result.passage_relevance.assessments)
+
+
+def test_long_sentence_keeps_query_window_instead_of_unrelated_prefix():
+    from app.services.passage_relevance import _bounded_relevance_excerpt
+    text='background '*200+'Licensing supports competition and reduces barriers '+ 'background '*200
+    excerpt,start=_bounded_relevance_excerpt(text,'Licensing supports competition',passage_role='body_prose')
+    assert 'Licensing supports competition' in excerpt and text[start:start+len(excerpt)]==excerpt
+
+
+def test_schema_failure_does_not_persist_values_or_unknown_field_names(monkeypatch):
+    monkeypatch.setattr("app.services.passage_relevance.chat_completion_json",
+        lambda *args, **kwargs: {"assessments": [{"PRIVATE FIELD": "PRIVATE CONTENT"}]})
+    gate = apply_passage_relevance_gate(_artifact()).passage_relevance
+    assert gate.method == "passage_relevance_schema_validation_failed"
+    assert "missing=" in gate.limitations[0]
+    assert "extra_forbidden=" in gate.limitations[0]
+    assert "PRIVATE" not in gate.model_dump_json()
+
+
+def test_later_batch_failure_retains_progress_without_partial_judgment(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("app.services.passage_relevance.get_provider_config",
+                        lambda *args: SimpleNamespace(input_batch_tokens=2000))
+    calls = []
+    def response(system, prompt, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise LLMCallFailure("timeout")
+        return {"assessments": [{"passage_id": p["passage_id"], "relevance": "relevant",
+            "confidence": "high", "evidence_role": "source_own_claim_or_finding"}
+            for p in json.loads(prompt)["passages"]]}
+    monkeypatch.setattr("app.services.passage_relevance.chat_completion_json", response)
+    result = apply_passage_relevance_gate(_artifact(top_k=6, page_count=8))
+    gate = result.passage_relevance
+    assert len(calls) == 2 and gate.batch_count == 1
+    assert gate.status == "not_assessed" and not gate.assessments
+    assert gate.method == "passage_relevance_timeout"
 
 
 def test_relevant_and_partial_candidates_are_selected_without_changing_verdict(
@@ -213,7 +300,9 @@ def test_abstract_scope_is_separate_from_specific_excerpt(monkeypatch, excerpt):
     def response(*args, **kwargs):
         return {'assessments':[{'passage_id':'abstract','relevance':'relevant',
             'evidence_role':'source_own_claim_or_finding','confidence':'medium','rationale':'Related content.'}],
-            'scope':{'relevance':'generally_relevant','confidence':'medium'},'related_excerpt':excerpt}
+            'scope':{'relevance':'generally_relevant','confidence':'medium',
+                'broad_subject_relation':'compatible','plausible_connection':'present',
+                'subject_comparison':'Shared subject.'},'related_excerpt':excerpt}
     monkeypatch.setattr('app.services.passage_relevance.chat_completion_json',response)
     result = assess_abstract_relevance(_artifact().claim,text)
     assert result['scope_assessment']['relevance'] == 'generally_relevant'
@@ -561,7 +650,9 @@ def test_relevance_gate_assesses_a_hash_bound_query_window_not_only_prefix(
 ):
     artifact = _artifact(top_k=1)
     passage = artifact.passages[0]
-    filler = "Unrelated historical background. " * 70
+    # Force the whole singleton beyond the unchanged prompt ceiling so this
+    # exercises bounded fallback, not the complete-candidate preference.
+    filler = "Unrelated historical background. " * 700
     target = "Licensing supports competition and reduces barriers."
     long_text = filler + target
     artifact = artifact.model_copy(
@@ -600,16 +691,18 @@ def test_relevance_gate_assesses_a_hash_bound_query_window_not_only_prefix(
     assessed = apply_passage_relevance_gate(artifact)
     assessment = assessed.passage_relevance.assessments[0]
 
-    assert target in captured["text"]
-    assert len(captured["text"]) == 1_400
+    original_input = re.sub(r'\[s\d{3}\] ', '', captured['text'])
+    assert target in original_input
+    assert len(original_input) <= 1_400
+    assert original_input.startswith('Unrelated') and original_input.endswith('.')
     assert assessment.assessment_input_truncated is True
     assert assessment.assessed_text_offset_start > 0
     assert assessment.assessed_text_offset_end == (
-        assessment.assessed_text_offset_start + len(captured["text"])
+        assessment.assessed_text_offset_start + len(original_input)
     )
-    expected_hash = hashlib.sha256(captured["text"].encode("utf-8")).hexdigest()
+    expected_hash = hashlib.sha256(original_input.encode("utf-8")).hexdigest()
     assert assessment.assessed_text_sha256 == expected_hash
-    assert assessment.model_input_text_sha256 == expected_hash
+    assert assessment.model_input_text_sha256 == hashlib.sha256(captured['text'].encode()).hexdigest()
 
 
 def test_relevance_window_uses_bounded_concepts_to_reach_late_scope_evidence(
@@ -618,7 +711,7 @@ def test_relevance_window_uses_bounded_concepts_to_reach_late_scope_evidence(
     artifact = _artifact(top_k=1)
     passage = artifact.passages[0]
     target = "Protectionism does not create national prosperity."
-    prefix = ("Protectionism appears in historical background. " * 45)
+    prefix = ("Protectionism appears in historical background. " * 450)
     evidence = "Reducing protectionism increases global well-being for trading participants."
     long_text = prefix + evidence
     artifact = artifact.model_copy(
@@ -772,6 +865,7 @@ def test_mid_sentence_parenthetical_limits_relevance_to_pre_marker_assertion(
     )
     apply_passage_relevance_gate(artifact)
 
-    assert captured["source_attributed_text"].endswith("(Smith, 2020)")
+    import re
+    assert re.sub(r'\[t\d+\] ', '', captured["source_attributed_text"]).endswith("(Smith, 2020)")
     assert "instructors" not in captured["source_attributed_text"]
     assert "instructors" in captured["complete_citation_unit"]

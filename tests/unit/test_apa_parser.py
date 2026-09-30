@@ -88,3 +88,11 @@ Singh, B. (2022). A following study. Quarterly Review, 3(1), 1-10.
 
     assert len(references) == 3
     assert references[1].startswith("Regional Media Council (2021)")
+def test_mixed_full_name_author_list_wrapped_before_year():
+    from app.services.parsers.apa_parser import ApaParser
+    raw = ('References\nWriter, C. (2009). A first work. https://example.org/first\n'
+           'Alex Example, Other, S., Third, F., & Fourth, G.\n'
+           '(2024). Another work. Journal, 1(3). https://doi.org/10.1234/example')
+    refs = ApaParser.split_references(raw)
+    assert len(refs) == 2
+    assert refs[1].startswith('Alex Example, Other')

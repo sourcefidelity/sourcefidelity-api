@@ -11,9 +11,10 @@ from __future__ import annotations
 import re
 import hashlib
 import unicodedata
-from typing import Optional
+from typing import Optional, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
+from app.services.body_title_formatting import BodyTitleAssessment, assess_body_title_italics
 
 from app.services.citation_extractor import SignalConfig, extract_citations
 from app.services.antecedent_resolver import resolve_claim_antecedents
@@ -35,7 +36,10 @@ from app.services.reference_consistency import (
     assess_reference_consistency,
 )
 from app.services.reference_layout import ReferenceLayoutArtifact
+from app.services.submitted_locator_inventory import SubmittedLocatorInventory
+from app.services.assessment_configuration import AssessmentConfiguration
 from app.services.reference_formatting import ReferenceFormattingAssessment
+from app.services.quotation_locator_requirement import QuotationLocatorRequirement, assess_quotation_locators
 from app.services.schemas import CitationMarkerMember, InTextCitation, ParsedReference
 from app.services.sentence_splitter import split_sentences
 from app.services.verification_evidence import (
@@ -108,8 +112,27 @@ class PaperExtractionArtifact(BaseModel):
     reference_word_count: int = 0
     reference_consistency: ReferenceConsistencyAssessment | None = None
     reference_layout: ReferenceLayoutArtifact | None = None
+    submitted_locator_inventory: SubmittedLocatorInventory | None = None
+    assessment_configuration: AssessmentConfiguration = Field(default_factory=AssessmentConfiguration)
+    # Missing historical policy retains its original evidence requirements.
+    required_doi_policy_version: Literal['apa7_verified_doi_required_v1', 'apa7_bibliographic_doi_required_v2'] = 'apa7_verified_doi_required_v1'
+    required_author_policy_version: Literal['apa7_verified_journal_author_required_v1'] | None = None
     reference_formatting: ReferenceFormattingAssessment | None = None
+    body_title_formatting: BodyTitleAssessment | None = None
+    quotation_locator_requirements: list[QuotationLocatorRequirement] = Field(default_factory=list)
     text_extraction: dict = Field(default_factory=dict)
+
+    @model_serializer(mode='wrap')
+    def preserve_body_title_snapshot_absence(self, handler):
+        """Do not add a new null field to a previously hash-bound snapshot.
+
+        Explicit nulls and observations remain serialized. Only the field that
+        was absent before this extension is omitted, not other legacy defaults.
+        """
+        value = handler(self)
+        if 'body_title_formatting' not in self.model_fields_set:
+            value.pop('body_title_formatting', None)
+        return value
 
 
 def extract_paper_evidence(
@@ -117,11 +140,13 @@ def extract_paper_evidence(
     *,
     paper_version_id: str,
     reference_text: str | None = None,
+    reference_layout_text: str | None = None,
     format_hint: Optional[str] = None,
     use_llm_boundaries: bool = True,
     use_llm_atomizer: bool = True,
     use_llm_reference_fallback: bool = True,
     signals: Optional[SignalConfig] = None,
+    docx_content: bytes | None = None,
 ) -> PaperExtractionArtifact:
     """Extract stable references and citation spans from one paper version.
 
@@ -172,6 +197,11 @@ def extract_paper_evidence(
     )
     if not references:
         raise PaperExtractionError("Reference section contained no parseable references")
+
+    if reference_layout_text:
+        from app.services.reference_url_repair import repair_reference_urls
+
+        references = repair_reference_urls(references, reference_layout_text)
 
     structural_detections = extract_citations(
         body_text,
@@ -266,6 +296,11 @@ def extract_paper_evidence(
         citations=[*accepted, *rejected],
     )
     return PaperExtractionArtifact(
+        body_title_formatting=(BodyTitleAssessment.model_validate(assess_body_title_italics(
+            content=docx_content, body=body_text, references=references,
+            citation_format=citation_format)) if docx_content is not None else None),
+        required_doi_policy_version='apa7_bibliographic_doi_required_v2',
+        required_author_policy_version='apa7_verified_journal_author_required_v1',
         paper_version_id=version_id,
         citation_format=citation_format,
         references=references,
@@ -282,6 +317,9 @@ def extract_paper_evidence(
         body_word_count=_word_count(body_text),
         reference_word_count=_word_count(reference_section),
         reference_consistency=reference_consistency,
+        quotation_locator_requirements=assess_quotation_locators(
+            body_text=body_text,citation_format=citation_format,claims=citation_claims,references=references,
+        ),
     )
 
 
@@ -375,6 +413,16 @@ def _build_marker_census(
         ):
             continue
         marker = match.group(0)
+        # A complete calendar date is an aside, not an author/year citation.
+        # Previously detected explicit source markers remain preserved above.
+        if re.fullmatch(r'\(\s*(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+(?:19|20)\d{2}\s*\)', marker, re.I):
+            continue
+        # A date-only range defining an explicitly named historical period is
+        # not another cited source. Recognized narrative markers were retained
+        # above, so this does not discard a matched title/author-year citation.
+        if (re.fullmatch(r'\(\s*(?:18|19|20)\d{2}\s*[-–—]\s*(?:18|19|20)\d{2}\s*\)', marker)
+                and re.search(r'\b(?:period|era|years)\s*$', body_text[max(0,match.start()-100):match.start()], re.I)):
+            continue
         linked_ids, candidate_ids = _link_broad_parenthetical_marker(
             marker, references
         )
@@ -384,8 +432,6 @@ def _build_marker_census(
                 match.start(),
                 required_end=match.end(),
             )
-            if linked_ids or candidate_ids
-            else None
         )
         marker_id = hashlib.sha256(
             f"citation-marker-v1:{match.start()}:{match.end()}:{marker}".encode(
@@ -581,7 +627,7 @@ def _recover_linked_sentence_citations(
             for marker in sentence_markers
         ]
         locator_matches = re.findall(
-            r"\bp{1,2}\.?\s*(\d+(?:\s*[-–—]\s*\d+)?)",
+            r"\bp{1,2}\.?\s*(\d+(?:\s*[-–—]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–—]\s*\d+)?)*)\s*(?=[);]|$)",
             " ".join(marker.text for marker in sentence_markers),
             flags=re.IGNORECASE,
         )
@@ -640,6 +686,63 @@ def _trim_report_prefix(text: str, start: int, end: int) -> int:
     return start
 
 
+def _bounded_narrative_extension(
+    base: InTextCitation,
+    proposals: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body: str,
+) -> InTextCitation | None:
+    """Accept only an exact, unopposed forward proposal with its original marker.
+
+    This checks structural eligibility, not semantic truth. Attribution is still
+    the ordinary source-blind extractor's proposal; no source text is consulted.
+    """
+    if (base.drop_reason or base.marker_type != "narrative"
+            or base.link_status != "linked" or len(base.reference_ids) != 1
+            or base.passage_start < 0
+            or body[base.passage_start:base.passage_end] != base.text):
+        return None
+    matching = [p for p in proposals if not p.drop_reason
+                and p.passage_start == base.passage_start
+                and p.passage_end >= base.passage_end
+                and p.link_status == "linked"
+                and p.reference_ids == base.reference_ids]
+    # Different proposed extents are an unresolved scope disagreement, even if
+    # the shorter extent is simply the original deterministic sentence.
+    if len({p.passage_end for p in matching}) != 1:
+        return None
+    proposal = matching[0]
+    if (proposal.passage_end <= base.passage_end
+            or proposal.passage_end - base.passage_end > 1000
+            or body[proposal.passage_start:proposal.passage_end] != proposal.text
+            or re.search(r"\n\s*\n", proposal.text)):
+        return None
+    if any(m.passage_start >= base.passage_end
+           and m.passage_start < proposal.passage_end for m in census):
+        return None
+    tail = body[base.passage_end:proposal.passage_end].strip()
+    sentences = split_sentences(tail)
+    if not 1 <= len(sentences) <= 2:
+        return None
+    cursor = base.passage_end
+    for sentence in sentences:
+        start = body.find(sentence, cursor, proposal.passage_end)
+        if start < 0 or body[cursor:start].strip():
+            return None
+        end = start + len(sentence)
+        span = _sentence_span_containing(body, start)
+        if span is None or span[:2] != (start, end):
+            return None
+        cursor = end
+    if cursor != proposal.passage_end:
+        return None
+    from app.services.citation_extractor import _detect_claim_type
+    return base.model_copy(update={
+        "text": proposal.text, "passage_end": proposal.passage_end,
+        "claim_type": _detect_claim_type(proposal.text), "confidence": "medium",
+    })
+
+
 def _merge_additive_llm_recovery(
     structural: list[InTextCitation],
     llm: list[InTextCitation],
@@ -647,7 +750,18 @@ def _merge_additive_llm_recovery(
     body_text: str,
 ) -> list[InTextCitation]:
     """Preserve deterministic detections and admit only bounded LLM additions."""
-    merged = list(structural)
+    merged = []
+    for base in structural:
+        extension = _bounded_narrative_extension(base, llm, census, body_text)
+        if extension is None:
+            merged.append(base)
+        else:
+            # Retain the exact deterministic detection in the rejected/audit
+            # collection; never silently overwrite its original wording/span.
+            merged.append(base.model_copy(update={
+                "drop_reason": "deterministic_base_of_bounded_narrative_extension_v1",
+            }))
+            merged.append(extension)
     structural_marker_ids = {
         marker.marker_id
         for marker in census
@@ -658,7 +772,7 @@ def _merge_additive_llm_recovery(
             for citation in structural
         )
     }
-    accepted_explicit = list(structural)
+    accepted_explicit = [citation for citation in merged if citation.drop_reason is None]
     for citation in llm:
         if citation.drop_reason is not None:
             merged.append(citation)

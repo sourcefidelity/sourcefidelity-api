@@ -183,6 +183,16 @@ def build_local_pdf_ocr_derivative(
             temp_dir = Path(directory)
             for page_index, page in enumerate(document):
                 matrix = fitz.Matrix(dpi / 72, dpi / 72)
+                # Enforce the render budget before allocating a raster. Checking
+                # only the resulting pixmap is too late for oversized inputs.
+                pixel_rect = (page.rect * matrix).irect
+                planned_pixels = pixel_rect.width * pixel_rect.height
+                if (
+                    planned_pixels <= 0
+                    or planned_pixels > max_pixels_per_page
+                    or total_pixels + planned_pixels > max_total_pixels
+                ):
+                    raise OcrDerivativeError("Rendered PDF pixels exceed the OCR bound.")
                 pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 pixels = pixmap.width * pixmap.height
                 total_pixels += pixels
@@ -412,3 +422,115 @@ def build_isolated_pdf_ocr_derivative(
                 "OCR worker manifest does not match the requested configuration."
             )
         return derivative
+
+
+def ocr_pdf_pages(
+    pdf_bytes: bytes,
+    page_indexes: list[int],
+    *,
+    language: str = "eng",
+    dpi: int = 300,
+    page_segmentation_mode: int = 6,
+    max_pixels_per_page: int = 25_000_000,
+    timeout_seconds_per_page: int = 45,
+    executable: str = "tesseract",
+) -> dict:
+    """OCR selected pages of a PDF for page-level repair (page-ocr-repair-v1).
+
+    Same engine, language, mode and pixel checks as the derivative builder;
+    each page keeps its render and text hashes and its mean word confidence.
+    Nothing is admitted here.
+    """
+    if language != "eng":
+        raise OcrDerivativeError("Only the validated English OCR language is enabled.")
+    if not 150 <= dpi <= 400:
+        raise OcrDerivativeError("OCR DPI must be between 150 and 400.")
+    # 6 is the validated mode; 3 (automatic layout) is the recorded per-page
+    # fallback for pages where pictures make mode 6 read noise.
+    if page_segmentation_mode not in (6, 3):
+        raise OcrDerivativeError("Only the validated OCR page segmentation modes are enabled.")
+    engine_version = _tesseract_version(executable)
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except (fitz.FileDataError, fitz.mupdf.FzErrorBase, RuntimeError) as exc:
+        raise OcrDerivativeError("The parent bytes are not a readable PDF.") from exc
+    pages = []
+    try:
+        if document.needs_pass:
+            raise OcrDerivativeError("Encrypted PDFs are not eligible for local OCR.")
+        with tempfile.TemporaryDirectory(prefix="sourcefidelity-page-ocr-") as directory:
+            temp_dir = Path(directory)
+            for page_index in sorted(set(page_indexes)):
+                if not 0 <= page_index < document.page_count:
+                    raise OcrDerivativeError("A requested page is outside the PDF.")
+                page = document[page_index]
+                matrix = fitz.Matrix(dpi / 72, dpi / 72)
+                pixel_rect = (page.rect * matrix).irect
+                planned = pixel_rect.width * pixel_rect.height
+                if planned <= 0 or planned > max_pixels_per_page:
+                    raise OcrDerivativeError("Rendered PDF pixels exceed the OCR bound.")
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                if pixmap.width * pixmap.height > max_pixels_per_page:
+                    raise OcrDerivativeError("Rendered PDF pixels exceed the OCR bound.")
+                png_bytes = pixmap.tobytes("png")
+                image_path = temp_dir / f"page-{page_index + 1:04d}.png"
+                image_path.write_bytes(png_bytes)
+                raw_text, mean_confidence = _run_tesseract_page(
+                    image_path, temp_dir / f"page-{page_index + 1:04d}", executable=executable,
+                    language=language, dpi=dpi, page_segmentation_mode=page_segmentation_mode,
+                    timeout_seconds=timeout_seconds_per_page)
+                text = _normalize_ocr_text(raw_text)
+                pages.append({"page_index": page_index, "render_sha256": _sha256(png_bytes), "text": text,
+                              "text_sha256": _sha256(text.encode("utf-8")), "character_count": len(text),
+                              "mean_word_confidence": (round(mean_confidence, 3)
+                                                       if mean_confidence is not None else None)})
+    finally:
+        document.close()
+    return {"engine": "tesseract", "engine_version": engine_version, "language": language, "render_dpi": dpi,
+            "page_segmentation_mode": page_segmentation_mode, "parent_content_sha256": _sha256(pdf_bytes),
+            "pages": pages}
+
+
+def ocr_pdf_pages_isolated(
+    pdf_bytes: bytes,
+    page_indexes: list[int],
+    *,
+    dpi: int = 300,
+    page_segmentation_mode: int = 6,
+    timeout_seconds_per_page: int = 45,
+    total_timeout_seconds: int = 1800,
+    max_output_bytes: int = 50_000_000,
+    executable: str = "tesseract",
+) -> dict:
+    """Run `ocr_pdf_pages` in a child process under one hard deadline."""
+    with tempfile.TemporaryDirectory(prefix="sourcefidelity-page-ocr-isolated-") as directory:
+        temp_dir = Path(directory)
+        input_path = temp_dir / "parent.pdf"
+        output_path = temp_dir / "pages.json"
+        input_path.write_bytes(pdf_bytes)
+        command = [sys.executable, "-m", "app.services.ocr_worker_cli", "--input", str(input_path),
+                   "--pages", ",".join(str(i) for i in sorted(set(page_indexes))),
+                   "--pages-output", str(output_path), "--dpi", str(dpi),
+                   "--page-segmentation-mode", str(page_segmentation_mode),
+                   "--timeout-seconds-per-page", str(timeout_seconds_per_page), "--executable", executable]
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, timeout=total_timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise OcrDerivativeError("Isolated page OCR exceeded its total deadline.") from exc
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise OcrDerivativeError("Isolated page OCR worker failed.") from exc
+        if result.stdout or result.stderr:
+            raise OcrDerivativeError("Isolated page OCR worker emitted unexpected output.")
+        if not output_path.is_file() or output_path.stat().st_size > max_output_bytes:
+            raise OcrDerivativeError("Isolated page OCR output is missing or too large.")
+        try:
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise OcrDerivativeError("Isolated page OCR output is invalid.") from exc
+    if output.get("parent_content_sha256") != _sha256(pdf_bytes) or output.get(
+            "page_segmentation_mode") != page_segmentation_mode:
+        raise OcrDerivativeError("Page OCR output is not bound to these PDF bytes.")
+    for page in output.get("pages") or []:
+        if _sha256(str(page.get("text", "")).encode("utf-8")) != page.get("text_sha256"):
+            raise OcrDerivativeError("Page OCR text hash does not match.")
+    return output

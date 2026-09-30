@@ -211,6 +211,7 @@ def find_accepted_representation(
             SourceRepresentationRecord.scope_type == normalized_scope_type,
             SourceRepresentationRecord.scope_id == scope_id.strip(),
             SourceRepresentationRecord.admission_state == "accepted",
+            SourceRepresentationRecord.completeness_verdict.in_((*ACCEPTABLE_COMPLETENESS, 'incomplete')),
             active_representation_clause(now=now),
         )
     )
@@ -225,11 +226,20 @@ def find_accepted_representation(
     else:
         return None
     records = session.scalars(
-        query.order_by(SourceRepresentationRecord.created_at.desc()).limit(1)
+        query.order_by(SourceRepresentationRecord.created_at.desc()).limit(20)
     ).all()
     if not records:
         return None
-    record = records[0]
+    from app.services.publisher_preview import valid_preview_receipt
+    eligible = [r for r in records if r.completeness_verdict in ACCEPTABLE_COMPLETENESS or (
+        r.identity_verdict in ACCEPTABLE_IDENTITY and r.cleanliness_verdict == 'clean'
+        and r.representation_kind == 'pdf'
+        and valid_preview_receipt((r.validation_evidence or {}).get('publisher_preview'),
+                                  r.content_object.content_sha256, r.source_url))]
+    if not eligible:
+        return None
+    # A complete copy remains preferable to a newer limited preview.
+    record = min(eligible, key=lambda r: r.completeness_verdict not in ACCEPTABLE_COMPLETENESS)
     expected_kind = normalize_source_kind(work_type)
     if expected_kind != "unknown":
         compatibility = compare_source_kinds(
@@ -245,12 +255,60 @@ def find_accepted_representation(
     return record
 
 
+def recheck_accepted_pdf_completeness(
+    session: Session, backend: StorageBackend, *, representation_id: str | uuid.UUID,
+    scope_type: str, scope_id: str, expected_content_sha256: str, document_kind: str,
+) -> dict:
+    """Explicit, downgrade-only correction of an already authorized copy.
+
+    This is not an admission route for new partial files. Existing scope/bytes
+    remain authorized for limited report evidence, while incomplete copies no
+    longer satisfy complete-source reuse. Keep the previous observation and
+    checker signals; immutable packages are corrected only by a successor.
+    """
+    from dataclasses import asdict
+    from app.services.verification_evidence import authorize_representation
+    from app.services.completeness_checker import check_completeness
+
+    record = session.scalar(select(SourceRepresentationRecord).where(
+        SourceRepresentationRecord.id == uuid.UUID(str(representation_id))
+    ).with_for_update().execution_options(populate_existing=True))
+    if record is None:
+        raise AdmissionError('Representation unavailable for completeness correction')
+    source = authorize_representation(session, backend, representation_id=record.id,
+                                      scope_type=scope_type, scope_id=scope_id)
+    if source.content_sha256 != expected_content_sha256 or source.media_type != 'application/pdf':
+        raise AdmissionError('Completeness correction source binding differs')
+    if document_kind not in {'book', 'article', 'chapter', 'unknown'}:
+        raise AdmissionError('Unsupported completeness document kind')
+    observation = check_completeness(source.content, document_kind=document_kind, external_lookup=False)
+    receipt = dict(version='accepted-pdf-completeness-recheck-v1',
+                   content_sha256=source.content_sha256,
+                   previous_verdict=record.completeness_verdict,
+                   observation=asdict(observation), changed=False)
+    if record.completeness_verdict in ACCEPTABLE_COMPLETENESS and observation.verdict == 'INCOMPLETE':
+        receipt['changed'] = True
+        receipt['observed_at'] = datetime.now(timezone.utc).isoformat()
+        evidence = dict(record.validation_evidence or {})
+        evidence['completeness_corrections'] = [*evidence.get('completeness_corrections', []), receipt]
+        record.validation_evidence = evidence
+        record.completeness_verdict = 'incomplete'
+        session.flush()
+    return receipt
+
+
 def _admission_state(request: AdmissionRequest) -> str:
     if not request.request_acceptance:
         return "needs_review"
+    from app.services.publisher_preview import valid_preview_receipt
+    preview = (request.representation.kind is RepresentationKind.PDF
+               and normalize_source_kind(request.work.work_type) == 'monograph'
+               and request.completeness_verdict.casefold() == 'incomplete'
+               and valid_preview_receipt(request.validation_evidence.get('publisher_preview'),
+                    hashlib.sha256(request.representation.content).hexdigest(), request.representation.source_url))
     if (
         request.identity_verdict.casefold() not in ACCEPTABLE_IDENTITY
-        or request.completeness_verdict.casefold() not in ACCEPTABLE_COMPLETENESS
+        or (request.completeness_verdict.casefold() not in ACCEPTABLE_COMPLETENESS and not preview)
         or request.cleanliness_verdict.casefold() not in ACCEPTABLE_CLEANLINESS
     ):
         return "needs_review"
@@ -267,7 +325,7 @@ def _object_key(
     return f"{license_class}/{digest}{suffix}.{EXTENSIONS[kind]}"
 
 
-def _canonical_work(session: Session, identity: WorkIdentity) -> CanonicalWorkRecord:
+def _canonical_work(session: Session, identity: WorkIdentity, *, separate_preview_kind: bool = False) -> CanonicalWorkRecord:
     doi = _normalize_doi(identity.doi)
     isbn = _normalize_isbn(identity.isbn)
     normalized_title = _normalize_title(identity.title)
@@ -283,13 +341,16 @@ def _canonical_work(session: Session, identity: WorkIdentity) -> CanonicalWorkRe
             select(CanonicalWorkRecord).where(CanonicalWorkRecord.isbn == isbn)
         )
     if existing is None and not doi and not isbn:
-        existing = session.scalar(
-            select(CanonicalWorkRecord).where(
+        query = select(CanonicalWorkRecord).where(
                 CanonicalWorkRecord.normalized_title == normalized_title,
                 CanonicalWorkRecord.author == identity.author,
                 CanonicalWorkRecord.year == identity.year,
             )
-        )
+        if separate_preview_kind:
+            # Title/author/year is not a globally unique identifier. Keep old
+            # webpage classifications intact rather than mutating their history.
+            query = query.where(CanonicalWorkRecord.work_type.in_({'book', 'monograph'}))
+        existing = session.scalar(query)
     if existing is not None:
         compatibility = compare_source_kinds(
             SourceKindAssessment(
@@ -364,7 +425,13 @@ def admit_representation(
 
     # Resolve canonical identity before any object-store write so a type
     # conflict cannot leave an unreferenced immutable object behind.
-    work = _canonical_work(session, request.work)
+    from app.services.publisher_preview import valid_preview_receipt
+    separate_preview_kind = (request.completeness_verdict == 'incomplete'
+        and normalize_source_kind(request.work.work_type) == 'monograph'
+        and _admission_state(request) == 'accepted'
+        and valid_preview_receipt(request.validation_evidence.get('publisher_preview'),
+            hashlib.sha256(request.representation.content).hexdigest(), request.representation.source_url))
+    work = _canonical_work(session, request.work, separate_preview_kind=separate_preview_kind)
     digest = hashlib.sha256(request.representation.content).hexdigest()
     _advisory_transaction_lock(
         session, "content-object", f"{request.license_class}:{digest}"

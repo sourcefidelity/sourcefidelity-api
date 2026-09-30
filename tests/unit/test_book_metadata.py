@@ -83,7 +83,7 @@ def test_google_books_exact_isbn_returns_full_metadata(monkeypatch):
     }
     calls = []
 
-    def fake_get(_url, *, params, timeout):
+    def fake_get(_url, *, params, timeout, headers=None):
         calls.append((params, timeout))
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
 

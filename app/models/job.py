@@ -58,6 +58,9 @@ class Job(Base):
     paper_version_id = Column(String(255), nullable=False, index=True)
     scope_type = Column(String(30), nullable=False, default="personal_owner")
     scope_id = Column(String(255), nullable=False)
+    # Optional assessment this paper was submitted for, within its scope.
+    # Without one, assessment-level settings (marks released) cannot apply.
+    assessment_id = Column(String(255), nullable=True, index=True)
     input_storage_key = Column(String(500), nullable=True)
     input_sha256 = Column(String(64), nullable=False)
     input_media_type = Column(String(100), nullable=False)

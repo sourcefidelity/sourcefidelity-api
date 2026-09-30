@@ -17,6 +17,12 @@ from app.services.evidence_report import enable_authenticated_paper_actions
 from app.services.storage.backend import get_storage_backend
 
 
+
+@pytest.fixture(autouse=True)
+def _no_run_details(monkeypatch):
+    """These tests stand in for the database; judgment results and job metrics are not under test."""
+    monkeypatch.setattr("app.routers.report._run_details", lambda *args, **kwargs: {})
+
 def _view():
     return {
         "title": "Bound report",
@@ -299,7 +305,9 @@ def test_report_source_upload_is_member_bound_and_same_origin(monkeypatch):
         app.dependency_overrides.clear()
 
 
-def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatch):
+@pytest.mark.parametrize('route', ['citation/claim-1/source/upload', 'source/upload'])
+@pytest.mark.parametrize('duplicate', ['none', 'same', 'conflict'])
+def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatch, route, duplicate):
     token = "v" * 48
     view = _view()
     view["citations"] = [
@@ -319,6 +327,13 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
             ],
         }
     ]
+    if duplicate != 'none':
+        from copy import deepcopy
+        second = deepcopy(view['citations'][0])
+        second['claim_id'] = 'claim-2'
+        if duplicate == 'conflict':
+            second['members'][1]['source']['year'] = '2022'
+        view['citations'].append(second)
     captured = {}
 
     def fake_admit_uploaded_source(**kwargs):
@@ -359,7 +374,7 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
     app.dependency_overrides[get_storage_backend] = lambda: object()
     try:
         response = TestClient(app).post(
-            "/report/report-1/citation/claim-1/source/upload",
+            f"/report/report-1/{route}",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Origin": "http://testserver",
@@ -367,6 +382,10 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
             },
             files={"file": ("source.pdf", b"%PDF-1.7 test", "application/pdf")},
         )
+        if duplicate == 'conflict' and route == 'source/upload':
+            assert response.status_code == 409
+            assert not captured
+            return
         assert response.status_code == 200
         assert response.json()["reference_id"] == "ref-b"
         assert captured["title"] == "Second work"
@@ -376,8 +395,9 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
 
 
 @pytest.mark.parametrize("match_count", [0, 2])
+@pytest.mark.parametrize('route', ['citation/claim-1/source/upload', 'source/upload'])
 def test_citation_source_upload_rejects_wrong_or_ambiguous_identity(
-    monkeypatch, match_count
+    monkeypatch, match_count, route
 ):
     token = "x" * 48
     view = _view()
@@ -421,7 +441,7 @@ def test_citation_source_upload_rejects_wrong_or_ambiguous_identity(
     app.dependency_overrides[get_storage_backend] = lambda: object()
     try:
         response = TestClient(app).post(
-            "/report/report-1/citation/claim-1/source/upload",
+            f"/report/report-1/{route}",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Origin": "http://testserver",
@@ -511,181 +531,26 @@ def test_source_upload_queue_failure_keeps_reanalysis_for_recovery(monkeypatch):
         app.dependency_overrides.clear()
 
 
-def test_report_annotation_routes_are_anchor_bound_append_only_and_same_origin(
-    monkeypatch,
-):
+def test_annotation_write_routes_no_longer_exist(monkeypatch):
+    """Comment, highlight and pen tools were removed (owner decision 2026-09-25)."""
     token = "n" * 48
     report_id = str(uuid.uuid4())
-    annotation_id = str(uuid.uuid4())
-    view, anchor_id = _anchor_view()
-    captured = {}
-
-    def fake_create(_session, **kwargs):
-        captured["create"] = kwargs
-        return {
-            "annotation_id": annotation_id,
-            "revision": 1,
-            "annotation_type": kwargs["annotation_type"],
-            "visibility": kwargs["visibility"],
-        }
-
-    def fake_revise(_session, **kwargs):
-        captured["revise"] = kwargs
-        return {
-            "annotation_id": annotation_id,
-            "revision": kwargs["expected_revision"] + 1,
-            "visibility": kwargs["visibility"],
-        }
-
     monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_bearer")
     monkeypatch.setattr(settings, "REPORT_PERSONAL_ACCESS_TOKEN", SecretStr(token))
     monkeypatch.setattr(settings, "SOURCE_REPOSITORY_SCOPE_ID", "owner-1")
-    monkeypatch.setattr(
-        "app.routers.report.load_authorized_evidence_report_bundle",
-        lambda *args, **kwargs: (
-            view,
-            SimpleNamespace(id=uuid.uuid4()),
-            _pdf_bytes(),
-        ),
-    )
-    monkeypatch.setattr("app.routers.report.create_paper_annotation", fake_create)
-    monkeypatch.setattr("app.routers.report.revise_paper_annotation", fake_revise)
     app.dependency_overrides[get_db] = lambda: object()
     app.dependency_overrides[get_storage_backend] = lambda: object()
     try:
         client = TestClient(app)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Origin": "http://testserver",
-            "Sec-Fetch-Site": "same-origin",
-        }
-        created = client.post(
-            f"/report/{report_id}/annotations",
-            headers=headers,
-            json={
-                "annotation_type": "comment",
-                "anchor_id": anchor_id,
-                "content": "Check this point.",
-                "visibility": "private",
-            },
-        )
-        assert created.status_code == 201
-        assert captured["create"]["anchor"]["anchor_id"] == anchor_id
-        assert captured["create"]["content"] == "Check this point."
-
-        revised = client.patch(
-            f"/report/{report_id}/annotations/{annotation_id}",
-            headers=headers,
-            json={"expected_revision": 1, "visibility": "released"},
-        )
-        assert revised.status_code == 200
-        assert captured["revise"]["expected_revision"] == 1
-        assert captured["revise"]["visibility"] == "released"
-
-        cross_site = client.post(
-            f"/report/{report_id}/annotations",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Origin": "https://attacker.invalid",
-                "Sec-Fetch-Site": "cross-site",
-            },
-            json={
-                "annotation_type": "highlight",
-                "anchor_id": anchor_id,
-            },
-        )
-        assert cross_site.status_code == 403
-    finally:
-        app.dependency_overrides.clear()
-
-
-def test_report_annotation_route_accepts_one_bounded_page_region(monkeypatch):
-    token = "p" * 48
-    report_id = str(uuid.uuid4())
-    view, _ = _anchor_view()
-    view["paper_surface"]["page_dimensions"] = [
-        {"page_index": 0, "width": 612.0, "height": 792.0}
-    ]
-    captured = {}
-
-    def fake_create(_session, **kwargs):
-        captured.update(kwargs)
-        return {
-            "annotation_id": str(uuid.uuid4()),
-            "revision": 1,
-            "annotation_type": kwargs["annotation_type"],
-            "anchor_kind": "page_region",
-            "visibility": kwargs["visibility"],
-        }
-
-    monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_bearer")
-    monkeypatch.setattr(settings, "REPORT_PERSONAL_ACCESS_TOKEN", SecretStr(token))
-    monkeypatch.setattr(settings, "SOURCE_REPOSITORY_SCOPE_ID", "owner-1")
-    monkeypatch.setattr(
-        "app.routers.report.load_authorized_evidence_report_bundle",
-        lambda *args, **kwargs: (
-            view,
-            SimpleNamespace(id=uuid.uuid4()),
-            _pdf_bytes(),
-        ),
-    )
-    monkeypatch.setattr("app.routers.report.create_paper_annotation", fake_create)
-    app.dependency_overrides[get_db] = lambda: object()
-    app.dependency_overrides[get_storage_backend] = lambda: object()
-    try:
-        client = TestClient(app)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Origin": "http://testserver",
-            "Sec-Fetch-Site": "same-origin",
-        }
-        created = client.post(
-            f"/report/{report_id}/annotations",
-            headers=headers,
-            json={
-                "annotation_type": "highlight",
-                "anchor": {
-                    "anchor_version": "page-region-anchor-v1",
-                    "anchor_kind": "page_region",
-                    "localization_level": "exact_rectangle",
-                    "rectangles": [
-                        {
-                            "page_index": 0,
-                            "x0": 80.0,
-                            "y0": 120.0,
-                            "x1": 260.0,
-                            "y1": 148.0,
-                        }
-                    ],
-                },
-            },
-        )
-        assert created.status_code == 201
-        assert captured["anchor"]["anchor_kind"] == "page_region"
-        assert captured["page_dimensions"] == {0: (612.0, 792.0)}
-
-        outside = client.post(
-            f"/report/{report_id}/annotations",
-            headers=headers,
-            json={
-                "annotation_type": "highlight",
-                "anchor": {
-                    "anchor_version": "page-region-anchor-v1",
-                    "anchor_kind": "page_region",
-                    "localization_level": "exact_rectangle",
-                    "rectangles": [
-                        {
-                            "page_index": 0,
-                            "x0": 80.0,
-                            "y0": 120.0,
-                            "x1": 700.0,
-                            "y1": 148.0,
-                        }
-                    ],
-                },
-            },
-        )
-        assert outside.status_code == 409
+        headers = {"Authorization": f"Bearer {token}", "Origin": "http://testserver",
+                   "Sec-Fetch-Site": "same-origin"}
+        created = client.post(f"/report/{report_id}/annotations", headers=headers,
+                              json={"annotation_type": "comment", "anchor_id": "a" * 64})
+        revised = client.patch(f"/report/{report_id}/annotations/{uuid.uuid4()}", headers=headers,
+                               json={"expected_revision": 1})
+        assert created.status_code in {404, 405} and revised.status_code in {404, 405}
+        from app import security
+        assert not hasattr(security, "REPORT_ANNOTATION_CAPABILITY")
     finally:
         app.dependency_overrides.clear()
 

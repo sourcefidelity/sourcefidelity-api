@@ -15,12 +15,15 @@ cache it; if it's HTML (paywall), fall back to abstract-only verification.
 """
 
 import logging
+import re
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
 from app.log_safety import private_value_id
 
 from app.services.safe_fetch import safe_fetch_bytes
+from app.services.candidate_budget import require_source_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +128,11 @@ def try_download_publisher_pdf(
         return None
 
     for url in urls_to_try:
+        require_source_candidate(url)
         try:
             data = safe_fetch_bytes(
                 url,
+                usage_label="publisher PDF",
                 accept_content_types=("application/pdf",),
                 timeout=_PDF_TIMEOUT,
                 headers=_BROWSER_HEADERS,
@@ -147,3 +152,94 @@ def try_download_publisher_pdf(
             )
 
     return None
+
+
+# ── MDPI official file server (owner approved 2026-09-29) ─────────────────
+# MDPI (DOI prefix 10.3390) answers automated requests to www.mdpi.com with 403
+# for both the article page and its /pdf route, while its own file host
+# mdpi-res.com serves the same open-access PDF. When an MDPI location is
+# blocked, one plain request to the file host is tried; the downloaded PDF
+# then passes the ordinary acquisition, safety and identity gates. No browser
+# user agent is sent and nothing else is attempted.
+MDPI_DOI_PREFIX = "10.3390/"
+MDPI_FILE_SERVER_ROUTE = "mdpi_file_server"
+MDPI_BLOCKED_STATUSES = frozenset({401, 403, 451})
+_MDPI_HOSTS = frozenset({"mdpi.com", "www.mdpi.com"})
+_DOI_HOSTS = frozenset({"doi.org", "dx.doi.org"})
+# Journal code, then volume, a two-digit issue and the article number: four
+# zero-padded digits, or five once a volume passes article 9999
+# (10.3390/literature5020007 is Literature 5(2), article 7).
+_MDPI_SUFFIX = re.compile(r"([a-z]+)(\d{7,10})")
+_MAX_MDPI_ISSUE = 24
+
+
+def _normalize_doi(doi: str | None) -> str:
+    value = unquote(str(doi or "")).strip().casefold()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi:"):
+        if value.startswith(prefix):
+            return value[len(prefix):].strip()
+    return value
+
+
+def is_mdpi_doi(doi: str | None) -> bool:
+    return _normalize_doi(doi).startswith(MDPI_DOI_PREFIX)
+
+
+def mdpi_file_server_urls(doi: str | None) -> list[str]:
+    """File-server PDF addresses for an MDPI article DOI, most likely first.
+
+    Built only from the DOI. The URL uses the journal's slug, which for most
+    journals equals the DOI code (``literature``) but for some does not
+    (``su`` is Sustainability); a constructed address that does not exist
+    answers 404 and is simply unavailable. A digit string that reads two ways
+    yields both readings; anything that is not an article DOI yields none.
+    """
+    normalized = _normalize_doi(doi)
+    if not normalized.startswith(MDPI_DOI_PREFIX):
+        return []
+    match = _MDPI_SUFFIX.fullmatch(normalized[len(MDPI_DOI_PREFIX):])
+    if not match:
+        return []
+    code, digits = match.groups()
+    urls: list[str] = []
+    for article_digits in (4, 5):
+        volume = digits[: -(2 + article_digits)]
+        issue = digits[-(2 + article_digits):-article_digits]
+        article = digits[-article_digits:]
+        if not volume or volume.startswith("0") or len(volume) > 3:
+            continue
+        if not 1 <= int(issue) <= _MAX_MDPI_ISSUE:
+            continue
+        if article_digits == 5 and (article.startswith("0") or int(volume) < 10):
+            # Five digits appear only once a volume passes article 9999, which
+            # only long-running mega-journals reach.
+            continue
+        if int(article) == 0:
+            continue
+        stem = f"{code}-{int(volume):02d}-{int(article):05d}"
+        url = f"https://mdpi-res.com/d_attachment/{code}/{stem}/article_deploy/{stem}.pdf"
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def is_mdpi_location(url: str | None) -> bool:
+    """Whether a location is MDPI's own site or a DOI link to an MDPI work."""
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return False
+    host = (parts.hostname or "").casefold()
+    if host in _MDPI_HOSTS:
+        return True
+    return host in _DOI_HOSTS and is_mdpi_doi(parts.path.lstrip("/"))
+
+
+def mdpi_request_headers() -> dict[str, str]:
+    """A plain request that names the application; no browser user agent."""
+    from app.config import settings
+
+    return {
+        "User-Agent": f"SourceFidelity/{settings.APP_VERSION} (academic source verification)",
+        "Accept": "application/pdf,*/*",
+    }

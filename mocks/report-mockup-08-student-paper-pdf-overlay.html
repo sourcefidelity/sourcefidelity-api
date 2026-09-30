@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report mockup 08 — student PDF view with overlaid relevance and coverage</title>
+  <style>
+    :root {
+      --ink: #111827;
+      --muted: #64748b;
+      --bg: #dde5f0;
+      --page: #ffffff;
+      --line: #d1d9e6;
+      --blue: #1e67ff;
+      --teal: #0aa2a7;
+      --amber: #ca8a04;
+      --brown: #8e5a2c;
+      --gray: #94a3b8;
+      --font-ui: "Inter", "Segoe UI", sans-serif;
+      --font-body: "Times New Roman", Times, serif;
+      --shadow: 0 16px 36px rgba(15, 23, 42, 0.15);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: linear-gradient(180deg, #eef2ff, #e6ecff);
+      font-family: var(--font-ui);
+      color: var(--ink);
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 18px;
+    }
+
+    .viewer {
+      width: min(920px, 100%);
+      display: grid;
+      gap: 8px;
+    }
+
+    .viewer-head {
+      background: var(--page);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 11px;
+      box-shadow: var(--shadow);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.86rem;
+    }
+
+    .title {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .page-hint {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-style: italic;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 4px 8px;
+      font-size: 0.76rem;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot.full { background: var(--blue); }
+    .dot.partial { background: var(--teal); }
+    .dot.attn { background: var(--amber); }
+    .dot.unavail { background: var(--brown); }
+    .dot.none { background: var(--gray); }
+
+    .pdf-page {
+      border: 1px solid #c8d2e4;
+      border-radius: 10px;
+      width: 100%;
+      min-height: 1040px;
+      padding: 62px 74px 70px 74px;
+      background: var(--page);
+      box-shadow: var(--shadow);
+      position: relative;
+      line-height: 1.75;
+      font-family: var(--font-body);
+      font-size: 12.9pt;
+      text-align: justify;
+      overflow: hidden;
+    }
+
+    .pdf-page::before {
+      content: "Student Paper — Urban Infrastructure and Public Transit Outcomes";
+      position: absolute;
+      top: 26px;
+      left: 74px;
+      right: 74px;
+      font-size: 0.88rem;
+      font-family: var(--font-ui);
+      color: #4b5563;
+      border-bottom: 1px solid #e2e8f0;
+      padding-bottom: 6px;
+      letter-spacing: 0.01em;
+      font-weight: 600;
+    }
+
+    .pdf-page::after {
+      content: "Page 1";
+      position: absolute;
+      right: 20px;
+      bottom: 24px;
+      color: #9ca3af;
+      font-size: 0.76rem;
+      font-family: var(--font-ui);
+    }
+
+    .paragraph {
+      margin: 0 0 14px 0;
+      text-indent: 1.4rem;
+      line-height: 1.86;
+    }
+
+    .citation-wrap {
+      position: relative;
+      display: inline;
+      padding-right: 86px;
+      margin-right: -70px;
+      z-index: 1;
+    }
+
+    .citation {
+      border-radius: 7px;
+      border: 1px solid #dbe3ef;
+      background: #f8fbff;
+      padding: 0 4px;
+      white-space: nowrap;
+      font-family: var(--font-ui);
+      font-size: 11.3pt;
+    }
+
+    .marker-strip {
+      position: absolute;
+      top: -3px;
+      right: 0;
+      transform: translateX(86px);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .rel-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      border: 1px solid #cfd8ea;
+      border-radius: 4px;
+      font-family: var(--font-ui);
+      font-size: 9px;
+      font-weight: 700;
+      color: #0f172a;
+      background: #fff;
+    }
+
+    .rel-full { color: var(--blue); border-color: #bfdbfe; background: #dbeafe; }
+    .rel-partial { color: #0f766e; border-color: #99f6e4; background: #ccfbf1; }
+    .rel-attn { color: #92400e; border-color: #fde68a; background: #fef3c7; }
+    .rel-unavail { color: var(--brown); border-color: #fdba74; background: #fef3c7; }
+    .rel-none { color: #475569; border-color: #e5e7eb; background: #f3f4f6; }
+
+    .coverage-badge {
+      width: 27px;
+      height: 11px;
+      border: 1px solid #d1d5db;
+      border-radius: 999px;
+      padding: 2px;
+      display: inline-flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #fff;
+      gap: 2px;
+    }
+
+    .coverage-badge span {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #d1d5db;
+      display: inline-block;
+    }
+
+    .coverage-3 span:nth-child(1),
+    .coverage-3 span:nth-child(2),
+    .coverage-3 span:nth-child(3) { background: #16a34a; }
+
+    .coverage-2 span:nth-child(1),
+    .coverage-2 span:nth-child(2) { background: #16a34a; }
+
+    .coverage-1 span:nth-child(1) { background: #ca8a04; }
+
+    .coverage-0 span:nth-child(1),
+    .coverage-0 span:nth-child(2),
+    .coverage-0 span:nth-child(3) { background: #94a3b8; }
+
+    .note-line {
+      margin-top: 24px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 7px;
+      color: #475569;
+      font-size: 0.84rem;
+      font-family: var(--font-ui);
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-style: italic;
+    }
+
+    @media (max-width: 900px) {
+      body {
+        padding: 8px;
+      }
+      .pdf-page {
+        padding-left: 36px;
+        padding-right: 36px;
+      }
+      .pdf-page::before {
+        left: 36px;
+        right: 36px;
+      }
+      .citation-wrap { padding-right: 0; margin-right: 0; }
+      .marker-strip {
+        position: static;
+        transform: none;
+        margin-left: 6px;
+        vertical-align: middle;
+      }
+      .citation {
+        white-space: normal;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="viewer">
+    <header class="viewer-head">
+      <div>
+        <div class="title">Student Paper PDF Mockup #8</div>
+        <div class="page-hint">Overlay mode: relevance + coverage shown directly in the paper text (no hover states).</div>
+      </div>
+      <div class="legend">
+        <span class="chip"><span class="dot full"></span>Relevance: full match</span>
+        <span class="chip"><span class="dot partial"></span>Relevance: limited</span>
+        <span class="chip"><span class="dot attn"></span>Relevance: attention</span>
+        <span class="chip"><span class="dot unavail"></span>Relevance: unavailable</span>
+      </div>
+    </header>
+
+    <section class="pdf-page" aria-label="Student paper page with citation overlays">
+      <p class="paragraph">Cities that coordinate capital planning across transport, water, and energy agencies typically report fewer service interruptions and better long-term outcomes, especially when maintenance funding is linked to measurable quarterly targets. In this paper, the student argues that a phased funding model improves network resilience and can be scaled across districts with similar baseline infrastructure age.
+      </p>
+
+      <p class="paragraph">The argument that stable maintenance schedules significantly reduce failure risk is largely supported by a cross-jurisdictional review, including operational records and audit summaries
+        <span class="citation-wrap">
+          <span class="citation">(Baker, 2019, p. 24)</span>
+          <span class="marker-strip" aria-label="relevance full, coverage high">
+            <span class="rel-badge rel-full" title="Relevance: full reference">F</span>
+            <span class="coverage-badge coverage-3" title="Coverage: high"><span></span><span></span><span></span></span>
+          </span>
+        </span>
+        . Their methodology section shows a matched time-series pattern and explicit budget milestones, which is highly aligned with the paper’s claim.</p>
+
+      <p class="paragraph">A follow-on claim compares procurement mechanisms across utility sectors, but the source language is only partially aligned.
+        <span class="citation-wrap">
+          <span class="citation">(Diaz, 2020, pp. 85-87)</span>
+          <span class="marker-strip" aria-label="relevance limited, coverage medium">
+            <span class="rel-badge rel-partial" title="Relevance: coverage-limited">L</span>
+            <span class="coverage-badge coverage-2" title="Coverage: medium"><span></span><span></span><span></span></span>
+          </span>
+        </span>
+        The source supports the general direction but not every procurement case discussed.
+      </p>
+
+      <p class="paragraph">Later, the student proposes that community-level contract clauses universally increase reliability, a claim that is not fully supported by the cited source details.
+        <span class="citation-wrap">
+          <span class="citation">(Wang, 2022, p. 11)</span>
+          <span class="marker-strip" aria-label="relevance attention needed, coverage low">
+            <span class="rel-badge rel-attn" title="Relevance: checked source; no clear matching passage">A</span>
+            <span class="coverage-badge coverage-1" title="Coverage: low"><span></span><span></span><span></span></span>
+          </span>
+        </span>
+        In several sentences, the quoted text reflects context, but not the same scope of clauses.
+      </p>
+
+      <p class="paragraph">The final section cites a policy briefing that cannot be validated in the accepted source set, so this sentence remains unverified until the same source is accepted.
+        <span class="citation-wrap">
+          <span class="citation">(Rossi, 2024, p. 6)</span>
+          <span class="marker-strip" aria-label="relevance unavailable, coverage none">
+            <span class="rel-badge rel-unavail" title="Relevance: source unavailable">U</span>
+            <span class="coverage-badge coverage-0" title="Coverage: none"><span></span><span></span><span></span></span>
+          </span>
+        </span>
+        Additional review is required before this claim can be treated as supported.
+      </p>
+
+      <p class="paragraph">For comparison, one line with two citations remains within normal prose flow and still readable, with each citation having its own paired overlay.
+        <span class="citation-wrap">
+          <span class="citation">(Smith, 1998; Wilson, 2004, p. 15)</span>
+          <span class="marker-strip" aria-label="mixed relevance and partial coverage">
+            <span class="rel-badge rel-partial" title="Relevance: mixed coverage by source">M</span>
+            <span class="coverage-badge coverage-2" title="Coverage: medium"><span></span><span></span><span></span></span>
+          </span>
+        </span>
+        This sentence shows that overlapping sources can be shown clearly without adding a separate evidence panel.
+      </p>
+
+      <div class="note-line">
+        Relevance tags are compact and placed next to each citation; coverage is shown as tiny dot-level indicators (3 = high, 2 = medium, 1 = low, 0 = none).
+      </div>
+      <div class="small">This mock intentionally excludes hover interactions and keeps all interpretation signals in-line within the paper body.</div>
+    </section>
+  </main>
+</body>
+</html>

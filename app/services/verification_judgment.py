@@ -84,6 +84,8 @@ def apply_bounded_structured_judgment(
     adjudication. Exact quotation matches remain deterministic and bypass the
     model entirely.
     """
+    if artifact.source_identity.status != 'verified':
+        return artifact
     if artifact.relationship.method == "deterministic_exact_quotation":
         judgment = StructuredJudgmentEvidence(
             status=RelationshipStatus.SUPPORTS,

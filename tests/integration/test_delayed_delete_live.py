@@ -62,7 +62,8 @@ def delayed_http_delete(backend, selected_key):
     storage = object.__new__(S3Backend)
     storage._bucket = backend.storage._bucket
     storage._client = boto3.client('s3', endpoint_url=f'http://127.0.0.1:{server.server_port}',
-        aws_access_key_id=settings.S3_ACCESS_KEY, aws_secret_access_key=settings.S3_SECRET_KEY,
+        aws_access_key_id=settings.S3_ACCESS_KEY.get_secret_value(),
+        aws_secret_access_key=settings.S3_SECRET_KEY.get_secret_value(),
         region_name=settings.S3_REGION, config=Config(connect_timeout=1, read_timeout=0.25,
             retries={'total_max_attempts': 1}, s3={'addressing_style': 'path'}))
     class Delayed:

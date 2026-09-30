@@ -124,6 +124,25 @@ _PROVIDERS: dict[str, ProviderConfig] = {
         max_output_tokens=4096,
         short_json_keys=True,  # smaller models benefit from compact output
     ),
+    # Must precede the bare "qwen" key: the registry takes the first substring
+    # match, and the cloud API differs from the local route on every field that
+    # matters. Matched by the Model Studio host or the production model id.
+    "aliyuncs": ProviderConfig(
+        name="Qwen (Model Studio API)",
+        json_mode=True,
+        json_object_required=True,
+        json_mode_required_for_json=False,
+        input_batch_tokens=100000,
+        max_output_tokens=131072,
+        short_json_keys=False,
+        # Thinking is on by default and does not support structured output;
+        # `enable_thinking` is not a standard OpenAI parameter, so it travels
+        # in extra_body (provider documentation, verified 2026-09-24).
+        reasoning_disable_body={"enable_thinking": False},
+        # Effort levels exist for this model but their parameter name is not
+        # verified here; dropping the string is safer than sending an unknown.
+        reasoning_effort_supported=False,
+    ),
     "qwen": ProviderConfig(
         name="Qwen (local)",
         json_mode=False,  # oMLX/Ollama response_format breaks Qwen JSON output; prompt alone works
@@ -179,6 +198,8 @@ def get_provider_config(
     combined = f"{model} {base_url}".lower()
 
     # Check each provider key
+    if "qwen3.8-flash" in combined:
+        return _PROVIDERS["aliyuncs"]
     for key, config in _PROVIDERS.items():
         if key in combined:
             return config

@@ -98,6 +98,12 @@ def _retry_or_fail(task, job_id: str, exc: BaseException, attempt_id=None, stage
         _fail(job_id, exc)
     else:
         _fail(job_id, exc, attempt_id)
+    # Where it failed, as application file:line frames only: no message, no
+    # values, so no student or source text reaches the log.
+    import traceback
+    frames = [f"{frame.filename.rsplit('/app/', 1)[-1]}:{frame.lineno}"
+              for frame in traceback.extract_tb(exc.__traceback__) if '/app/app/' in frame.filename][-6:]
+    logger.error("Paper workflow failure location: %s %s", type(exc).__name__, " < ".join(reversed(frames)))
     # Celery logs and serializes terminal exception messages. Validation errors
     # can embed source/student input, so persist the typed failure locally but
     # never hand the original exception or its context to the task backend.

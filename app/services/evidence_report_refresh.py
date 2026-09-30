@@ -42,6 +42,9 @@ def refresh_evidence_report_projection(
     report_id: str | uuid.UUID,
     assess_abstracts: bool = False,
     reextract_citations: bool = False,
+    submitted_link_updates: list[dict] | None = None,
+    verification_replacements: dict[str, str] | None = None,
+    reassess_reference_formatting: bool = False,
 ) -> dict:
     """Refresh only the report-facing projection; Evidence Packages stay immutable."""
     parsed_id = report_id if isinstance(report_id, uuid.UUID) else uuid.UUID(str(report_id))
@@ -75,6 +78,46 @@ def refresh_evidence_report_projection(
         extraction = _backfill_word_counts(extraction, paper_artifact, backend)
 
     aggregate = deepcopy(base_report.report_json or {})
+    if verification_replacements:
+        from app.services.paper_workflow import _report_member
+        if reextract_citations:
+            raise ValueError('Evidence replacement cannot also re-extract citations')
+        known = set(aggregate.get('report_ids') or [])
+        if len(set(verification_replacements.values())) != len(verification_replacements):
+            raise ValueError('Replacement members must remain distinct')
+        for old_id, new_id in verification_replacements.items():
+            if old_id not in known or new_id in known:
+                raise ValueError('Replacement is not a new version of a retained member')
+            old = session.get(VerificationReportRecord, uuid.UUID(old_id))
+            new = session.get(VerificationReportRecord, uuid.UUID(new_id))
+            _validate_verification_replacement(old, new, job)
+            replacement = _report_member(new)
+            matches = 0
+            for group in aggregate.get('citation_groups') or []:
+                for member in group.get('members') or []:
+                    if member.get('report_id') == old_id:
+                        member.update(replacement)
+                        matches += 1
+            if matches != 1:
+                raise ValueError('Replacement must identify exactly one aggregate member')
+        aggregate['report_ids'] = [verification_replacements.get(r,r) for r in aggregate['report_ids']]
+        aggregate['evidence_reassessment'] = {'base_report_id':str(base_report.id),
+                                            'replacements':dict(verification_replacements)}
+    if submitted_link_updates:
+        from app.services.submitted_links import SubmittedLink, initial_observations
+        expected = {(r.reference_id, row.kind): row for r in extraction.references for row in initial_observations(r)}
+        updates = {}
+        for value in submitted_link_updates:
+            row = SubmittedLink.model_validate(value)
+            key = (row.reference_id, row.kind)
+            original = expected.get(key)
+            if (original is None or row.reference_snapshot_sha256 != original.reference_snapshot_sha256
+                    or row.submitted_sha256 != original.submitted_sha256 or row.request_sha256 != original.request_sha256
+                    or row.state != 'observed'):
+                raise ValueError('Submitted-link update is not bound to this reference')
+            updates[key] = row.model_dump(mode='json')
+        aggregate['submitted_link_observations'] = [r for r in aggregate.get('submitted_link_observations', [])
+            if (r.get('reference_id'), r.get('kind')) not in updates] + list(updates.values())
     citation_groups = list(aggregate.get("citation_groups") or [])
     abstract_assessments = 0
     if assess_abstracts:
@@ -88,7 +131,7 @@ def refresh_evidence_report_projection(
                 if not abstract.get("text"):
                     continue
                 member["abstract_relevance"] = assess_abstract_relevance(
-                    claim, str(abstract["text"])
+                    claim, str(abstract["text"]), source_title=next((r.title for r in extraction.references if r.reference_id == member.get('reference_id')), "")
                 )
                 abstract_assessments += 1
         aggregate["citation_groups"] = citation_groups
@@ -142,6 +185,55 @@ def refresh_evidence_report_projection(
             **deepcopy(job.verification_summary or {}),
             "citation_groups": deepcopy(aggregate["citation_groups"]),
         }
+    if reassess_reference_formatting:
+        from app.services.reference_formatting import assess_reference_formatting
+        from app.services.source_type import classify_reference_source_kind
+        layout = extraction.reference_layout
+        # DOCX style observations bind to the submitted DOCX, not the retained
+        # converted PDF used for page geometry.
+        if layout is None or layout.content_sha256 != job.input_sha256:
+            raise ValueError('Reference style observations are not bound to the retained input')
+        before = _json_digest(extraction.model_dump(mode='json'))
+        extraction = extraction.model_copy(deep=True)
+        for reference in extraction.references:
+            kind = classify_reference_source_kind(reference.raw_ref, title=reference.title, url=reference.url)
+            if reference.source_kind == 'webpage' and kind.kind == 'monograph' and kind.confidence == 'high':
+                reference.source_kind = kind.kind
+                reference.source_kind_confidence = kind.confidence
+                reference.source_kind_evidence = list(kind.evidence)
+        extraction.reference_formatting = assess_reference_formatting(
+            layout, references=extraction.references,
+        )
+        # Preserve independently assessed reference order; no new bibliography
+        # segmentation or citation extraction occurs in a style-only correction.
+        previous_formatting = PaperExtractionArtifact.model_validate(job.extraction_payload).reference_formatting
+        if previous_formatting is not None:
+            extraction.reference_formatting.order_result = previous_formatting.order_result
+            order = previous_formatting.order_result
+            if order is not None and order.status != 'not_assessed':
+                assessment = extraction.reference_formatting
+                assessment.assessed_rule_ids = list(dict.fromkeys([
+                    *assessment.assessed_rule_ids, order.rule_id,
+                ]))
+                assessment.status = 'partial'
+            extraction.reference_formatting = type(extraction.reference_formatting).model_validate(
+                extraction.reference_formatting.model_dump(mode='json')
+            )
+        after = _json_digest(extraction.model_dump(mode='json'))
+        aggregate['reference_formatting_correction'] = {
+            'version': 'reference-formatting-reassessment-v1', 'base_report_id': str(base_report.id),
+            'previous_extraction_sha256': before, 'corrected_extraction_sha256': after,
+            'source_sha256': job.input_sha256,
+            'presentation_sha256': paper_artifact.presentation_sha256,
+        }
+        aggregate['extraction_snapshot'] = extraction.model_dump(mode='json')
+        aggregate['reference_formatting'] = extraction.reference_formatting.model_dump(mode='json')
+        # Citation geometry is unchanged; only renew its full-snapshot binding.
+        if aggregate.get('citation_anchor_correction'):
+            aggregate['citation_anchor_correction']['extraction_sha256'] = after
+            job.upload_evidence = {**deepcopy(job.upload_evidence or {}),
+                'citation_anchor_correction': deepcopy(aggregate['citation_anchor_correction'])}
+        job.extraction_payload = extraction.model_dump(mode='json')
     successor = Report(
         job_id=report.job_id,
         total_references=base_report.total_references,
@@ -152,8 +244,10 @@ def refresh_evidence_report_projection(
         report_version=latest_report.report_version + 1,
         previous_report_id=latest_report.id,
         amendment_reason=(
+            "bounded_evidence_reassessment" if verification_replacements else
+            "reference_formatting_reassessment" if reassess_reference_formatting else
             "citation_projection_correction" if reextract_citations else
-            "abstract_relevance_assessment" if assess_abstracts else "projection_refresh"
+            "abstract_relevance_assessment" if assess_abstracts else "submitted_link_recheck" if submitted_link_updates else "projection_refresh"
         ),
     )
     session.add(successor)
@@ -171,6 +265,10 @@ def refresh_evidence_report_projection(
             view, backend.download(paper_artifact.presentation_storage_key)
         )
     successor.report_json = {**aggregate, "evidence_report": view}
+    if verification_replacements:
+        job.verification_summary = {**deepcopy(job.verification_summary or {}),
+            'report_ids':list(aggregate['report_ids']),
+            'citation_groups':deepcopy(aggregate['citation_groups'])}
     session.commit()
     return {
         "report_id": str(successor.id),
@@ -182,6 +280,27 @@ def refresh_evidence_report_projection(
         "reference_finding_count": len(view.get("reference_practice") or []),
         "word_counts": dict(view.get("word_counts") or {}),
     }
+
+
+def _validate_verification_replacement(old, new, job):
+    """No new paper, member, source or extracted generation through re-ranking."""
+    from app.services.verification_report import _payload_digest
+    if old is None or new is None:
+        raise ValueError('Replacement evidence is unavailable')
+    for record in (old,new):
+        if (record.scope_type != job.scope_type or record.scope_id != job.scope_id
+                or record.paper_version_id != job.paper_version_id
+                or record.evidence_sha256 != _payload_digest(record.report_payload)):
+            raise ValueError('Replacement evidence scope or fingerprint differs')
+    a,b=old.report_payload,new.report_payload
+    if a.get('claim') != b.get('claim') or a.get('source_binding') != b.get('source_binding'):
+        raise ValueError('Replacement claim or member differs')
+    for key in ('representation_id','content_sha256','canonical_work_id'):
+        if (a.get('source_identity') or {}).get(key) != (b.get('source_identity') or {}).get(key):
+            raise ValueError('Replacement source differs')
+    for key in ('extracted_text_sha256','extraction_version'):
+        if (a.get('authoritative_evidence_package') or {}).get(key) != (b.get('authoritative_evidence_package') or {}).get(key):
+            raise ValueError('Replacement extraction differs')
 
 
 def _json_digest(value: dict) -> str:

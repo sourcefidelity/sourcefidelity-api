@@ -1,3 +1,4 @@
+from app.services.evidence_report import summary_text
 """Summary traceability, media actions, citation boundaries and edition guards."""
 from copy import deepcopy
 from types import SimpleNamespace
@@ -5,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.evidence_report import (
-    _build_role_summaries, _render_role_summaries, _member_accepts_upload,
+    _build_report_summary, _render_report_summary, _member_accepts_upload,
     _eligible_display_passages, _render_reference_panel_template,
 )
 from app.services.citation_extractor import _extract_attributed_text_and_index
@@ -20,33 +21,34 @@ from app.services.verification_evidence import passage_role_from_text
 
 def test_single_missing_entry_is_a_summary_priority_with_citation_location():
     citations = [{"members": []} for _ in range(4)] + [{"members": [], "missing_reference_members": ["Writer, 2020"]}]
-    summary = _build_role_summaries(citations=citations, overview={}, pervasive_hanging_indent=False)
-    for audience in ("student", "instructor"):
-        text = " ".join(summary[audience]["academic_practice"])
-        assert "citation 5" in text and "Writer, 2020" in text
-        html = _render_role_summaries(summary, audience=audience)
-        assert "<ol>" not in html and "<ul>" in html
+    summary = _build_report_summary(citations=citations, overview={}, pervasive_hanging_indent=False)
+    text = " ".join(map(summary_text, summary["academic_practice"]))
+    assert "citation 5" not in text and "Writer, 2020" in text
+    assert "1 in-text source has" in text
+    html = _render_report_summary(summary)
+    assert "<ol>" not in html and "<ul>" in html
 
 
-def test_repeated_issues_take_priority_over_one_off_within_category():
-    indirect = {"best_evidence": {"evidence_role": "representation_of_other_work"}}
+def test_a_single_issue_is_listed_beside_a_repeated_one():
+    # Owner decision 2026-09-30: the rule that hid one-off issues is removed.
+    indirect = {"secondary_citation": {"sentence_keys": ["a"], "attributed_to": ["Grabher"]}}
     citations = [{"members": [indirect]}, {"members": [indirect]},
                  {"members": [], "missing_reference_members": ["Writer, 2020"]}]
-    summary = _build_role_summaries(citations=citations, overview={}, pervasive_hanging_indent=False)
-    assert "2 citations" in " ".join(summary["instructor"]["academic_practice"])
-    assert "Writer" not in " ".join(summary["instructor"]["academic_practice"])
+    summary = _build_report_summary(citations=citations, overview={}, pervasive_hanging_indent=True)
+    text = " ".join(map(summary_text, summary["academic_practice"]))
+    assert "2 citations" in text and "Writer" in text
 
 
 def test_report_summary_requires_paper_flags_except_hanging_indent():
     citations=[{"members": [], "missing_reference_members": ["Writer, 2020"]}]
-    summary=_build_role_summaries(citations=citations,overview={},pervasive_hanging_indent=True,
+    summary=_build_report_summary(citations=citations,overview={},pervasive_hanging_indent=True,
                                  reference_practice=[],require_paper_flags=True)
-    assert not summary['student']['academic_practice']
-    assert summary['student']['reference_formatting']
+    assert not summary['academic_practice']
+    assert summary['reference_formatting']
     citations[0]['paper_location']={'localization_level':'exact_rectangle','rectangles':[{'page_index':0}]}
-    summary=_build_role_summaries(citations=citations,overview={},pervasive_hanging_indent=False,
+    summary=_build_report_summary(citations=citations,overview={},pervasive_hanging_indent=False,
                                  reference_practice=[],require_paper_flags=True)
-    assert 'Writer' in ' '.join(summary['student']['academic_practice'])
+    assert 'Writer' in ' '.join(map(summary_text, summary['academic_practice']))
 
 
 @pytest.mark.parametrize("kind,raw,allowed", [

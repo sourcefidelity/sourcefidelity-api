@@ -14,6 +14,8 @@ from typing import Literal
 
 import fitz
 from docx import Document
+from docx.text.run import Run
+from docx.oxml.ns import qn
 from pydantic import BaseModel, Field, model_validator
 
 from app.services.schemas import ParsedReference
@@ -38,6 +40,8 @@ class ReferenceEntryLayout(BaseModel):
     italic_character_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
     bold_character_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
     text_style_spans: list["ReferenceTextStyleSpan"] = Field(default_factory=list)
+    style_binding_version: Literal['reference-style-binding-v1'] | None = None
+    style_observation_ranges: list["ReferenceStyleRange"] = Field(default_factory=list)
     rectangles: list["ReferenceLayoutRectangle"] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
@@ -52,9 +56,24 @@ class ReferenceEntryLayout(BaseModel):
             or self.italic_character_fraction is not None
             or self.bold_character_fraction is not None
             or self.text_style_spans
+            or self.style_observation_ranges
+            or self.style_binding_version
             or self.rectangles
         ):
             raise ValueError("Unmatched layout entries cannot carry measurements")
+        if self.style_observation_ranges and not self.style_binding_version:
+            raise ValueError('Style observations require a versioned binding')
+        return self
+
+
+class ReferenceStyleRange(BaseModel):
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+
+    @model_validator(mode='after')
+    def validate_range(self):
+        if self.end <= self.start:
+            raise ValueError('Style range must be nonempty')
         return self
 
 
@@ -128,6 +147,8 @@ class _LayoutLine:
     bold_characters: int
     styled_characters: int
     style_spans: tuple[tuple[int, int, bool, bool], ...] = ()
+    style_complete: bool = True
+    indent_complete: bool = True
     bbox: tuple[float, float, float, float] | None = None
 
 
@@ -174,6 +195,12 @@ def _extract_pdf(
                     )
                     if not text:
                         continue
+                    # Page-number-only margin lines are not bibliography text.
+                    # Keep numeric lines in the content area, which may be locators.
+                    if (text.isdecimal() and spans and
+                            (max(s['bbox'][3] for s in spans) < page.rect.height * .06
+                             or min(s['bbox'][1] for s in spans) > page.rect.height * .94)):
+                        continue
                     styled = sum(len(span.get("text", "")) for span in spans)
                     italic = sum(
                         len(span.get("text", ""))
@@ -195,6 +222,7 @@ def _extract_pdf(
                             bold_characters=bold,
                             styled_characters=styled,
                             style_spans=style_spans,
+                            style_complete=all('flags' in span and bool(span.get('font')) for span in spans),
                             bbox=(
                                 round(min(span["bbox"][0] for span in spans), 3),
                                 round(min(span["bbox"][1] for span in spans), 3),
@@ -226,9 +254,13 @@ def _extract_docx(
     document = Document(io.BytesIO(content))
     lines: list[_LayoutLine] = []
     for paragraph_index, paragraph in enumerate(document.paragraphs):
+        # Native hyperlink runs belong to the visible paragraph too. Omitting
+        # them loses URL text and lowers otherwise exact entry mappings.
+        runs = [run for part in paragraph.iter_inner_content()
+                for run in ([part] if isinstance(part, Run) else part.runs)]
         text, style_spans = _styled_text(
-            (run.text, _docx_run_italic(run), _docx_run_bold(run))
-            for run in paragraph.runs
+            (run.text, bool(_docx_run_italic(run)), bool(_docx_run_bold(run)))
+            for run in runs
         )
         if not text:
             continue
@@ -244,9 +276,9 @@ def _extract_docx(
             else paragraph.style.paragraph_format.first_line_indent
         )
         first_x = left_indent + first_line_indent
-        styled = sum(len(run.text) for run in paragraph.runs)
-        italic = sum(len(run.text) for run in paragraph.runs if _docx_run_italic(run))
-        bold = sum(len(run.text) for run in paragraph.runs if _docx_run_bold(run))
+        styled = sum(len(run.text) for run in runs)
+        italic = sum(len(run.text) for run in runs if _docx_run_italic(run))
+        bold = sum(len(run.text) for run in runs if _docx_run_bold(run))
         lines.append(
             _LayoutLine(
                 text=text,
@@ -257,8 +289,26 @@ def _extract_docx(
                 bold_characters=bold,
                 styled_characters=styled,
                 style_spans=style_spans,
+                style_complete=all(_docx_run_italic(run) is not None and _docx_run_bold(run) is not None for run in runs),
             )
         )
+        if '\n' in text:
+            original = lines.pop()
+            offset = 0
+            for fragment in text.split('\n'):
+                stop = offset + len(fragment)
+                spans = tuple((max(a, offset)-offset, min(b, stop)-offset, i, bld)
+                              for a, b, i, bld in style_spans if a < stop and b > offset)
+                if fragment.strip():
+                    lines.append(_LayoutLine(
+                        text=fragment, location_index=paragraph_index,
+                        x0=original.x0, continuation_x0=None,
+                        italic_characters=sum(b-a for a,b,i,_ in spans if i),
+                        bold_characters=sum(b-a for a,b,_,bold in spans if bold),
+                        styled_characters=len(fragment), style_spans=spans,
+                        style_complete=original.style_complete, indent_complete=False,
+                    ))
+                offset = stop + 1
     return _build_artifact(
         content=content,
         media_type=(
@@ -269,7 +319,7 @@ def _extract_docx(
         references=references,
         lines=lines,
         style_limitation=(
-            "DOCX measurements resolve direct and paragraph-style indentation plus direct run style; theme and linked-style inheritance may remain incomplete."
+            "DOCX font observations resolve document defaults, paragraph/base and character styles, and direct overrides. Unsupported style contexts remain unknown. Soft-break fragments do not establish reference-level hanging indentation."
         ),
         docx_paragraph_mode=True,
     )
@@ -405,8 +455,18 @@ def _match_entries(
             results.append(_unmatched(reference, "reference_layout_text_not_matched"))
             continue
         score, start, end = best
+        # A unique complete normalized entry is stronger than a near match
+        # elsewhere (e.g. the same author/title/URL with a different date).
+        # Multiple exact occurrences still compete and remain unplaced.
+        if score == 1.0:
+            candidates = [item for item in candidates if item[0] == 1.0]
         second_score = max(
-            (item[0] for item in candidates[1:] if item[1] != start),
+            (item[0] for item in candidates[1:] if item[1] != start
+             # A lower-scoring strict superset of an exact span is not a
+             # competing occurrence (e.g. the same entry plus a page number).
+             # Distinct exact occurrences still remain ambiguous.
+             and not (score == 1.0 and item[0] < 1.0
+                      and item[1] < start and item[2] >= end)),
             default=0.0,
         )
         if second_score >= score - 0.015:
@@ -433,8 +493,10 @@ def _match_entries(
             if continuation_median is not None
             else None
         )
+        if not all(line.indent_complete for line in selected):
+            continuation_median = hanging = None
         styled = sum(line.styled_characters for line in selected)
-        text_style_spans = _bind_style_spans(reference.raw_ref, selected)
+        text_style_spans, observed_ranges = _bind_style_evidence(reference.raw_ref, selected)
         results.append(
             ReferenceEntryLayout(
                 reference_id=reference.reference_id,
@@ -459,6 +521,8 @@ def _match_entries(
                     else None
                 ),
                 text_style_spans=text_style_spans,
+                style_binding_version='reference-style-binding-v1',
+                style_observation_ranges=observed_ranges,
                 rectangles=[
                     ReferenceLayoutRectangle(
                         page_index=line.location_index,
@@ -524,29 +588,38 @@ def _bind_style_spans(
     raw_reference: str,
     lines: list[_LayoutLine],
 ) -> list[ReferenceTextStyleSpan]:
+    return _bind_style_evidence(raw_reference, lines)[0]
+
+
+def _bind_style_evidence(raw_reference: str, lines: list[_LayoutLine]):
     """Map observed font runs onto the retained reference without guessing fields."""
     observed_parts = []
     observed_styles: list[tuple[bool, bool]] = []
+    observed_known = []
     for line_index, line in enumerate(lines):
         if line_index:
             observed_parts.append(" ")
             observed_styles.append((False, False))
+            observed_known.append(False)
         observed_parts.append(line.text)
         flags = [(False, False)] * len(line.text)
         for start, end, italic, bold in line.style_spans:
             for index in range(max(0, start), min(len(flags), end)):
                 flags[index] = (italic, bold)
         observed_styles.extend(flags)
+        observed_known.extend([line.style_complete] * len(line.text))
     observed = "".join(observed_parts)
     if not observed or not raw_reference:
-        return []
+        return [], []
     raw_flags = [(False, False)] * len(raw_reference)
+    known = [False] * len(raw_reference)
     matcher = SequenceMatcher(None, raw_reference, observed, autojunk=False)
     for tag, raw_start, raw_end, observed_start, observed_end in matcher.get_opcodes():
         if tag != "equal":
             continue
         for offset in range(raw_end - raw_start):
             raw_flags[raw_start + offset] = observed_styles[observed_start + offset]
+            known[raw_start + offset] = observed_known[observed_start + offset]
     result = []
     start = 0
     while start < len(raw_flags):
@@ -566,7 +639,29 @@ def _bind_style_spans(
             )
         )
         start = end
-    return result
+    ranges = []
+    index = 0
+    while index < len(known):
+        if not known[index]:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(known) and known[end]:
+            end += 1
+        ranges.append(ReferenceStyleRange(start=index,end=end))
+        index = end
+    return result, ranges
+
+
+def reference_span_style_observed(entry: ReferenceEntryLayout, raw_reference: str, start: int, end: int) -> bool:
+    """Whether every non-space character has bound font observations, not a style verdict."""
+    if (entry.style_binding_version != 'reference-style-binding-v1'
+            or entry.reference_text_sha256 != hashlib.sha256(raw_reference.encode()).hexdigest()
+            or not 0 <= start < end <= len(raw_reference)
+            or not raw_reference[start:end].strip()):
+        return False
+    return all(any(r.start <= i < r.end for r in entry.style_observation_ranges)
+        for i in range(start,end) if not raw_reference[i].isspace())
 
 
 def _pdf_span_italic(span: dict) -> bool:
@@ -581,16 +676,59 @@ def _pdf_span_bold(span: dict) -> bool:
     )
 
 
-def _docx_run_italic(run) -> bool:
-    if run.italic is not None:
-        return bool(run.italic)
-    return bool(run.style and run.style.font.italic)
+def _docx_run_italic(run) -> bool | None:
+    return _docx_toggle(run, 'italic', 'i')
 
 
-def _docx_run_bold(run) -> bool:
-    if run.bold is not None:
-        return bool(run.bold)
-    return bool(run.style and run.style.font.bold)
+def _docx_run_bold(run) -> bool | None:
+    return _docx_toggle(run, 'bold', 'b')
+
+
+def _docx_toggle(run, attribute: str, tag: str) -> bool | None:
+    direct = getattr(run, attribute)
+    if direct is not None:
+        return bool(direct)
+    # Bounded paragraph/character style cascade, including document defaults.
+    # Cycles or unresolved style references are unknown, never plain text.
+    styles = run.part.styles
+    value = False
+    defaults = styles.element.find(qn('w:docDefaults'))
+    if defaults is not None:
+        node = defaults.find('.//' + qn('w:' + tag))
+        if node is not None:
+            value = node.get(qn('w:val'), '1').lower() not in {'0','false','off'}
+    paragraph = run._r.getparent()
+    while paragraph is not None and paragraph.tag != qn('w:p'):
+        paragraph = paragraph.getparent()
+    if paragraph is None:
+        return None
+    ppr = paragraph.find(qn('w:pPr'))
+    if ppr is not None and ppr.find(qn('w:numPr')) is not None:
+        return None  # Numbering/style interactions need separate acceptance.
+    known_style_ids = {element.get(qn('w:styleId')) for element in styles.element}
+    if paragraph.style and paragraph.style not in known_style_ids:
+        return None
+    if run._r.style and run._r.style not in known_style_ids:
+        return None
+    paragraph_style = run.part.get_style(paragraph.style, 1)
+    for style in (paragraph_style, run.style):
+        seen = set()
+        while style is not None:
+            if style.style_id in seen or len(seen) >= 64:
+                return None
+            seen.add(style.style_id)
+            style_ppr = style.element.find(qn('w:pPr'))
+            if style_ppr is not None and style_ppr.find(qn('w:numPr')) is not None:
+                return None
+            if getattr(style.font, attribute) is True:
+                value = not value
+            # An explicit unresolved basedOn cannot silently inherit normal.
+            base_id = style.element.basedOn_val
+            base = style.base_style
+            if base_id and base is None:
+                return None
+            style = base
+    return value
 
 
 def _length_points(value) -> float:

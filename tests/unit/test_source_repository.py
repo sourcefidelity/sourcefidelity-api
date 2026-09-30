@@ -72,6 +72,36 @@ class TemporarilyFailingDeleteStorage(MemoryStorage):
         return super().delete(key)
 
 
+def test_explicit_completeness_downgrade_preserves_limited_access_not_full_reuse(session):
+    from dataclasses import replace
+    from app.services.source_repository import recheck_accepted_pdf_completeness
+    from test_preview_evidence_repairs import numbered_book
+    backend = MemoryStorage()
+    data = numbered_book([1,2,3,None,201,202,203])
+    request = _request()
+    request = replace(request, representation=replace(request.representation, content=data))
+    record = admit_representation(session, backend, request)
+    session.commit()
+    original = dict(record.validation_evidence)
+    args = dict(representation_id=record.id, scope_type=record.scope_type, scope_id=record.scope_id,
+                expected_content_sha256=hashlib.sha256(data).hexdigest(), document_kind='book')
+    with pytest.raises(EvidenceAuthorizationError):
+        recheck_accepted_pdf_completeness(session, backend, **{**args, 'scope_id':'other'})
+    with pytest.raises(AdmissionError):
+        recheck_accepted_pdf_completeness(session, backend, **{**args, 'expected_content_sha256':'0'*64})
+    assert record.validation_evidence == original
+    receipt = recheck_accepted_pdf_completeness(session, backend, **args)
+    session.commit()
+    assert receipt['changed'] and record.completeness_verdict == 'incomplete'
+    assert record.validation_evidence['completeness_corrections'] == [receipt]
+    assert all(record.validation_evidence[k] == v for k,v in original.items())
+    assert find_accepted_representation(session, scope_type=record.scope_type,
+        scope_id=record.scope_id, doi=request.work.doi) is None
+    assert authorize_representation(session, backend, representation_id=record.id,
+        scope_type=record.scope_type, scope_id=record.scope_id).completeness_verdict == 'incomplete'
+    assert not recheck_accepted_pdf_completeness(session, backend, **args)['changed']
+
+
 @pytest.fixture
 def session() -> Session:
     engine = create_engine("sqlite+pysqlite:///:memory:")

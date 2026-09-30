@@ -48,6 +48,21 @@ def test_observed_header_fields_without_citation_input():
     assert observed["html_sha256"] == hashlib.sha256(html.encode()).hexdigest()
 
 
+@pytest.mark.parametrize('year,author,usable', [('2023','Rivera, A., & Chen, M.',True),
+    ('2020','Rivera, A., & Chen, M.',False), ('2023','Different, B.',False)])
+def test_identified_journal_near_year_difference_is_not_failed_acquisition(monkeypatch,year,author,usable):
+    from app.services.source_type import SourceKindAssessment
+    html=page().replace('<h1>', '<div>Vol. 12 No. 4 Article</div><h1>')
+    resolver=resolver_for(monkeypatch,html)
+    result=resolver._try_web_fetch('https://publisher.example/new/article',title='Advances in language research',
+        expected_author=author,expected_year=year,
+        expected_source_kind=SourceKindAssessment(kind='journal_article',confidence='high'))
+    assert result.success is usable
+    if usable:
+        assert result.metadata['work_identity_basis']=='journal-title-author-near-year-v1'
+        assert any(c['field_name']=='year' and c['outcome']=='material_conflict' for c in result.metadata['identity_comparisons'])
+
+
 @pytest.mark.parametrize('publication', ['<dt>Publication date</dt><dd><a>1991</a></dd>', ''])
 def test_archive_upload_date_cannot_become_book_publication_year(publication):
     html=page(date='2023-05-01').replace('</main>',f'<dl>{publication}<dt>Addeddate</dt><dd>2023-05-04</dd></dl></main>')
@@ -171,7 +186,86 @@ def test_doi_only_adapter_is_not_a_required_failed_title_search():
         resolver._record_discovery_attempt(category="academic_adapter", provider="control", result=result, required=True)
         assert trace["attempts"][0].required is False
         assert trace["attempts"][0].reason_code == "route_not_applicable"
+        # A route the app declined is labelled declined, never as a provider
+        # failure (it read `operational_failure` until 2026-09-25).
+        assert [q.execution_outcome for q in trace["queries"]] == ["declined"]
         # The declared academic-search requirement is not removed.
         assert trace["required"] == {"academic_adapter"}
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
+
+
+def test_byline_job_titles_are_not_read_as_surnames():
+    # TODAY.com, 2026-09-29: "Ariana Brockington Trending News Reporter" made
+    # "Reporter" the surname and the student's own link was rejected.
+    from app.services.web_source_metadata import _without_job_title
+    assert _without_job_title('Ariana Brockington Trending News Reporter') == 'Ariana Brockington'
+    assert _without_job_title('Jane Doe, Senior Staff Writer') == 'Jane Doe'
+    for unchanged in ('Brian Lowry', 'John Writer', 'Senior Editor', 'Editor'):
+        assert _without_job_title(unchanged) == unchanged
+
+
+def test_html_entities_do_not_split_a_journal_name():
+    # Crossref's "Journal of Digital Media &amp; Policy" (Chalaby, 2026-09-29).
+    from app.services.reference_discovery import _normalize_text
+    from app.services.retrieval.crossref import _first_container
+    assert _normalize_text('Journal of Digital Media &amp; Policy') == _normalize_text('Journal of Digital Media & Policy')
+    assert _first_container({'container-title': ['Journal of Digital Media &amp; Policy']}) == (
+        'Journal of Digital Media & Policy')
+
+
+def test_a_sites_own_related_link_line_does_not_make_the_article_incomplete():
+    # ScreenRant, 2026-09-30: the whole article was extracted except the site's
+    # "Related:" link, and the page was reported as limited text.
+    from app.services.web_completeness import assess_web_completeness
+    paragraphs = [f'Paragraph {i} explains how much the films earned at the box office in detail.' for i in range(12)]
+    body = '\n'.join(paragraphs[:6] + ['Related: 10 Things Fans Get Wrong About The Films'] + paragraphs[6:])
+    html = ('<html><body><div class="article-body">' + ''.join(f'<p>{p}</p>' for p in body.split('\n'))
+            + '</div></body></html>')
+    extracted = '\n'.join(paragraphs)
+    assert assess_web_completeness(html, extracted)['verdict'] == 'complete'
+    # A real article paragraph that was not extracted still leaves it unassessed.
+    assert assess_web_completeness(html, '\n'.join(paragraphs[1:]))['verdict'] == 'not_assessed'
+
+
+def test_an_old_page_states_its_title_author_and_year_in_plain_text():
+    # Jump Cut archive, 2026-09-30: no metadata, a banner h1, the work in the
+    # title element and a "from <journal>, no. 1, 1974" source statement.
+    from app.services.web_source_metadata import extract_web_source_metadata
+    html = ('<html><head><title>Rivers of the Northern Plains by Mary Stone</title></head><body>'
+            '<h1>RIVER REVIEW<br>A JOURNAL OF WATER</h1><p>Rivers of the Northern Plains by Mary Stone '
+            'from River Review, no. 3, 1976, pp. 4-9 copyright River Review, 1976, 2004</p>'
+            '<p>The essay begins here.</p></body></html>')
+    observed = extract_web_source_metadata(html, 'https://example.org/essay.html')
+    assert observed['title'] == 'Rivers of the Northern Plains' and observed['authors'] == ['Mary Stone']
+    assert observed['year'] == '1976' and observed['date_method'] == 'visible_source_statement'
+    # A page with ordinary metadata keeps it.
+    tagged = html.replace('<head>', '<head><meta property="og:title" content="Tagged Title">')
+    assert extract_web_source_metadata(tagged, 'https://example.org/essay.html')['title'] == 'Tagged Title'
+
+
+def test_a_whole_work_must_fit_its_kinds_length():
+    # Owner decision 2026-09-30: articles too long and books too short are not whole works.
+    from app.services.web_completeness import length_fits_kind
+    assert length_fits_kind(3_500, "journal_article") is True
+    assert length_fits_kind(60_000, "journal_article") is False
+    assert length_fits_kind(8_000, "monograph") is False and length_fits_kind(80_000, "monograph") is True
+    assert length_fits_kind(3_500, "unknown") is None
+
+
+def test_a_stated_page_is_complete_only_without_cut_off_signs_and_at_a_fitting_length():
+    # Rule A, owner decision 2026-09-30.
+    from app.services.web_completeness import stated_page_completeness
+    body = " ".join(["The essay continues its argument about rivers in detail."] * 150)
+    page = f"<html><body><h1>Rivers</h1><p>{body}</p></body></html>"
+    assert stated_page_completeness(page, body, "journal_article")["verdict"] == "complete"
+    assert stated_page_completeness(page, body, "monograph")["reason"] == "length_does_not_fit_kind"
+    assert stated_page_completeness(page, body, "unknown")["reason"] == "kind_unknown"
+    short = " ".join(["A short teaser."] * 50)
+    assert stated_page_completeness(page, short, "journal_article")["reason"] == "too_short_for_a_whole_work"
+    for cut in ('<link rel="next" href="/p2">', "<p>Subscribe to continue reading.</p>", "<p>Continue reading</p>"):
+        cut_page = page.replace("<body>", "<body>" + cut)
+        assert stated_page_completeness(cut_page, body, "journal_article")["verdict"] == "not_assessed"
+    # A "Continue reading" link in a sidebar of other articles does not cut this one off.
+    sidebar = page.replace("</body>", '<aside><a href="/x">Other essay. Continue reading</a></aside></body>')
+    assert stated_page_completeness(sidebar, body, "journal_article")["verdict"] == "complete"

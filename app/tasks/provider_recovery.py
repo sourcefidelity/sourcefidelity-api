@@ -44,12 +44,17 @@ def probe_retrieval_provider_recovery() -> dict:
         for group in settings.SEARXNG_ENGINE_GROUPS.split(";")
         if group.strip()
     }
+    api_first = settings.SEARCH_POLICY_VERSION == "api-first-search-v2"
+    if api_first and not settings.SEARCH_SEARXNG_FALLBACK_ENABLED:
+        configured_searx_keys = set()
     supported_keys = [
         key
         for key in store.incident_providers()
         # Preserve old/experimental incidents, but do not turn an engine
         # removed from the configured cascade into indefinite probe traffic.
-        if key in configured_searx_keys or key == "duckduckgo"
+        # A stale incident for a removed provider (duckduckgo) is therefore
+        # kept in the store and never probed.
+        if key in configured_searx_keys
     ]
     for provider_key in supported_keys:
         if store.cooldown_remaining(provider_key) > 0:
@@ -94,11 +99,26 @@ def probe_retrieval_provider_recovery() -> dict:
 
 
 @celery_app.task(name="requeue_recovered_provider_work")
-def requeue_recovered_provider_work(provider: str) -> dict:
-    """Refresh only completed jobs with retryable dependencies on ``provider``."""
+def requeue_recovered_provider_work(provider: str, force_search: bool = False, automatic: bool = True) -> dict:
+    """Refresh only completed jobs with retryable dependencies on ``provider``.
+
+    ``force_search`` repeats paid web searches even where the job's scope holds
+    a completed-search memo (search-reuse-memo-v1).
+    """
     normalized = provider.strip().casefold()
     if not normalized:
         return {"provider": "", "jobs_requeued": 0, "reference_members": 0}
+    from app.services.assessment_marks import institutional_deployment
+    if automatic and not institutional_deployment():
+        # Personal: no automatic re-searching; the user decides with Search again
+        # (owner decision 2026-09-29). A hand-started run passes automatic=False.
+        return {"provider": normalized, "jobs_requeued": 0, "reference_members": 0,
+                "disabled": "personal_deployment"}
+    if not settings.PROVIDER_RECOVERY_REFRESH_ENABLED:
+        # The single gate every automatic re-run passes through: the probe and
+        # live web search both reach this task via `schedule_provider_recovery`.
+        return {"provider": normalized, "jobs_requeued": 0, "reference_members": 0,
+                "disabled": "PROVIDER_RECOVERY_REFRESH_ENABLED"}
     limit = max(1, settings.PROVIDER_RECOVERY_MAX_JOBS)
     scan_limit = max(100, min(limit * 10, 2_000))
     escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -125,6 +145,7 @@ def requeue_recovered_provider_work(provider: str) -> dict:
                 job.id,
                 provider=normalized,
                 commit=False,
+                force_search=force_search,
             )
             if affected:
                 scheduled.append((str(job.id), len(affected), attempt_id_for(job)))

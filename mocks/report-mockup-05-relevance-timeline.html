@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report mockup 05 — relevance timeline</title>
+  <style>
+    :root {
+      --blue: #1e67ff;
+      --teal: #0aa2a7;
+      --amber: #cc7e00;
+      --brown: #8e5a2c;
+      --gray: #6b7280;
+      --line: #d8e2ef;
+      --paper: #ffffff;
+      --text: #111827;
+      --muted: #64748b;
+      --shadow: 0 16px 34px rgba(15, 23, 42, 0.08);
+      --font: "Inter", "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #f5f8ff, #edf2fc);
+      font-family: var(--font);
+      color: var(--text);
+    }
+
+    .report {
+      max-width: 1540px;
+      margin: 14px auto;
+      padding: 0 14px 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .header,
+    .paper,
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .header {
+      display: grid;
+      gap: 8px;
+      padding: 11px;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 1.05rem;
+    }
+
+    .sub {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 999px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-weight: 600;
+      color: #0f172a;
+    }
+
+    button.active {
+      background: #eff6ff;
+      border-color: #bfdbfe;
+      color: #1d4ed8;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .summary-item {
+      background: #f8fbff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      display: grid;
+      gap: 4px;
+    }
+
+    .summary-item .label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      font-weight: 700;
+    }
+
+    .summary-item .value {
+      font-size: 1.2rem;
+      font-weight: 700;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 8px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 8px;
+      background: #fff;
+      font-size: 0.8rem;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .blue { background: var(--blue); }
+    .teal { background: var(--teal); }
+    .amber { background: var(--amber); }
+    .brown { background: var(--brown); }
+    .gray { background: var(--gray); }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.18fr 0.82fr;
+      gap: 10px;
+      min-height: calc(100vh - 260px);
+    }
+
+    .paper,
+    .panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8fafc;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .content {
+      padding: 10px;
+      overflow: auto;
+      line-height: 1.7;
+    }
+
+    .paper-page {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+
+    .paper-page h2 {
+      margin: 0 0 8px;
+      font-size: 1.03rem;
+    }
+
+    .citation {
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+      border-radius: 8px;
+      padding: 2px 4px;
+      font-size: 0.9rem;
+      border: 1px solid #e2e8f0;
+    }
+
+    .citation.full { background: #dbeafe; }
+    .citation.partial { background: #ccfbf1; }
+    .citation.attention { background: #fde68a; }
+    .citation.unavailable { background: #f3f4f6; }
+
+    .citation-token {
+      border-radius: 5px;
+      padding: 0 2px;
+      font-weight: 700;
+      font-size: 0.92rem;
+    }
+
+    .citation-token.author { background: rgba(30, 103, 255, 0.15); }
+    .citation-token.year { background: rgba(10, 162, 167, 0.16); }
+    .citation-token.page { background: rgba(204, 126, 0, 0.16); }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid #d1d5db;
+      padding: 1px 7px;
+      margin-left: 6px;
+      font-weight: 700;
+      font-size: 0.72rem;
+    }
+
+    .tag.full { background: #dbeafe; color: #1d4ed8; }
+    .tag.partial { background: #ccfbf1; color: #0f766e; }
+    .tag.attention { background: #fef3c7; color: #92400e; }
+    .tag.unavailable { background: #f3f4f6; color: #475569; }
+
+    .member {
+      border: 1px solid #dce4f2;
+      border-radius: 10px;
+      padding: 8px;
+      margin-bottom: 9px;
+      background: #fff;
+      display: grid;
+      gap: 6px;
+    }
+
+    .source-title {
+      margin: 0;
+      font-size: 1rem;
+    }
+
+    .source-meta {
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .timeline {
+      margin-top: 6px;
+      border-top: 1px dashed #e2e8f0;
+      padding-top: 8px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .timeline-header {
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .chips {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .step {
+      border: 1px solid #e5e7eb;
+      border-radius: 9px;
+      padding: 7px;
+      display: grid;
+      gap: 6px;
+      text-align: center;
+      position: relative;
+      background: #f8fafc;
+    }
+
+    .step strong {
+      font-size: 0.84rem;
+    }
+
+    .status-badge {
+      justify-self: center;
+      border-radius: 999px;
+      font-size: 0.68rem;
+      padding: 2px 6px;
+      font-weight: 700;
+      border: 1px solid #d1d5db;
+    }
+
+    .status-full { background: #dbeafe; color: #1d4ed8; }
+    .status-partial { background: #ccfbf1; color: #0f766e; }
+    .status-attn { background: #fef3c7; color: #92400e; }
+    .status-miss { background: #f3f4f6; color: #475569; }
+
+    .coverage-line {
+      width: 100%;
+      height: 7px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      overflow: hidden;
+    }
+
+    .coverage-line span {
+      display: block;
+      height: 100%;
+    }
+
+    .coverage-line.full { background: #bfdbfe; }
+    .coverage-line.partial { background: #99f6e4; }
+    .coverage-line.attn { background: #fcd34d; }
+    .coverage-line.miss { background: #e5e7eb; }
+
+    .row-note {
+      font-size: 0.72rem;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .hint {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: #fff;
+      font-size: 0.88rem;
+    }
+
+    @media (max-width: 1200px) {
+      .split, .summary, .legend, .chips {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (min-width: 901px) {
+      .chips {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="report">
+    <header class="header">
+      <h1>Student paper report mockup 05</h1>
+      <div class="sub">Relevance timeline variant using the same report shell + metadata-highlight citation format.</div>
+      <div class="controls">
+        <button class="active">Split</button>
+        <button>Paper only</button>
+        <button>Panel only</button>
+        <button class="aud active">Student</button>
+        <button>Instructor</button>
+      </div>
+      <div class="summary">
+        <div class="summary-item"><span class="label">Citations checked</span><span class="value">12</span></div>
+        <div class="summary-item"><span class="label">High</span><span class="value">7</span></div>
+        <div class="summary-item"><span class="label">Attention</span><span class="value">3</span></div>
+        <div class="summary-item"><span class="label">Coverage</span><span class="value">74%</span></div>
+      </div>
+      <div class="legend">
+        <div class="legend-item"><span class="dot blue"></span>Full-reference</div>
+        <div class="legend-item"><span class="dot teal"></span>Coverage-limited</div>
+        <div class="legend-item"><span class="dot amber"></span>Needs attention</div>
+        <div class="legend-item"><span class="dot brown"></span>No clear matching passage</div>
+        <div class="legend-item"><span class="dot gray"></span>Unavailable / search incomplete</div>
+      </div>
+      <div class="hint">
+        <strong>New format:</strong> Each source has a horizontal timeline showing claim order and relevance-state transitions, then per-claim coverage bars.
+      </div>
+    </header>
+
+    <section class="split">
+      <section class="paper">
+        <div class="toolbar"><strong>Paper</strong><span class="muted">Relevance-aware citation stream</span></div>
+        <div class="content">
+          <article class="paper-page">
+            <h2>Introduction</h2>
+            <p>
+              Transit-oriented infrastructure planning aligns most strongly when maintenance windows are explicit.
+              <span class="citation full">(
+                <span class="citation-token author">Baker</span>,
+                <span class="citation-token year">2019</span>,
+                <span class="citation-token page">p. 24</span>
+              )
+              <span class="tag full">full-reference</span>
+            </p>
+            <p>
+              Shared financing frameworks with public agencies are supported by local records.
+              <span class="citation full">(
+                <span class="citation-token author">Chen</span>,
+                <span class="citation-token year">2021</span>,
+                <span class="citation-token page">p. 41</span>
+              )
+              <span class="tag full">full-reference</span>
+            </p>
+          </article>
+
+          <article class="paper-page">
+            <h2>Method and findings</h2>
+            <p>
+              The claim that contract incentives always improve reliability is only partly supported.
+              <span class="citation partial">(
+                <span class="citation-token author">Diaz</span>,
+                <span class="citation-token year">2020</span>,
+                <span class="citation-token page">pp. 85-87</span>
+              )
+              <span class="tag partial">coverage-limited</span>
+            </p>
+            <p>
+              A maintenance argument has weak passage matching against the source.
+              <span class="citation attention">(
+                <span class="citation-token author">Wang</span>,
+                <span class="citation-token year">2022</span>,
+                <span class="citation-token page">missing locator</span>
+              )
+              <span class="tag attention">reviewed, no clear matching passage</span>
+            </p>
+            <p>
+              One source remains unavailable in the accepted source set.
+              <span class="citation unavailable">(
+                <span class="citation-token author">Rossi</span>,
+                <span class="citation-token year">2024</span>,
+                <span class="citation-token page">p. 6</span>
+              )
+              <span class="tag unavailable">unavailable</span>
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="toolbar"><strong>Evidence panel</strong><span class="muted">Per-source relevance timeline + claim coverage</span></div>
+        <div class="content">
+          <section class="member">
+            <h3 class="source-title">Baker (2019) · Ref-001</h3>
+            <div class="source-meta">Status: full-reference · 3 linked claims</div>
+            <div class="timeline">
+              <div class="timeline-header">
+                <span>Claim timeline</span><span>Coverage distribution</span>
+              </div>
+              <div class="chips">
+                <div class="step"><strong>C1</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:94%;"></span></div></div>
+                <div class="step"><strong>C2</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:86%;"></span></div></div>
+                <div class="step"><strong>C3</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:87%;"></span></div></div>
+              </div>
+              <div class="row-note"><span>High relevance</span><span>92% weighted</span></div>
+            </div>
+          </section>
+
+          <section class="member">
+            <h3 class="source-title">Chen (2021) · Ref-002</h3>
+            <div class="source-meta">Status: full-reference · 2 linked claims</div>
+            <div class="timeline">
+              <div class="timeline-header">
+                <span>Claim timeline</span><span>Coverage distribution</span>
+              </div>
+              <div class="chips">
+                <div class="step"><strong>C4</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:88%;"></span></div></div>
+                <div class="step"><strong>C5</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:82%;"></span></div></div>
+                <div class="step"><strong>C6</strong><span class="status-badge status-full">full</span><div class="coverage-line full"><span style="width:80%;"></span></div></div>
+              </div>
+              <div class="row-note"><span>High relevance</span><span>84% weighted</span></div>
+            </div>
+          </section>
+
+          <section class="member">
+            <h3 class="source-title">Diaz (2020) · Ref-014</h3>
+            <div class="source-meta">Status: coverage-limited · 2 linked claims</div>
+            <div class="timeline">
+              <div class="timeline-header">
+                <span>Claim timeline</span><span>Coverage distribution</span>
+              </div>
+              <div class="chips">
+                <div class="step"><strong>C7</strong><span class="status-badge status-partial">limited</span><div class="coverage-line partial"><span style="width:43%;"></span></div></div>
+                <div class="step"><strong>C8</strong><span class="status-badge status-partial">limited</span><div class="coverage-line partial"><span style="width:52%;"></span></div></div>
+                <div class="step"><strong>C9</strong><span class="status-badge status-attn">attention</span><div class="coverage-line attn"><span style="width:31%;"></span></div></div>
+              </div>
+              <div class="row-note"><span>Mixed relevance</span><span>42% weighted</span></div>
+            </div>
+          </section>
+
+          <section class="member">
+            <h3 class="source-title">Wang (2022) · Ref-008</h3>
+            <div class="source-meta">Status: no clear matching passage</div>
+            <div class="timeline">
+              <div class="timeline-header">
+                <span>Claim timeline</span><span>Coverage distribution</span>
+              </div>
+              <div class="chips">
+                <div class="step"><strong>C10</strong><span class="status-badge status-attn">attention</span><div class="coverage-line attn"><span style="width:28%;"></span></div></div>
+                <div class="step"><strong>C11</strong><span class="status-badge status-miss">attention</span><div class="coverage-line miss"><span style="width:0%;"></span></div></div>
+                <div class="step"><strong>C12</strong><span class="status-badge status-attn">attention</span><div class="coverage-line attn"><span style="width:35%;"></span></div></div>
+              </div>
+              <div class="row-note"><span>Needs targeted review</span><span>25% weighted</span></div>
+            </div>
+          </section>
+
+          <section class="member">
+            <h3 class="source-title">Rossi (2024) · Ref-041</h3>
+            <div class="source-meta">Status: unavailable in current source set</div>
+            <div class="timeline">
+              <div class="timeline-header">
+                <span>Claim timeline</span><span>Coverage distribution</span>
+              </div>
+              <div class="chips">
+                <div class="step"><strong>C13</strong><span class="status-badge status-miss">unavailable</span><div class="coverage-line miss"><span style="width:0%;"></span></div></div>
+                <div class="step"><strong>C14</strong><span class="status-badge status-miss">unavailable</span><div class="coverage-line miss"><span style="width:0%;"></span></div></div>
+                <div class="step"><strong>C15</strong><span class="status-badge status-miss">unavailable</span><div class="coverage-line miss"><span style="width:0%;"></span></div></div>
+              </div>
+              <div class="row-note"><span>No accepted evidence</span><span>0% weighted</span></div>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </section>
+  </div>
+</body>
+</html>

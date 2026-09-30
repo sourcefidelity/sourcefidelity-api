@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+# The leading authors are the identifying ones - a citation and every matching
+# rule use them - and `ExpectedBibliographicFields` keeps this many. Adapters
+# that trim their own author lists trim to the same number, so no adapter can
+# silently deliver less than the identity comparison would have kept.
+OBSERVED_AUTHOR_LIMIT = 64
+
 class RepresentationKind(str, Enum):
     """Machine-actionable representation kinds with distinct validation paths."""
 
@@ -110,12 +116,59 @@ class RetrievalResult:
         self.full_text = representation.content
 
 
+# Catalogues of books hold monographs and their parts, and nothing else.
+BOOK_SOURCE_KINDS = frozenset({"monograph", "edited_collection", "book_section"})
+# Scholarly article and grey-literature indexes. They hold articles, papers,
+# reports and theses, not books; a book is settled against a catalogue.
+SCHOLARLY_PAPER_KINDS = frozenset(
+    {"journal_article", "conference_paper", "book_review", "report", "thesis"})
+
+
 class RetrievalSource(ABC):
     """Abstract retrieval source."""
 
     name: str = "base"
     capabilities: frozenset[str] = frozenset()
     documentation_url: str | None = None
+
+    # Bibliographic kinds this adapter can plausibly return, or None when it
+    # is not restricted by kind. Declared here so routing is checkable on the
+    # class instead of hand-written per provider in the resolver, which is how
+    # a book catalogue came to be queried for journal articles: measured over
+    # the 2026-09-23 corpus run, Open Library produced 9 candidates on
+    # journal-article references and **not one was plausible**.
+    #
+    # An unknown expected kind always passes: ignorance about a reference is
+    # not a reason to narrow its search.
+    supported_source_kinds: frozenset[str] | None = None
+
+    # Whether this route must complete before the application may say a
+    # reference could not be found. `True` is the SAFE direction: a required
+    # route that fails forces `search_incomplete`, which blocks a potentially
+    # fabricated reference finding. Marking an adapter `False` removes that
+    # block, so it is a judgment about evidence, never a performance tweak.
+    #
+    # Until 2026-09-23 this was derived from `deferred`, which actually means
+    # "batches DOI prefetch" -- an unrelated property -- so every adapter but
+    # `semantic_scholar` was required by default and nobody had decided it.
+    # `None` means undeclared; `tests/unit/test_required_route_declaration.py`
+    # requires every registered adapter to state a value.
+    required_for_search_completion: bool | None = None
+
+    @classmethod
+    def blocks_search_completion(cls) -> bool:
+        """Resolve the declaration, falling back to the old derivation."""
+        if cls.required_for_search_completion is not None:
+            return cls.required_for_search_completion
+        return not getattr(cls, "deferred", False)
+
+    @classmethod
+    def handles_source_kind(cls, kind: str | None) -> bool:
+        """Whether this adapter is worth calling for this expected kind."""
+        if cls.supported_source_kinds is None:
+            return True
+        normalized = (kind or "unknown").strip().casefold() or "unknown"
+        return normalized == "unknown" or normalized in cls.supported_source_kinds
 
     @abstractmethod
     def search_by_doi(self, doi: str) -> RetrievalResult:

@@ -1,6 +1,8 @@
 """Opt-in pure-scan OCR intake boundary regressions."""
 
 import hashlib
+from dataclasses import replace
+import pytest
 
 from app.services import pure_scan_ocr
 from app.services.ocr_derivative import OcrDerivative, OcrPageResult
@@ -12,8 +14,8 @@ def _derivative(*, confidence: float = 91.0) -> OcrDerivative:
     texts = (
         "Rejecting the Center: Radical Grassroots Politics in the 1970s\n"
         "Joshua Zeitz\nJournal article source material published in 2008.\n",
-        "673\nSubstantive article body text with enough words for verification.\n",
-        "674\nAdditional substantive source text continues on this page.\n",
+        "673\n" + "Substantive article body text with enough words for verification.\n" * 3,
+        "674\n" + "Additional substantive source text continues on this page.\n" * 3,
     )
     content = "\f".join(texts).encode("utf-8")
     page_results = tuple(
@@ -99,7 +101,7 @@ def test_expected_range_page_mapping_uses_consistent_observed_anchors() -> None:
     assert method == "observed_plus_consistent_expected_range_inference"
 
 
-def test_pure_scan_ocr_prepares_validated_parent_derivative_pair(monkeypatch) -> None:
+def test_pure_scan_ocr_without_layout_preserves_unconfirmed_derivative(monkeypatch) -> None:
     derivative = _derivative()
     monkeypatch.setattr(pure_scan_ocr, "_check_text_quality", lambda _content: "pure_scan")
     monkeypatch.setattr(
@@ -123,11 +125,11 @@ def test_pure_scan_ocr_prepares_validated_parent_derivative_pair(monkeypatch) ->
         enabled=True,
     )
 
-    assert result.status == "ready"
-    assert result.parent is not None and result.parent.content.startswith(b"%PDF")
-    assert result.derivative is not None
-    assert result.derivative.original_kind.value == "pdf"
-    assert result.validation is not None and result.validation.accept
+    assert result.status == "identity_unconfirmed"
+    assert result.parent is None and result.derivative is None
+    assert result.derivative_record is derivative
+    assert result.validation is not None and not result.validation.accept
+    assert result.validation.identity_confidence == "medium"
 
 
 def test_pure_scan_ocr_rejects_low_confidence_derivative(monkeypatch) -> None:
@@ -150,6 +152,21 @@ def test_pure_scan_ocr_rejects_low_confidence_derivative(monkeypatch) -> None:
     assert result.status == "ocr_failed"
 
 
+@pytest.mark.parametrize('confidence',[None,float('nan'),float('inf'),101.0,-1.0,'90',True])
+def test_every_substantive_page_needs_valid_confidence(monkeypatch,confidence):
+    derivative=_derivative()
+    derivative=replace(derivative,page_results=(
+        replace(derivative.page_results[0],mean_word_confidence=confidence),
+        *derivative.page_results[1:],
+    ))
+    monkeypatch.setattr(pure_scan_ocr,'_check_text_quality',lambda _: 'pure_scan')
+    monkeypatch.setattr(pure_scan_ocr,'_check_completeness',lambda *a,**k: ('complete',3))
+    monkeypatch.setattr(pure_scan_ocr,'build_isolated_pdf_ocr_derivative',lambda *a,**k:derivative)
+    result=prepare_pure_scan_ocr(b'%PDF-parent-bytes',safety_verified=True,enabled=True)
+    assert result.status=='ocr_failed'
+    assert result.parent is None and result.derivative is None
+
+
 def test_ocr_identity_matches_given_name_surname_to_initialled_byline() -> None:
     result = validate_ocr_derivative_text(
         "Rejecting the Center: Radical Grassroots Politics in the 1970s — "
@@ -165,5 +182,6 @@ def test_ocr_identity_matches_given_name_surname_to_initialled_byline() -> None:
         page_count=17,
     )
 
-    assert result.accept
-    assert result.identity_confidence == "high"
+    # Surname remains a supporting signal, not evidence of title prominence.
+    assert not result.accept
+    assert result.identity_confidence == "medium"

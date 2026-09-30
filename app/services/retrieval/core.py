@@ -13,9 +13,11 @@ import time
 
 import httpx
 
-from app.config import settings
+from app.services.processing_metrics import record_provider_request
+from app.config import secret_value, settings
 from app.log_safety import safe_exception_code
-from app.services.retrieval.base import AcquisitionLocation, RepresentationKind, RetrievalSource, RetrievalResult
+from app.services.retrieval.base import SCHOLARLY_PAPER_KINDS, AcquisitionLocation, RepresentationKind, RetrievalSource, RetrievalResult
+from app.services.retrieval import shared_pacing
 from app.services.retrieval.provider_runtime import (
     ProviderHealthStore,
     ProviderPolicy,
@@ -39,11 +41,36 @@ SEARCH_URL = f"{CORE_BASE}/search/outputs/"
 #      1 ReadTimeout @ 21s.
 # So we need BOTH rate-limiting AND full serialization. Holding the lock for
 # the whole request (not just the start) makes CORE calls strictly serial; the
-# min-interval wait inside the lock keeps us under the per-window quota.
+# interval wait inside the lock keeps us under the per-window quota.
+#
+# Pacing follows the key's own quota (2026-09-25). CORE reports the requests
+# allowed per window (one minute: the documented tiers are 10 or 25 a minute)
+# in X-RateLimit-Limit, and puts a future X-RateLimit-Retry-After timestamp on
+# EVERY response, about 9s ahead, even with the whole quota remaining. The
+# documentation says that header matters only after the limit is hit. Obeying
+# it on every call, on top of a fixed 10s interval, held CORE to about six
+# calls a minute; it is now obeyed only when X-RateLimit-Remaining is 0 or on
+# a 429, and the interval is derived from the reported limit.
 _CORE_MAX_RETRY_WAIT_SECONDS = 15.0
+_CORE_WINDOW_SECONDS = 60.0
 _core_lock = threading.Lock()
 _core_last_request = 0.0
 _core_next_allowed_request = 0.0
+_core_quota_interval: float | None = None
+
+
+def _header_int(resp: "httpx.Response", name: str) -> int | None:
+    try:
+        return int(resp.headers.get(name))
+    except (TypeError, ValueError):
+        return None
+
+
+def _quota_interval(limit: int | None) -> float | None:
+    """Seconds between calls that stay inside the reported per-window quota."""
+    if not limit or limit <= 0:
+        return None
+    return _CORE_WINDOW_SECONDS / limit * 1.05   # a small margin for clock skew
 
 
 def _retry_wait_seconds(
@@ -69,6 +96,14 @@ def _retry_wait_seconds(
         return None
 
 
+class CoreBusy(Exception):
+    """Another worker process held CORE's one in-flight slot for too long."""
+
+
+# How long to wait for another process's CORE request before declining.
+_CORE_SHARED_WAIT_SECONDS = 60.0
+
+
 def _core_request(
     url: str,
     params: dict,
@@ -76,21 +111,33 @@ def _core_request(
     headers: dict | None = None,
     min_interval: float = 10.0,
 ) -> "httpx.Response":
-    """Make a serialized CORE request with shared response-directed pacing.
+    """Make a serialized CORE request with shared, quota-derived pacing.
 
-    CORE sends a future X-RateLimit-Retry-After timestamp on successful
-    responses as well as on 429s. A short instruction is shared by every
-    retriever in this process; the configured interval remains the fallback.
-    Longer instructions are left to the existing bounded 429 circuit rather
-    than making an application worker sleep without limit.
+    The interval between calls comes from the key's reported quota once one
+    response has been seen; `min_interval` is the fallback before that. A
+    Retry-After instruction is obeyed only when the quota is exhausted or the
+    call was refused; a short one is shared by every retriever in this process,
+    and longer ones are left to the bounded 429 circuit rather than making an
+    application worker sleep without limit.
+
+    The thread lock serializes this process; `shared_pacing` serializes and
+    paces every worker process on the same key, because CORE stalls a second
+    in-flight request and the quota belongs to the key. Without Redis the
+    process-local pacing alone applies, as before.
     """
-    global _core_last_request, _core_next_allowed_request
-    with _core_lock:
+    global _core_last_request, _core_next_allowed_request, _core_quota_interval
+    with _core_lock, shared_pacing.exclusive(
+            "core", hold_seconds=timeout + 10, wait_seconds=_CORE_SHARED_WAIT_SECONDS) as held:
+        if held is False:
+            raise CoreBusy("CORE busy in another worker")
         now = time.monotonic()
+        interval = _core_quota_interval if _core_quota_interval is not None else min_interval
+        shared_wait = shared_pacing.reserve_start("core", interval) or 0.0
         wait = max(
             0.0,
-            min_interval - (now - _core_last_request),
+            interval - (now - _core_last_request),
             _core_next_allowed_request - now,
+            shared_wait,
         )
         if wait > 0:
             time.sleep(wait)
@@ -102,43 +149,96 @@ def _core_request(
             timeout=timeout,
             follow_redirects=True,
         )
-        directed_wait = _retry_wait_seconds(resp)
+        reported = _quota_interval(_header_int(resp, "X-RateLimit-Limit"))
+        if reported is not None:
+            _core_quota_interval = reported
+        exhausted = resp.status_code == 429 or _header_int(resp, "X-RateLimit-Remaining") == 0
+        directed_wait = _retry_wait_seconds(resp) if exhausted else None
         if directed_wait is not None and directed_wait <= _CORE_MAX_RETRY_WAIT_SECONDS:
             _core_next_allowed_request = max(
                 _core_next_allowed_request,
                 time.monotonic() + directed_wait,
             )
+            shared_pacing.defer("core", directed_wait)
         return resp
 
 
-def _build_title_query(title: str, author: str | None) -> str:
-    """Build a CORE title search query using the syntax that actually works.
+# Punctuation other than in-word apostrophes and hyphens is removed from the
+# quoted phrase: a colon inside it (a subtitle separator) made CORE answer
+# HTTP 500 (measured 2026-09-25), and the phrase match ignores punctuation.
+_PHRASE_UNSAFE = re.compile(r"[^\w\s'’-]")
+_MAX_TITLE_WORDS = 6
 
-    Empirically validated (Aug 12): CORE's `q` default-field AND semantics work
-    well, but `title:"..."` (quoted phrase under the title: field) broadens
-    catastrophically — `title:"New Media Giants"` returns ~7.5M hits and times
-    out under load, while the default-field form `New Media Giants Croteau`
-    returns 2 hits. Quotes appear to disable the field filter rather than
-    enforce a phrase. So: use the default field, AND the significant title
-    tokens, and append the author surname when available for triangulation.
+
+def _author_clause(author: str | None) -> str:
+    """`authors:<surname>`, quoted when the surname has more than one word."""
+    surname = (author or "").split(",")[0].strip()
+    surname = " ".join(re.findall(r"[^\W\d_]+(?:['’-][^\W\d_]+)*", surname))
+    if not surname:
+        return ""
+    return f'authors:"{surname}"' if " " in surname else f"authors:{surname}"
+
+
+def _title_queries(title: str, author: str | None) -> list[str]:
+    """CORE title queries, most exact first (measured 2026-09-25).
+
+    Without a field name CORE searches every field, full text included, and
+    matches ANY of the words: the former default-field query matched 11-31
+    million records for well-known titles, ran slowly enough to hit our read
+    timeout, and put keyword coincidences ("... Reproducibility Project") in
+    the five results kept, so the relevance filter then rejected them all. A
+    quoted title under the title field is an exact phrase and returned only
+    the right record; the earlier note that it "broadens catastrophically" no
+    longer holds. A phrase misses a slightly misquoted title, so the fallback
+    requires each significant title word in the title field instead, which
+    still found the right record for a misquoted title.
     """
-    toks = [w for w in re.split(r"[^A-Za-z0-9]+", title) if len(w) >= 4]
-    parts = toks[:6]  # cap to avoid over-constraining short titles
-    if author:
-        surname = author.split(",")[0].strip()
-        if surname:
-            parts.append(surname)
-    return " ".join(parts) if parts else title
+    author_clause = _author_clause(author)
+    phrase = " ".join(_PHRASE_UNSAFE.sub(" ", title or "").split())
+    words = [w for w in re.findall(r"\w+", title or "") if len(w) >= 4 and not w.isdigit()]
+    queries = []
+    if phrase:
+        queries.append(" AND ".join(part for part in (f'title:"{phrase}"', author_clause) if part))
+    if len(words) >= 2 or (words and author_clause):
+        clauses = [f"title:{w}" for w in words[:_MAX_TITLE_WORDS]]
+        queries.append(" AND ".join(clauses + ([author_clause] if author_clause else [])))
+    return list(dict.fromkeys(queries))
 
+
+# A call the app declined to make. Distinct from any outcome of a real request.
+PROVIDER_SKIPPED_ERROR = "provider_call_skipped"
 
 
 class CoreRetriever(RetrievalSource):
+    # Broad open-access aggregator covering repositories the indexes miss. It
+    # augments Crossref and OpenAlex, the main article sources; a failed CORE
+    # search does not make a search incomplete (owner decision 2026-09-29).
+    required_for_search_completion = False
     name = "core"
-    capabilities = frozenset({"doi", "batch_doi", "title_author", "metadata", "oa_link"})
+    # Open-access repositories: papers, reports and theses, not books.
+    supported_source_kinds = SCHOLARLY_PAPER_KINDS
+    capabilities = frozenset({"doi", "batch_doi", "title_author", "metadata", "oa_link", "metadata_only_search"})
     documentation_url = "https://api.core.ac.uk/docs/v3"
     default_policy = ProviderPolicy(
-        timeout_seconds=8.0,
-        min_interval_seconds=10.0,
+        # Measured 2026-09-21 by running Stardom at both values, with the former
+        # unfielded query (see _title_queries): CORE answered a
+        # title/author search in 6.7-10.4s (n=4, median 8.1s); an 8.0s budget
+        # sits inside that distribution, so half the calls time out, three
+        # timeouts open the circuit and the rest of the run is skipped.
+        # The paired runs cost CORE 80.8s at 8.0s against 120.2s at 20.0s — a
+        # difference of 39 seconds, which buys a required corroboration route
+        # that actually answers. The wall-time regression first blamed on this
+        # setting was mostly web-search variance, not CORE.
+        # The labelled-corpus run of 2026-09-25 measured the fielded queries at
+        # 1.6s median and 4.7s p95 per call, with no timeouts; 20s stays as a
+        # hang bound only. The same run showed CORE's quota is a 150-request
+        # bucket (X-RateLimit-Remaining fell to 29 with no 429) whose
+        # retry-after moves about 4-5s ahead per request, which `_core_request`
+        # obeys once the bucket is empty. A 10s fallback pace before the first
+        # quota header made four concurrent processes wait up to 64s for
+        # nothing; 1s is the fallback now.
+        timeout_seconds=20.0,
+        min_interval_seconds=1.0,
         batch_size=5,
         cooldown_seconds=300,
         max_consecutive_failures=2,
@@ -167,7 +267,9 @@ class CoreRetriever(RetrievalSource):
             "cooldown_seconds": 0,
             "rate_limit_limit": None,
             "rate_limit_remaining": None,
+            "busy_skips": 0,
         }
+        self._last_skip: str | None = None
 
     def _record_rate_limit_headers(self, resp: httpx.Response) -> None:
         for header, metric in (
@@ -193,7 +295,13 @@ class CoreRetriever(RetrievalSource):
         if self._health_store.cooldown_remaining(self.name) > 0:
             self.provider_metrics["cooldown_skips"] += 1
             return None
-        resp = self._send(params)
+        try:
+            resp = self._send(params)
+        except CoreBusy:
+            # Not a CORE failure and not a timeout: our own workers were busy.
+            self.provider_metrics["busy_skips"] += 1
+            self._last_skip = "busy"
+            return None
         self._record_rate_limit_headers(resp)
         if resp.status_code == 429:
             wait = self._retry_wait_seconds(resp)
@@ -214,7 +322,7 @@ class CoreRetriever(RetrievalSource):
 
     def _send(self, params: dict) -> httpx.Response:
         """Perform one serialized request and update timeout health state."""
-        self.provider_metrics["calls"] += 1
+        sent = True
         try:
             resp = _core_request(
                 SEARCH_URL,
@@ -251,15 +359,32 @@ class CoreRetriever(RetrievalSource):
         except httpx.HTTPError:
             self.provider_metrics["network_errors"] += 1
             raise
+        except CoreBusy:
+            sent = False   # declined before any request left this worker
+            raise
+        finally:
+            if sent:
+                self.provider_metrics["calls"] += 1
+                record_provider_request("core")
         self._consecutive_timeouts = 0
         if resp.status_code != 429:
             self._health_store.record_success(self.name)
         return resp
 
     def _circuit_error(self) -> str:
+        """Report a skipped call as a skip, never as a timeout.
+
+        No request is made once the circuit or cooldown is open, so the trace
+        must not record a timeout the app never waited for. The marker below is
+        classified as `cooldown_skipped`; the word "timeout" is deliberately
+        absent, because the outcome classifier matches error text.
+        """
+        if self._last_skip == "busy" and not (self._timeout_circuit_open or self._rate_limited):
+            self._last_skip = None
+            return f"{PROVIDER_SKIPPED_ERROR}: CORE busy in another worker"
         if self._timeout_circuit_open or self.provider_metrics["cooldown_skips"]:
-            return "CORE timeout circuit/cooldown is open"
-        return "Rate limited (429); circuit open"
+            return f"{PROVIDER_SKIPPED_ERROR}: CORE circuit open after repeated slow responses"
+        return f"{PROVIDER_SKIPPED_ERROR}: CORE rate limited (429)"
 
     @staticmethod
     def _normalize_doi(doi: str) -> str:
@@ -313,7 +438,7 @@ class CoreRetriever(RetrievalSource):
 
     def _headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {settings.CORE_API_KEY}",
+            "Authorization": f"Bearer {secret_value(settings.CORE_API_KEY)}",
             "User-Agent": f"SourceFidelity/{settings.APP_VERSION}",
         }
 
@@ -357,29 +482,41 @@ class CoreRetriever(RetrievalSource):
                 source_name=self.name, success=False, error="No CORE_API_KEY configured"
             )
         try:
-            # Use the query form that actually works on v3 (see _build_title_query):
-            # default-field AND of significant title words + author surname.
-            # The old `title:"{title}"` form broadened to millions of hits and
-            # timed out under load.
-            q = _build_title_query(title, author)
-            params = {"q": q, "limit": 5}
-            resp = self._request(params)
-            if resp is None:
-                return RetrievalResult(
-                    source_name=self.name,
-                    success=False,
-                    error=self._circuit_error(),
-                )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                return RetrievalResult(source_name=self.name, success=False, error="No results")
-
             from app.services.relevance import score_relevance
+            from app.services.reference_review_scope import screen_metadata
+            # Exact title phrase first; the word-by-word title query only when
+            # the phrase found nothing relevant (see _title_queries).
+            outputs: list[dict] = []
+            seen: set = set()
+            for q in _title_queries(title, author):
+                resp = self._request({"q": q, "limit": 5})
+                if resp is None:
+                    if outputs:
+                        break   # judge what was already returned
+                    return RetrievalResult(
+                        source_name=self.name,
+                        success=False,
+                        error=self._circuit_error(),
+                    )
+                resp.raise_for_status()
+                results = resp.json().get("results")
+                if not isinstance(results, list) or any(not isinstance(output, dict) for output in results):
+                    raise ValueError("Invalid CORE result list")
+                fresh = [output for output in results
+                         if (output.get("id") or output.get("doi") or output.get("title")) not in seen]
+                seen.update(output.get("id") or output.get("doi") or output.get("title") for output in fresh)
+                outputs.extend(fresh)
+                if any(score_relevance(title, parsed.title or "", author, parsed.authors or []).is_relevant
+                       for parsed in map(self._parse_output, fresh)):
+                    break
+            if not outputs:
+                return RetrievalResult(source_name=self.name, success=False, error="No results",
+                    metadata={"identity_search_reason_code": "metadata_empty_response_unqualified"})
 
-            for output in results:
-                result = self._parse_output(output)
+            parsed_results = [self._parse_output(output) for output in outputs]
+            review_screen = screen_metadata(title, author, parsed_results)
+            for result in parsed_results:
+                result.metadata = {**(result.metadata or {}), 'bounded_review_screen': review_screen}
                 matched_title = result.title or ""
                 matched_authors = result.authors or []
                 rel = score_relevance(title, matched_title, author, matched_authors)
@@ -392,7 +529,10 @@ class CoreRetriever(RetrievalSource):
             return RetrievalResult(
                 source_name=self.name,
                 success=False,
-                error=f"No relevant match (top {len(results)} results were keyword coincidences)",
+                error=f"No relevant match (top {len(outputs)} results were keyword coincidences)",
+                metadata={"identity_search_result_count": len(outputs),
+                          "bounded_review_screen": review_screen,
+                          "identity_search_reason_code": "metadata_candidates_filtered"},
             )
         except Exception as e:
             error = safe_exception_code(e)

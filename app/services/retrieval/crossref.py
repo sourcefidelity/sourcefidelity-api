@@ -5,12 +5,14 @@ last resort for metadata verification, and for book lookups (editor vs
 author roles -> monograph vs edited-collection detection).
 """
 
+import html
 import logging
 
 import httpx
 
 from app.config import settings
 from app.log_safety import safe_exception_code
+from app.services.doi_cache import doi_request_segment
 from app.services.retrieval.base import (
     AcquisitionLocation,
     RepresentationKind,
@@ -18,6 +20,7 @@ from app.services.retrieval.base import (
     RetrievalSource,
 )
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
+from app.services.processing_metrics import record_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +28,11 @@ CROSSREF_BASE = "https://api.crossref.org"
 
 
 class CrossrefRetriever(RetrievalSource):
+    # A principal scholarly index. Its silence is part of what makes
+    # "not found" mean anything, so its failure must block that claim.
+    required_for_search_completion = True
     name = "crossref"
-    capabilities = frozenset({"doi", "title_author", "isbn", "metadata", "abstract", "locations"})
+    capabilities = frozenset({"doi", "title_author", "isbn", "metadata", "abstract", "locations", "metadata_only_search"})
     documentation_url = "https://api.crossref.org/swagger-ui/index.html"
     default_policy = ProviderPolicy(timeout_seconds=15.0)
 
@@ -43,6 +49,7 @@ class CrossrefRetriever(RetrievalSource):
 
     def _get(self, url: str, params: dict | None = None) -> httpx.Response:
         self.provider_metrics["calls"] += 1
+        record_provider_request("crossref")
         try:
             resp = httpx.get(
                 url,
@@ -68,11 +75,15 @@ class CrossrefRetriever(RetrievalSource):
         return {"User-Agent": f"SourceFidelity/{settings.APP_VERSION} (mailto:{email})"}
 
     def search_by_doi(self, doi: str) -> RetrievalResult:
-        url = f"{CROSSREF_BASE}/works/{doi}"
+        segment = doi_request_segment(str(doi or ""))
+        if segment is None:
+            return RetrievalResult(source_name=self.name, success=False, error="No DOI supplied")
+        url = f"{CROSSREF_BASE}/works/{segment}"
         try:
             resp = self._get(url)
             if resp.status_code == 404:
-                return RetrievalResult(source_name=self.name, success=False, error="Not found")
+                return RetrievalResult(source_name=self.name, success=False, error="Not found",
+                    metadata={"identifier_check": "not_registered", "identity_search_result_count": 0})
             resp.raise_for_status()
             data = resp.json()
             return self._parse_message(data.get("message", {}))
@@ -90,10 +101,18 @@ class CrossrefRetriever(RetrievalSource):
             resp = self._get(url, params)
             resp.raise_for_status()
             data = resp.json()
-            items = data.get("message", {}).get("items", [])
+            items = data.get("message", {}).get("items")
+            if not isinstance(items, list):
+                raise ValueError("Invalid Crossref result list")
             if not items:
-                return RetrievalResult(source_name=self.name, success=False, error="No results")
-            return self._parse_message(items[0])
+                return RetrievalResult(source_name=self.name, success=False, error="No results",
+                    metadata={"identity_search_result_count": 0} if data.get("status") == "ok" else {})
+            from app.services.reference_review_scope import screen_metadata
+            results = [self._parse_message(item) for item in items]
+            result = results[0]
+            result.metadata['bounded_review_screen'] = screen_metadata(title, author, results)
+            result.metadata['identity_search_result_count'] = len(items)
+            return result
         except Exception as e:
             error = safe_exception_code(e)
             logger.warning("Crossref title search failed (type=%s)", type(e).__name__)
@@ -127,7 +146,7 @@ class CrossrefRetriever(RetrievalSource):
         title = ""
         titles = msg.get("title", []) or []
         if titles:
-            title = titles[0]
+            title = html.unescape(str(titles[0]))
 
         year = "n.d."
         issued = msg.get("issued", {}) or {}
@@ -172,8 +191,34 @@ class CrossrefRetriever(RetrievalSource):
                 "publisher": publisher,
                 "work_type": msg.get("type"),
                 "page": msg.get("page"),
+                # The journal, volume and issue identify an article the
+                # way the publisher identifies a book. They were in the
+                # retained message but never surfaced, so every observed
+                # container and volume was empty and the comparison
+                # resolved `unknown` for want of a located value.
+                "container_title": _first_container(msg),
+                "volume": _scalar(msg.get("volume")),
+                "issue": _scalar(msg.get("issue")),
             },
         )
+
+
+def _scalar(value) -> str:
+    """Crossref scalars only; a list or object is not a volume."""
+    return value.strip() if isinstance(value, str) and len(value) <= 80 else ""
+
+
+def _first_container(msg: dict) -> str:
+    """The deposited container title, when there is exactly one.
+
+    Crossref deposits a list. More than one entry means the record is
+    ambiguous about what contains the work, which is not a value to
+    compare a student's reference against.
+    """
+    titles = msg.get("container-title")
+    if isinstance(titles, list) and len(titles) == 1:
+        return html.unescape(_scalar(titles[0]))[:1000]
+    return ""
 
 
 def _parse_full_text_links(msg: dict) -> list[AcquisitionLocation]:

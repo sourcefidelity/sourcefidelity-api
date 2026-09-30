@@ -13,8 +13,10 @@ import re
 
 import httpx
 
-from app.config import settings
+from app.config import secret_value, settings
 from app.services.book_metadata import isbn10_to_isbn13, normalize_isbn
+from app.services.bibliographic_scripts import cross_script_comparison_unresolved
+from app.services.processing_metrics import record_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,35 @@ class BookMetadataSearch:
     error_code: str | None = None
 
 
+# Exactly the fields consumed below. Keep this in step with _record_digest.
+_VOLUME_FIELDS = (
+    "totalItems,items(id,volumeInfo(title,subtitle,authors,publisher,"
+    "publishedDate,description,industryIdentifiers,pageCount,printType,"
+    "previewLink,infoLink))"
+)
+_HEADERS = {
+    # The catalog enables gzip only when the agent string advertises it.
+    "Accept-Encoding": "gzip",
+    "User-Agent": "SourceFidelity/0.1 (academic source verification) (gzip)",
+}
+_DIGEST_VOLUME_KEYS = (
+    "title", "subtitle", "authors", "publisher", "publishedDate",
+    "description", "industryIdentifiers", "pageCount", "printType",
+    "previewLink", "infoLink",
+)
+
+
+def _record_digest(item: dict, info: dict) -> str:
+    """Identify a catalog record by the fields this adapter reads."""
+    projection = {
+        "id": item.get("id"),
+        "volumeInfo": {key: info.get(key) for key in _DIGEST_VOLUME_KEYS},
+    }
+    return hashlib.sha256(
+        json.dumps(projection, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
 class GoogleBooksRetriever:
     """Search Google Books while keeping discovery separate from admission."""
 
@@ -100,11 +131,19 @@ class GoogleBooksRetriever:
             "q": query,
             "maxResults": max(1, min(max_results, 20)),
             "printType": "books",
+            # Ask for only the fields this adapter reads. The volume resource
+            # otherwise carries sale info, access flags, thumbnail URLs and
+            # search snippets that we never use but did hash, so an unrelated
+            # change on the catalog's side moved our evidence hash.
+            "fields": _VOLUME_FIELDS,
         }
         if settings.GOOGLE_BOOKS_API_KEY:
-            params["key"] = settings.GOOGLE_BOOKS_API_KEY
+            params["key"] = secret_value(settings.GOOGLE_BOOKS_API_KEY)
         try:
-            response = httpx.get(GOOGLE_BOOKS_BASE, params=params, timeout=15)
+            record_provider_request("google_books")
+            response = httpx.get(
+                GOOGLE_BOOKS_BASE, params=params, timeout=15, headers=_HEADERS
+            )
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
@@ -114,6 +153,11 @@ class GoogleBooksRetriever:
             )
             status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
             outcome = (
+                # A caller error is not a catalog outcome. One such TypeError
+                # surfaced as "no identity-compatible exact-edition page count",
+                # which reads exactly like a genuine empty answer.
+                "internal_error"
+                if isinstance(exc, (TypeError, AttributeError, NameError, ImportError)) else
                 "rate_limited" if status == 429 else
                 "access_restricted" if status in {401, 403, 451} else
                 "timeout" if isinstance(exc, httpx.TimeoutException) else
@@ -124,7 +168,7 @@ class GoogleBooksRetriever:
 
         if (not isinstance(payload, dict) or "error" in payload
                 or not isinstance(payload.get("items", []), list)
-                or (not payload.get("items") and payload.get("totalItems") != 0)):
+                or (not payload.get("items") and (type(payload.get("totalItems")) is not int or payload["totalItems"] != 0))):
             return BookMetadataSearch(query, "response_invalid", error_code="invalid_response")
 
         results: list[BookMetadata] = []
@@ -180,12 +224,24 @@ class GoogleBooksRetriever:
                     info_link=info.get("infoLink"),
                     match_confidence=confidence,
                     match_reason=reason,
-                    record_sha256=hashlib.sha256(
-                        json.dumps(item, sort_keys=True, ensure_ascii=False).encode()
-                    ).hexdigest(),
+                    # Hash a canonical projection of the fields this adapter
+                    # actually reads, not the raw payload. The hash identifies a
+                    # catalog record in findings, so it must move only when
+                    # something we rely on moves — and must not depend on the
+                    # server having honoured the `fields` request.
+                    record_sha256=_record_digest(item, info),
                 )
             )
-        rank = {"high": 3, "medium": 2, "low": 1, "none": 0}
+        # The catalog can return one volume more than once in a single response.
+        # Downstream, a repeated volume collides on its derived candidate id and
+        # invalidates the whole discovery trace, costing the reference its entire
+        # assessment. Drop the repeat here so the reported count and the reviewed
+        # records describe the same set of distinct volumes.
+        distinct: dict[str, BookMetadata] = {}
+        for result in results:
+            distinct.setdefault(result.volume_id or result.record_sha256, result)
+        results = list(distinct.values())
+        rank = {"high": 3, "medium": 2, "low": 1, "unresolved": 0, "none": 0}
         ranked = sorted(
             results,
             key=lambda result: (
@@ -264,6 +320,9 @@ def _metadata_match(
         }
         if candidate_canonical and canonical not in candidate_canonical:
             return "none", "Google Books record did not return the queried ISBN"
+
+    if cross_script_comparison_unresolved(expected_title, candidate_title):
+        return "unresolved", "cross_script_title_unresolved"
 
     title_expected = _tokens(expected_title)
     title_candidate = _tokens(candidate_title)

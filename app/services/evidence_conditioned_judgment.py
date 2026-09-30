@@ -114,6 +114,9 @@ def apply_evidence_conditioned_unit_judgment(
     artifact: VerificationEvidenceArtifact,
 ) -> VerificationEvidenceArtifact:
     """Attach segmented shadow findings without changing the final verdict."""
+    if artifact.source_identity.status != 'verified':
+        return _not_assessed(artifact, 'source_identity_unconfirmed',
+            'Source identity must be confirmed before relationship assessment.')
     if artifact.claim.granularity != "citation_unit":
         return _not_assessed(
             artifact,

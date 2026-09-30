@@ -73,6 +73,17 @@ def test_ocr_derivative_validation_rejects_altered_content(monkeypatch) -> None:
         validate_ocr_derivative(replace(derivative, content=derivative.content + b"changed"))
 
 
+def test_ocr_budget_rejects_before_raster_allocation(monkeypatch) -> None:
+    monkeypatch.setattr(ocr_derivative, "_tesseract_version", lambda _: "test")
+    raw = _one_page_pdf()
+    def forbidden_render(*args, **kwargs):
+        pytest.fail("Over-budget raster must not be allocated")
+    monkeypatch.setattr(fitz.Page, "get_pixmap", forbidden_render)
+    for bounds in [{"max_pixels_per_page": 1}, {"max_total_pixels": 1}]:
+        with pytest.raises(OcrDerivativeError, match="OCR bound"):
+            build_local_pdf_ocr_derivative(raw, **bounds)
+
+
 def test_ocr_derivative_rejects_unvalidated_language() -> None:
     with pytest.raises(OcrDerivativeError, match="English"):
         build_local_pdf_ocr_derivative(_one_page_pdf(), language="chi_sim")

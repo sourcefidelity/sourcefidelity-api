@@ -49,6 +49,15 @@ _FULL_PAGE_IMAGE_THRESHOLD = 0.90
 # If this fraction of sampled pages have substantial text, the PDF has a text layer.
 _HAS_TEXT_FRACTION = 0.5
 
+# A scan can have a searchable rights footer while the article remains an
+# image. Discount only this complete, known notice for quality assessment;
+# never alter retained/extracted source text or treat general repetition as noise.
+_RIGHTS_NOTICE = re.compile(
+    r"reproduced with permission of the copyright owner\.\s*"
+    r"further reproduction prohibited without permission\.",
+    re.IGNORECASE,
+)
+
 # Text-quality verdict constants.
 PURE_SCAN = "pure_scan"      # No text layer — unusable without OCR.
 SCAN_OCR = "scan_ocr"        # Text layer over full-page images — OCR may have errors.
@@ -98,9 +107,7 @@ def classify_text_quality(file_bytes: bytes, sample_size: int = 8) -> TextQualit
             page_area = rect.width * rect.height
 
             # Text presence
-            text_len = len(page.get_text().strip())
-            if text_len > 50:  # substantial text, not stray artifacts
-                text_pages += 1
+            page_text = page.get_text().strip()
 
             # Image coverage
             img_area = 0.0
@@ -110,7 +117,13 @@ def classify_text_quality(file_bytes: bytes, sample_size: int = 8) -> TextQualit
                         img_area = max(img_area, abs(r.width * r.height))
                 except Exception:
                     pass
-            coverages.append(img_area / page_area if page_area else 0.0)
+            coverage = img_area / page_area if page_area else 0.0
+            coverages.append(coverage)
+            quality_text = page_text
+            if coverage >= _FULL_PAGE_IMAGE_THRESHOLD:
+                quality_text = _RIGHTS_NOTICE.sub("", quality_text).strip()
+            if len(quality_text) > 50:
+                text_pages += 1
     finally:
         doc.close()
 
@@ -247,7 +260,8 @@ def _analyze_page_blocks(page) -> tuple[bool, bool]:
     right_threshold = mid_x + pad
 
     try:
-        d = page.get_text("dict")
+        # This check consumes text geometry only, not decoded image payloads.
+        d = page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)
     except Exception:
         return False, False
 

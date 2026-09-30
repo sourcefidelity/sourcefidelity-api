@@ -9,6 +9,7 @@ from app.services.retrieval.base import RetrievalResult
 from app.services.retrieval.google_books import GoogleBooksRetriever
 from app.services.schemas import ParsedReference
 from app.services.source_resolver import SourceResolver, SourceResolutionError
+from app.services.bibliographic_scripts import cross_script_comparison_unresolved
 
 
 def _volume(year="1983", identifiers=True):
@@ -21,6 +22,59 @@ def _volume(year="1983", identifiers=True):
     if identifiers:
         info["industryIdentifiers"] = [{"identifier": "0306406152", "type": "ISBN_10"}]
     return {"id": "volume-" + year, "volumeInfo": info}
+
+
+@pytest.mark.parametrize("left,right,unresolved", [
+    ("Economic history", "经济史", True),
+    ("Economic history 2013", "经济史 2013", True),
+    ("Istoriya", "История", True),
+    ("Logos", "λόγος", True),
+    ("Ｈｉｓｔｏｒｙ", "History", False),
+    ("History", "Unrelated chemistry", False),
+    ("经济史", "经济史", False),
+    ("", "经济史", False),
+    ("123", "经济史", False),
+    ("经济史 Economic history", "Economic history", False),
+])
+def test_script_comparability_is_not_translation(left, right, unresolved):
+    assert cross_script_comparison_unresolved(left, right) is unresolved
+
+
+@pytest.mark.parametrize("author,year", [("Alex Morgan", "1984"), ("Different Writer", "2020")])
+def test_cross_script_metadata_is_unknown_not_confirmed_or_exhausted(monkeypatch, author, year):
+    volume = _volume(year)
+    volume['volumeInfo'].update(title="电影史", subtitle=None, authors=[author])
+    resolver, reference, _, _ = _setup(monkeypatch, {"items": [volume]})
+    reference.source_kind = 'monograph'
+    result = resolver.resolve_reference(reference)
+    candidate = result.metadata['reference_discovery']['candidates'][0]
+    title = next(c for c in candidate['comparisons'] if c['field_name'] == 'title')
+    assert title['outcome'] == 'unknown'
+    assert title['reason_code'] == 'cross_script_title_unresolved'
+    assert candidate['acquisition_outcome'] == 'metadata_only'
+    assert candidate['disposition_reason_code'] == 'cross_script_title_unresolved'
+    assert not candidate['plausible_identity_match']
+    assert result.metadata['reference_discovery']['outcome'] == 'search_incomplete'
+    assert not result.success and result.full_text is None
+
+
+def test_same_script_title_mismatch_still_rejected(monkeypatch):
+    volume = _volume()
+    volume['volumeInfo'].update(title="Quantum chemistry methods", subtitle=None)
+    resolver, reference, _, _ = _setup(monkeypatch, {"items": [volume]})
+    reference.source_kind = 'monograph'
+    result = resolver.resolve_reference(reference)
+    candidate = result.metadata['reference_discovery']['candidates'][0]
+    assert candidate['acquisition_outcome'] == 'identity_rejected'
+
+
+def test_cross_script_does_not_override_conflicting_isbn():
+    from app.services.retrieval.google_books import _metadata_match
+    confidence, _ = _metadata_match(identifiers=('9787508077550',),
+        candidate_title='电影史', candidate_authors=[], candidate_publisher=None,
+        candidate_date=None, expected_isbn='9780306406157', expected_title='Film history',
+        expected_author=None, expected_publisher=None, expected_year=None)
+    assert confidence == 'none'
 
 
 def _setup(monkeypatch, payload=None):
@@ -73,6 +127,66 @@ def test_alternate_publication_years_remain_separate_candidates(monkeypatch):
     assert len({c["candidate_id"] for c in record["candidates"]}) == 2
     assert {c["observed"]["year"] for c in record["candidates"]} == {"1983", "1984"}
     assert not record["contributes_to_neutral_pattern"]
+
+
+@pytest.mark.parametrize('mode', ['positive', 'single', 'duplicate', 'rejected', 'matching', 'multiple', 'stale', 'hash', 'unpermitted'])
+def test_catalog_year_discrepancy_is_separate_from_edition_identity(monkeypatch, mode):
+    from copy import deepcopy
+    from app.services.reference_formatting import book_publication_year_discrepancy
+    years = ['1983','1982'] if mode == 'multiple' else ['1984'] if mode == 'matching' else ['1983']
+    volumes = [_volume(y) for y in years]
+    if mode != 'single':
+        second = deepcopy(volumes[0])
+        second['id'] += '-independent-volume'
+        volumes.append(second)
+    resolver, reference, _, _ = _setup(monkeypatch, {'items':volumes})
+    reference.source_kind = 'monograph'
+    record = resolver.resolve_reference(reference).metadata['reference_discovery']
+    if mode == 'duplicate': record['candidates'][1]['edition_metadata'] = deepcopy(record['candidates'][0]['edition_metadata'])
+    if mode == 'stale': reference.year = '2000'
+    if mode == 'hash': record['candidates'][0]['comparisons'][1]['expected_sha256'] = '0'*64
+    if mode == 'unpermitted': record['attempts'][0]['permitted'] = False
+    if mode == 'rejected': record['candidates'][0]['acquisition_outcome'] = 'identity_rejected'
+    before = deepcopy(record)
+    finding = book_publication_year_discrepancy(reference, record)
+    assert bool(finding) == (mode == 'positive')
+    assert record == before
+    if finding:
+        assert finding['field_difference'] == {'field_name':'year', 'submitted_value':'1984', 'located_value':'1983'}
+        assert finding['exact_edition_established'] is False
+        assert record['outcome'] == 'possible_match'
+
+
+@pytest.mark.parametrize('damage', [None, 'rejected', 'stale', 'unpermitted'])
+def test_only_credible_matching_year_neutralizes_other_edition_notice(monkeypatch, damage):
+    from app.services.evidence_report import _identity_view
+    resolver, reference, _, _ = _setup(monkeypatch, {'items':[_volume('1983'),_volume('1984')]})
+    record=resolver.resolve_reference(reference).metadata['reference_discovery']
+    candidate=next(c for c in record['candidates'] if c['observed']['year']=='1984')
+    if damage=='rejected': candidate['acquisition_outcome']='identity_rejected'
+    if damage=='stale': next(c for c in candidate['comparisons'] if c['field_name']=='title')['expected_sha256']='0'*64
+    if damage=='unpermitted': record['attempts'][0]['permitted']=False
+    assert _identity_view(record)['edition_year_unresolved'] == bool(damage)
+
+
+@pytest.mark.parametrize('damage',[None,'author','hash','unrelated','not_catalog'])
+def test_catalog_short_main_title_with_submitted_year_prevents_false_year_flag(monkeypatch,damage):
+    from copy import deepcopy
+    from app.services.reference_formatting import book_publication_year_discrepancy
+    old=_volume('1983');old['volumeInfo']['title']='The Cinema History'
+    second=deepcopy(old);second['id']='second-1983'
+    matching=_volume('1984');matching['volumeInfo'].update(title='Cinema History',subtitle=None)
+    if damage=='author':matching['volumeInfo']['authors']=['Different Writer']
+    if damage=='unrelated':matching['volumeInfo']['title']='Another Cinema Book'
+    resolver,reference,_,_=_setup(monkeypatch,{'items':[old,second,matching]})
+    reference.source_kind='monograph';reference.title='The Cinema History: A history of the screen'
+    record=resolver.resolve_reference(reference).metadata['reference_discovery']
+    c=next(c for c in record['candidates'] if c['observed']['year']=='1984')
+    if damage=='hash':next(x for x in c['comparisons'] if x['field_name']=='title')['expected_sha256']='0'*64
+    if damage=='not_catalog':c['disposition_reason_code']='source_identity_rejected'
+    original=deepcopy(record)
+    assert bool(book_publication_year_discrepancy(reference,record))==bool(damage)
+    assert record==original
 
 
 def test_same_observed_isbn_can_bind_year_conflict(monkeypatch):

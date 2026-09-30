@@ -9,12 +9,14 @@ import httpx
 
 from app.services.relevance import extract_surnames, score_relevance
 from app.services.retrieval.base import (
+    BOOK_SOURCE_KINDS,
     RepresentationKind,
     RetrievalResult,
     RetrievalSource,
     SourceRepresentation,
 )
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
+from app.services.processing_metrics import record_provider_request
 
 logger = logging.getLogger(__name__)
 _DEFAULT_LANGS = ("en", "fr", "de", "zh", "es", "it", "ru", "ja", "pt", "ar")
@@ -25,6 +27,10 @@ _NON_CONTENT_PREFIXES = ("author:", "index:", "page:", "category:", "template:",
 
 
 class WikisourceRetriever(RetrievalSource):
+    # Unchanged for now, as for Gutenberg.
+    required_for_search_completion = True
+    # Public-domain book texts. The year bound lives in the resolver.
+    supported_source_kinds = BOOK_SOURCE_KINDS
     name = "wikisource"
     capabilities = frozenset({"title_search", "full_text", "public_domain", "multilingual"})
     documentation_url = "https://www.mediawiki.org/wiki/API:Action_API"
@@ -69,6 +75,7 @@ class WikisourceRetriever(RetrievalSource):
         self, lang: str, title: str, author: str | None, query: str
     ) -> RetrievalResult:
         endpoint = f"https://{lang}.wikisource.org/w/api.php"
+        record_provider_request("wikisource")
         response = httpx.get(
             endpoint,
             params={
@@ -125,6 +132,7 @@ class WikisourceRetriever(RetrievalSource):
 
     def _fetch_rendered_page(self, lang: str, page_title: str) -> tuple[str, str] | None:
         endpoint = f"https://{lang}.wikisource.org/w/api.php"
+        record_provider_request("wikisource")
         response = httpx.get(
             endpoint,
             params={

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report mockup 01 — citation metadata highlights</title>
+  <style>
+    :root {
+      --blue: #1e67ff;
+      --teal: #0aa2a7;
+      --amber: #cc7e00;
+      --brown: #8e5a2c;
+      --gray: #6b7280;
+      --line: #dce3ef;
+      --panel: #ffffff;
+      --paper: #ffffff;
+      --text: #111827;
+      --muted: #64748b;
+      --shadow: 0 16px 34px rgba(17, 24, 39, 0.08);
+      --font: "Merriweather", "Times New Roman", serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: linear-gradient(180deg, #f5f8ff 0, #edf2fc 100%); font-family: var(--font); color: var(--text); }
+    .report { max-width: 1520px; margin: 16px auto; padding: 0 14px 14px; display: grid; gap: 10px; }
+    .panel { border: 1px solid var(--line); }
+    .header { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--panel); box-shadow: var(--shadow); display: grid; gap: 8px; }
+    .header h1 { margin: 0; font-size: 1.1rem; }
+    .sub { color: var(--muted); font-size: .92rem; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      border: 1px solid var(--line);
+      background: white;
+      border-radius: 9px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font-weight: 600;
+      color: #0f172a;
+    }
+    button.active { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
+    .legend { display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 8px; }
+    .key { display: flex; gap: 7px; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 6px 9px; background: #fff; font-size: .82rem; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+    .blue { background: var(--blue); }
+    .teal { background: var(--teal); }
+    .amber { background: var(--amber); }
+    .brown { background: var(--brown); }
+    .gray { background: var(--gray); }
+    .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .summary-card { background: #f9fbff; border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+    .summary-card .label { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .02em; font-weight: 700; }
+    .summary-card .value { display: block; margin-top: 4px; font-size: 1.14rem; font-weight: 700; }
+    .note { border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: #fff; }
+    .note .gauge { margin-top: 8px; }
+    .gauge-track { height: 9px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
+    .gauge-fill { height: 100%; width: 74%; background: linear-gradient(90deg, #9dbbff, #4f8cff); border-radius: 999px; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 10px;
+      min-height: calc(100vh - 250px);
+    }
+    .paper, .side {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .paper-toolbar, .side-toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8fafc;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .paper-body, .side-body { padding: 12px; overflow: auto; line-height: 1.72; }
+    .paper-page { border: 1px solid #e5e7eb; border-radius: 10px; margin-bottom: 11px; padding: 10px; }
+    .paper-page h2 { margin: 0 0 8px; font-size: 1.05rem; }
+    .citation {
+      border-radius: 7px;
+      padding: 0 2px;
+      font-style: normal;
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+    }
+    .citation.full { background: #dbeafe; }
+    .citation.limited { background: #d0f2f3; }
+    .citation.review { background: #fde68a; }
+    .citation.unavailable { background: #f3f4f6; }
+    .citation-token { border-radius: 5px; padding: 0 2px; font-weight: 700; }
+    .citation-token.author { background: rgba(30, 103, 255, 0.15); }
+    .citation-token.year { background: rgba(10, 162, 167, 0.16); }
+    .citation-token.page { background: rgba(204, 126, 0, 0.18); }
+    .tag {
+      border-radius: 999px;
+      border: 1px solid #d1d5db;
+      font-size: .72rem;
+      padding: 1px 7px;
+      margin-left: 6px;
+      background: #fff;
+      font-weight: 700;
+    }
+    .tag.full { background: #dbeafe; color: #1d4ed8; }
+    .tag.limited { background: #ccfbf1; color: #0f766e; }
+    .tag.review { background: #fef9c3; color: #92400e; }
+    .tag.unavailable { background: #f3f4f6; color: #475569; }
+
+    .member { border: 1px solid #dbe3ef; border-radius: 10px; padding: 10px; background: #fff; margin-bottom: 9px; }
+    .member h3 { margin: 0 0 5px; }
+    .muted { color: var(--muted); font-size: .84rem; }
+    .meter { margin-top: 8px; border-radius: 999px; background: #e5e7eb; height: 8px; overflow: hidden; }
+    .meter>span { display: block; height: 100%; }
+    .meter.full > span { background: linear-gradient(90deg, #93c5fd, #2563eb); }
+    .meter.limited > span { background: linear-gradient(90deg, #67e8f9, #0ea5a4); }
+    .meter.review > span { background: linear-gradient(90deg, #fcd34d, #d97706); }
+    .meter.unavailable > span { background: linear-gradient(90deg, #e5e7eb, #94a3b8); }
+    .student-only { display: inline; }
+    .instructor-only { display: none; }
+    body.mode-instructor .student-only { display: none; }
+    body.mode-instructor .instructor-only { display: inline; }
+
+    @media (max-width: 1200px) {
+      .layout { grid-template-columns: 1fr; }
+      .summary, .legend { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 760px) {
+      .legend { grid-template-columns: 1fr 1fr; }
+      .summary { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body class="mode-student">
+  <div class="report">
+    <header class="header panel">
+      <h1>Student paper report mockup 01</h1>
+      <div class="sub">Paper: “Adaptive infrastructure priorities in transit-dependent cities” · References: 4 · Checked citations: 12</div>
+      <div class="controls">
+        <button class="active" data-layer="split">Split</button>
+        <button data-layer="paper-only">Paper only</button>
+        <button data-layer="panel-only">Evidence panel only</button>
+        <button class="audience active" data-audience="student">Student view</button>
+        <button class="audience" data-audience="instructor">Instructor view</button>
+      </div>
+      <div class="summary">
+        <div class="summary-card"><span class="label">Full reference</span><span class="value">7</span></div>
+        <div class="summary-card"><span class="label">Coverage limited</span><span class="value">3</span></div>
+        <div class="summary-card"><span class="label">No clear passage</span><span class="value">1</span></div>
+        <div class="summary-card"><span class="label">Overall coverage</span><span class="value">74%</span></div>
+      </div>
+      <div class="legend">
+        <div class="key"><span class="dot blue"></span>Full reference</div>
+        <div class="key"><span class="dot teal"></span>Limited</div>
+        <div class="key"><span class="dot amber"></span>Needs attention</div>
+        <div class="key"><span class="dot brown"></span>No clear matching passage</div>
+        <div class="key"><span class="dot gray"></span>Unavailable / incomplete search</div>
+      </div>
+      <div class="note">
+        <strong>Adaptation change:</strong> citation brackets now carry author/year/page highlights in color, while each source card remains the report-style evidence-group structure.
+        <div class="gauge"><div class="gauge-track"><div class="gauge-fill"></div></div></div>
+      </div>
+    </header>
+
+    <div class="layout" id="layout">
+      <main class="paper panel">
+        <div class="paper-toolbar"><div><strong>Paper</strong></div><div class="muted">Page 1 · citation metadata highlights</div></div>
+        <article class="paper-body">
+          <section class="paper-page">
+            <h2>Introduction</h2>
+            <p>
+              Transit-oriented infrastructure planning can reduce congestion only when maintenance sequencing is stable across budget cycles.
+              This is reflected in <span class="citation full">(
+              <span class="citation-token author">Baker</span>,
+              <span class="citation-token year">2019</span>,
+              <span class="citation-token page">p. 24–26</span>)
+              <span class="tag full">full-reference</span>.
+            </p>
+            <p>
+              In mixed governance settings, public utilities perform better when financing and maintenance oversight are jointly governed.
+              See <span class="citation full">(
+              <span class="citation-token author">Chen</span>,
+              <span class="citation-token year">2021</span>,
+              <span class="citation-token page">p. 41</span>) <span class="tag full">covered</span>.
+            </p>
+          </section>
+          <section class="paper-page">
+            <h2>Method and findings</h2>
+            <p>
+              The student writes that procurement incentives always improve service reliability. The cited evidence is only partial:
+              <span class="citation limited">(
+              <span class="citation-token author">Diaz</span>,
+              <span class="citation-token year">2020</span>,
+              <span class="citation-token page">pp. 85–87</span>) <span class="tag limited">coverage-limited</span>.
+            </p>
+            <p>
+              A claim references maintenance records without a locator chain:
+              <span class="citation review">(
+              <span class="citation-token author">Wang</span>,
+              <span class="citation-token year">2022</span>,
+              <span class="citation-token page">missing locator</span>) <span class="tag review">no clear matching passage</span>.
+            </p>
+            <p>
+              A 2024 source is not in the accepted source set and appears unavailable:
+              <span class="citation unavailable">(
+              <span class="citation-token author">Rossi</span>,
+              <span class="citation-token year">2024</span>,
+              <span class="citation-token page">p. 6</span>) <span class="tag unavailable">unavailable</span>.
+            </p>
+          </section>
+        </article>
+      </main>
+
+      <aside class="side panel">
+        <div class="side-toolbar"><div><strong>Evidence panel</strong></div><div class="muted">Relevance + coverage by source</div></div>
+        <div class="side-body">
+          <div class="member">
+            <h3>Baker (2019) · Ref-001</h3>
+            <div class="muted">Relevance: full-reference · 6/7 citation slots covered</div>
+            <div class="meter full"><span style="width: 86%;"></span></div>
+            <div class="muted" style="margin-top: 6px;">Coverage: 12 claims checked</div>
+          </div>
+          <div class="member">
+            <h3>Chen (2021) · Ref-002</h3>
+            <div class="muted">Relevance: full-reference · 5/6 citation slots covered</div>
+            <div class="meter full"><span style="width: 83%;"></span></div>
+            <div class="muted" style="margin-top: 6px;">Coverage: 10 claims checked</div>
+          </div>
+          <div class="member">
+            <h3>Diaz (2020) · Ref-014</h3>
+            <div class="muted">Relevance: coverage-limited · wording diverges on two clauses</div>
+            <div class="meter limited"><span style="width: 42%;"></span></div>
+            <div class="muted" style="margin-top: 6px;">Coverage: 7 claims checked</div>
+          </div>
+          <div class="member">
+            <h3>Wang (2022) · Ref-008</h3>
+            <div class="muted">Relevance: no clear matching passage</div>
+            <div class="meter review"><span style="width: 28%;"></span></div>
+            <div class="muted" style="margin-top: 6px;">Coverage: locator gap</div>
+          </div>
+          <div class="member">
+            <h3>Rossi (2024) · Ref-041</h3>
+            <div class="muted">Relevance: unavailable in accepted source set</div>
+            <div class="meter unavailable"><span style="width: 0%;"></span></div>
+            <div class="muted" style="margin-top: 6px;">Coverage: 0/0</div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const body = document.body;
+    document.querySelectorAll('[data-audience]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const audience = btn.getAttribute('data-audience');
+        body.className = (audience === 'instructor') ? 'mode-instructor' : 'mode-student';
+        document.querySelectorAll('[data-audience]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+    // Layout controls intentionally static in this static mock.
+  </script>
+</body>
+</html>

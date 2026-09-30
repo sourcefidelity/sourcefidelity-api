@@ -17,6 +17,27 @@ from app.services.evidence_report_refresh import refresh_evidence_report_project
 from app.services.paper_extraction import extract_paper_evidence
 
 
+@pytest.mark.parametrize('changed',['scope','claim','binding','source','extraction','digest'])
+def test_reassessment_replacement_rejects_changed_boundaries(changed):
+    from app.services.evidence_report_refresh import _validate_verification_replacement
+    from app.services.verification_report import _payload_digest
+    payload={'claim':{'text':'Exact claim'},'source_binding':{'reference_id':'r'},
+        'source_identity':{'representation_id':'rep','content_sha256':'hash','canonical_work_id':'work'},
+        'authoritative_evidence_package':{'extracted_text_sha256':'text-hash','extraction_version':'v1'}}
+    old=SimpleNamespace(scope_type='personal_owner',scope_id='owner',paper_version_id='p',
+        report_payload=payload,evidence_sha256=_payload_digest(payload))
+    new=deepcopy(old);job=SimpleNamespace(scope_type='personal_owner',scope_id='owner',paper_version_id='p')
+    _validate_verification_replacement(old,new,job)
+    if changed=='scope':new.scope_id='other'
+    elif changed=='claim':new.report_payload['claim']['text']='Changed claim'
+    elif changed=='binding':new.report_payload['source_binding']['reference_id']='other'
+    elif changed=='source':new.report_payload['source_identity']['content_sha256']='other'
+    elif changed=='extraction':new.report_payload['authoritative_evidence_package']['extracted_text_sha256']='other'
+    else:new.evidence_sha256='tampered'
+    if changed!='digest':new.evidence_sha256=_payload_digest(new.report_payload)
+    with pytest.raises(ValueError):_validate_verification_replacement(old,new,job)
+
+
 def test_correction_extends_latest_lineage_without_changing_shared_anchors():
     with fitz.open() as doc:
         page=doc.new_page()
@@ -63,10 +84,21 @@ def test_correction_extends_latest_lineage_without_changing_shared_anchors():
         view=session.get(Report,uuid.UUID(later['report_id'])).report_json['evidence_report']
         assert view['paper_surface']['matched_citation_anchor_count']==1
         assert artifact.presentation_evidence==original[2]
+        from app.services.reference_layout import extract_reference_layout_from_bytes
+        payload=deepcopy(job.extraction_payload)
+        payload['reference_layout']=extract_reference_layout_from_bytes(
+            paper,'paper.pdf',references=extracted.references,citation_format='apa').model_dump(mode='json')
+        job.extraction_payload=payload;session.commit()
+        styled=refresh_evidence_report_projection(session,backend,report_id=first.id,reassess_reference_formatting=True)
+        successor=session.get(Report,uuid.UUID(styled['report_id']))
+        assert successor.report_json['reference_formatting_correction']['version']=='reference-formatting-reassessment-v1'
+        assert successor.report_json['evidence_report']['paper_surface']['matched_citation_anchor_count']==1
+        assert first.report_json==original[0] and second.report_json==original[1]
+        assert artifact.presentation_evidence==original[2]
         job.status='running';session.commit()
         with pytest.raises(ValueError,match='completed'):
             refresh_evidence_report_projection(session,backend,report_id=first.id)
-        assert len(list(session.scalars(select(Report))))==4
+        assert len(list(session.scalars(select(Report))))==5
 
 
 @pytest.mark.parametrize('changed', [True,False])

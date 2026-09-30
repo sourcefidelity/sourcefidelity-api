@@ -87,6 +87,27 @@ def _request(**changes):
     return VerificationRunRequest(**values)
 
 
+def test_possible_match_obeys_scope_hash_and_cleanup_boundaries(database):
+    storage = MemoryStorage()
+    with database() as session:
+        run = begin_verification_run(session, storage, _request(identity_verdict='possible_match'))
+        source = load_verification_run_source(session, storage, run.id,
+            scope_type='personal_owner', scope_id='owner-1')
+        assert source.identity_verdict == 'possible_match'
+        with pytest.raises(VerificationRunAuthorizationError):
+            load_verification_run_source(session, storage, run.id,
+                scope_type='personal_owner', scope_id='other-owner')
+        key = next(iter(storage.objects))
+        storage.objects[key] = b'changed bytes'
+        with pytest.raises(VerificationRunError):
+            load_verification_run_source(session, storage, run.id,
+                scope_type='personal_owner', scope_id='owner-1')
+        cleanup_verification_run(session, storage, run.id,
+            scope_type='personal_owner', scope_id='owner-1', outcome='failed')
+        assert not storage.objects
+        assert session.scalar(select(SourceRepresentationRecord)) is None
+
+
 def _processor(storage, *, add_derivatives=True):
     def process(session, source, run_id):
         if add_derivatives:

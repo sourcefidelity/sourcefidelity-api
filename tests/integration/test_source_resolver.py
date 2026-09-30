@@ -284,7 +284,9 @@ def test_resolve_reference_failure_retains_each_attempt_without_deriving_absence
 
 def test_live_unlocated_outcome_remains_suppressed_pending_real_control(
     resolver: SourceResolver,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", "configured-search-v1")
     resolver._check_local_cache = Mock(
         return_value=RetrievalResult(source_name="local_cache", success=False)
     )
@@ -379,6 +381,83 @@ def test_malformed_doi_is_rejected_without_request(resolver: SourceResolver, mon
     safe_request.assert_not_called()
 
 
+@pytest.mark.parametrize('direct_success', [True, False])
+def test_supplied_doi_metadata_and_direct_resolution_precede_paid_search(resolver, monkeypatch, direct_success):
+    from app.config import settings
+    monkeypatch.setattr(settings, 'DOI_RESOLVER_URL', None)
+    events = []
+    web = Mock(); web.name = 'web_search'; web.capabilities = {'web_discovery'}
+    metadata_adapter = Mock(); metadata_adapter.name = 'crossref'; metadata_adapter.capabilities = {'doi', 'title_author'}
+    resolver._retrieval_sources = [metadata_adapter, web]
+    resolver._check_local_cache = Mock(return_value=RetrievalResult(source_name='local_cache', success=False))
+    def metadata(*args):
+        assert args[0] == [metadata_adapter]
+        # An unconfirming DOI is followed by a title-only search of the
+        # required indexes (reference-verification-v1), still before paid search.
+        events.append('metadata' if args[1] == '10.1234/example' else 'title' if args[1] is None else 'other')
+        return []
+    resolver._lookup_structured_sources = metadata
+    def direct(doi, title, **kw):
+        events.append('direct')
+        assert kw['public'] and doi == '10.1234/example'
+        return RetrievalResult(source_name='doi_resolver', success=direct_success,
+            full_text=b'%PDF-source' if direct_success else None, error=None if direct_success else 'timeout')
+    resolver._try_doi_resolver = direct
+    def paid(*args, **kwargs):
+        events.append('paid')
+        return RetrievalResult(source_name='web_search', success=False, error='No results')
+    resolver._try_source = paid
+    if direct_success:
+        result = resolver.resolve(doi='10.1234/example', title='Specific article title', author='Author')
+        assert result.full_text
+        assert events == ['metadata', 'title', 'direct']
+    else:
+        with pytest.raises(SourceResolutionError):
+            resolver.resolve(doi='10.1234/example', title='Specific article title', author='Author')
+        assert events == ['metadata', 'title', 'direct', 'paid']
+
+
+def test_public_doi_never_inherits_operator_trusted_prefix(resolver, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, 'DOI_RESOLVER_URL', 'https://operator.example/')
+    fetch = Mock(return_value=_resolver_response(b'%PDF-test', 'application/pdf'))
+    monkeypatch.setattr('app.services.source_resolver.safe_request', fetch)
+    resolver._validated_doi_resolver_pdf = Mock(return_value=RetrievalResult(source_name='doi_resolver', success=False))
+    result = resolver._try_doi_resolver('10.1234/example', 'Expected', public=True)
+    assert fetch.call_args.args[0] == 'https://doi.org/10.1234/example'
+    assert fetch.call_args.kwargs['trust_prefix'] is None
+    resolver._validated_doi_resolver_pdf.assert_called_once()
+    assert resolver._validated_doi_resolver_pdf.call_args.kwargs['access_type'] is None
+    assert fetch.call_args.kwargs['max_bytes'] == settings.STUDENT_URL_MAX_SIZE_MB * 1024 * 1024
+    assert not result.success
+
+
+def test_supplied_doi_url_is_not_fetched_twice_before_search(resolver, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, 'DOI_RESOLVER_URL', None)
+    web = Mock(); web.name = 'web_search'; web.capabilities = {'web_discovery'}
+    resolver._retrieval_sources = [web]
+    resolver._check_local_cache = Mock(return_value=RetrievalResult(source_name='local_cache', success=False))
+    resolver._lookup_structured_sources = Mock(return_value=[])
+    resolver._try_web_fetch = Mock(return_value=RetrievalResult(source_name='web_fetch', success=False, error='timeout'))
+    resolver._try_doi_resolver = Mock(side_effect=AssertionError('Duplicate DOI fetch'))
+    resolver._try_source = Mock(return_value=RetrievalResult(source_name='web_search', success=False, error='No results'))
+    with pytest.raises(SourceResolutionError):
+        resolver.resolve(doi='10.1234/example', title='Specific article',
+                         student_url='https://doi.org/10.1234/example')
+    resolver._try_web_fetch.assert_called_once()
+    resolver._try_doi_resolver.assert_not_called()
+
+
+def test_public_doi_html_requires_observed_identity_not_body_doi(resolver, monkeypatch):
+    html = b'<html><head><title>Expected article title</title></head><body>10.1234/example</body></html>'
+    monkeypatch.setattr('app.services.source_resolver.safe_request', Mock(return_value=_resolver_response(html, 'text/html')))
+    resolver._landing_metadata_identity = Mock(return_value=None)
+    result = resolver._try_doi_resolver('10.1234/example', 'Expected article title', public=True)
+    assert not result.success and not result.full_text
+    assert 'identity remains unconfirmed' in result.error
+
+
 @pytest.mark.integration
 def test_doi_resolver_rejects_login_or_menu_html(
     resolver: SourceResolver, monkeypatch: pytest.MonkeyPatch
@@ -400,7 +479,9 @@ def test_doi_resolver_rejects_login_or_menu_html(
 
     assert result.success is False
     assert "title does not match" in (result.error or "")
-    assert result.metadata == {"identity_rejected": True}
+    assert result.metadata['identity_rejected'] is True
+    assert set(result.metadata) == {'identity_rejected', 'operation_timing', 'operation_timings'}
+    assert result.metadata['operation_timing']['elapsed_seconds'] >= 0
 
 
 @pytest.mark.integration
@@ -454,7 +535,12 @@ def test_doi_resolver_rejects_wrong_pdf_through_common_validator(
 
     assert result.success is False
     assert "failed source identity" in (result.error or "")
-    assert result.metadata["identity_rejected"] is True
+    # This fixture supplies unrelated body wording, not independently observed
+    # conflicting bibliographic fields. It stays unusable without claiming an
+    # affirmative source conflict from missing identity observations.
+    assert result.metadata["identity_unconfirmed"] is True
+    assert result.metadata["identity_reason_code"] == "identity_insufficient_observations"
+    assert result.full_text is None
 
 
 @pytest.mark.integration
@@ -933,7 +1019,8 @@ def test_web_fetch_returns_typed_html_text_and_limited_evidence_compatibility(
 
     result = resolver._try_web_fetch("https://news.example/article", "News article")
 
-    assert result.success
+    assert not result.success  # Title alone cannot stop the discovery chain.
+    assert result.metadata['identity_confidence'] != 'high'
     assert result.representation is not None
     assert result.representation.kind is RepresentationKind.PLAIN_TEXT
     assert result.representation.original_kind is RepresentationKind.HTML

@@ -121,7 +121,9 @@ def test_grouped_upload_is_one_button_per_unavailable_member():
     member=abstract_member('No quoted wording is here.')
     citation={'members':[member,{**member,'reference_id':'r2'}],'student_text':'Example','upload_action':{'enabled':True,'href':'/report/id/citation/id/source/upload'}}
     rendered=_render_panel_template(citation,1)
-    assert rendered.count('<h3>Abstract only sources</h3>')==1
+    assert rendered.count('Abstract Retrieved</span></span></h3>')==2
+    assert 'data-source-member="1" hidden' in rendered
+    assert 'aria-label="Next source"' in rendered
     assert rendered.count('data-choose-source')==2
     assert rendered.count('name="file"')==2
     assert 'type="submit"' not in rendered

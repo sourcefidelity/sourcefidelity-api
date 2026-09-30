@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 import boto3
 from botocore.exceptions import ClientError
 
-from app.config import settings
+from app.config import secret_value, settings
 from app.log_safety import private_value_id
 from app.services.upload_completion import UploadReceipt
 
@@ -60,8 +60,8 @@ class S3Backend(StorageBackend):
         self._client = boto3.client(
             "s3",
             endpoint_url=settings.S3_ENDPOINT,
-            aws_access_key_id=settings.S3_ACCESS_KEY,
-            aws_secret_access_key=settings.S3_SECRET_KEY,
+            aws_access_key_id=secret_value(settings.S3_ACCESS_KEY),
+            aws_secret_access_key=secret_value(settings.S3_SECRET_KEY),
             region_name=settings.S3_REGION,
         )
         self._bucket = settings.S3_BUCKET

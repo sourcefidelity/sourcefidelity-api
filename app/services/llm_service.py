@@ -9,13 +9,16 @@ is configured via `app.services.providers.ProviderConfig`.
 
 import json
 import logging
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+from typing import Callable, Mapping, Optional, List, Dict, Any
 
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
-from app.config import settings
-from app.services.providers import get_provider_config
+from app.config import secret_value, settings
+from app.services.providers import ProviderConfig, get_provider_config
 from app.services.processing_metrics import record_llm_attempt, record_llm_usage
+
+JSON_REPAIR_SUFFIX = "\n\nIMPORTANT: Output valid JSON only. No markdown, no explanation."
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +26,91 @@ _client: Optional[OpenAI] = None
 _provider_cache: Optional[object] = None
 
 
+@dataclass(frozen=True)
+class LLMRoute:
+    """One explicitly routed model endpoint (a Judgment panel arm).
+
+    Carries its own client, model, provider config and request body extras, so
+    a routed call never falls back to the default client or to model-name
+    detection (a Qwen API model name would otherwise select the local-Qwen
+    config). Built only by `judge_arms`, after that arm's policy gate passed.
+    """
+
+    arm_id: str
+    model: str
+    endpoint_host: str
+    client_factory: Callable[[], Any]
+    provider_config: ProviderConfig
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
+    price_context: Callable[[str], dict] = lambda model: {}
+    # Output allowance for this arm when it must reason before answering.
+    max_output_tokens: int | None = None
+
+
+def _receipt_from_response(response, receipt: dict) -> None:
+    """Numeric and identifying provenance only; never response text."""
+    receipt["returned_model"] = str(getattr(response, "model", "") or "")[:120]
+    extra = getattr(response, "model_extra", None) or {}
+    provider = extra.get("provider") if isinstance(extra, dict) else None
+    receipt["returned_provider"] = str(provider)[:80] if provider else None
+    usage = getattr(response, "usage", None)
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens",
+                 "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            receipt[name] = value
+    receipt.update(cache_split(usage))
+    usage_extra = getattr(usage, "model_extra", None) or {}
+    cost = usage_extra.get("cost") if isinstance(usage_extra, dict) else None
+    receipt["reported_cost_usd"] = float(cost) if type(cost) in (int, float) and cost >= 0 else None
+
+
+def cache_split(usage) -> dict:
+    """Cache-hit and miss prompt tokens for a response that lacks DeepSeek's fields:
+    the OpenAI-style cached count when reported, otherwise no cache hit."""
+    prompt = getattr(usage, "prompt_tokens", None)
+    if (getattr(usage, "prompt_cache_hit_tokens", None) is not None
+            or not isinstance(prompt, int) or isinstance(prompt, bool) or prompt < 0):
+        return {}
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    cached = cached if isinstance(cached, int) and not isinstance(cached, bool) and 0 <= cached <= prompt else 0
+    return {"prompt_cache_hit_tokens": cached, "prompt_cache_miss_tokens": prompt - cached}
+
+
+class LLMCallFailure(RuntimeError):
+    """Application-owned failure category; never retain provider response text."""
+
+    def __init__(self, category: str, *, attempts: int = 1):
+        allowed = {
+            "not_configured", "timeout", "connection_failed", "rate_limited",
+            "authentication_failed", "provider_server_error", "provider_request_rejected",
+            "request_failed", "empty_response", "invalid_json",
+        }
+        self.category = category if category in allowed else "request_failed"
+        self.attempts = attempts
+        super().__init__(f"Failed to get valid JSON or complete LLM request: {self.category}")
+
+
+def _request_failure_category(error: Exception) -> str:
+    if isinstance(error, APITimeoutError):
+        return "timeout"
+    if isinstance(error, APIConnectionError):
+        return "connection_failed"
+    if isinstance(error, APIStatusError):
+        if error.status_code == 429:
+            return "rate_limited"
+        if error.status_code in {401, 403}:
+            return "authentication_failed"
+        return "provider_server_error" if error.status_code >= 500 else "provider_request_rejected"
+    return "request_failed"
+
+
 def get_client() -> OpenAI:
     """Get or create the OpenAI client singleton."""
     global _client
     if _client is None:
-        client_kwargs = {"api_key": settings.LLM_API_KEY}
+        client_kwargs = {"api_key": secret_value(settings.LLM_API_KEY)}
         if settings.LLM_BASE_URL:
             client_kwargs["base_url"] = settings.LLM_BASE_URL
         _client = OpenAI(**client_kwargs)
@@ -43,6 +126,8 @@ def chat_completion(
     response_format: Optional[Dict[str, str]] = None,
     disable_thinking: bool = False,
     reasoning_effort: Optional[str] = None,
+    route: Optional[LLMRoute] = None,
+    receipt: Optional[dict] = None,
 ) -> str:
     """Send a chat completion request to the LLM.
 
@@ -74,11 +159,19 @@ def chat_completion(
     Raises:
         RuntimeError: If LLM is not configured or request fails.
     """
-    if not settings.LLM_API_KEY:
-        raise RuntimeError("LLM_API_KEY not configured. Set it in .env or environment.")
+    if route is None and not settings.LLM_API_KEY:
+        raise LLMCallFailure("not_configured")
 
-    client = get_client()
-    model = model or settings.LLM_MODEL
+    if route is not None:
+        # A routed arm uses only its own client, model and body extras.
+        try:
+            client = route.client_factory()
+        except Exception:
+            raise LLMCallFailure("not_configured") from None
+        model = route.model
+    else:
+        client = get_client()
+        model = model or settings.LLM_MODEL
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -106,7 +199,9 @@ def chat_completion(
     #     degradation on model swap is visible) rather than sent to a provider
     #     that may reject or no-op it. Ignored when thinking is disabled.
     extra_body: Dict[str, Any] = {}
-    if disable_thinking:
+    if route is not None:
+        extra_body.update(route.extra_body)
+    elif disable_thinking:
         config = get_provider_config(model)
         if config.reasoning_disable_body:
             extra_body.update(config.reasoning_disable_body)
@@ -133,19 +228,32 @@ def chat_completion(
         kwargs["extra_body"] = extra_body
 
     try:
-        record_llm_attempt()
+        from urllib.parse import urlsplit
+        from app.services.usage_cost import llm_price_context
+        if route is not None:
+            price_context = route.price_context(model)
+            endpoint_host = route.endpoint_host
+        else:
+            price_context = llm_price_context(model, settings.LLM_BASE_URL or '')
+            # Host only: never a path, query or credential. The OpenAI client's
+            # default endpoint is used when no base URL is configured.
+            endpoint_host = urlsplit(settings.LLM_BASE_URL).hostname if settings.LLM_BASE_URL else 'api.openai.com'
+        record_llm_attempt(model=model, endpoint_host=endpoint_host)
         response = client.chat.completions.create(**kwargs)
-        record_llm_usage(response.usage)
+        record_llm_usage(response.usage, price_context=price_context, model=model, endpoint_host=endpoint_host)
+        if receipt is not None:
+            _receipt_from_response(response, receipt)
+            receipt["price_context"] = dict(price_context or {})
         content = response.choices[0].message.content
         logger.debug(
             "LLM response: model=%s, tokens=%d",
             model,
             response.usage.total_tokens if response.usage else 0,
         )
-        return content
+        return content or ""
     except Exception as e:
         logger.error("LLM request failed (type=%s)", type(e).__name__)
-        raise RuntimeError("LLM request failed") from e
+        raise LLMCallFailure(_request_failure_category(e)) from None
 
 
 def _salvage_truncated_json(text: str) -> Any | None:
@@ -218,6 +326,8 @@ def chat_completion_json(
     disable_thinking: bool = False,
     reasoning_effort: Optional[str] = None,
     allow_partial: bool = False,
+    route: Optional[LLMRoute] = None,
+    receipt: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Send a chat completion request expecting JSON output.
 
@@ -253,10 +363,9 @@ def chat_completion_json(
     Raises:
         RuntimeError: If LLM is not configured or all retries + salvage fail.
     """
-    config = get_provider_config(model)
+    config = route.provider_config if route is not None else get_provider_config(model)
     response_format = {"type": "json_object"} if config.json_mode else None
 
-    last_error = None
     empty_attempts = 0
     for attempt in range(max_retries + 1):
         try:
@@ -269,14 +378,16 @@ def chat_completion_json(
                 response_format=response_format,
                 disable_thinking=disable_thinking,
                 reasoning_effort=reasoning_effort,
+                **({"route": route, "receipt": receipt} if route is not None else {}),
             )
+            if receipt is not None:
+                receipt["attempts"] = attempt + 1
 
             # Parse JSON — success path
             data = json.loads(response_text.strip())
             return data
 
-        except json.JSONDecodeError as e:
-            last_error = e
+        except json.JSONDecodeError:
             is_empty = not (response_text and response_text.strip())
             logger.warning(
                 "JSON parse failed (attempt %d/%d, %s; response_chars=%d)",
@@ -314,10 +425,7 @@ def chat_completion_json(
                     )
                     return salvaged
                 if attempt < max_retries:
-                    user_prompt = (
-                        f"{user_prompt}\n\nIMPORTANT: Output valid JSON only. "
-                        "No markdown, no explanation."
-                    )
+                    user_prompt = user_prompt + JSON_REPAIR_SUFFIX
 
             # Empty response — allow ONE retry (transient), then stop retrying.
             # Burning all max_retries on identical empty responses wastes minutes.
@@ -331,12 +439,14 @@ def chat_completion_json(
                     )
                     break
 
+        except LLMCallFailure:
+            raise
         except Exception as e:
-            raise RuntimeError("LLM request failed") from e
+            raise LLMCallFailure(_request_failure_category(e)) from None
 
-    raise RuntimeError(
-        f"Failed to get valid JSON after {attempt + 1} attempts"
-    ) from last_error
+    raise LLMCallFailure(
+        "empty_response" if is_empty else "invalid_json", attempts=attempt + 1
+    ) from None
 
 
 def _supports_json_mode(model: Optional[str] = None) -> bool:

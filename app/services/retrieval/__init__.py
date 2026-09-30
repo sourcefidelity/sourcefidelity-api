@@ -24,6 +24,9 @@ from app.services.retrieval.crossref import CrossrefRetriever
 from app.services.retrieval.gutenberg import GutenbergRetriever
 from app.services.retrieval.wikisource import WikisourceRetriever
 from app.services.retrieval.elsevier import ElsevierRetriever
+from app.services.retrieval.open_library import OpenLibraryRetriever
+from app.services.retrieval.datacite import DataCiteRetriever
+from app.services.retrieval.eric import EricRetriever
 from app.services.retrieval.web_search import WebSearchRetriever
 
 from app.config import settings
@@ -55,6 +58,14 @@ _RETRIEVER_CLASSES: dict[str, type[RetrievalSource]] = {
     "gutenberg": GutenbergRetriever,
     "wikisource": WikisourceRetriever,
     "elsevier": ElsevierRetriever,
+    # A second, independent book catalog so monograph coverage does not
+    # rest on Google Books alone, and DOI coverage for theses, reports
+    # and repository deposits that Crossref does not register.
+    "open_library": OpenLibraryRetriever,
+    "datacite": DataCiteRetriever,
+    # Positive-only: education literature, whose silence about any other
+    # field is not evidence. See positive-only-corroboration-v1.
+    "eric": EricRetriever,
     # Web-search fallback: searches configured discovery providers after the
     # academic-DB chain fails. Only active when SEARCH_PROVIDER is configured.
     # Add "web_search" to RETRIEVAL_SOURCES in .env to enable.

@@ -15,26 +15,32 @@ from sqlalchemy.orm import Session
 
 from app.models.report import Report
 from app.services.evidence_report import (
-    load_authorized_evidence_report_bundle, citation_tones, grouped_members,
-    _render_citation_information, _processing_label,
-    _inline_locator, _check_sentence,
+    load_authorized_evidence_report_bundle,
+    _render_citation_information,
+    _inline_locator, _check_sentence, _panel_statement,
+    project_reference_flags,
 )
-from app.services.paper_annotations import list_current_paper_annotations
 from app.services.storage.backend import StorageBackend
+from app.services.report_member_navigation import member_targets, marker_words
+from app.services.highlight_priority import SUBMITTED_LINK_FINDINGS
 
 
-REPORT_EXPORT_VERSION = "released-report-pdf-v2"
+REPORT_EXPORT_VERSION = "released-report-pdf-v30"
 
 _TONE_COLORS = {
     "evidence_available": (0.145, 0.388, 0.655),
     "limited_evidence": (0.086, 0.549, 0.549),
+    "partial_evidence": (0.545, 0.486, 0.663),
     "retrieved_no_connection": (0.549, 0.420, 0.310),
     "attention": (0.851, 0.373, 0.008),
     "not_assessed": (0.722, 0.753, 0.784),
 }
-_VIOLET = (0.463, 0.318, 0.659)
 _AMBER = (0.851, 0.373, 0.008)
 _QUOTE_FILL = (1.000, 0.824, 0.478)
+# Soft red for "Cannot be verified"; bright solid blue for details that differ from
+# the located record (both Evidence, owner decision 2026-09-24).
+_UNVERIFIED_FILL = (0.949, 0.545, 0.510)
+_DIFFERENCE_BLUE = (0.039, 0.486, 1.0)
 _FIXED_PDF_DATE = "D:20000101000000Z"
 
 
@@ -57,7 +63,7 @@ def build_released_report_export(
     scope_type: str,
     scope_id: str,
 ) -> ReleasedReportExport:
-    """Build one released-only derivative without persisting a partial object."""
+    """Build the one report's PDF derivative without persisting a partial object."""
     view, artifact, paper_content = load_authorized_evidence_report_bundle(
         session,
         backend,
@@ -79,38 +85,21 @@ def build_released_report_export(
     if paper_sha256 != artifact.presentation_sha256:
         raise ReportExportError("Retained paper presentation does not match its hash")
 
-    annotations = list_current_paper_annotations(
-        session,
-        report_id=parsed_report_id,
-        scope_type=scope_type,
-        scope_id=scope_id,
-        visibility="released",
-    )
-    _validate_annotation_bindings(
-        annotations,
-        artifact_id=str(artifact.id),
-        paper_version_id=artifact.paper_version_id,
-        paper_sha256=paper_sha256,
-    )
-
     manifest = _base_manifest(
         report=report,
         view=view,
         artifact=artifact,
         paper_sha256=paper_sha256,
-        annotations=annotations,
     )
     content, overlay_counts = _render_pdf(
         paper_content,
         citations=list(view.get("citations") or []),
         reference_practice=list(view.get("reference_practice") or []),
-        annotations=annotations,
         view=view,
         export_binding=(
             f"report={manifest['report_id']};"
             f"report_version={manifest['report_version']};"
-            f"paper_sha256={manifest['paper_presentation_sha256']};"
-            f"released_annotations={manifest['released_annotation_set_sha256']}"
+            f"paper_sha256={manifest['paper_presentation_sha256']}"
         ),
     )
     manifest["overlay_counts"] = overlay_counts
@@ -124,23 +113,7 @@ def build_released_report_export(
     )
 
 
-def _base_manifest(*, report, view, artifact, paper_sha256, annotations) -> dict:
-    annotation_revisions = [
-        {
-            "annotation_id": item["annotation_id"],
-            "revision": int(item["revision"]),
-            "annotation_type": item["annotation_type"],
-            "anchor_sha256": item["anchor_sha256"],
-            "content_sha256": hashlib.sha256(
-                str(item.get("content") or "").encode("utf-8")
-            ).hexdigest(),
-            "user_label_sha256": hashlib.sha256(
-                str(item.get("user_label") or "").encode("utf-8")
-            ).hexdigest(),
-        }
-        for item in annotations
-    ]
-    annotation_set_sha256 = _digest({"revisions": annotation_revisions})
+def _base_manifest(*, report, view, artifact, paper_sha256) -> dict:
     return {
         "export_version": REPORT_EXPORT_VERSION,
         "report_id": str(report.id),
@@ -152,8 +125,6 @@ def _base_manifest(*, report, view, artifact, paper_sha256, annotations) -> dict
         "paper_artifact_id": str(artifact.id),
         "paper_version_id": str(view.get("paper_version_id") or ""),
         "paper_presentation_sha256": paper_sha256,
-        "released_annotation_revisions": annotation_revisions,
-        "released_annotation_set_sha256": annotation_set_sha256,
         "source_policy": {
             "source_bytes_embedded": False,
             "source_excerpts_embedded": True,
@@ -167,110 +138,145 @@ def _render_pdf(
     *,
     citations: list[dict],
     reference_practice: list[dict],
-    annotations: list[dict],
     export_binding: str,
     view: dict | None = None,
 ) -> tuple[bytes, dict[str, int]]:
     counts = {
         "citation_underlines": 0,
+        "source_member_highlights": 0,
         "quotation_differences": 0,
         "reference_practice_findings": 0,
-        "released_highlights": 0,
-        "released_comments": 0,
+        "patchwriting_passages": 0,
     }
     try:
         document = fitz.open(stream=paper_content, filetype="pdf")
     except Exception as exc:
         raise ReportExportError("Retained paper presentation is not a readable PDF") from exc
     try:
+        if view is not None:
+            view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
+            reference_practice = view.get('reference_practice') or []
+            citations = view.get('citations') or citations
+        words_by_page = marker_words(document)
+        from app.services.report_member_navigation import missing_reference_targets
+        from app.services.highlight_priority import (
+            subtract_rectangles, ACADEMIC_FINDINGS, UNVERIFIED_FINDINGS, REFERENCE_DIFFERENCE_FINDINGS)
+        from app.services.evidence_report import normalize_reference_findings
+        reference_practice = normalize_reference_findings(reference_practice)
+        paint_regions = []
+        unverified_ids = {f.get('reference_id') for f in reference_practice
+            if f.get('finding_type') in UNVERIFIED_FINDINGS}
+        for finding in reference_practice:
+            if (finding.get('finding_type') not in SUBMITTED_LINK_FINDINGS
+                    and finding.get('finding_type') not in REFERENCE_DIFFERENCE_FINDINGS):
+                priority = (1.5 if finding.get('finding_type') == 'source_topical_mismatch' else
+                            3 if finding.get('finding_type') in ACADEMIC_FINDINGS | UNVERIFIED_FINDINGS else 2)
+                paint_regions.extend((page, tuple(rect), priority) for page,rect in
+                                     _valid_rectangles(document, finding.get('rectangles')))
         for citation in citations:
-            tone = str(citation.get("tone") or "not_assessed")
-            tones = citation_tones(citation)
+            from app.services.report_layers import topical_mismatch
+            paint_regions.extend((t['page_index'],tuple(t[k] for k in ('x0','y0','x1','y1')),1.5)
+                for t in member_targets(citation, words_by_page)
+                if topical_mismatch(citation['members'][t['member_index']], citation))
+            paint_regions.extend((t['page_index'],tuple(t[k] for k in ('x0','y0','x1','y1')),3)
+                for t in member_targets(citation, words_by_page)
+                if citation['members'][t['member_index']].get('reference_id') in unverified_ids)
+            paint_regions.extend((page,tuple(rect),3) for page,rect in
+                _valid_rectangles(document, citation.get('quotation_difference_rectangles')))
+            paint_regions.extend((t['page_index'],tuple(t[k] for k in ('x0','y0','x1','y1')),3)
+                for t in missing_reference_targets(citation, words_by_page))
+        passages = list((view or {}).get('patchwriting_passages') or [])
+        for passage in passages:
+            paint_regions.extend((page,tuple(rect),3) for page,rect in
+                _valid_rectangles(document, (passage.get('paper_location') or {}).get('rectangles')))
+
+        def paint_highlight(page_index, rectangle, color, opacity, priority):
+            covers = [rect for page,rect,rank in paint_regions if page == page_index and rank > priority]
+            for part in subtract_rectangles(tuple(rectangle), covers):
+                document[page_index].draw_rect(part, color=None, fill=color, fill_opacity=opacity, overlay=True)
+
+        for citation in citations:
+            for target in missing_reference_targets(citation, words_by_page):
+                rectangle = fitz.Rect(*(target[k] for k in ('x0','y0','x1','y1')))
+                document[target['page_index']].draw_rect(rectangle, color=None, fill=_QUOTE_FILL, fill_opacity=.45, overlay=True)
             for page_index, rectangle in _valid_rectangles(
                 document, (citation.get("paper_location") or {}).get("rectangles")
             ):
                 page = document[page_index]
-                for part, member_state in enumerate(tones):
-                    page.draw_line(
-                        (rectangle.x0 + rectangle.width * part / len(tones), max(rectangle.y0, rectangle.y1 - 0.8)),
-                        (rectangle.x0 + rectangle.width * (part+1) / len(tones), max(rectangle.y0, rectangle.y1 - 0.8)),
-                        color=_TONE_COLORS[member_state], width=0.9, overlay=True,
-                    )
+                page.draw_line(
+                    (rectangle.x0, max(rectangle.y0, rectangle.y1 - 0.8)),
+                    (rectangle.x1, max(rectangle.y0, rectangle.y1 - 0.8)),
+                    color=(.77,.80,.82), width=.6, overlay=True,
+                )
                 counts["citation_underlines"] += 1
+                from app.services.report_layers import citation_partial_relevance
+                if citation_partial_relevance(citation):
+                    page.draw_rect((rectangle + (-1,-1,1,1)) & page.rect,
+                                   color=(.85,.37,.01), width=1.2, overlay=True)
+            for target in member_targets(citation, words_by_page):
+                rectangle=fitz.Rect(*(target[key] for key in ('x0','y0','x1','y1')))
+                unverified = citation['members'][target['member_index']].get('reference_id') in unverified_ids
+                paint_highlight(target['page_index'], rectangle,
+                    _UNVERIFIED_FILL if unverified else _TONE_COLORS[target['tone']],
+                    .42 if unverified else .23, 3 if unverified else 1)
+                counts['source_member_highlights'] += 1
+                from app.services.report_layers import topical_mismatch
+                if topical_mismatch(citation['members'][target['member_index']], citation):
+                    paint_highlight(target['page_index'], rectangle, (.937,.510,.729), .38, 1.5)
             for page_index, rectangle in _valid_rectangles(
                 document, citation.get("quotation_difference_rectangles")
             ):
                 document[page_index].draw_rect(
                     rectangle,
-                    color=_AMBER,
-                    fill=_QUOTE_FILL,
+                    color=None,
+                    fill=(1,.878,.4),
                     width=0.65,
-                    fill_opacity=0.55,
+                    fill_opacity=0.35,
                     overlay=True,
                 )
                 counts["quotation_differences"] += 1
 
         for finding in reference_practice:
             rendered = False
-            for page_index, rectangle in _valid_rectangles(
-                document, finding.get("rectangles")
-            ):
-                document[page_index].draw_rect(
-                    rectangle,
-                    color=_AMBER,
-                    fill=_AMBER,
-                    width=0.8,
-                    fill_opacity=0.12,
-                    overlay=True,
-                )
+            rectangles = list(_valid_rectangles(document, finding.get("rectangles")))
+            for page_index, rectangle in rectangles:
+                if finding.get('finding_type') == 'source_topical_mismatch':
+                    paint_highlight(page_index, rectangle, (.937,.510,.729), .38, 1.5)
+                if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+                    if (page_index,rectangle) == rectangles[-1]:
+                        cx,cy=rectangle.x1+10,(rectangle.y0+rectangle.y1)/2
+                        if cx+8>document[page_index].rect.width:
+                            cx=max(8,rectangle.x0-10)
+                        document[page_index].draw_polyline([(cx,cy-6),(cx+6,cy),(cx,cy+6),(cx-6,cy),(cx,cy-6)],
+                            color=(.463,.318,.659),fill=(.463,.318,.659),width=1,overlay=True)
+                elif finding.get('finding_type') in REFERENCE_DIFFERENCE_FINDINGS:
+                    document[page_index].draw_rect(rectangle, color=_DIFFERENCE_BLUE, width=1.5, overlay=True)
+                elif finding.get('finding_type') in UNVERIFIED_FINDINGS:
+                    paint_highlight(page_index, rectangle, _UNVERIFIED_FILL, .42, 3)
+                elif finding.get('finding_type') != 'source_topical_mismatch':
+                    color=(1,.895,.36) if finding.get('finding_type') in ACADEMIC_FINDINGS else _AMBER
+                    paint_highlight(page_index, rectangle, color, .3,
+                        3 if finding.get('finding_type') in ACADEMIC_FINDINGS else 2)
                 rendered = True
             if rendered:
                 counts["reference_practice_findings"] += 1
 
-        comment_offsets: dict[tuple[int, str], int] = {}
-        for annotation in annotations:
-            rectangles = _valid_rectangles(
-                document, (annotation.get("anchor") or {}).get("rectangles")
-            )
-            if annotation.get("annotation_type") == "highlight":
-                for page_index, rectangle in rectangles:
-                    document[page_index].draw_rect(
-                        rectangle,
-                        color=None,
-                        fill=_VIOLET,
-                        fill_opacity=0.22,
-                        overlay=True,
-                    )
-                    counts["released_highlights"] += 1
-                continue
-            if annotation.get("annotation_type") != "comment" or not rectangles:
-                continue
-            page_index, rectangle = rectangles[0]
-            key = (page_index, str((annotation.get("anchor") or {}).get("anchor_id") or ""))
-            offset = comment_offsets.get(key, 0)
-            comment_offsets[key] = offset + 1
-            point = fitz.Point(
-                min(document[page_index].rect.x1 - 18, rectangle.x1 + offset * 10),
-                min(document[page_index].rect.y1 - 18, rectangle.y0 + offset * 10),
-            )
-            note = document[page_index].add_text_annot(
-                point, str(annotation.get("content") or "")
-            )
-            note.set_colors(stroke=_VIOLET)
-            note.set_info(
-                title="SourceFidelity",
-                subject=str(annotation.get("user_label") or "Released instructor comment"),
-                content=str(annotation.get("content") or ""),
-                creationDate=_FIXED_PDF_DATE,
-                modDate=_FIXED_PDF_DATE,
-            )
-            note.update()
-            counts["released_comments"] += 1
+        # Patchwriting passages: the Academic Practice yellow, like the other
+        # academic-practice findings.
+        for passage in passages:
+            placed = False
+            for page_index, rectangle in _valid_rectangles(
+                document, (passage.get('paper_location') or {}).get('rectangles')
+            ):
+                paint_highlight(page_index, rectangle, (1,.895,.36), .3, 3)
+                placed = True
+            if placed:
+                counts["patchwriting_passages"] += 1
 
-        counts.update(_append_evidence(document, citations, reference_practice, annotations, view or {}))
+        counts.update(_append_evidence(document, citations, reference_practice, view or {}))
         document.set_metadata(
             {
-                "title": "SourceFidelity released annotated report",
+                "title": "SourceFidelity report",
                 "author": "",
                 "subject": export_binding,
                 "keywords": "SourceFidelity released export",
@@ -290,60 +296,162 @@ def _render_pdf(
     return content, counts
 
 
-def _append_evidence(document, citations, findings, annotations, view) -> dict:
-    """Append inspectable evidence and printed comments with two-way links."""
+def _append_evidence(document, citations, findings, view) -> dict:
+    """Append inspectable evidence with two-way links."""
     paper_pages = document.page_count
     blocks = [
-        '<h1 id="evidence-start">Evidence and released comments</h1>',
+        '<h1 id="evidence-start">Evidence</h1>',
         '<p>Click a marked passage in the paper to open its evidence here. Each entry links back to the paper. '
         'Evidence availability does not establish citation correctness. Missing text or a retrieval miss does not establish source absence.</p>',
-        '<p>Blue: full text available; teal: abstract or limited text available; brown: completed passage check with no clear matching passage; '
-        'orange: a specific issue to check; grey: no retrieved text or not verifiable. Each source occupies an equal share of the underline, in the order shown below.</p>',
+        '<p>Translucent highlights identify individual sources: blue for full text, teal for abstracts, blue-mauve for limited text, '
+        'and grey for no retrieved text or not verifiable. Light-grey underlines show the complete citation span. '
+        'Select a source highlight to open its source-specific entry; the underline opens the complete citation entry. '
+        'Pink highlights indicate a possible topical mismatch. Soft red marks a reference that cannot be verified and its citations; '
+        'a blue outline marks reference details that differ from the located record. '
+        'Orange highlights identify formatting issues, purple diamonds identify submitted-link issues, '
+        'and yellow highlights indicate Academic Practice issues.</p>',
     ]
-    for category, priorities in (view.get("role_summaries", {}).get("student", {})).items():
+    blocks.append('<h2>Patterns and issues</h2>')
+    from app.services.report_style_guidance import guidance_links
+    from app.services.evidence_report import _citation_guidance_kinds
+    citation_format = str(view.get('citation_format') or '')
+    from app.services.evidence_report import report_summary, summary_text
+    for category, priorities in report_summary(view).items():
         if priorities:
-            blocks.append('<h3>'+escape(category.replace('_',' ').capitalize())+'</h3><ul>'+''.join('<li>'+escape(item)+'</li>' for item in priorities)+'</ul>')
+            label = 'Citation and reference formatting' if category == 'reference_formatting' else category.replace('_',' ').capitalize()
+            # The PDF keeps the complete count-only sentence: it has no side
+            # window for instance links to open (ARCHITECTURE §8).
+            blocks.append('<h3>'+escape(label)+'</h3><ul>'+''.join('<li>'+escape(summary_text(item))+'</li>' for item in priorities)+'</ul>')
+    from app.services.evidence_report import _render_upload_priorities
+    from app.services.highlight_priority import UNVERIFIED_FINDINGS as _UNVERIFIED
+    blocks.append(_render_upload_priorities([{**c,'upload_action':{}} for c in citations],
+        unverified=frozenset(f.get('reference_id') for f in findings if f.get('finding_type') in _UNVERIFIED)))
     targets = []
+    words_by_page = marker_words(document)
+    from app.services.evidence_report import _patchwriting_by_window, render_patchwriting
+    passages = [p for p in view.get('patchwriting_passages') or []
+                if isinstance(p, dict) and isinstance(p.get('number'), int)]
+    patchwriting = _patchwriting_by_window(passages, citations)
     for index, citation in enumerate(citations, 1):
         key = f"citation-{index}"
         rectangles = (citation.get("paper_location") or {}).get("rectangles") or []
-        targets.append((key, rectangles, f"Citation {index}"))
+        targets.append((key, [{**r,'y0':max(r['y0'],r['y1']-1)} for r in rectangles], f"Citation {index}"))
         blocks.append(f'<h2 id="{key}">Citation {index}</h2><p class="return" id="return-{key}">Back to marked paper passage</p>')
         blocks.append('<blockquote class="student">'+escape(str(citation.get('display_student_text') or citation.get('student_text') or citation.get('citation_marker') or 'Citation text not retained'))+'</blockquote>')
-        for label, members in grouped_members(citation):
-            level = members[0].get('coverage_level') or 'unavailable'
-            blocks.append('<h3 class="'+escape(level, quote=True)+'">'+escape(label)+'</h3>')
-            for member in members:
-                # Public reference URLs can remain clickable; source access,
-                # mutation URLs and complete source bytes are never portable.
-                blocks.append(_portable_member_html(member))
+        if citation.get('missing_reference_members'):
+            blocks.append('<blockquote>'+escape(_panel_statement(citation.get('boundary_reason') or ''))+'</blockquote>')
+        member_marks = member_targets(citation, words_by_page)
+        for member_index, member in enumerate(citation.get('members', [])):
+            member_key=f'{key}-source-{member_index+1}'
+            label=f'Citation {index}, source {member_index+1}'
+            marks=[r for r in member_marks if r['member_index']==member_index]
+            targets.append((member_key,marks,label))
+            blocks.append(f'<h2 id="{member_key}">{label}</h2><p class="return" id="return-{member_key}">Back to source citation</p>')
+            blocks.append(_portable_member_html(member))
+            if member.get('show_quotation_check'):
+                from app.services.evidence_report import render_quotation_comparisons
+                comparison = render_quotation_comparisons(
+                    member.get('quotation_check') or {},
+                    str(citation.get('display_student_text') or citation.get('student_text') or ''), portable=True)
+                if comparison:
+                    blocks.append('<div>' + comparison + '</div>')
+            if ('citation', index, member_index) in patchwriting:
+                # Patchwriting with the source's other Academic Practice checks.
+                blocks.append('<h3>Academic Practice</h3>' + render_patchwriting(
+                    patchwriting[('citation', index, member_index)], portable=True))
+            from app.services.report_layers import topical_mismatch
+            if topical_mismatch(member, citation):
+                scope = member['abstract_relevance']['scope_assessment']
+                blocks.append('<p>The abstract appears unrelated to the topic attributed to this source. '
+                              +escape(scope['rationale'])+'</p>')
+        from app.services.evidence_report import citation_after_punctuation
+        if citation_after_punctuation(citation):
+            blocks.append("<h3>Citation and reference formatting</h3><p>This parenthetical citation is placed after "
+                          "the sentence's final punctuation.</p>")
         blocks.append(_render_citation_information(citation, index).replace('<details>', '<div>').replace('</details>', '</div>').replace('<summary>', '<h4>').replace('</summary>', '</h4>'))
+        blocks.append(guidance_links(_citation_guidance_kinds(citation), citation_format))
     for index, finding in enumerate(findings, 1):
         key = f"reference-{index}"
-        targets.append((key, finding.get("rectangles") or [], f"Reference practice {index}"))
-        blocks.append(f'<h2 id="{key}">Reference practice {index}</h2><p id="return-{key}" class="return">Back to marked reference</p>')
-        blocks.append('<p>'+escape(str(finding.get('finding') or 'Reference practice finding'))+'</p>')
-        blocks.append('<p>'+escape(str((finding.get('source') or {}).get('raw_reference') or ''))+'</p>')
+        from app.services.highlight_priority import finding_category
+        heading = {'evidence': 'Evidence', 'academic': 'Academic Practice'}.get(
+            finding_category(finding.get('finding_type')), 'Citation and reference formatting') + f' {index}'
+        if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+            heading = f'Submitted-link issue {index}'
+        if finding.get('finding_type') == 'source_topical_mismatch':
+            heading = f'Potential topical mismatch {index}'
+        rectangles = finding.get('rectangles') or []
+        if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+            rectangles = [{**r,'x0':r['x1']+2,'x1':r['x1']+12,
+                           'y0':(r['y0']+r['y1'])/2-5,'y1':(r['y0']+r['y1'])/2+5} for r in rectangles[-1:]]
+        elif finding.get('finding_type') != 'source_topical_mismatch':
+            rectangles = [{**r,'y1':r['y1']+3} for r in rectangles]
+        targets.append((key, rectangles, heading))
+        return_label = ('Back to marked passage' if finding.get('finding_type') in {'required_quotation_locator_missing', 'body_title_style'}
+                        else 'Back to marked reference')
+        blocks.append(f'<h2 id="{key}">{heading}</h2><p id="return-{key}" class="return">{return_label}</p>')
+        from app.services.reference_credibility import credibility_finding_html, credibility_records_html
+        from app.services.evidence_report import _panel_statement
+        # No coaching text in the PDF either (owner decision 2026-09-30).
+        blocks.append('<p>'+credibility_finding_html({**finding, 'finding': _panel_statement(finding.get('finding') or '')})+'</p>')
+        if finding.get('finding_type') == 'required_quotation_locator_missing':
+            blocks.append('<blockquote>'+escape(str(finding.get('quote_text') or ''))+'</blockquote>')
+        raw_reference = escape(str((finding.get('source') or {}).get('raw_reference') or ''))
+        if finding.get('finding_type') == 'reference_identifier_conflict':
+            # "The submitted DOI identifies:" is completed by the identified
+            # record, never by the student's own reference.
+            blocks.append(credibility_records_html(finding))
+            blocks.append('<p>Reference as submitted: '+raw_reference+'</p>')
+        else:
+            blocks.append('<p>'+raw_reference+'</p>')
+        if finding.get('finding_type') in {'potentially_fabricated_reference', 'unverified_reference'}:
+            blocks.append(credibility_records_html(finding))
+        if finding.get('finding_type') == 'source_topical_mismatch':
+            blocks.append('<h3>Selected citation</h3><blockquote>'+escape(finding['citation_text'])+
+                '</blockquote><h3>Abstract</h3><blockquote>'+escape(finding['abstract_text'])+
+                '</blockquote>')
         difference = finding.get('field_difference') or {}
         if difference and finding.get('finding_type') == 'bibliographic_conflict':
-            blocks.append('<p>In your reference: '+escape(str(difference.get('submitted_value') or 'Not retained'))+
-                          '<br>In the located record: '+escape(str(difference.get('located_value') or 'Not retained'))+
-                          '<br>Record provider: '+escape(str(difference.get('provider') or 'Not retained'))+'</p>')
+            blocks.append('<p>In your reference: '+escape(str(difference.get('submitted_value') or 'Not retained'))+'</p>')
         if finding.get('related_references'):
-            blocks.append('<p>References sharing this author and year:</p><ul>' + ''.join(
+            related_label = ('Entries identifying the same source:'
+                             if finding.get('finding_type') == 'duplicate_reference_entry'
+                             else 'References sharing this author and year:')
+            blocks.append('<p>'+related_label+'</p><ul>' + ''.join(
                 '<li>'+escape(str(peer.get('raw_reference') or ''))+'</li>'
                 for peer in finding['related_references']) + '</ul>')
         if finding.get('located_record'):
             located = finding['located_record']
             fields = [', '.join(located.get('authors') or []), str(located.get('year') or ''), str(located.get('title') or ''), str(located.get('container_title') or ''), str(located.get('doi') or '')]
             blocks.append('<p>Located record: '+escape('. '.join(field for field in fields if field))+'</p>')
-    for index, annotation in enumerate(annotations, 1):
-        if annotation.get('annotation_type') != 'comment':
+        blocks.append(guidance_links([finding.get('finding_type')], citation_format))
+    # A patchwriting highlight links to the section that shows it: its
+    # citation's source, else a Reference section for words no citation covers.
+    from app.services.patchwriting_report import passage_windows
+    from app.services.report_references import reference_numbers
+    numbers = reference_numbers(view)
+    written: set = set()
+    for passage in passages:
+        window = next(iter(passage_windows(passage, citations)), None)
+        rectangles = [{**r,'y1':r['y1']+3} for r in (passage.get('paper_location') or {}).get('rectangles') or []]
+        if window is None:
             continue
-        key=f"comment-{index}"
-        targets.append((key, (annotation.get('anchor') or {}).get('rectangles') or [], f"Released comment {index}"))
-        blocks.append(f'<h2 id="{key}">Released comment {index}</h2><p id="return-{key}" class="return">Back to commented passage</p><p>'+escape(str(annotation.get('content') or ''))+'</p>')
-    blocks.append('<p class="metrics">'+escape(_processing_label(view.get('processing_metrics') or {}))+'</p>')
+        if window['citation']:
+            targets.append((f"passage-{passage['number']}", rectangles,
+                            f"Citation {window['citation']}, source {window['member_index']+1}"))
+            continue
+        number = numbers.get(window['reference_id'])
+        if not number:
+            continue
+        key, heading = f"reference-entry-{number}", f"Reference {number}"
+        targets.append((f"passage-{passage['number']}", rectangles, heading))
+        if key in written:
+            continue
+        written.add(key)
+        source = window['item'].get('source') or {}
+        blocks.append(f'<h2 id="{key}">{heading}</h2>'
+                      '<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or ''))+'</p>'
+                      '<h3>Academic Practice</h3>' + render_patchwriting(patchwriting.get(('reference', window['reference_id'])),
+                                                                          portable=True))
     positions = {}
     def position(element):
         if element.id and element.id not in positions and not fitz.Rect(element.rect).is_empty:
@@ -363,7 +471,7 @@ def _append_evidence(document, citations, findings, annotations, view) -> dict:
     finally:
         appendix.close()
     links = 0
-    toc = [[1, "Submitted paper", 1], [1, "Evidence and released comments", paper_pages + 1]]
+    toc = [[1, "Submitted paper", 1], [1, "Evidence", paper_pages + 1]]
     # Position callbacks can report an element that the layout engine never
     # paints. Bind destinations to actual rendered headings, not callbacks.
     rendered_headings = {}
@@ -390,6 +498,8 @@ def _append_evidence(document, citations, findings, annotations, view) -> dict:
             document[back_page+paper_pages].insert_link({"kind":fitz.LINK_GOTO,"from":back_rect,"page":valid[0][0],"to":valid[0][1].tl})
             links += 1
     document.set_toc(toc)
+    # The PDF carries no processing or cost details; those are an
+    # instructor-only section of the HTML report (ARCHITECTURE §8).
     for index in range(paper_pages, document.page_count):
         document[index].insert_text((42,775),f"Evidence appendix {index-paper_pages+1} / {document.page_count-paper_pages}",fontsize=8,color=(.36,.4,.45))
     return {"paper_pages":paper_pages,"evidence_appendix_pages":document.page_count-paper_pages,"internal_evidence_links":links}
@@ -434,23 +544,41 @@ def _write_evidence_blocks(blocks, css, position):
 def _portable_member_html(member: dict) -> str:
     """Use the PDF engine's supported block tags, with no interactive widgets."""
     source=member.get('source') or {}
-    parts = ['<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or 'Reference unavailable'))+'</p>']
-    if member.get('availability') and member['availability'] != 'Source not retrieved':
-        parts.append('<p>'+escape(member['availability'])+'</p>')
-    primary = member.get('best_evidence') or {}
-    if primary:
-        parts.append('<blockquote>'+escape(str(primary.get('display_text') or primary.get('text') or ''))+_inline_locator(primary)+'</blockquote>')
+    from app.services.evidence_report import (
+        _member_is_media, _display_evidence_note, _member_evidence_extracts,
+        _member_evidence_contexts, _panel_statement,
+    )
+    media = _member_is_media(member)
+    parts = ['<h3>Media Reference - Cannot Retrieve</h3>'] if media else []
+    parts.append('<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or 'Reference unavailable'))+'</p>')
+    if not media and member.get('availability') and member['availability'] != 'Source not retrieved':
+        parts.append('<p>'+escape(_panel_statement(member['availability']))+'</p>')
+    disagreement = member.get('scope_disagreement') or {}
+    if not media and disagreement.get('note'):
+        parts.append('<p class="muted">'+escape(_panel_statement(disagreement['note']))+'</p>')
+    for primary in _member_evidence_extracts(member):
+        parts.append('<blockquote>'+escape(str(primary.get('display_text', primary.get('text')) or ''))+_inline_locator(primary)+'</blockquote>')
         for key in ('evidence_note',):
             if primary.get(key):
-                parts.append('<p class="muted">'+escape(str(primary[key]))+'</p>')
-        if primary.get('context_text'):
-            parts.append('<h4>Full context for the selected excerpt</h4><blockquote>'+escape(primary['context_text'])+_inline_locator(primary)+'</blockquote>')
-    for item in member.get('additional_evidence') or []:
-        parts.append('<h4>Additional evidence and context</h4><blockquote>'+escape(str(item.get('context_text') or item.get('text') or ''))+_inline_locator(item)+'</blockquote>')
+                note = _display_evidence_note(member, primary)
+                if note:
+                    parts.append('<p class="muted">'+escape(note)+'</p>')
+    contexts = _member_evidence_contexts(member)
+    if contexts:
+        parts.append('<h4>Additional evidence and context</h4>')
+    for item in contexts:
+        parts.append('<blockquote>'+escape(str(item['context_text']))+_inline_locator(item)+'</blockquote>')
+        note = _display_evidence_note(member, item)
+        if note:
+            parts.append('<p class="muted">'+escape(note)+'</p>')
+    from app.services.evidence_report import secondary_citation_line
+    secondary = secondary_citation_line(member.get('secondary_citation'))
+    if secondary:
+        parts.append('<p>'+escape(secondary)+'</p>')
     for key,label in (('quotation','Quotation'),('locator','Locator')):
         check=member.get(key+'_check') or {}
         if member.get('show_'+key+'_check') and member.get('coverage_level') != 'unavailable':
-            parts.append('<p>'+escape(_check_sentence(label, check))+'</p>')
+            parts.append('<p>'+escape(_panel_statement(_check_sentence(label, check)))+'</p>')
     return '<div>'+''.join(parts)+'</div>'
 
 
@@ -473,23 +601,6 @@ def _valid_rectangles(document, items) -> list[tuple[int, fitz.Rect]]:
             continue
         result.append((page_index, rectangle))
     return result
-
-
-def _validate_annotation_bindings(
-    annotations: list[dict],
-    *,
-    artifact_id: str,
-    paper_version_id: str,
-    paper_sha256: str,
-) -> None:
-    for item in annotations:
-        if (
-            item.get("visibility") != "released"
-            or item.get("paper_artifact_id") != artifact_id
-            or item.get("paper_version_id") != paper_version_id
-            or item.get("paper_content_sha256") != paper_sha256
-        ):
-            raise ReportExportError("Released annotation does not match the paper surface")
 
 
 def _page_count(content: bytes) -> int:

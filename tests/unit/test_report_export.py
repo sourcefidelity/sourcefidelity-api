@@ -1,4 +1,4 @@
-"""Released annotated PDF export acceptance tests."""
+"""PDF export acceptance tests: one report, no annotations (owner decision 2026-09-25)."""
 
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -18,10 +18,7 @@ from app.main import app
 from app.models import Base
 from app.models.job import Job, JobStage, JobStatus
 from app.models.report import Report, ReportPaperArtifactRecord
-from app.services.paper_annotations import (
-    create_paper_annotation,
-    revise_paper_annotation,
-)
+from app.services.paper_annotations import create_paper_annotation
 from app.services.report_export import (
     ReleasedReportExport,
     ReportExportError,
@@ -52,6 +49,54 @@ class MemoryStorage(StorageBackend):
 
     def list_keys(self, prefix):
         return [key for key in self.objects if key.startswith(prefix)]
+
+
+def test_pdf_carries_no_processing_details(monkeypatch):
+    import app.services.report_export as module
+    original = module._write_evidence_blocks
+    observed = []
+    def inspect_blocks(blocks, css, position):
+        assert not any('class="metrics"' in block for block in blocks)
+        result = original(blocks, css, position)
+        observed.append(len(result))
+        return result
+    monkeypatch.setattr(module, '_write_evidence_blocks', inspect_blocks)
+    with fitz.open() as document:
+        document.new_page()
+        counts = module._append_evidence(document, [], [], {})
+        assert counts['evidence_appendix_pages'] == observed[0]
+        # Processing time, requests and cost are instructor-only HTML details.
+        text = ''.join(page.get_text() for page in document)
+        assert 'Processing time' not in text and 'Estimated cost' not in text and 'CPU time' not in text
+
+
+def test_pdf_is_the_one_report_without_audience(export_store, monkeypatch):
+    session, storage, report, artifact, view, paper = export_store
+    view['summary'] = {'evidence': ['Finding first.', 'Finding second.', 'Finding third.']}
+    monkeypatch.setattr('app.services.report_export.project_reference_flags', lambda value, *args: value)
+    exported = build_released_report_export(session, storage, report_id=report.id,
+        scope_type='personal_owner', scope_id='owner-1')
+    assert 'audience' not in exported.manifest
+    assert not any(key.startswith('released_annotation') for key in exported.manifest)
+    with fitz.open(stream=exported.content, filetype='pdf') as document:
+        import unicodedata
+        text = ' '.join(unicodedata.normalize('NFKC', ' '.join(page.get_text() for page in document)).split())
+    assert 'Finding third.' in text and 'Patterns and issues' in text
+    assert 'Student report' not in text and 'Instructor report' not in text
+
+
+def test_html_export_links_carry_no_audience_and_no_print():
+    from app.services.evidence_report import render_evidence_report_html
+    view = {'title': 'Export checks', 'citation_format': 'APA', 'citations': [],
+        'reference_practice': [], 'summary': {}, 'word_counts': {},
+        'overview': {}, 'gauges': [], 'limits': [], 'paper_surface': {},
+        'export_action': {'report_href': '/report/test',
+            'pdf_href': '/report/test/export.pdf', 'manifest_href': '/report/test/export/manifest'}}
+    html = render_evidence_report_html(view, csp_nonce='test-nonce-123456789')
+    assert '/report/test/export.pdf"' in html and '/report/test/export.html"' in html
+    assert '/report/test/export/manifest"' in html and 'audience=' not in html
+    assert 'Preview / print PDF' not in html
+    assert '/export/print' not in html
 
 
 def _pdf_bytes():
@@ -130,7 +175,7 @@ def _view(artifact, *, source_secret="Inspectable source excerpt."):
                 ],
             }
         ],
-        "role_summaries": {},
+        "summary": {},
         "gauges": [],
         "limits": [],
     }
@@ -226,35 +271,15 @@ def _create_annotation(
     )
 
 
-def test_released_export_is_deterministic_hash_bound_and_source_free(export_store):
+def test_released_export_is_deterministic_hash_bound_and_source_free(export_store, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, 'REPORT_AUTH_MODE', 'institutional_adapter')
     session, storage, report, artifact, _view_data, paper = export_store
     citation_anchor = _anchor("a" * 64)
-    _create_annotation(
-        session,
-        report,
-        artifact,
-        annotation_type="highlight",
-        anchor=citation_anchor,
-        visibility="released",
-    )
-    _create_annotation(
-        session,
-        report,
-        artifact,
-        annotation_type="comment",
-        anchor=_anchor("", y0=120, y1=145, kind="page_region"),
-        content="Released comment text.",
-        visibility="released",
-    )
-    _create_annotation(
-        session,
-        report,
-        artifact,
-        annotation_type="comment",
-        anchor=citation_anchor,
-        content="PRIVATE-COMMENT-MUST-NOT-EXPORT",
-        visibility="private",
-    )
+    # Rows stored before the annotation tools were removed stay untouched and
+    # are never exported.
+    stored = _create_annotation(session, report, artifact, annotation_type="comment", anchor=citation_anchor,
+                                content="STORED-COMMENT-MUST-NOT-EXPORT", visibility="released")
 
     first = build_released_report_export(
         session,
@@ -283,16 +308,16 @@ def test_released_export_is_deterministic_hash_bound_and_source_free(export_stor
         "source_excerpts_embedded": True,
         "authorization_bound_source_actions_embedded": False,
     }
-    assert {key:first.manifest["overlay_counts"][key] for key in ("citation_underlines", "quotation_differences", "reference_practice_findings", "released_highlights", "released_comments")} == {
+    assert {key:first.manifest["overlay_counts"][key] for key in ("citation_underlines", "quotation_differences", "reference_practice_findings")} == {
         "citation_underlines": 1,
         "quotation_differences": 1,
         "reference_practice_findings": 1,
-        "released_highlights": 1,
-        "released_comments": 1,
     }
-    serialized_manifest = str(first.manifest)
-    assert "Released comment text." not in serialized_manifest
-    assert "PRIVATE-COMMENT-MUST-NOT-EXPORT" not in serialized_manifest
+    assert "STORED-COMMENT-MUST-NOT-EXPORT" not in str(first.manifest)
+    from app.models.report import PaperAnnotationRecord
+    from sqlalchemy import select
+    assert session.execute(select(PaperAnnotationRecord).where(
+        PaperAnnotationRecord.annotation_id == uuid.UUID(stored["annotation_id"]))).scalars().first() is not None
     assert "SOURCE-CONTENT-MUST-NOT-EXPORT" not in first.content.decode(
         "latin-1", errors="ignore"
     )
@@ -302,15 +327,11 @@ def test_released_export_is_deterministic_hash_bound_and_source_free(export_stor
         assert exported.page_count > 1
         appendix = "\n".join(page.get_text() for page in list(exported)[1:])
         assert "Inspectable source excerpt." in appendix
-        assert "Released comment text." in appendix
-        assert "PRIVATE-COMMENT-MUST-NOT-EXPORT" not in appendix
+        assert "STORED-COMMENT-MUST-NOT-EXPORT" not in appendix
         assert any(link.get("page",0) > 0 for link in exported[0].get_links())
         assert any(link.get("page") == 0 for page in list(exported)[1:] for link in page.get_links())
-        notes = list(exported[0].annots() or [])
-        assert len(notes) == 1
-        assert notes[0].info["content"] == "Released comment text."
-        assert "PRIVATE-COMMENT-MUST-NOT-EXPORT" not in str(notes[0].info)
-        assert len(exported[0].get_drawings()) >= 4
+        assert list(exported[0].annots() or []) == []
+        assert len(exported[0].get_drawings()) >= 3  # underline, quotation difference, reference mark
         assert "SOURCE-CONTENT-MUST-NOT-EXPORT" not in exported[0].get_text()
         assert f"report={report.id}" in exported.metadata["subject"]
         original = fitz.open(stream=paper, filetype="pdf")
@@ -320,88 +341,6 @@ def test_released_export_is_deterministic_hash_bound_and_source_free(export_stor
             original.close()
     finally:
         exported.close()
-
-
-def test_export_uses_only_latest_released_revision_and_handles_empty_set(export_store):
-    session, storage, report, artifact, _view_data, _paper = export_store
-    private = _create_annotation(
-        session,
-        report,
-        artifact,
-        annotation_type="comment",
-        anchor=_anchor("a" * 64),
-        content="Initially private.",
-    )
-    released = revise_paper_annotation(
-        session,
-        report_id=report.id,
-        annotation_id=private["annotation_id"],
-        scope_type="personal_owner",
-        scope_id="owner-1",
-        author_provider="personal_local",
-        author_subject="owner",
-        expected_revision=1,
-        content="Released successor.",
-        visibility="released",
-    )
-    revise_paper_annotation(
-        session,
-        report_id=report.id,
-        annotation_id=released["annotation_id"],
-        scope_type="personal_owner",
-        scope_id="owner-1",
-        author_provider="personal_local",
-        author_subject="owner",
-        expected_revision=2,
-        content="Returned to private.",
-        visibility="private",
-    )
-
-    exported = build_released_report_export(
-        session,
-        storage,
-        report_id=report.id,
-        scope_type="personal_owner",
-        scope_id="owner-1",
-    )
-    assert exported.manifest["released_annotation_revisions"] == []
-    assert exported.manifest["overlay_counts"]["released_comments"] == 0
-    document = fitz.open(stream=exported.content, filetype="pdf")
-    try:
-        assert list(document[0].annots() or []) == []
-    finally:
-        document.close()
-
-
-def test_export_fails_closed_on_annotation_paper_hash_mismatch(export_store, monkeypatch):
-    session, storage, report, artifact, _view_data, _paper = export_store
-    monkeypatch.setattr(
-        "app.services.report_export.list_current_paper_annotations",
-        lambda *args, **kwargs: [
-            {
-                "annotation_id": str(uuid.uuid4()),
-                "revision": 1,
-                "paper_artifact_id": str(artifact.id),
-                "paper_version_id": artifact.paper_version_id,
-                "paper_content_sha256": "0" * 64,
-                "annotation_type": "highlight",
-                "anchor_kind": "citation_anchor",
-                "anchor_sha256": "1" * 64,
-                "anchor": _anchor("a" * 64),
-                "content": None,
-                "user_label": None,
-                "visibility": "released",
-            }
-        ],
-    )
-    with pytest.raises(ReportExportError, match="does not match"):
-        build_released_report_export(
-            session,
-            storage,
-            report_id=report.id,
-            scope_type="personal_owner",
-            scope_id="owner-1",
-        )
 
 
 def test_failed_export_leaves_no_partial_object_and_retry_succeeds(
@@ -460,12 +399,12 @@ def test_paginated_appendix_retains_every_heading_and_evidence_span():
         })
     content, counts = _render_pdf(
         _pdf_bytes(), citations=citations, reference_practice=[],
-        annotations=[], export_binding="synthetic-pagination",
+        export_binding="synthetic-pagination",
     )
     with fitz.open(stream=content, filetype="pdf") as document:
         text = " ".join(" ".join(page.get_text().split()) for page in list(document)[1:])
         assert counts["evidence_appendix_pages"] > 1
-        assert len(document.get_toc()) == 67
+        assert len(document.get_toc()) == 132  # Citation and source-specific destinations.
         for index in range(65):
             assert f"Selected paper passage {index}." in text
             assert f"Unique evidence start {index}." in text
@@ -476,7 +415,6 @@ def test_export_routes_require_authorization_and_return_bound_artifacts(monkeypa
     token = "e" * 48
     manifest = {
         "export_sha256": "1" * 64,
-        "released_annotation_set_sha256": "2" * 64,
     }
     exported = ReleasedReportExport(
         content=b"%PDF-1.7\nreleased",
@@ -494,24 +432,21 @@ def test_export_routes_require_authorization_and_return_bound_artifacts(monkeypa
         "overview": {},
         "citations": [],
         "reference_practice": [],
-        "role_summaries": {},
+        "summary": {},
         "gauges": [],
         "limits": [],
     }
     monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_bearer")
     monkeypatch.setattr(settings, "REPORT_PERSONAL_ACCESS_TOKEN", SecretStr(token))
     monkeypatch.setattr(settings, "SOURCE_REPOSITORY_SCOPE_ID", "owner-1")
-    monkeypatch.setattr(
-        "app.routers.report.build_released_report_export",
-        lambda *args, **kwargs: exported,
-    )
+    calls = []
+    def build(*args, **kwargs):
+        calls.append(kwargs)
+        return exported
+    monkeypatch.setattr("app.routers.report.build_released_report_export", build)
     monkeypatch.setattr(
         "app.routers.report.load_authorized_evidence_report_bundle",
         lambda *args, **kwargs: (view, SimpleNamespace(id="artifact-1"), _pdf_bytes()),
-    )
-    monkeypatch.setattr(
-        "app.routers.report.list_current_paper_annotations",
-        lambda *args, **kwargs: [],
     )
     app.dependency_overrides[get_db] = lambda: object()
     app.dependency_overrides[get_storage_backend] = lambda: object()
@@ -525,6 +460,11 @@ def test_export_routes_require_authorization_and_return_bound_artifacts(monkeypa
         assert pdf.headers["x-sourcefidelity-export-sha256"] == "1" * 64
         assert pdf.headers["x-sourcefidelity-manifest-sha256"] == "3" * 64
         assert "attachment" in pdf.headers["content-disposition"]
+        # An old audience link still works and gets the one report.
+        for old in ("instructor", "student", "invalid"):
+            legacy = client.get(f"/report/report-1/export.pdf?audience={old}", headers=headers)
+            assert legacy.status_code == 200 and 'sourcefidelity-report.pdf' in legacy.headers['content-disposition']
+        assert all('audience' not in call for call in calls)
 
         details = client.get("/report/report-1/export/manifest", headers=headers)
         assert details.status_code == 200
@@ -532,8 +472,8 @@ def test_export_routes_require_authorization_and_return_bound_artifacts(monkeypa
         assert details.headers["cache-control"] == "no-store, private"
 
         printable = client.get("/report/report-1/export/print", headers=headers)
-        assert printable.status_code == 200
-        assert printable.content == pdf.content
-        assert 'inline' in printable.headers['content-disposition']
+        assert printable.status_code == 404
+        assert client.get("/report/report-1/export.pdf?inline=true", headers=headers).headers['content-disposition'].startswith('attachment')
+        assert client.get("/report/report-1/export/manifest?audience=instructor", headers=headers).status_code == 200
     finally:
         app.dependency_overrides.clear()

@@ -6,20 +6,23 @@ import argparse
 import json
 from pathlib import Path
 
-from app.services.ocr_derivative import build_local_pdf_ocr_derivative
+from app.services.ocr_derivative import build_local_pdf_ocr_derivative, ocr_pdf_pages
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--input", required=True)
-    parser.add_argument("--derivative-output", required=True)
-    parser.add_argument("--manifest-output", required=True)
-    parser.add_argument("--language", required=True)
+    parser.add_argument("--derivative-output")
+    parser.add_argument("--manifest-output")
+    # Page-repair mode: OCR only these pages and write one JSON result.
+    parser.add_argument("--pages")
+    parser.add_argument("--pages-output")
+    parser.add_argument("--language", default="eng")
     parser.add_argument("--dpi", required=True, type=int)
-    parser.add_argument("--page-segmentation-mode", required=True, type=int)
-    parser.add_argument("--max-pages", required=True, type=int)
-    parser.add_argument("--max-pixels-per-page", required=True, type=int)
-    parser.add_argument("--max-total-pixels", required=True, type=int)
+    parser.add_argument("--page-segmentation-mode", default=6, type=int)
+    parser.add_argument("--max-pages", type=int)
+    parser.add_argument("--max-pixels-per-page", default=25_000_000, type=int)
+    parser.add_argument("--max-total-pixels", type=int)
     parser.add_argument("--timeout-seconds-per-page", required=True, type=int)
     parser.add_argument("--executable", required=True)
     return parser.parse_args()
@@ -28,6 +31,19 @@ def _arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = _arguments()
     input_path = Path(arguments.input)
+    if arguments.pages is not None:
+        output_path = Path(arguments.pages_output)
+        if input_path.parent != output_path.parent:
+            raise ValueError("OCR worker files must share one private temporary directory")
+        result = ocr_pdf_pages(
+            input_path.read_bytes(), [int(value) for value in arguments.pages.split(",") if value],
+            language=arguments.language, dpi=arguments.dpi,
+            page_segmentation_mode=arguments.page_segmentation_mode,
+            max_pixels_per_page=arguments.max_pixels_per_page,
+            timeout_seconds_per_page=arguments.timeout_seconds_per_page, executable=arguments.executable)
+        output_path.write_text(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+                               encoding="utf-8")
+        return
     derivative_path = Path(arguments.derivative_output)
     manifest_path = Path(arguments.manifest_output)
     if input_path.parent != derivative_path.parent or input_path.parent != manifest_path.parent:

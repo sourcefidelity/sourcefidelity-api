@@ -84,8 +84,8 @@ def test_identity_panel_uses_plausible_candidate_and_exact_field_values():
         'located_record':result['located_record'],
         'source':{'raw_reference':'Writer (2020). Study.', 'author':'Writer','year':'2020','title':'Study'}},1)
     assert 'In your reference:</strong> 2020' in html
-    assert 'In the located record:</strong> 2021' in html
-    assert 'Record provider: catalog' in html
+    # The located value and provider lines were removed (owner decision 2026-09-30).
+    assert 'In the located record' not in html and 'Record provider' not in html
 
 
 @pytest.mark.parametrize('fault', ['', 'hash', 'span', 'confidence', 'missing_detail', 'truncated'])

@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import hashlib
 import io
+import json
 
 import fitz
 from docx import Document
@@ -153,6 +154,7 @@ def test_expired_pending_marking_copy_is_physically_removed():
 
 
 def test_docx_retains_native_source_and_separately_hashed_pdf(monkeypatch):
+    from app.services.schemas import ParsedReference
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -196,7 +198,15 @@ def test_docx_retains_native_source_and_separately_hashed_pdf(monkeypatch):
         )
         session.add(job)
         session.commit()
-        record = ensure_report_paper_artifact(session, storage, job=job, content=content)
+        record = ensure_report_paper_artifact(session, storage, job=job, content=content,
+            references=[ParsedReference(reference_id='r', raw_ref='Smith, J. (2020). A book.')])
+        navigation = record.presentation_evidence['submitted_reference_navigation']
+        assert navigation['input_sha256'] == job.input_sha256
+        assert navigation['layout']['content_sha256'] == record.presentation_sha256
+        saved_navigation = json.dumps(navigation, sort_keys=True)
+        ensure_report_paper_artifact(session, storage, job=job, content=content,
+            references=[ParsedReference(reference_id='changed', raw_ref='Changed reference')])
+        assert json.dumps(record.presentation_evidence['submitted_reference_navigation'],sort_keys=True) == saved_navigation
         assert record.presentation_status == "page_faithful_ready"
         assert record.storage_key != record.presentation_storage_key
         source = storage.download(record.storage_key)

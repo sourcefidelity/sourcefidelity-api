@@ -94,6 +94,7 @@ def verify_citation_against_webpage(
     try:
         resp = safe_request(
             url,
+            usage_label="web page",
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",

@@ -4,8 +4,7 @@ from collections import Counter
 from app.services.retrieval.web_search import WebSearchRetriever
 from app.services.retrieval.base import RepresentationKind
 from app.services.retrieval.provider_runtime import ProviderPolicy
-from app.services.search.base import SearchResult
-from app.services.search.duckduckgo import DuckDuckGoSearch
+from app.services.search.base import SearchProvider, SearchResult
 from app.services.search.searxng import SearXNGSearch, classify_searxng_failure
 
 
@@ -223,8 +222,32 @@ def test_expired_searx_incident_allows_one_probe_and_records_recovery(monkeypatc
     retriever._on_provider_recovered.assert_called_once_with("searxng")
 
 
-def test_direct_duckduckgo_captcha_opens_persistent_cooldown() -> None:
-    primary = DuckDuckGoSearch()
+class _HealthManagedProvider(SearchProvider):
+    """Stand-in for a direct, health-managed (non-API-policy) provider.
+
+    The scraper-backed provider that occupied this role was removed; the
+    mechanism it exercised is still live, so it is tested through a stub
+    opted into `_HEALTH_MANAGED_DIRECT_PROVIDERS`.
+    """
+
+    @property
+    def name(self) -> str:
+        return "StubDirect"
+
+    def search(self, query: str, num_results: int = 10):  # pragma: no cover
+        return []
+
+
+def _health_managed(monkeypatch) -> _HealthManagedProvider:
+    monkeypatch.setattr(
+        "app.services.retrieval.web_search._HEALTH_MANAGED_DIRECT_PROVIDERS",
+        frozenset({"stubdirect"}),
+    )
+    return _HealthManagedProvider()
+
+
+def test_direct_provider_captcha_opens_persistent_cooldown(monkeypatch) -> None:
+    primary = _health_managed(monkeypatch)
     primary.search = Mock(return_value=[])
     primary.last_status = "captcha"
     retriever = _retriever(primary)
@@ -235,7 +258,7 @@ def test_direct_duckduckgo_captcha_opens_persistent_cooldown() -> None:
     primary.search.assert_called_once()
     retriever._health_store.record_unavailable.assert_called_once()
     assert retriever._health_store.record_unavailable.call_args.args[0] == (
-        "duckduckgo"
+        "stubdirect"
     )
     assert retriever._health_store.record_unavailable.call_args.kwargs[
         "status"
@@ -245,8 +268,10 @@ def test_direct_duckduckgo_captcha_opens_persistent_cooldown() -> None:
     )
 
 
-def test_direct_duckduckgo_success_closes_incident_and_schedules_refresh() -> None:
-    primary = DuckDuckGoSearch()
+def test_direct_provider_success_closes_incident_and_schedules_refresh(
+    monkeypatch,
+) -> None:
+    primary = _health_managed(monkeypatch)
     primary.search = Mock(return_value=[_result()])
     primary.last_status = "completed"
     retriever = _retriever(primary)
@@ -256,10 +281,10 @@ def test_direct_duckduckgo_success_closes_incident_and_schedules_refresh() -> No
     assert retriever._run_search("recovery query")
 
     retriever._health_store.claim_recovery_probe.assert_called_once_with(
-        "duckduckgo"
+        "stubdirect"
     )
-    assert retriever.recovered_provider_keys == {"duckduckgo"}
-    retriever._on_provider_recovered.assert_called_once_with("duckduckgo")
+    assert retriever.recovered_provider_keys == {"stubdirect"}
+    retriever._on_provider_recovered.assert_called_once_with("stubdirect")
 
 
 def test_timeout_retries_once_without_immediate_group_suspension(monkeypatch) -> None:

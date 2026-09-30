@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import re
+import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.services.retrieval.base import (
@@ -21,13 +22,50 @@ from app.services.source_type import (
 
 
 _CONFIDENCE_RANK = {"rejected": -1, "low": 0, "medium": 1, "high": 2}
+# A title this short cannot carry a merge on word overlap alone.
+_MIN_TOKENS_FOR_UNSUPPORTED_MERGE = 4
 _TRACKING_QUERY_PREFIXES = ("utm_",)
+_TITLE_TAIL_BOUNDARY = re.compile(r"^\s*[-:;.,/?!|\u2013\u2014(\[]")
+_LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+")
+
+
+def _normalized_locator(value: str) -> str:
+    """Compare submitted and observed addresses without their decoration."""
+    text = (value or "").strip().lower()
+    text = re.sub(r"^https?://", "", text)
+    text = re.sub(r"^www\.", "", text)
+    text = text.split("#", 1)[0].split("?", 1)[0]
+    return text.rstrip("/")
+
+
+def _result_locators(result: RetrievalResult) -> set[str]:
+    values = {result.full_text_url or ""}
+    values.update(location.url or "" for location in (result.locations or []))
+    metadata = result.metadata or {}
+    values.add(str(metadata.get("url") or ""))
+    return {_normalized_locator(value) for value in values if value}
+
+
+def _normalized_title(value: str) -> str:
+    collapsed = re.sub(r"\s+", " ", (value or "").strip().lower())
+    return _LEADING_ARTICLE.sub("", collapsed)
 
 
 @dataclass(frozen=True)
 class IdentityAssessment:
     confidence: str
     reason: str
+    # "part" when the cited title matched, "container" when only the work that
+    # contains it did. A container match identifies the book, never the part.
+    title_basis: str = ""
+    # "title_alone" when a distinctive title was the only agreeing field, and
+    # "corroborated" when author, year, publisher or an identifier agreed too.
+    # A distinctive title is good enough to show a reader what was probably
+    # cited, but it is one signal: the record may still be a different edition,
+    # a reprint, or another work sharing the phrase. So a title-alone merge
+    # identifies for display and is barred from contributing a discrepancy
+    # against the student's reference -- see corroborated_results.
+    corroboration: str = "corroborated"
 
     @property
     def accepted(self) -> bool:
@@ -40,6 +78,9 @@ class CanonicalWorkGraph:
 
     expected_doi: str | None = None
     expected_title: str | None = None
+    expected_container_title: str = ""
+    expected_publisher: str = ""
+    expected_url: str = ""
     expected_author: str | None = None
     expected_year: str | None = None
     expected_source_kind: str = "unknown"
@@ -48,6 +89,8 @@ class CanonicalWorkGraph:
     accepted_results: list[RetrievalResult] = field(default_factory=list)
     identity_evidence: list[dict] = field(default_factory=list)
     rejected_candidates: list[dict] = field(default_factory=list)
+    # Accepted results whose only agreeing field was a distinctive title.
+    _title_alone_results: list[RetrievalResult] = field(default_factory=list)
     _locations: dict[str, AcquisitionLocation] = field(default_factory=dict)
 
     def add(self, result: RetrievalResult) -> IdentityAssessment:
@@ -55,6 +98,9 @@ class CanonicalWorkGraph:
             result,
             expected_doi=self.expected_doi,
             expected_title=self.expected_title,
+            expected_container_title=self.expected_container_title,
+            expected_publisher=self.expected_publisher,
+            expected_url=self.expected_url,
             expected_author=self.expected_author,
             expected_year=self.expected_year,
             expected_source_kind=self.expected_source_kind,
@@ -72,6 +118,12 @@ class CanonicalWorkGraph:
             "expected_source_kind": normalize_source_kind(self.expected_source_kind),
             "observed_source_kind": provider_kind.kind,
             "observed_source_kind_confidence": provider_kind.confidence,
+            "title_basis": assessment.title_basis,
+            "corroboration": assessment.corroboration,
+            "rejection_code": (
+                "doi_registers_a_different_title"
+                if assessment.reason.startswith("the supplied DOI resolves")
+                else None),
         }
         if not assessment.accepted:
             self.rejected_candidates.append(evidence)
@@ -79,6 +131,8 @@ class CanonicalWorkGraph:
 
         self.identity_evidence.append(evidence)
         self.accepted_results.append(result)
+        if assessment.corroboration == "title_alone":
+            self._title_alone_results.append(result)
         for location in result.locations:
             self._merge_location(location)
         return assessment
@@ -120,6 +174,11 @@ class CanonicalWorkGraph:
                 "identity_evidence": self.identity_evidence,
                 "rejected_candidates": self.rejected_candidates,
                 "metadata_conflicts": self._metadata_conflicts(),
+                # Identified for display, barred from supplying a discrepancy.
+                "title_alone_providers": [
+                    result.source_name for result in self._title_alone_results],
+                "corroborated_providers": [
+                    result.source_name for result in self.corroborated_results],
                 "location_count": len(self._locations),
                 "abstract_providers": [
                     result.source_name
@@ -154,10 +213,15 @@ class CanonicalWorkGraph:
             full_text_url=locations[0].url if locations else None,
             locations=locations,
             abstract=abstract_result.abstract if abstract_result else None,
-            doi=self.expected_doi or _consensus_value(self.accepted_results, "doi"),
-            title=self.expected_title or _consensus_value(self.accepted_results, "title"),
-            year=self.expected_year or _consensus_value(self.accepted_results, "year"),
-            authors=_best_authors(self.accepted_results, self.expected_author),
+            # Where the reference left a field blank, the merged record fills
+            # it. A corroborated record answers first: a title-alone match may
+            # be a different edition, and its year would then be presented as
+            # this work's. When only title-alone records exist, theirs is the
+            # best available answer and is still shown.
+            doi=self.expected_doi or _consensus_value(self._display_results, "doi"),
+            title=self.expected_title or _consensus_value(self._display_results, "title"),
+            year=self.expected_year or _consensus_value(self._display_results, "year"),
+            authors=_best_authors(self._display_results, self.expected_author),
         )
 
     def _merge_location(self, location: AcquisitionLocation) -> None:
@@ -205,12 +269,32 @@ class CanonicalWorkGraph:
             return None
         return max(candidates, key=lambda result: len(result.abstract or ""))
 
+    @property
+    def corroborated_results(self) -> list[RetrievalResult]:
+        """Accepted records that agreed on more than the title alone.
+
+        A distinctive title is enough to identify a work for a reader, but it
+        is a single signal: a reprint, a later edition, or another work sharing
+        the phrase can satisfy it. Letting such a record disagree with the
+        student's year or DOI would report a discrepancy that rests entirely on
+        the merge being right, which nothing here established. Title-alone
+        records stay in the graph, stay visible, and contribute locations and
+        text; they do not supply a disagreement.
+        """
+        title_alone = {id(result) for result in self._title_alone_results}
+        return [r for r in self.accepted_results if id(r) not in title_alone]
+
+    @property
+    def _display_results(self) -> list[RetrievalResult]:
+        """Corroborated records where there are any, otherwise all of them."""
+        return self.corroborated_results or self.accepted_results
+
     def _metadata_conflicts(self) -> dict[str, list[dict]]:
         conflicts: dict[str, list[dict]] = {}
         for field_name in ("doi", "title", "year"):
             observed: dict[str, list[str]] = {}
             display: dict[str, str] = {}
-            for result in self.accepted_results:
+            for result in self.corroborated_results:
                 value = getattr(result, field_name)
                 if not value or value == "n.d.":
                     continue
@@ -232,20 +316,41 @@ def assess_work_identity(
     expected_title: str | None,
     expected_author: str | None,
     expected_year: str | None,
+    expected_container_title: str = "",
+    expected_publisher: str = "",
+    expected_url: str = "",
     expected_source_kind: str = "unknown",
     expected_source_kind_confidence: str = "unknown",
     expected_source_kind_evidence: tuple[str, ...] = (),
 ) -> IdentityAssessment:
-    """Assess provider-record identity before its locations enter the graph."""
+    """Assess provider-record identity before its locations enter the graph.
+
+    Identity rests on the combination of title, author and year rather than on
+    title text alone: a record agreeing on several of them is unlikely to be a
+    different work, and a record agreeing on none of them is not this one
+    however many words its title happens to share.
+    """
     normalized_expected_doi = _normalize_doi(expected_doi)
     normalized_result_doi = _normalize_doi(result.doi)
+    doi_matches = False
     if normalized_expected_doi and normalized_result_doi:
-        if normalized_expected_doi == normalized_result_doi:
+        if normalized_expected_doi != normalized_result_doi:
+            return IdentityAssessment(
+                "rejected",
+                f"DOI conflict: expected {normalized_expected_doi}, provider returned {normalized_result_doi}",
+            )
+        # A matching DOI is strong evidence, not a bypass. A fabricated or
+        # partly fabricated reference frequently carries a real DOI lifted from
+        # another work, so resolving that DOI and accepting whatever it names
+        # would confirm the invention and hand the reader a stranger's text.
+        # The title still has to agree; a DOI that resolves to a different
+        # title is itself the finding, and is reported as one below.
+        doi_matches = True
+        if not expected_title:
+            # Nothing to contradict: the reference supplied an identifier and
+            # no title, so the registration is the only identity evidence
+            # there is, and it outranks the coarse provider type taxonomy.
             return IdentityAssessment("high", "exact DOI match")
-        return IdentityAssessment(
-            "rejected",
-            f"DOI conflict: expected {normalized_expected_doi}, provider returned {normalized_result_doi}",
-        )
 
     expected_kind = SourceKindAssessment(
         normalize_source_kind(expected_source_kind),
@@ -254,44 +359,106 @@ def assess_work_identity(
     )
     observed_kind = classify_provider_source_kind(result.metadata)
     kind_compatibility = compare_source_kinds(expected_kind, observed_kind)
-    if kind_compatibility.verdict == "incompatible":
+    if kind_compatibility.verdict == "incompatible" and not doi_matches:
         return IdentityAssessment(
             "rejected",
             f"bibliographic type conflict: {kind_compatibility.reason}",
         )
 
-    if not expected_title or not result.title:
-        return IdentityAssessment("low", "insufficient DOI/title identity evidence")
+    def _title_agrees(expected: str, observed: str) -> bool:
+        """Equal, or one extends the other at a subtitle boundary, or near-equal.
 
-    expected_tokens = _significant_tokens(expected_title)
-    result_tokens = _significant_tokens(result.title)
-    if not expected_tokens or not result_tokens:
-        return IdentityAssessment("low", "title did not contain comparable tokens")
-    overlap = len(expected_tokens & result_tokens) / len(expected_tokens)
+        Bare containment is what merged "The Studio System" into "A Fine
+        Romance: Adapting Broadway to Hollywood in the Studio System Era".
+        """
+        left, right = _normalized_title(expected), _normalized_title(observed)
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        longer, shorter = (right, left) if len(right) > len(left) else (left, right)
+        if longer.startswith(shorter) and _TITLE_TAIL_BOUNDARY.match(longer[len(shorter):]):
+            return True
+        left_tokens, right_tokens = _significant_tokens(expected), _significant_tokens(observed)
+        if not left_tokens or not right_tokens:
+            return False
+        shared = left_tokens & right_tokens
+        return (len(shared) / len(left_tokens) >= 0.8
+                and len(shared) / len(right_tokens) >= 0.8)
 
-    supporting_fields: list[str] = []
+    agreements: list[str] = []
+    title_basis = ""
+    if expected_title and result.title and _title_agrees(expected_title, result.title):
+        agreements.append("title")
+        title_basis = "part"
+    elif (expected_container_title and result.title
+            and _title_agrees(expected_container_title, result.title)):
+        # The containing work a miscited part names is still named correctly.
+        agreements.append("title")
+        title_basis = "container"
+
     if expected_author and result.authors:
         surname = _author_surname(expected_author)
-        if surname and any(surname in author.lower() for author in result.authors):
-            supporting_fields.append("author")
+        if surname and any(surname in _fold_diacritics(author).lower()
+                           for author in result.authors):
+            agreements.append("author")
     if expected_year and result.year and _year(expected_year) == _year(result.year):
-        supporting_fields.append("year")
+        agreements.append("year")
+    observed_publisher = _publisher_from_result(result) or ""
+    if expected_publisher and observed_publisher:
+        expected_imprint = _significant_tokens(expected_publisher)
+        observed_imprint = _significant_tokens(observed_publisher)
+        # "McGraw Hill" and "McGraw-Hill Education" are the same imprint.
+        if expected_imprint and observed_imprint and (
+                expected_imprint <= observed_imprint or observed_imprint <= expected_imprint):
+            agreements.append("publisher")
+    # The identifier the student supplied. An exact DOI match has already
+    # returned above; a submitted URL the provider also lists is the same kind
+    # of evidence, once both are stripped of scheme, www and query decoration.
+    if doi_matches:
+        agreements.append("identifier")
+    elif expected_url:
+        submitted = _normalized_locator(expected_url)
+        if submitted and submitted in _result_locators(result):
+            agreements.append("identifier")
 
-    if overlap >= 0.8 and supporting_fields:
+    distinctive = _significant_tokens(
+        (expected_title if title_basis != "container" else expected_container_title) or "")
+    summary = f"{'+'.join(agreements) or 'nothing'} agree"
+    if title_basis == "container":
+        summary += " (title matched the containing work, not the cited part)"
+
+    # A distinctive title can still stand alone; anything shorter needs the
+    # combination the owner's rule describes — title plus one other field, or
+    # three fields agreeing — because a work matching that much is unlikely to
+    # be a different one.
+    if "title" in agreements and len(distinctive) >= _MIN_TOKENS_FOR_UNSUPPORTED_MERGE:
+        corroborated = len(agreements) >= 2
         return IdentityAssessment(
-            "high",
-            f"title overlap={overlap:.2f} with {'+'.join(supporting_fields)} support",
-        )
-    if overlap >= 0.75:
-        return IdentityAssessment("medium", f"strong title overlap={overlap:.2f}")
-    if overlap >= 0.6 and supporting_fields:
+            "high" if corroborated else "medium", summary, title_basis,
+            "corroborated" if corroborated else "title_alone")
+    if "title" in agreements and len(agreements) >= 2:
+        return IdentityAssessment("high" if len(agreements) >= 3 else "medium",
+                                  summary, title_basis)
+    # The title is the anchor. Author, year and publisher agreeing without it
+    # describes "a book by this author, that year, from that imprint", which a
+    # prolific author with a regular publisher can satisfy more than once — and
+    # the cost of being wrong is the app showing a different work's text as the
+    # cited source. Such a record is retained as a rejected candidate for
+    # inspection rather than merged.
+    if doi_matches and "title" not in agreements:
+        # The condition worth reporting rather than merging: the identifier
+        # resolves, and it resolves to something else.
         return IdentityAssessment(
-            "medium",
-            f"title overlap={overlap:.2f} with {'+'.join(supporting_fields)} support",
-        )
+            "low",
+            f"the supplied DOI resolves to a different title: submitted "
+            f"{(expected_title or '')[:120]!r}, registered {(result.title or '')[:120]!r}",
+            title_basis)
     return IdentityAssessment(
-        "low", f"provider record did not meet merge threshold (title overlap={overlap:.2f})"
-    )
+        "low",
+        f"insufficient agreement: {summary}"
+        + ("; the title did not agree" if "title" not in agreements else ""),
+        title_basis)
 
 
 def canonicalize_location_url(url: str) -> str:
@@ -336,10 +503,24 @@ def _significant_tokens(value: str) -> set[str]:
     }
 
 
+def _fold_diacritics(value: str) -> str:
+    """Compare names written with and without their marks.
+
+    Measured on stored candidates: "Kir, E., & Akyuz, A." against OpenAlex's
+    "Elif Kir, Asli Akyuz" scored as no author agreement because the surnames
+    differ only by a dotless i and a diaeresis, leaving a same-work record
+    resting on its title alone.
+    """
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return stripped.replace("\u0131", "i").replace("\u0130", "i")
+
+
 def _author_surname(value: str) -> str:
-    if "," in value:
-        return value.split(",", 1)[0].strip().lower()
-    parts = [part for part in re.findall(r"[A-Za-z]+", value) if part]
+    folded = _fold_diacritics(value)
+    if "," in folded:
+        return folded.split(",", 1)[0].strip().lower()
+    parts = [part for part in re.findall(r"[A-Za-z]+", folded) if part]
     return parts[-1].lower() if parts else ""
 
 

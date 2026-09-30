@@ -2,6 +2,7 @@ from unittest.mock import Mock
 
 import httpx
 
+from pydantic import SecretStr
 from app.config import settings
 from app.services.retrieval.elsevier import (
     ElsevierRetriever,
@@ -27,7 +28,7 @@ def test_non_elsevier_doi_skips_article_api(monkeypatch) -> None:
 
 
 def test_elsevier_doi_uses_metadata_then_native_xml(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "ELSEVIER_API_KEY", "synthetic-test-key")
+    monkeypatch.setattr(settings, "ELSEVIER_API_KEY", SecretStr("synthetic-test-key"))
     metadata = {
         "full-text-retrieval-response": {
             "coredata": {

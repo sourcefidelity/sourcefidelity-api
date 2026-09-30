@@ -30,11 +30,14 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
+import time
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.parse import urljoin
 
 import httpx
+from app.services.retrieval_deadline import remaining
+from app.services.submitted_links import observe_request, response_observed, response_body_observed
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,14 @@ _DEFAULT_HEADERS = {
 
 class UnsafeUrlError(ValueError):
     """Raised when a URL (or a redirect target) is non-public or otherwise blocked."""
+
+    def __init__(self, message, *, reason='not_recorded'):
+        super().__init__(message)
+        self.reason = reason
+
+
+class ResponseMediaTypeError(ValueError):
+    """Final response MIME type is outside the caller's allowed set."""
 
 
 class ResponseTooLargeError(Exception):
@@ -159,7 +170,7 @@ def _validate_host(host: str) -> None:
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as exc:
-        raise UnsafeUrlError("cannot resolve public host") from exc
+        raise UnsafeUrlError("cannot resolve public host", reason='dns_failure') from exc
 
     checked = 0
     for _family, _type, _proto, _canon, sockaddr in infos:
@@ -170,7 +181,7 @@ def _validate_host(host: str) -> None:
             continue
         checked += 1
         if _is_blocked_ip(ip):
-            raise UnsafeUrlError("hostname resolves to a non-public IP")
+            raise UnsafeUrlError("hostname resolves to a non-public IP", reason='non_public_destination')
     if checked == 0:
         raise UnsafeUrlError("hostname did not resolve to a usable address")
 
@@ -182,7 +193,7 @@ def _validate_url(url: str) -> None:
     if scheme not in ("http", "https"):
         raise UnsafeUrlError(f"blocked scheme: {scheme!r}")
     if parsed.userinfo:
-        raise UnsafeUrlError("URL credentials are not permitted")
+        raise UnsafeUrlError("URL credentials are not permitted", reason='url_credentials')
     _validate_host(parsed.host)
 
 
@@ -222,13 +233,14 @@ def _validate_connected_peer(response: httpx.Response, *, trusted: bool) -> None
     try:
         connected_ip = ipaddress.ip_address(str(raw_ip))
     except ValueError:
-        raise UnsafeUrlError("connected peer address is invalid") from None
+        raise UnsafeUrlError("connected peer address is invalid", reason='invalid_connected_peer') from None
     if _is_blocked_ip(connected_ip):
-        raise UnsafeUrlError("connected peer is a non-public address")
+        raise UnsafeUrlError("connected peer is a non-public address", reason='non_public_connected_peer')
 
 
 # ── Public API ───────────────────────────────────────────────────────────
 
+@observe_request
 def safe_request(
     url: str,
     *,
@@ -240,6 +252,8 @@ def safe_request(
     max_redirects: int = _MAX_REDIRECTS,
     max_meta_refreshes: int = 0,
     trust_prefix: str | None = None,
+    allowed_media_types: frozenset[str] | None = None,
+    usage_label: str | None = None,
 ) -> httpx.Response:
     """SSRF-safe, size-capped HTTP request with manual redirect following.
 
@@ -254,9 +268,15 @@ def safe_request(
         max_bytes: Abort once the body exceeds this many bytes.
         timeout: Request timeout in seconds.
         headers: Extra headers (merged over the default browser User-Agent).
+        allowed_media_types: Optional final-response MIME allowlist, checked
+            before body iteration; redirects retain the ordinary safety checks.
         raise_on_status: If True (default), raise ``httpx.HTTPStatusError`` on
             4xx/5xx. Set False for callers that need to inspect status codes
             themselves (e.g. the link validator, which categorizes 403/404).
+        usage_label: What this fetch is, for the report's technical details.
+            ``adapter:<name>`` counts as an academic-adapter request; any other
+            label (or none) counts as a direct web fetch. Recorded once per
+            call, only after the first hop passes the safety check.
         max_redirects: Maximum redirect hops before giving up.
         max_meta_refreshes: Maximum immediate HTML meta-refresh hops. Disabled
             by default; PDF acquisition enables one hop for repository viewers
@@ -281,8 +301,18 @@ def safe_request(
     redirect_count = 0
     meta_refresh_count = 0
 
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+    # httpx read timeouts apply per wait, not to an entire redirect/body chain.
+    # Preserve one elapsed allowance across all hops and streamed chunks.
+    deadline = time.monotonic() + remaining(timeout)
+
+    def time_left():
+        value = remaining(deadline - time.monotonic())
+        return value
+
+    recorded = False
+    with httpx.Client(timeout=time_left(), follow_redirects=False) as client:
         while True:
+            time_left()
             # Only the very first hop may be a trusted operator host; every
             # redirect target is re-validated regardless of trust_prefix.
             trusted_first_hop = bool(
@@ -295,7 +325,18 @@ def safe_request(
                 logger.debug("safe_request: using trusted operator origin for first hop")
             else:
                 _validate_url(current)
+            client.timeout = httpx.Timeout(time_left())
+            if not recorded:
+                recorded = True
+                from app.services.processing_metrics import record_direct_fetch, record_provider_request
+                label = str(usage_label or "other web fetch")
+                if label.startswith("adapter:"):
+                    record_provider_request(label[len("adapter:"):])
+                else:
+                    record_direct_fetch(label)
             with client.stream(method, current, headers=merged_headers) as resp:
+                time_left()
+                response_observed(current, resp.status_code, resp.headers.get("location"))
                 _validate_connected_peer(resp, trusted=trusted_first_hop)
                 if resp.status_code in _REDIRECT_CODES:
                     location = resp.headers.get("location")
@@ -311,13 +352,20 @@ def safe_request(
                     continue
 
                 # Final response — stream into a capped buffer.
+                if allowed_media_types is not None:
+                    media_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if media_type not in allowed_media_types:
+                        raise ResponseMediaTypeError("response_media_type_not_permitted")
                 buf = bytearray()
                 for chunk in resp.iter_bytes():
+                    time_left()
                     buf.extend(chunk)
                     if len(buf) > max_bytes:
                         raise ResponseTooLargeError(
                             f"response exceeded the {max_bytes}-byte safety limit"
                         )
+                time_left()
+                response_body_observed(buf)
                 if raise_on_status:
                     resp.raise_for_status()
                 # Cache the read body so .content / .text work after close.
@@ -346,6 +394,7 @@ def safe_fetch_bytes(
     timeout: float = 30.0,
     headers: dict[str, str] | None = None,
     max_meta_refreshes: int = 0,
+    usage_label: str | None = None,
 ) -> bytes:
     """SSRF-safe, size-capped fetch returning the response body as bytes.
 
@@ -360,6 +409,7 @@ def safe_fetch_bytes(
         timeout=timeout,
         headers=headers,
         max_meta_refreshes=max_meta_refreshes,
+        usage_label=usage_label,
     )
     if accept_content_types:
         ct = resp.headers.get("content-type", "").lower()

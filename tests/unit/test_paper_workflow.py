@@ -96,7 +96,9 @@ class MemoryStorage(StorageBackend):
         return [key for key in self.objects if key.startswith(prefix)]
 
 
-def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypatch):
+@pytest.mark.parametrize("judgments_enabled", [False, True])
+@pytest.mark.parametrize("joint_enabled", [False, True])
+def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypatch, judgments_enabled, joint_enabled):
     content = (
         b"A complete source discusses careful evidence retrieval and verification."
     )
@@ -133,7 +135,8 @@ def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypa
     )
     calls = []
 
-    def gate(artifact):
+    def gate(artifact, **_kwargs):
+        assert _kwargs['source_title'] == 'Submitted study title'
         calls.append("gate")
         outcome = (
             "no_relevant_candidate_passage"
@@ -178,6 +181,19 @@ def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypa
         calls.append("critic")
         return artifact
 
+    def joint(artifact, *, source_title):
+        assert source_title == 'Submitted study title'
+        assert artifact.passage_relevance.outcome == 'relevant_candidates_found'
+        calls.append('joint')
+        return artifact.joint_evidence_selection
+
+    monkeypatch.setattr('app.services.joint_evidence_selection.select_joint_evidence', joint)
+    def selection(artifact):
+        calls.append('selection')
+        return artifact
+    monkeypatch.setattr('app.services.evidence_sentence_selection.attach_sentence_evidence', selection)
+    monkeypatch.setattr('app.services.paper_workflow.settings.PAPER_EXPERIMENTAL_JOINT_SELECTION_ENABLED', joint_enabled)
+
     monkeypatch.setattr(
         "app.services.paper_workflow.settings.EVIDENCE_RETRIEVAL_SEMANTIC_BACKEND",
         "deberta_nli",
@@ -197,6 +213,7 @@ def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypa
         "app.services.paper_workflow.apply_facet_evidence_judgment", judgment
     )
     monkeypatch.setattr("app.services.paper_workflow.apply_decisive_label_critic", critic)
+    monkeypatch.setattr("app.services.paper_workflow.settings.PAPER_EXPERIMENTAL_RELATIONSHIP_JUDGMENTS_ENABLED", judgments_enabled)
 
     artifact = _shadow_artifact(
         source,
@@ -204,6 +221,7 @@ def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypa
         True,
         active_reference_id="ref-1",
         cited_author_label="Smith",
+        source_title='Submitted study title',
     )
 
     assert calls == [
@@ -211,12 +229,13 @@ def test_shadow_workflow_runs_semantic_rescue_only_after_confirmed_miss(monkeypa
         "gate",
         "rescue",
         "gate",
-        "foundation",
-        "judgment",
-        "critic",
-    ]
+    ] + (["joint"] if joint_enabled else []) + ["selection", "foundation"] + (["judgment", "critic"] if judgments_enabled else [])
     assert artifact.passage_relevance.outcome == "relevant_candidates_found"
     assert artifact.candidate_passage_retrieval.semantic_rescue_status == "complete"
+    calls.clear()
+    _shadow_artifact(source, claim, False, active_reference_id='ref-1',
+                     cited_author_label='Smith', source_title='Submitted study title')
+    assert calls == ['foundation']
 
 
 def test_authorized_report_bundle_requires_hash_bound_pdf_surface(monkeypatch):
@@ -294,6 +313,59 @@ class Resolver:
         )
 
 
+class ProvisionalResolver(Resolver):
+    def resolve_reference(self, reference):
+        result = super().resolve_reference(reference)
+        result.metadata['identity_confidence'] = 'medium'
+        result.metadata['provisional_source'] = {
+            'policy_version': 'submission-possible-match-v1',
+            'content_sha256': hashlib.sha256(result.full_text).hexdigest(),
+            'reason': 'The publication year differs from the reference.',
+        }
+        return result
+
+
+def test_possible_match_paper_pipeline_cleans_source_and_preserves_label(monkeypatch):
+    from app.models.source_repository import SourceRepresentationRecord
+    monkeypatch.setattr(paper_upload, 'scan_with_clamd',
+        lambda _: (SafetyVerdict.CLEAN, 'stream: OK'))
+    engine = create_engine('sqlite+pysqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    storage = MemoryStorage()
+    with factory() as session:
+        job = create_paper_job(session, storage, content=_paper_bytes(),
+            filename='paper.docx', media_type=DOCX_MEDIA_TYPE, scope_id='personal-default')
+        job_id = job.id
+        extract_paper_job(session, storage, job_id, llm_enabled=False)
+        assert retrieve_paper_sources(session, storage, job_id,
+            resolver=ProvisionalResolver()) == {'transient_authorized': 1}
+        assert session.scalar(select(VerificationRunRecord)).identity_verdict == 'possible_match'
+        assert session.scalar(select(SourceRepresentationRecord)) is None
+    summary = verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    assert summary['reports_persisted'] == 2
+    with factory() as session:
+        assert session.scalar(select(VerificationRunRecord)).cleaned_at is not None
+        records = session.scalars(select(VerificationReportRecord)).all()
+        for record in records:
+            assert record.verdict == 'not_assessed'
+            assert record.report_payload['source_identity']['status'] == 'uncertain'
+            assert 'The publication year differs from the reference.' in record.report_payload['source_identity']['limitations']
+        finalize_paper_job(session, storage, job_id)
+        aggregate = session.scalar(select(Report))
+        view = aggregate.report_json['evidence_report']
+        html = render_evidence_report_html(view, csp_nonce='test-provisional-nonce')
+        assert 'Possible source match' in html
+        assert 'The publication year differs from the reference.' in html
+        for citation in view['citations']:
+            for member in citation['members']:
+                assert member['identity_status'] == 'possible_match'
+                assert not member['show_quotation_check']
+                assert not member['show_locator_check']
+                assert member['relevance_status'] == 'not_assessed'
+        assert not any(key.startswith('verification-runs/') for key in storage.objects)
+
+
 class CompoundResolver:
     def __init__(self):
         self.calls = []
@@ -350,14 +422,14 @@ def _paper_bytes():
     return output.getvalue()
 
 
-def _compound_paper_bytes():
+def _compound_paper_bytes(*, with_link=False):
     document = Document()
     document.add_paragraph(
         "Smith (2020) and Jones (2021) show that the shared result is stable."
     )
     document.add_paragraph("References")
     document.add_paragraph("Smith, J. (2020). First source. Example Press.")
-    document.add_paragraph("Jones, A. (2021). Second source. Example Press.")
+    document.add_paragraph("Jones, A. (2021). Second source. Example Press." + (' https://example.org/source' if with_link else ''))
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -381,6 +453,70 @@ def _retry_test_job(monkeypatch, *, store_only=False, factory=None, storage=None
     return factory, storage, job_id
 
 
+def test_uncited_identity_checkpoint_never_creates_source_run(monkeypatch):
+    from app.services.bibliography_identity import POLICY
+    from app.services import paper_workflow
+    factory, storage, job_id = _retry_test_job(monkeypatch)
+    calls = []
+    class IdentityResolver:
+        def prefetch_title_candidates(self, queries):
+            calls.append(("prefetch", len(queries)))
+        def prefetch_deferred_dois(self, dois):
+            pass
+        def resolve_reference(self, reference, *, identity_only=False):
+            assert identity_only and reference.reference_id == "uncited-book"
+            calls.append(("identity", reference.reference_id))
+            # Even a defective injected result cannot authorize source use.
+            return RetrievalResult(source_name="test", success=True,
+                full_text=b"Must not store these bytes", abstract="Must not use this abstract",
+                metadata={"repository_representation_id": str(uuid.uuid4()),
+                          "identity_confidence": "high"})
+    with factory() as session:
+        job = session.get(Job, job_id)
+        original_sources = list(job.source_results)
+        payload = dict(job.extraction_payload)
+        payload["references"] = [*payload["references"],
+            dict(payload["references"][0], reference_id="uncited-book", source_kind="monograph")]
+        job.extraction_payload = payload
+        job.stage = "extracted"
+        session.commit()
+        objects = dict(storage.objects)
+        runs = list(session.scalars(select(VerificationRunRecord.id)))
+        retrieve_paper_sources(session, storage, job_id, resolver=IdentityResolver())
+        saved = job.source_results[-1]
+        assert saved["identity_only_policy"] == POLICY
+        assert saved["status"] == "metadata_only"
+        assert not {"representation_id", "run_id", "abstract_evidence"} & saved.keys()
+        assert job.source_results[:-1] == original_sources
+        assert storage.objects == objects
+        assert list(session.scalars(select(VerificationRunRecord.id))) == runs
+        before = list(calls)
+        retrieve_paper_sources(session, storage, job_id, resolver=IdentityResolver())
+        assert calls == before
+
+
+def test_cited_sources_keep_priority_over_uncited_search_budget(monkeypatch):
+    from app.services.source_resolver import SourceResolutionError
+    factory, storage, job_id = _retry_test_job(monkeypatch)
+    calls = []
+    class NoSources:
+        def resolve_reference(self, reference, *, identity_only=False):
+            calls.append((reference.reference_id, identity_only))
+            raise SourceResolutionError("Synthetic unavailable source")
+    with factory() as session:
+        job = session.get(Job, job_id)
+        payload = dict(job.extraction_payload)
+        cited_id = payload["references"][0]["reference_id"]
+        payload["references"] = [dict(payload["references"][0],
+            reference_id="alphabetically-first-uncited", source_kind="monograph"), *payload["references"]]
+        job.extraction_payload = payload
+        job.source_results = []
+        job.stage = "extracted"
+        session.commit()
+        retrieve_paper_sources(session, storage, job_id, resolver=NoSources())
+        assert calls == [(cited_id, False), ("alphabetically-first-uncited", True)]
+
+
 @pytest.mark.parametrize("store_only", [False, True])
 def test_finalization_resumes_after_projection_failure(monkeypatch, store_only):
     from app.services import paper_workflow
@@ -400,6 +536,53 @@ def test_finalization_resumes_after_projection_failure(monkeypatch, store_only):
         result = finalize_paper_job(session, storage, job_id)
         assert finalize_paper_job(session, storage, job_id)["report_id"] == result["report_id"]
         assert len(session.scalars(select(Report)).all()) == 1
+
+
+class CandidateAuditResolver(Resolver):
+    """Discovery records carrying the development-only candidate-link audit."""
+
+    AUDIT_URL = "https://exa.example/CANDIDATE_AUDIT_URL_SENTINEL.pdf"
+
+    def resolve_reference(self, reference):
+        result = super().resolve_reference(reference)
+        audit = {"audit_policy": "dev-candidate-audit-v1", "omitted_count": 0, "candidates": [
+            {"provider": "exa", "query_id": "query-audit", "rank": 1, "url": self.AUDIT_URL,
+             "url_truncated": False, "disposition": "identity_rejected",
+             "reason_code": "identity_rejected"}]}
+        attempt = {"attempt_id": "attempt-audit", "route_category": "bounded_web",
+                   "provider": "web_search", "candidate_audit": audit}
+        result.metadata["reference_discovery"]["attempts"] = [attempt]
+        result.metadata["reference_discovery_trace"]["attempts"] = [dict(attempt)]
+        return result
+
+
+def test_report_projection_never_renders_candidate_audit_urls(monkeypatch):
+    monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _content: (SafetyVerdict.CLEAN, "OK"))
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    storage = MemoryStorage()
+    sentinel = "CANDIDATE_AUDIT_URL_SENTINEL"
+    with factory() as session:
+        job = create_paper_job(session, storage, content=_paper_bytes(), filename="audit.docx",
+                               media_type=DOCX_MEDIA_TYPE, scope_id="personal-default")
+        job_id = job.id
+        extract_paper_job(session, storage, job_id, llm_enabled=False)
+        retrieve_paper_sources(session, storage, job_id, resolver=CandidateAuditResolver())
+        # The development record is present in the stored source results...
+        assert sentinel in json.dumps(session.get(Job, job_id).source_results)
+    verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    with factory() as session:
+        finalize_paper_job(session, storage, job_id)
+        aggregate = session.scalar(select(Report))
+        view = aggregate.report_json["evidence_report"]
+        html = render_evidence_report_html(view, csp_nonce="test-candidate-audit-nonce")
+        payloads = [record.report_payload for record in session.scalars(select(VerificationReportRecord))]
+        # ...but no report projection, rendering or package carries it.
+        assert sentinel not in json.dumps(aggregate.report_json, default=str)
+        assert sentinel not in html
+        assert "candidate_audit" not in json.dumps(aggregate.report_json, default=str)
+        assert payloads and sentinel not in json.dumps(payloads, default=str)
 
 
 @pytest.mark.parametrize("boundary", ["processing", "partial_batch"])
@@ -682,6 +865,49 @@ def test_collective_claim_is_verified_against_each_exact_source_membership():
     assert grouped == {"ref-smith": [claim], "ref-jones": [claim]}
 
 
+def test_unbound_continuation_preserves_anchor_without_blocking_explicit_evidence(monkeypatch):
+    from app.services import paper_workflow
+    factory, storage, job_id = _retry_test_job(monkeypatch)
+    with factory() as session:
+        job = session.get(Job, job_id)
+        payload = dict(job.extraction_payload)
+        claims = [dict(item) for item in payload["citation_claims"]]
+        assert len(claims) == 2
+        claims[1].update(citation_marker="implicit_continuation", citation_markers=[])
+        continuation_id = claims[1]["claim_id"]
+        payload["citation_claims"] = claims
+        job.extraction_payload = payload
+        session.commit()
+    checked = []
+    original = paper_workflow._shadow_artifact
+    def capture(source, claim, *args, **kwargs):
+        checked.append(claim.claim_id)
+        return original(source, claim, *args, **kwargs)
+    monkeypatch.setattr(paper_workflow, "_shadow_artifact", capture)
+    summary = verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    assert checked == [claims[0]["claim_id"]]
+    assert summary["reports_persisted"] == 1
+    assert not summary["source_failures"]
+    continuation = next(g for g in summary["citation_groups"] if g["claim_id"] == continuation_id)
+    assert continuation["members"][0]["status"] == "citation_not_assessed"
+    assert continuation["members"][0]["reason_code"] == "continuation_source_marker_unresolved"
+    with factory() as session:
+        finalize_paper_job(session, storage, job_id)
+        view = session.scalar(select(Report)).report_json["evidence_report"]
+    citation = next(c for c in view["citations"] if c["claim_id"] == continuation_id)
+    assert citation["student_text"] == claims[1]["text"]
+    member = citation["members"][0]
+    assert member["status"] == "citation_not_assessed"
+    assert not member["best_evidence"]
+    assert not member["show_quotation_check"]
+    html = _render_member(member)
+    assert "Continuation not assessed" in html
+    assert "Source not retrieved" not in html
+    panel = _render_panel_template(citation, 1)
+    assert '<h3 class="member-label">Not assessed</h3>' in panel
+    assert "<h3>Not retrieved</h3>" not in panel
+
+
 def test_report_distinguishes_failed_cited_webpage_with_metadata_only():
     assert _report_source_failure_reason(
         {
@@ -702,29 +928,193 @@ def test_report_distinguishes_failed_cited_webpage_with_metadata_only():
     ) == "cited_webpage_unavailable_metadata_only"
 
 
-def test_only_search_incomplete_operational_providers_become_retry_dependencies():
-    trace = {
-        "queries": [
-            {
-                "execution_provider": "searxng",
-                "execution_outcome": "cooldown_skipped",
-            },
-            {
-                "execution_provider": "exa",
-                "execution_outcome": "no_results",
-            },
-        ]
-    }
+def test_only_blocking_providers_become_retry_dependencies():
+    """A provider is a re-run trigger only if the completion gate counts it.
 
+    Rewritten 2026-09-24. The previous version asserted that SearXNG became a
+    trigger because its query was cooldown-skipped, whatever its role. All four
+    re-run waves on 2026-09-23 -- 192 reference re-runs -- came from exactly
+    that, though SearXNG cannot complete or invalidate a search under
+    `api-first-search-v2`, and they moved fabrication flags between report
+    versions without changing any completion gate.
+    """
+    from tests.unit.blocked_discovery import blocked_record
+
+    optional = blocked_record("r1", policy="api-first-search-v2", web_outcomes={
+        "brave": "results", "exa": "results", "searxng": "cooldown_skipped"})
+    required_web = blocked_record("r2", policy="api-first-search-v2",
+                                  web_outcomes={"brave": "timeout", "exa": "results"})
+    adapter = blocked_record("r3", adapter="core")
+
+    assert _retryable_provider_dependencies(None, optional) == []
+    assert _retryable_provider_dependencies(None, required_web) == ["brave"]
+    assert _retryable_provider_dependencies(None, adapter) == ["core"]
+    # A reference that got a real answer is never re-run.
     assert _retryable_provider_dependencies(
-        trace, {"outcome": "search_incomplete"}
-    ) == ["searxng"]
-    assert _retryable_provider_dependencies(
-        trace, {"outcome": "unlocated_after_search"}
-    ) == []
+        None, {**adapter, "outcome": "unlocated_after_search"}) == []
+    # An unreadable record names nothing rather than guessing.
+    assert _retryable_provider_dependencies(None, {"outcome": "search_incomplete"}) == []
 
 
-def test_checkpointed_workflow_persists_shadow_report_and_cleans(monkeypatch):
+@pytest.mark.parametrize("identity_found", [True, False])
+def test_metadata_only_identity_survives_checkpoint_reload_and_report(monkeypatch, identity_found):
+    from app.services.reference_discovery import ExpectedBibliographicFields
+    from app.services.source_resolver import SourceResolver, SourceResolutionError, _ACTIVE_DISCOVERY_TRACE
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Network is forbidden in metadata-only workflow regression")
+
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _: (SafetyVerdict.CLEAN, "OK"))
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    storage = MemoryStorage()
+    captured = {}
+
+    class MetadataOnlyResolver:
+        calls = 0
+
+        def resolve_reference(self, reference):
+            self.calls += 1
+            token = _ACTIVE_DISCOVERY_TRACE.set({
+                "reference_id": reference.reference_id,
+                "expected": ExpectedBibliographicFields(title=reference.title,
+                    authors=[reference.author], year=reference.year),
+                "search_policy_version": "api-first-search-v2",
+                "required_web_providers": ["brave", "exa"],
+                "required": {"academic_adapter", "bounded_web"},
+                "queries": [], "attempts": [], "candidates": [], "limitations": [],
+            })
+            try:
+                # Independently declared synthetic metadata; never source text.
+                SourceResolver._record_discovery_attempt(category="academic_adapter", provider="crossref",
+                    result=RetrievalResult(source_name="crossref", success=identity_found,
+                        title="A useful title" if identity_found else None,
+                        authors=["Smith, J."] if identity_found else [],
+                        year="2020" if identity_found else None, error=None if identity_found else "No results"),
+                    required=True)
+                trace, discovery = SourceResolver._discovery_artifacts()
+            finally:
+                _ACTIVE_DISCOVERY_TRACE.reset(token)
+            captured.update(trace=trace, discovery=discovery)
+            exc = SourceResolutionError("Synthetic acquisition unavailable")
+            exc.reference_discovery_trace = trace
+            exc.reference_discovery = discovery
+            raise exc
+
+    resolver = MetadataOnlyResolver()
+    with factory() as session:
+        job = create_paper_job(session, storage, content=_paper_bytes(), filename="identity.docx",
+            media_type=DOCX_MEDIA_TYPE, scope_id="personal-default")
+        job_id = job.id
+        extract_paper_job(session, storage, job_id, llm_enabled=False)
+        assert retrieve_paper_sources(session, storage, job_id, resolver=resolver) == {"unavailable": 1}
+    expected = "confirmed" if identity_found else "search_incomplete"
+    with factory() as session:
+        job = session.get(Job, job_id)
+        result = job.source_results[0]
+        assert result["reference_discovery"] == captured["discovery"]
+        assert result["reference_discovery_trace"] == captured["trace"]
+        assert result["reference_discovery"]["outcome"] == expected
+        assert result["status"] == "unavailable"
+        assert not result.get("representation_id") and not result.get("abstract_evidence")
+        retrieve_paper_sources(session, storage, job_id, resolver=resolver)
+        assert resolver.calls == 1
+    verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    with factory() as session:
+        finalize_paper_job(session, storage, job_id)
+    with factory() as session:
+        job = session.get(Job, job_id)
+        report = session.scalar(select(Report).where(Report.job_id == job_id))
+        view = report.report_json["evidence_report"]
+        assert get_authorized_evidence_report_view(session, report.id,
+            scope_type="personal_owner", scope_id="personal-default") == view
+        with pytest.raises(EvidenceReportAuthorizationError):
+            get_authorized_evidence_report_view(session, report.id,
+                scope_type="personal_owner", scope_id="another-owner")
+        assert view["overview"]["verified_full_text_sources"] == 0
+        assert session.scalars(select(VerificationReportRecord)).all() == []
+        assert len(view["citations"]) == 2
+        for citation in view["citations"]:
+            assert len(citation["members"]) == 1
+            for member in citation["members"]:
+                assert member["reference_identity"]["status"] == expected
+                assert not member["reference_identity"]["attention"]
+                assert not member.get("best_evidence")
+        assert job.source_results[0]["reference_discovery_trace"] == captured["trace"]
+    engine.dispose()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("observed", [False, True])
+def test_submitted_link_observations_checkpoint_and_report_data(monkeypatch, failure, observed):
+    import httpx
+    from app.services.submitted_links import observe_reference, observe_request, response_observed
+    from app.services.source_resolver import SourceResolutionError
+    monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _: (SafetyVerdict.CLEAN, "OK"))
+    engine = create_engine("sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    storage = MemoryStorage()
+    document = Document()
+    document.add_paragraph("Careful verification improves accuracy (Smith, 2020).")
+    document.add_paragraph("References")
+    document.add_paragraph("Smith, J. (2020). A useful title. Example Press. https://example.org/source")
+    data = io.BytesIO(); document.save(data)
+    class ObservedResolver(Resolver):
+        @observe_reference
+        def resolve_reference(self, reference):
+            if observed:
+                @observe_request
+                def fixture_request(url):
+                    response_observed(url, 404)
+                    return httpx.Response(404, content=b"fixture only")
+                fixture_request(reference.url)
+            if failure:
+                self.calls += 1
+                raise SourceResolutionError("fixture unavailable")
+            return super().resolve_reference(reference)
+    resolver = ObservedResolver()
+    with factory() as session:
+        job = create_paper_job(session, storage, content=data.getvalue(), filename="fixture.docx",
+            media_type=DOCX_MEDIA_TYPE, scope_id="personal-default")
+        job_id = job.id
+        extract_paper_job(session, storage, job_id, llm_enabled=False)
+        retrieve_paper_sources(session, storage, job_id, resolver=resolver)
+        expected = job.source_results[0]["submitted_link_observations"]
+        assert expected and all(r["state"] == ("observed" if observed else "not_checked") for r in expected)
+        if observed:
+            assert expected[0]["requests"][0]["outcome"] == "not_found"
+    with factory() as session:
+        job = session.get(Job, job_id)
+        assert job.source_results[0]["submitted_link_observations"] == expected
+        retrieve_paper_sources(session, storage, job_id, resolver=resolver)
+        assert resolver.calls == 1
+    summary = verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    assert summary["submitted_link_observations"] == expected
+    with factory() as session:
+        finalize_paper_job(session, storage, job_id)
+    with factory() as session:
+        report = session.scalar(select(Report).where(Report.job_id == job_id))
+        assert report.report_json["submitted_link_observations"] == expected
+        view = report.report_json['evidence_report']
+        assert view['submitted_link_observations'] == expected
+        member_rows = [row for citation in view['citations'] for member in citation['members']
+                       for row in member.get('submitted_link_observations', [])]
+        assert member_rows == expected
+        from app.services.evidence_report import render_evidence_report_html
+        for audience in ('student', 'instructor'):
+            html = render_evidence_report_html({**view, 'audience': audience}, csp_nonce='link-check-test-nonce')
+            assert 'Submitted links in uncited references' not in html
+            assert 'Submitted link check' not in html  # No localized reference flag in this raw view.
+    engine.dispose()
+
+
+@pytest.mark.parametrize('require_links',[False, True])
+def test_checkpointed_workflow_persists_shadow_report_and_cleans(monkeypatch, require_links):
     monkeypatch.setattr(
         paper_upload,
         "scan_with_clamd",
@@ -746,6 +1136,7 @@ def test_checkpointed_workflow_persists_shadow_report_and_cleans(monkeypatch):
             filename="paper.docx",
             media_type=DOCX_MEDIA_TYPE,
             scope_id="personal-default",
+            require_reference_links=require_links,
         )
         job_id = job.id
         extracted = extract_paper_job(session, storage, job_id, llm_enabled=False)
@@ -754,9 +1145,32 @@ def test_checkpointed_workflow_persists_shadow_report_and_cleans(monkeypatch):
         assert extracted["reference_layout_matched"] == extracted["reference_layout_total"]
         assert extracted["reference_formatting_status"] == "partial"
         assert extracted["reference_formatting_differences"] == 1
+        job.upload_evidence = {**job.upload_evidence,
+            'assessment_configuration':{'version':'assessment-configuration-v1', 'require_reference_links':not require_links}}
+        session.commit()
         assert job.input_storage_key is None
         assert extract_paper_job(session, storage, job_id, llm_enabled=False) == extracted
-        resolver = Resolver()
+        class PrefetchResolver(Resolver):
+            def __init__(self):
+                super().__init__()
+                self.phases = []
+
+            def prefetch_title_candidates(self, queries):
+                self.phases.append('titles')
+                assert queries
+                return {}
+
+            def prefetch_deferred_dois(self, dois):
+                assert self.phases == ['titles']
+                self.phases.append('dois')
+                return {}
+
+            def resolve_reference(self, reference):
+                assert self.phases == ['titles', 'dois']
+                self.phases.append('resolve')
+                return super().resolve_reference(reference)
+
+        resolver = PrefetchResolver()
         retrieved = retrieve_paper_sources(
             session,
             storage,
@@ -818,20 +1232,25 @@ def test_checkpointed_workflow_persists_shadow_report_and_cleans(monkeypatch):
             for item in evidence
         )
         assert aggregate.report_json["decision_applied"] is False
-        assert aggregate.report_json["reference_consistency"]["assessment_version"] == "reference-consistency-v2"
+        assert aggregate.report_json["reference_consistency"]["assessment_version"] == "reference-consistency-v3"
         assert aggregate.report_json["reference_consistency"]["formatting_status"] == "not_assessed"
         assert aggregate.report_json["reference_consistency"]["formatting_reason_codes"] == [
             "layout_evidence_ready_style_rules_not_accepted"
         ]
         assert aggregate.report_json["reference_layout"]["status"] == "complete"
         assert aggregate.report_json["reference_formatting"]["assessment_version"] == (
-            "reference-formatting-v1"
+            "reference-formatting-v2"
         )
         assert aggregate.report_json["reference_formatting"]["result_counts"] == {
             "difference": 1
         }
         evidence_view = aggregate.report_json["evidence_report"]
-        assert evidence_view["view_version"] == "evidence-led-report-v13"
+        assert evidence_view['assessment_configuration']['require_reference_links'] is require_links
+        assert evidence_view["submitted_locator_inventory"] is not None
+        assert evidence_view["submitted_locator_inventory"]["contributes_to_issue_counts"] is False
+        assert evidence_view["view_version"] == "evidence-led-report-v31"
+        assert evidence_view['reference_credibility']
+        assert all(not item['findings'] for item in evidence_view['reference_credibility'].values())
         assert evidence_view["paper_surface"]["status"] == "presentation_source_retained"
         assert evidence_view["paper_surface"]["reason_code"] == (
             "deterministic_pdf_render_required"
@@ -1016,13 +1435,13 @@ def test_evidence_report_renders_continuous_page_surface_with_typed_overlay():
     assert 'class="selected-citation"' in rendered
     assert "View in paper" not in rendered
     assert "Citation evidence</h2>" not in rendered
-    assert "Submitted paper</h2>" in rendered
-    assert "Selected citation</h2>" in rendered
+    assert "Submitted paper</h2>" not in rendered
+    assert 'href="#citation-location-1">Citation 1</a><span data-proposition-suffix></span></h2>' in rendered
     assert "Citations without exact page geometry" not in rendered
     assert "mouseenter" not in rendered
-    assert 'id="paper-only"' in rendered
-    assert 'id="layer-evidence" type="checkbox" checked' in rendered
-    assert 'id="layer-reference" type="checkbox" checked' in rendered
+    assert 'id="paper-layout"' not in rendered and 'id="sources-layout"' not in rendered
+    assert 'id="sources-layout"' not in rendered   # one layout (2026-09-28)
+    assert 'id="judgment-layout"' not in rendered
     assert "[hidden]{display:none!important}" in rendered
     assert 'id="report-splitter"' in rendered
     assert 'aria-valuemin="30" aria-valuemax="80" aria-valuenow="68"' in rendered
@@ -1030,27 +1449,31 @@ def test_evidence_report_renders_continuous_page_surface_with_typed_overlay():
     assert "Paper view" not in rendered
     assert "Citation spans represented" not in rendered
     assert "How to read this report" in rendered
-    assert "Priorities for revision" in rendered
+    assert "Patterns and issues" not in rendered and "Priorities for revision" not in rendered
     assert "Repeated patterns" not in rendered
-    assert "Report Counts and Evidence Breakdown" in rendered
+    assert "Report Counts and Evidence Breakdown" not in rendered
     assert "Facet Fidelity" not in rendered
     assert 'id="zoom-in"' in rendered and 'id="zoom-out"' in rendered
-    assert 'id="add-comment"' in rendered
-    assert 'id="add-highlight"' in rendered
-    assert 'id="pen-tool"' in rendered
-    assert 'id="undo-annotation"' in rendered
-    assert 'id="redo-annotation"' in rendered
+    assert 'id="add-comment"' not in rendered
+    assert 'id="add-highlight"' not in rendered
+    assert 'id="pen-tool"' not in rendered
+    assert 'id="undo-annotation"' not in rendered
+    assert 'id="redo-annotation"' not in rendered
     assert "solid underline" not in rendered
     assert "dashed: abstract or limited text retrieval" not in rendered
     assert "dotted: no text retrieved" not in rendered
-    assert "teal: abstract or limited text available" in rendered
-    assert "brown: checked source; no clear matching passage" in rendered
-    assert "light grey: no retrieved text or not verifiable" in rendered
+    assert 'class="color-key teal"></i>abstract' not in rendered   # swatches removed 2026-09-28
+    assert 'class="color-key mauve"></i>limited text' not in rendered
+    assert "brown: checked source; no clear matching passage" not in rendered
+    assert 'class="color-key gray"></i>no retrieved text' not in rendered
+    assert "Light-grey underline: complete citation span" not in rendered   # key rebuilt 2026-09-28
     assert ".citation-overlay.retrieved_no_connection{" in rendered
     assert ".citation-overlay.retrieved_no_connection .underline" not in rendered
 
 
-def test_evidence_report_renders_saved_annotation_overlay_and_controls():
+def test_stored_annotations_are_never_rendered():
+    """The comment, highlight and pen tools were removed (owner decision
+    2026-09-25); records stored before then stay untouched and unshown."""
     anchor_id = "a" * 64
     view = {
         "title": "Annotated report",
@@ -1110,68 +1533,10 @@ def test_evidence_report_renders_saved_annotation_overlay_and_controls():
 
     rendered = render_evidence_report_html(view, csp_nonce="saved-annotation-nonce")
 
-    assert "persisted-highlight" in rendered
-    assert "instructor-comment-marker" in rendered
-    assert "Check this distinction." in rendered
-    assert "Select text or a citation, then choose Comment or Highlight" in rendered
-    assert "Pen (draft)" in rendered
-    assert "instructor comment or highlight" in rendered
-    assert 'data-annotation-operation="visibility"' in rendered
-    assert 'data-annotation-operation="delete"' in rendered
-
-
-def test_evidence_report_renders_generic_page_region_and_filters_private_student_view():
-    anchor_id = "e" * 64
-    view = {
-        "title": "General annotation report",
-        "citation_format": "APA",
-        "paper_surface": {
-            "page_dimensions": [{"page_index": 0, "width": 612.0, "height": 792.0}],
-            "page_href_template": "/report/report-1/paper/page/{page_index}",
-        },
-        "overview": {},
-        "citations": [],
-        "annotations": [
-            {
-                "annotation_id": "f" * 36,
-                "revision": 1,
-                "annotation_type": "highlight",
-                "anchor_kind": "page_region",
-                "anchor": {
-                    "anchor_version": "page-region-anchor-v1",
-                    "anchor_kind": "page_region",
-                    "anchor_id": anchor_id,
-                    "localization_level": "exact_rectangle",
-                    "page_indexes": [0],
-                    "rectangles": [
-                        {
-                            "page_index": 0,
-                            "x0": 80.0,
-                            "y0": 120.0,
-                            "x1": 260.0,
-                            "y1": 148.0,
-                        }
-                    ],
-                },
-                "content": None,
-                "visibility": "private",
-            }
-        ],
-        "annotation_action": {
-            "create_href": "/report/report-1/annotations",
-            "revision_href_template": "/report/report-1/annotations/{annotation_id}",
-        },
-        "limits": [],
-    }
-
-    rendered = render_evidence_report_html(view, csp_nonce="generic-region-nonce")
-
-    assert 'data-page-index="0"' in rendered
-    assert 'class="paper-annotation-overlay persisted-highlight annotation-private-only"' not in rendered
-    assert 'class="annotation-region-bg"' not in rendered
-    assert f'data-panel-template="annotation-panel-{anchor_id}"' not in rendered
-    assert 'body[data-audience="student"] .annotation-private-only' in rendered
-    assert "Choose Comment or Highlight to save this paper area." in rendered
+    for absent in ("persisted-highlight", "instructor-comment-marker", "Check this distinction.",
+                   "data-annotation-operation", "instructor comment or highlight", "annotation-panel-",
+                   "data-annotation-create", "Pen (draft)"):
+        assert absent not in rendered
 
 
 def test_abstract_only_member_shows_abstract_once_without_unavailable_or_checks():
@@ -1200,11 +1565,12 @@ def test_abstract_only_member_shows_abstract_once_without_unavailable_or_checks(
 
     rendered = _render_member(member)
 
-    assert "Abstract evidence" in rendered
-    assert "The abstract describes the study" in rendered
+    # Collapsed under "Abstract" (owner request 2026-09-28).
+    assert ('<details class="abstract-disclosure"><summary>Abstract</summary><blockquote>'
+            'The abstract describes the study') in rendered
+    assert "Abstract evidence" not in rendered
     assert "Only the abstract was retrieved" not in rendered
-    assert ">Abstract<" not in rendered
-    assert 'class="source-excerpt"' in rendered
+    assert 'class="source-excerpt"' not in rendered
     assert 'class="locator">Abstract' not in rendered
     assert "No source evidence is available" not in rendered
     assert "Deterministic checks" not in rendered
@@ -1212,7 +1578,7 @@ def test_abstract_only_member_shows_abstract_once_without_unavailable_or_checks(
     assert member["limitations"] == []
 
 
-def test_partial_passage_is_visibly_labeled_as_incomplete_coverage():
+def test_partial_selection_label_is_not_projected_as_support_judgment():
     passage = {
         "passage_id": "partial",
         "excerpt": "Participants reported that general training opportunities were limited.",
@@ -1229,8 +1595,8 @@ def test_partial_passage_is_visibly_labeled_as_incomplete_coverage():
         },
     )
 
-    assert "addresses only part of the citation" in view["evidence_note"]
-    assert "does not establish every material detail" in view["evidence_note"]
+    assert "addresses only part of the citation" not in view["evidence_note"]
+    assert "does not establish every material detail" not in view["evidence_note"]
 
 
 def test_minor_quotation_difference_names_and_marks_the_changed_word():
@@ -1317,7 +1683,7 @@ def test_primary_evidence_uses_one_or_two_sentences_and_retains_full_context():
     assert "survey software" in view["context_text"]
 
 
-def test_compound_panel_has_one_collapsed_citation_information_section():
+def test_compound_panel_has_no_citation_information_section():
     def member(author):
         return {
             "source": {
@@ -1346,8 +1712,9 @@ def test_compound_panel_has_one_collapsed_citation_information_section():
         7,
     )
 
-    assert rendered.count("<summary>Citation Information</summary>") == 1
-    assert rendered.count("Source completeness is uncertain") == 1
+    # Removed from the window (owner request 2026-09-28).
+    assert "Citation Information" not in rendered
+    assert "Source completeness is uncertain" not in rendered
     assert "Citation 7" in rendered
     assert "Material Limitation" not in rendered
 
@@ -1411,7 +1778,7 @@ def test_display_priority_uses_persisted_relevance_without_changing_union():
     assert {item["passage_id"] for item in ordered} == {"direct", "topic"}
 
 
-def test_indirect_passage_is_only_a_fallback_when_direct_evidence_exists():
+def test_indirect_passage_reaches_additive_selection_when_direct_evidence_exists():
     passages = [
         {"passage_id": "direct", "excerpt": "The source reports its own finding."},
         {"passage_id": "indirect", "excerpt": "Another study reports the idea."},
@@ -1434,7 +1801,7 @@ def test_indirect_passage_is_only_a_fallback_when_direct_evidence_exists():
 
     eligible = _eligible_display_passages(passages, gate)
 
-    assert [item["passage_id"] for item in eligible] == ["direct"]
+    assert [item["passage_id"] for item in eligible] == ["direct", "indirect"]
 
 
 def test_indirect_passage_remains_when_it_is_the_only_relevant_fallback():
@@ -1457,7 +1824,7 @@ def test_indirect_passage_remains_when_it_is_the_only_relevant_fallback():
     assert [item["passage_id"] for item in eligible] == ["indirect"]
 
 
-def test_partial_passages_collapse_to_one_when_no_fully_relevant_passage_exists():
+def test_partial_passages_remain_available_for_bounded_additional_context():
     passages = [
         {"passage_id": "first", "excerpt": "One partial connection."},
         {"passage_id": "second", "excerpt": "Another partial connection."},
@@ -1476,7 +1843,7 @@ def test_partial_passages_collapse_to_one_when_no_fully_relevant_passage_exists(
 
     eligible = _eligible_display_passages(passages, gate)
 
-    assert [item["passage_id"] for item in eligible] == ["first"]
+    assert [item["passage_id"] for item in eligible] == ["first", "second"]
 
 
 def test_display_priority_keeps_exact_check_evidence_ahead_of_shadow_relevance():
@@ -1683,8 +2050,15 @@ def test_provider_recovery_refreshes_only_affected_member_as_immutable_successor
         )
         source_results = json.loads(json.dumps(job.source_results))
         failed = next(item for item in source_results if item["status"] == "unavailable")
-        failed["retryable_provider_dependencies"] = ["searxng"]
         failed_reference_id = failed["reference_id"]
+        # The refresh recomputes blocking providers from the stored record, so
+        # the record must genuinely be held incomplete by SearXNG. Under the
+        # legacy policy SearXNG is a required web route, which it is not under
+        # api-first.
+        from tests.unit.blocked_discovery import blocked_record
+        failed["reference_discovery"] = blocked_record(
+            failed_reference_id, web_outcomes={"searxng": "cooldown_skipped"})
+        failed["retryable_provider_dependencies"] = ["searxng"]
         job.source_results = source_results
         session.commit()
 
@@ -1737,7 +2111,7 @@ def test_uploaded_source_reanalysis_is_targeted_idempotent_and_immutable(monkeyp
         job = create_paper_job(
             session,
             storage,
-            content=_compound_paper_bytes(),
+            content=_compound_paper_bytes(with_link=True),
             filename="uploaded-source-refresh.docx",
             media_type=DOCX_MEDIA_TYPE,
             scope_id="personal-default",
@@ -1793,6 +2167,17 @@ def test_uploaded_source_reanalysis_is_targeted_idempotent_and_immutable(monkeyp
             ),
         )
         commit_source_admissions(session)
+        from app.services.submitted_links import initial_observations, LinkRequest
+        from app.services.schemas import ParsedReference
+        rows = initial_observations(ParsedReference.model_validate(jones))
+        assert len(rows) == 1
+        now = datetime.now(timezone.utc)
+        rows[0].state = 'observed'
+        rows[0].requests = [LinkRequest(started_at=now,completed_at=now,request_sha256=rows[0].request_sha256,http_status=404,outcome='not_found')]
+        observed = [row.model_dump(mode='json') for row in rows]
+        job.source_results = [{**item, 'submitted_link_observations': observed}
+            if item.get('reference_id') == jones['reference_id'] else item for item in job.source_results]
+        session.commit()
         prepared = prepare_uploaded_source_refresh(
             session,
             storage,
@@ -1801,6 +2186,8 @@ def test_uploaded_source_reanalysis_is_targeted_idempotent_and_immutable(monkeyp
             representation_id=admitted.id,
         )
         assert prepared["scheduled"] is True
+        replacement = next(item for item in job.source_results if item['reference_id'] == jones['reference_id'])
+        assert replacement['submitted_link_observations'] == observed
         assert session.get(Job, uuid.UUID(prepared["job_id"])).upload_evidence["workflow_dispatch_v1"]["attempt_id"] == prepared["attempt_id"]
         duplicate = prepare_uploaded_source_refresh(
             session,
@@ -2077,3 +2464,36 @@ def test_store_only_job_stops_after_extraction_and_cleans(monkeypatch, through_t
         assert session.scalar(select(VerificationRunRecord)) is None
         assert session.scalar(select(VerificationReportRecord)) is None
     _assert_only_report_marking_copy(storage)
+
+
+def test_patchwriting_runs_inside_the_paper_check_and_is_not_rendered(monkeypatch):
+    # Owner decision 2026-09-29: patchwriting-v2 runs while each source's text is
+    # authorized, including a source held only for the run; nothing is rendered.
+    from app.services import patchwriting as pw
+    monkeypatch.setattr(paper_upload, 'scan_with_clamd',
+        lambda _: (SafetyVerdict.CLEAN, 'stream: OK'))
+    from app.config import settings
+    monkeypatch.setattr(settings, 'PATCHWRITING_AT_CHECK_ENABLED', True)
+    engine = create_engine('sqlite+pysqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    storage = MemoryStorage()
+    with factory() as session:
+        job = create_paper_job(session, storage, content=_paper_bytes(),
+            filename='paper.docx', media_type=DOCX_MEDIA_TYPE, scope_id='personal-default')
+        job_id = job.id
+        extract_paper_job(session, storage, job_id, llm_enabled=False)
+        retrieve_paper_sources(session, storage, job_id, resolver=ProvisionalResolver())
+    summary = verify_paper_sources(factory, storage, job_id, llm_enabled=False)
+    block = summary['patchwriting']
+    assert block['policy_version'] == pw.POLICY_VERSION and block['decision_applied'] is False
+    assert block['sources'], 'the run-only source was compared'
+    assert block['body']['status'] == 'ready', block['body']
+    assert all(v.get('status') != 'not_assessed' for v in block['sources'].values()), block['sources']
+    for entry in block['sources'].values():
+        assert entry['policy_version'] == pw.POLICY_VERSION
+    with factory() as session:
+        finalize_paper_job(session, storage, job_id)
+        view = session.scalar(select(Report)).report_json['evidence_report']
+    html = render_evidence_report_html(view, csp_nonce='test-patchwriting-nonce')
+    assert 'close_paraphrase' not in html and 'unquoted_verbatim' not in html

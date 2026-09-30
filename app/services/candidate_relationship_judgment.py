@@ -9,7 +9,7 @@ rewrite, merge, or omit the text it is judging. All output remains shadow-only.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import re
 from typing import Literal
@@ -46,7 +46,7 @@ from app.services.verification_evidence import (
 )
 
 
-CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v9"
+CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v11-list-tail"
 CANDIDATE_JUDGMENT_VERSION = "one-candidate-relationship-v2"
 MAX_CANDIDATES = 16
 MAX_PASSAGES = 3
@@ -329,6 +329,20 @@ def attach_verification_candidates(
                         allow_interpretive_participial=len(content_spans) == 1,
                     )
                 )
+    # Match the existing obligation scope for one uniquely positioned marker.
+    # Retain post-marker wording as context, without assigning it to the source.
+    if (marker_span is not None and claim.citation_marker_type == "parenthetical"
+        and len(claim.reference_ids) == 1 and not claim.source_segments
+        and claim.text.count(claim.citation_marker) == 1
+        and len(claim.citation_markers) <= 1):
+        from app.services.evidence_obligations import claim_source_attributed_text
+        attributed = claim_source_attributed_text(claim, getattr(artifact, "source_binding", None))
+        if attributed == claim.text[:marker_span[1]].strip():
+            specs = [replace(spec, attribution="student", relationship_eligible=False,
+                             verification_scope="not_source_verification",
+                             method="post_marker_outside_attributed_scope")
+                     if spec.spans and all(start >= marker_span[1] for start, _ in spec.spans)
+                     and spec.attribution == "cited_source" else spec for spec in specs]
     specs = _deduplicate_specs(specs)[: MAX_CANDIDATES - 1]
     specialized_voice = any(
         spec.attribution != "cited_source" or not spec.relationship_eligible
@@ -493,6 +507,9 @@ def apply_candidate_relationship_judgment(
     artifact: VerificationEvidenceArtifact,
 ) -> VerificationEvidenceArtifact:
     """Classify each eligible fixed candidate independently, without verdict changes."""
+    if artifact.source_identity.status != 'verified':
+        return _not_assessed(artifact, 'source_identity_unconfirmed',
+            'Source identity must be confirmed before relationship assessment.')
     if artifact.verification_candidates.status == "not_run":
         artifact = attach_verification_candidates(artifact)
     if artifact.citation_use_routing.status == "not_run":
@@ -732,10 +749,12 @@ def _decompose(
 
     comma = _COMMA_CLAUSE.search(value)
     independent = _COMMA_INDEPENDENT.search(value)
-    if independent and not _has_predicate(value[independent.end():]):
-        # A serial-list tail such as ", and completely disabled" is not an
-        # independent clause. Splitting it would create a subjectless semantic
-        # fragment and repeat the earlier free-span atomization failure.
+    if independent and not _has_predicate(value[independent.end():].split(",", 1)[0]):
+        # A serial-list tail such as ", and completely disabled" or "power,
+        # identity, and the nature of reality" is not an independent clause.
+        # Only the text up to the next comma counts: a verb in a later
+        # participle ("allowing her to grow") does not make the list item a
+        # clause (owner review 2026-09-29, v11).
         independent = None
     bare_independent = _bare_comma_independent(value)
     participle = (
@@ -783,10 +802,15 @@ def _decompose(
         if split is participle and left:
             # A trailing participle inherits the immediately preceding clause;
             # judging the fragment alone repeats the old atomization failure.
+            # A preceding piece without its own verb is not a clause, so the
+            # participle inherits the whole left side instead.
+            parent = left[-1].spans
+            if not _has_predicate(" ".join(text[a:b] for a, b in parent)):
+                parent = tuple(span for item in left for span in item.spans)
             return left + [
                 _CandidateSpec(
                     "participial_clause",
-                    tuple([*left[-1].spans, right_span]),
+                    tuple([*parent, right_span]),
                     "participial_clause_with_exact_parent",
                     True,
                 )
@@ -1583,10 +1607,24 @@ def _materially_redundant_candidate_ids(candidates):
             shorter = min(len(left_positions), len(right_positions))
             if shorter < 80:
                 continue
+            if _participle_with_its_parent(left, right, left_positions, right_positions):
+                # A trailing participle is judged with its exact parent clause by
+                # design; containing the parent is not redundancy (v11).
+                continue
             intersection = len(left_positions & right_positions)
             if intersection / shorter >= 0.9 and shorter - intersection <= 16:
                 redundant.update({left.candidate_id, right.candidate_id})
     return redundant
+
+
+def _participle_with_its_parent(left, right, left_positions, right_positions) -> bool:
+    pairs = ((left, left_positions, right, right_positions), (right, right_positions, left, left_positions))
+    # Only a main clause: a comma-split fragment ("with it …") and its
+    # participle stay redundant and fail closed, as before.
+    return any(child.generation_method == "participial_clause_with_exact_parent"
+               and parent.generation_method in {"structural_clause_fallback", "unsplit_predicate_clause"}
+               and parent_positions < child_positions
+               for child, child_positions, parent, parent_positions in pairs)
 
 
 def _normalize_limitations(raw):

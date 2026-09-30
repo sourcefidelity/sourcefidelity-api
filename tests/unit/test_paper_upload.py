@@ -64,7 +64,8 @@ def _docx_bytes(text="A paper"):
     return output.getvalue()
 
 
-def test_docx_job_commits_locator_verifies_hash_and_cleans(monkeypatch, session):
+@pytest.mark.parametrize('require_links',[False, True])
+def test_docx_job_commits_locator_verifies_hash_and_cleans(monkeypatch, session, require_links):
     monkeypatch.setattr(
         paper_upload,
         "scan_with_clamd",
@@ -79,6 +80,7 @@ def test_docx_job_commits_locator_verifies_hash_and_cleans(monkeypatch, session)
         filename="paper.docx",
         media_type=DOCX_MEDIA_TYPE,
         scope_id="personal-default",
+        require_reference_links=require_links,
     )
 
     assert job.input_storage_key in storage.objects
@@ -86,6 +88,7 @@ def test_docx_job_commits_locator_verifies_hash_and_cleans(monkeypatch, session)
     assert loaded_job.id == job.id
     assert loaded == content
     assert job.upload_evidence["structural_verdict"] == "clean"
+    assert loaded_job.upload_evidence['assessment_configuration']['require_reference_links'] is require_links
     assert job.upload_evidence["paper_retention_mode"] == "temporary"
     assert job.upload_evidence["paper_input_upload_state"] == "ready"
 

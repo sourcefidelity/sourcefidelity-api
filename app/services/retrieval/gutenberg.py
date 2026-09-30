@@ -13,6 +13,7 @@ import httpx
 from app.log_safety import safe_exception_code
 from app.services.relevance import extract_surnames, score_relevance
 from app.services.retrieval.base import (
+    BOOK_SOURCE_KINDS,
     AcquisitionLocation,
     RepresentationKind,
     RetrievalResult,
@@ -20,6 +21,7 @@ from app.services.retrieval.base import (
     SourceRepresentation,
 )
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
+from app.services.processing_metrics import record_provider_request
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,12 @@ _END_MARKER = re.compile(
 
 class GutenbergRetriever(RetrievalSource):
     """Retrieve public-domain-in-the-USA editions from Gutenberg's OPDS feed."""
+    # Unchanged for now. A public-domain archive failing says nothing about
+    # a modern book, which argues for False; the kind and year bounds now
+    # keep it from being consulted for one at all.
+    required_for_search_completion = True
+    # Public-domain book texts. The year bound lives in the resolver.
+    supported_source_kinds = BOOK_SOURCE_KINDS
 
     name = "gutenberg"
     capabilities = frozenset({"title_search", "full_text", "public_domain"})
@@ -69,6 +77,7 @@ class GutenbergRetriever(RetrievalSource):
         if surname:
             query = f"{title} {surname}"
         try:
+            record_provider_request("gutenberg")
             response = httpx.get(
                 GUTENBERG_SEARCH,
                 params={"query": query},
@@ -96,6 +105,7 @@ class GutenbergRetriever(RetrievalSource):
             return RetrievalResult(source_name=self.name, success=False, error=error)
 
     def _fetch_edition(self, item_url: str) -> RetrievalResult:
+        record_provider_request("gutenberg")
         response = httpx.get(
             item_url,
             headers=_HEADERS,
@@ -140,6 +150,7 @@ class GutenbergRetriever(RetrievalSource):
         if not result.full_text_url:
             return result
         try:
+            record_provider_request("gutenberg")
             response = httpx.get(
                 result.full_text_url,
                 headers=_HEADERS,

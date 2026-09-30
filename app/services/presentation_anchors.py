@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.services.schemas import InTextCitation
 
 
-PRESENTATION_ANCHOR_VERSION = "presentation-anchor-v2"
+PRESENTATION_ANCHOR_VERSION = "presentation-anchor-v3"
 
 
 class PresentationRectangle(BaseModel):
@@ -97,7 +97,7 @@ def bind_citations_to_pdf(
     ] = []
     try:
         for page_index, page in enumerate(document):
-            for item in page.get_text("words", sort=True):
+            for item in _sentence_boundary_words(page):
                 token = _token(item[4])
                 if token:
                     page_height = float(page.rect.height)
@@ -367,3 +367,34 @@ def _token_matches(surface_tokens, words, target) -> tuple[list[tuple[int, int]]
 def _token(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold().replace("\u00ad", "")
     return "".join(character for character in normalized if character.isalnum())
+
+
+def _sentence_boundary_words(page):
+    """Split a missing-space sentence join using exact PDF character boxes.
+
+    Never estimate a partial word's width or accept an alphanumeric prefix.
+    Unrecoverable character geometry leaves the original conservative word.
+    """
+    chars = None
+    for word in page.get_text('words', sort=True):
+        boundaries = [m.end() for m in re.finditer(r'[.!?](?=[A-Z])', word[4])]
+        if not boundaries:
+            yield word
+            continue
+        if chars is None:
+            chars = [c for b in page.get_text('rawdict')['blocks'] for line in b.get('lines', [])
+                     for span in line.get('spans', []) for c in span.get('chars', [])]
+        box = fitz.Rect(word[:4])
+        observed = [c for c in chars if box.contains(fitz.Point((c['bbox'][0]+c['bbox'][2])/2,
+                                                               (c['bbox'][1]+c['bbox'][3])/2))]
+        if ''.join(c['c'] for c in observed) != word[4]:
+            yield word
+            continue
+        start = 0
+        for end in boundaries + [len(word[4])]:
+            pieces = observed[start:end]
+            rect = fitz.Rect(pieces[0]['bbox'])
+            for c in pieces[1:]:
+                rect |= fitz.Rect(c['bbox'])
+            yield (*rect, word[4][start:end], *word[5:])
+            start = end

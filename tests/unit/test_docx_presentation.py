@@ -61,3 +61,29 @@ def test_external_content_field_is_rejected():
     unsafe = _replace_archive_part(content, name, document)
     with pytest.raises(DocxPresentationError, match="external-content field"):
         _reject_renderer_network_dependencies(unsafe)
+
+
+@pytest.mark.parametrize('simple', [False, True])
+@pytest.mark.parametrize('instruction,blocked', [
+    ('HYPERLINK "https://example.invalid/link/article"', False),
+    ('HYPERLINK "https://example.invalid/INCLUDETEXT"', False),
+    ('HYPERLINK "https://example.invalid/link" INCLUDETEXT "https://example.invalid/x"', True),
+    ('INCLUDETEXT "https://example.invalid/x"', True),
+    ('LINK Excel.Sheet "https://example.invalid/x"', True),
+    ('DDEAUTO application topic', True),
+])
+def test_hyperlink_arguments_are_not_external_commands(simple, instruction, blocked):
+    from xml.sax.saxutils import escape, quoteattr
+    content = _docx_bytes()
+    name = 'word/document.xml'
+    field = (f'<w:fldSimple w:instr={quoteattr(instruction)}/>' if simple else
+             f'<w:r><w:instrText>{escape(instruction)}</w:instrText></w:r>')
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        document = archive.read(name).replace(
+            b'</w:body>', f'<w:p>{field}</w:p></w:body>'.encode())
+    candidate = _replace_archive_part(content, name, document)
+    if blocked:
+        with pytest.raises(DocxPresentationError, match='external-content field'):
+            _reject_renderer_network_dependencies(candidate)
+    else:
+        _reject_renderer_network_dependencies(candidate)

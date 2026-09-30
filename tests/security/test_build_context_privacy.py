@@ -7,6 +7,7 @@ def test_docker_context_excludes_private_artifacts():
     patterns = set((root / '.dockerignore').read_text().splitlines())
     required = {
         '.git', '.git-rewrite/', '.env', '.env.*', 'private_guiding_history/',
+        'private_guiding_contracts/', 'private_guiding_tools/', 'sources/',
         'STATE.md', 'PLAN.md', 'ARCHITECTURE.md', 'ROADMAP.md', 'AGENTS.md',
         'RESEARCH.md', 'REVIEW*.md', 'Review*.md', 'SYSTEM_PROMPT.md', 'COSTS.md',
         'HPC_SURVEY_ANSWERS.md', 'CAMPUS_TEST_INSTRUCTIONS.md',
@@ -19,3 +20,18 @@ def test_docker_context_excludes_private_artifacts():
     assert required <= patterns
     # No later broad negation may reopen an excluded private directory.
     assert {line for line in patterns if line.startswith('!')} == {'!.env.example'}
+
+
+def test_git_excludes_supplied_sources_regardless_of_file_format():
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    paths = ['sources/example.html', 'sources/editions/example.epub',
+             'sources/example.txt', 'sources/example.pdf',
+             'private_guiding_contracts/example.md',
+             'private_guiding_tools/example.py']
+    result = subprocess.run(
+        ['git', 'check-ignore', '--stdin'], input='\n'.join(paths) + '\n',
+        text=True, capture_output=True, cwd=root, check=True,
+    )
+    assert set(result.stdout.splitlines()) == set(paths)

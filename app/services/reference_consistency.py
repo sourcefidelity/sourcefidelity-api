@@ -11,10 +11,116 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.services.schemas import InTextCitation, ParsedReference
+from app.services.schemas import InTextCitation, MediaAnalysisCandidate, ParsedReference
 
 
-REFERENCE_CONSISTENCY_VERSION = "reference-consistency-v2"
+REFERENCE_CONSISTENCY_VERSION = "reference-consistency-v3"
+
+
+def inspect_media_type_context(*, body: str, body_sha256: str,
+                               candidate: MediaAnalysisCandidate,
+                               references: list[ParsedReference]) -> dict:
+    """Compare explicit submitted designations, never resolve work identity.
+
+    Exact title equality supplies diagnostic candidates only. Multiple entries
+    remain ambiguous even if one happens to agree with the proposed type.
+    """
+    result = dict(version='media-type-context-v1', status='not_assessed',
+                  reference_ids=[], explicit_types={}, reference_bindings={},
+                  source_identity_assessed=False, automatic_findings_enabled=False)
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    if (digest(body) != body_sha256
+            or not 0 <= candidate.passage_start < candidate.passage_end <= len(body)
+            or digest(body[candidate.passage_start:candidate.passage_end]) != candidate.passage_sha256
+            or not candidate.passage_start <= candidate.title_start < candidate.title_end <= candidate.passage_end
+            or body[candidate.title_start:candidate.title_end] != candidate.title):
+        result['status'] = 'invalid_binding'
+        return result
+    if candidate.title_role != 'work_title':
+        return result
+    labels = {'play': 'play', 'film': 'film', 'documentary': 'film',
+              'song': 'song', 'album': 'album', 'film review': 'article'}
+    def observed_title(reference):
+        # The parser may retain an explicit terminal medium descriptor in title.
+        # Remove only a recognized descriptor for this diagnostic comparison.
+        title = reference.title.strip()
+        suffix = re.search(r'\s+\[([^\[\]]+)\]$', title)
+        if suffix and suffix.group(1).strip().casefold() in labels:
+            title = title[:suffix.start()]
+        return title.casefold()
+    matches = [r for r in references if observed_title(r) == candidate.title.strip().casefold()]
+    result['reference_ids'] = [r.reference_id for r in matches]
+    if len(matches) != 1:
+        if matches:
+            result['status'] = 'ambiguous_reference_context'
+        return result
+    ref = matches[0]
+    if sum(r.reference_id == ref.reference_id for r in references) != 1 or ref.needs_review:
+        result['status'] = 'ambiguous_reference_context'
+        return result
+    types = {labels[label.strip().casefold()] for label in re.findall(r'\[([^\[\]]+)\]', ref.raw_ref)
+             if label.strip().casefold() in labels}
+    result['reference_bindings'] = {ref.reference_id: digest(ref.raw_ref)}
+    result['explicit_types'] = {ref.reference_id: sorted(types)}
+    if len(types) > 1:
+        result['status'] = 'ambiguous_reference_context'
+    elif types and candidate.media_type not in {'unknown', 'other'}:
+        result['status'] = ('submitted_type_agrees' if candidate.media_type in types
+                            else 'submitted_type_disagrees')
+    return result
+
+
+def inspect_media_reference_context(*, body: str, body_sha256: str, candidate: MediaAnalysisCandidate,
+                                    references: list[ParsedReference],
+                                    citations: list[InTextCitation]) -> dict:
+    """Expose existing citation links, not a second identity/omission verifier.
+
+    A film link in a song-analysis passage can support later application of the
+    approved performance policy, but does not itself prove which version was used.
+    """
+    result = dict(version='media-reference-context-v1', status='not_assessed',
+                  film_reference_ids=[], reference_bindings={},
+                  source_use_assessed=False, reference_absence_assessed=False,
+                  automatic_findings_enabled=False)
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    if (digest(body) != body_sha256
+            or not 0 <= candidate.passage_start < candidate.passage_end <= len(body)
+            or digest(body[candidate.passage_start:candidate.passage_end]) != candidate.passage_sha256
+            or not candidate.passage_start <= candidate.title_start < candidate.title_end <= candidate.passage_end
+            or body[candidate.title_start:candidate.title_end] != candidate.title):
+        result['status'] = 'invalid_binding'
+        return result
+    if candidate.media_type != 'song':
+        return result
+    reference_id_counts: dict[str, int] = defaultdict(int)
+    for reference in references:
+        reference_id_counts[reference.reference_id] += 1
+    films = {r.reference_id:r for r in references if reference_id_counts[r.reference_id] == 1
+             and not r.needs_review
+             and r.source_kind == 'traditional_media' and r.source_kind_confidence == 'high'
+             and re.search(r'\[film\]', r.raw_ref, re.I)}
+    found = set()
+    for citation in citations:
+        if (citation.link_status != 'linked' or citation.candidate_reference_ids
+                or not 0 <= citation.passage_start < citation.passage_end <= len(body)
+                or body[citation.passage_start:citation.passage_end] != citation.text):
+            continue
+        markers = [(m.text, m.local_start, m.local_end, m.reference_ids)
+                   for m in citation.citation_markers]
+        if not markers and citation.citation_marker and citation.text.count(citation.citation_marker) == 1:
+            start = citation.text.index(citation.citation_marker)
+            markers = [(citation.citation_marker, start, start+len(citation.citation_marker), citation.reference_ids)]
+        for text, start, end, ids in markers:
+            if (not text or not 0 <= start < end <= len(citation.text)
+                    or citation.text[start:end] != text
+                    or not candidate.passage_start <= citation.passage_start+start < citation.passage_start+end <= candidate.passage_end):
+                continue
+            found.update(rid for rid in ids if rid in films and rid in citation.reference_ids)
+    result['film_reference_ids'] = sorted(found)
+    result['reference_bindings'] = {rid:digest(films[rid].raw_ref) for rid in sorted(found)}
+    if found:
+        result['status'] = 'film_reference_context_available' if len(found)==1 else 'multiple_film_contexts'
+    return result
 
 FindingType = Literal[
     "missing_reference_entry",
@@ -97,6 +203,13 @@ def assess_reference_consistency(
 
     findings: list[ReferenceConsistencyFinding] = []
     observed_reference_ids: set[str] = set()
+    # Recheck retained original citation text before turning a missed link into
+    # an uncited-entry diagnostic. This does not mutate historical detections.
+    from app.services.citation_extractor import extract_citations
+    for text in dict.fromkeys(c.text for c in citations):
+        for recovered in extract_citations(text, references, format_hint=citation_format):
+            observed_reference_ids.update(recovered.reference_ids)
+            observed_reference_ids.update(recovered.candidate_reference_ids)
     seen_citation_findings: set[tuple] = set()
     for citation in citations:
         observed_reference_ids.update(citation.reference_ids)
@@ -150,6 +263,7 @@ def assess_reference_consistency(
     by_normalized_entry: dict[str, list[str]] = defaultdict(list)
     by_doi: dict[str, list[str]] = defaultdict(list)
     by_citation_key: dict[str, list[str]] = defaultdict(list)
+    by_corroborated_web_identity: dict[tuple, list[str]] = defaultdict(list)
     for reference in references:
         if reference.needs_review:
             findings.append(
@@ -170,12 +284,16 @@ def assess_reference_consistency(
             by_doi[reference.doi.casefold()].append(reference.reference_id)
         if reference.citation_key:
             by_citation_key[reference.citation_key.casefold()].append(reference.reference_id)
+        web_key = _corroborated_web_key(reference)
+        if web_key:
+            by_corroborated_web_identity[web_key].append(reference.reference_id)
 
     duplicate_groups: set[tuple[str, ...]] = set()
     definite_duplicate_pairs: set[frozenset[str]] = set()
     for reason_code, groups in (
         ("same_normalized_reference_entry", by_normalized_entry),
         ("same_normalized_doi", by_doi),
+        ("same_author_title_and_specific_url", by_corroborated_web_identity),
     ):
         for reference_ids in groups.values():
             unique = tuple(dict.fromkeys(reference_ids))
@@ -197,6 +315,30 @@ def assess_reference_consistency(
                 )
             )
 
+    # Overlapping corroboration routes describe one duplicate group, not
+    # independent errors. Preserve all reasons in the group's explanation.
+    duplicate_findings = [f for f in findings if f.finding_type == "duplicate_reference_entry"]
+    findings = [f for f in findings if f.finding_type != "duplicate_reference_entry"]
+    groups: list[set[str]] = []
+    for finding in duplicate_findings:
+        group = set(finding.reference_ids)
+        overlaps = [g for g in groups if g & group]
+        for prior in overlaps:
+            group.update(prior)
+            groups.remove(prior)
+        groups.append(group)
+    duplicate_ids = set().union(*groups) if groups else set()
+    for group in groups:
+        reasons = sorted({f.reason_code for f in duplicate_findings if group & set(f.reference_ids)})
+        findings.append(_finding(
+            finding_type="duplicate_reference_entry", level="attention",
+            reason_code="corroborated_duplicate_group", reference_ids=sorted(group),
+            explanation=("These entries repeat the same source. " +
+                         ("The author, title and specific source URL agree despite different submitted dates."
+                          if "same_author_title_and_specific_url" in reasons else
+                          "The entries have identical reference text or the same DOI."))))
+        definite_duplicate_pairs.update(frozenset((a, b)) for a in group for b in group if a != b)
+
     likely_groups = _likely_repetition_groups(
         references,
         excluded_pairs=definite_duplicate_pairs,
@@ -214,10 +356,13 @@ def assess_reference_consistency(
             )
         )
 
+    by_id = {reference.reference_id: reference for reference in references}
     for citation_key, reference_ids in by_citation_key.items():
         unique = list(dict.fromkeys(reference_ids))
-        if len(unique) < 2:
+        if len(unique) < 2 or any(set(unique) <= group for group in groups):
             continue
+        if len({apa_in_text_form(by_id[rid]) for rid in unique if rid in by_id}) == len(unique):
+            continue  # their in-text citations already differ
         findings.append(
             _finding(
                 finding_type="duplicate_citation_key",
@@ -231,7 +376,7 @@ def assess_reference_consistency(
         )
 
     for reference in references:
-        if reference.reference_id in observed_reference_ids:
+        if reference.reference_id in observed_reference_ids or reference.reference_id in duplicate_ids:
             continue
         findings.append(
             _finding(
@@ -317,6 +462,54 @@ def _finding(
 def _normalize_reference_entry(value: str) -> str:
     normalized = re.sub(r"\s+", " ", value).strip().casefold()
     return normalized.rstrip(". ")
+
+
+def _corroborated_web_key(reference: ParsedReference) -> tuple | None:
+    """Submitted multi-field duplication, not URL-only work equivalence.
+
+    Restrict date-tolerant matching to specific webpage records. Book editions,
+    components, different authors/titles and generic site roots do not qualify.
+    """
+    from urllib.parse import urlsplit
+    import unicodedata
+    from app.services.source_type import classify_reference_source_kind
+
+    if (reference.needs_review or reference.doi or reference.source_kind != "webpage"
+            or reference.container_title.strip() or reference.pages.strip()):
+        return None
+    # A retained webpage label cannot override explicit book/component evidence.
+    # Exclude URLs from this textual screen: a slug is not an edition statement.
+    bibliographic_text = re.sub(r"https?://\S+|www\.\S+", " ", reference.raw_ref, flags=re.I)
+    if re.search(
+        r"\bISBN(?:-1[03])?\b|\bedition\b|"
+        r"\b(?:\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|"
+        r"eighth|ninth|tenth|revised|rev\.?|expanded|updated)\s+ed\b",
+        bibliographic_text + " " + reference.title, re.I,
+    ):
+        return None
+    observed_kind = classify_reference_source_kind(
+        bibliographic_text, title=reference.title
+    ).kind
+    if observed_kind not in {"unknown", "webpage", "blog_post", "news_article"}:
+        return None
+    def web_identity_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFC", value).casefold()
+        return " ".join("".join(
+            char if unicodedata.category(char)[0] in {"L", "M", "N"} else " "
+            for char in normalized
+        ).split())
+
+    title, author = web_identity_text(reference.title), web_identity_text(reference.author)
+    if len(title) < 15 or len(title.split()) < 3 or not author or author in {"unknown", "anonymous"}:
+        return None
+    try:
+        url = urlsplit(reference.url or "")
+        if url.scheme not in {"http", "https"} or not url.hostname or url.path.strip("/") == "":
+            return None
+        # Fragments can select distinct routed resources, not just page positions.
+        return author, title, url.hostname.casefold(), url.port, url.path, url.query, url.fragment
+    except ValueError:
+        return None
 
 
 def _likely_repetition_groups(
@@ -416,3 +609,18 @@ def _author_parts(value: str) -> tuple[str, str]:
 
 def _identity_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+def apa_in_text_form(reference) -> str:
+    """The APA in-text author form: one surname, two joined, or "et al." for three or more.
+
+    "Yang, M., O'Sullivan, P.S., ... (2019)" and "Yang, Y., & Wang, X. (2019)"
+    share a first surname and year, but their citations ("Yang et al., 2019",
+    "Yang & Wang, 2019") already differ (Academic Article, 2026-09-30).
+    """
+    author = str(getattr(reference, "author", "") or "")
+    names = re.findall(r"([^\W\d_][\w'’\-]*(?:\s+[^\W\d_][\w'’\-]*)?)\s*,\s*(?:[A-Z](?:\.|\b)[\s\-]*)+", author)
+    surnames = [n.strip().casefold() for n in names] or [author.split(",")[0].strip().casefold()]
+    year = str(getattr(reference, "year", "") or "").casefold()
+    if len(surnames) >= 3:
+        return f"{surnames[0]} et al. {year}"
+    return " & ".join(surnames) + f" {year}"

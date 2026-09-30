@@ -1,97 +1,90 @@
 # SourceFidelity API
 
-**Self-hosted source-verification tool for academic papers — for instructors, institutions, and reviewers.**
+**Open-source, AI-augmented analysis of how academic papers use their sources.**
 
-SourceFidelity verifies the citations in a student paper against the actual cited sources — retrieving full texts from open-access databases, publisher sites, direct PDF links, HTML pages, and instructor-uploaded copies — then checking whether each reference is accurate and if each quotation and paraphrase is supported. It is evidence for an instructor's or reviewer's judgment, not an automated verdict.
+SourceFidelity identifies, verifies and retrieves the sources a paper cites, then produces an inspectable report on how the paper uses them: whether each cited work can be located, how each citation relates to the retrieved source text, where academic practice or referencing style needs attention, and what evidence each finding rests on.
 
-It is primarily an **institutional** tool (deployed on a department or university server, integrated via the planned Moodle plugin), but it is also usable directly by an **individual instructor** who wants to use it independently of their institution, and by **journal editors and conference organizers** for manuscript screening.
+It produces evidence for an instructor's own judgment and feedback to help students improve their writing. It does not detect AI-written text, determine intent or misconduct, assign grades or sanctions, or replace an institution's academic-integrity process.
 
-> **Status:** Pre-release, active development. The reference-extraction, source-retrieval, and in-text-citation-extraction pipelines are working and validated on real student papers. The verification engine (4-verdict scoring) and reporting system are under construction. See [Roadmap](#roadmap).
+> **Status:** Working prototype. The full pipeline — paper upload to evidence package to live and exported report — runs end to end on real student papers. Prototype acceptance is still in progress; reference-verification accuracy is the current focus. Moodle and library integrations are planned, not built. See [Roadmap](#roadmap).
 
 ---
 
 ## Why SourceFidelity
 
-Existing tools (Turnitin and similar) **only** focus on similarity matching — finding text that looks copied. SourceFidelity *also* focuses on similarity matching (patchwriting and plagiarism detection are part of the roadmap), but its distinctive focus is on **source verification**: did this student represent their sources accurately? SourceFidelity targets that gap:
+Generative AI has made it easy to submit work that cites sources the writer has not read, or that do not say what the paper claims. Existing tools do not address this well:
 
-- **Verifies cited claims against retrieved source texts**, not just surface similarity.
-- **Four verdicts** per citation: *Consistent*, *Misrepresentation*, *Topical mismatch*, *Inconclusive*. Each carries a distinct judgement so instructors can distinguish honest misreading from likely fabrication.
-- **Text-availability confidence** so verdicts from full, retrieved texts and paywalled/abstract-only sources are honestly marked with different confidence.
-- **Self-hosted by the institution or instructor.** Student papers never leave your infrastructure. Cloud LLMs (if used) receive text with PII stripped beforehand.
-- **Benefit-of-doubt by design.** When the system can't tell whether a passage is the student's own analysis or an uncited paraphrase, it defaults to not flagging. A false accusation of plagiarism destroys trust permanently.
-- **Formative when integrated, analytical when standalone.** When deployed through the planned Moodle plugin, students can submit their own papers for screening and receive a simplified, pedagogically-framed report — patterns and suggestions rather than punitive scores — and the plugin's LLM explains problems without generating corrected text. Used this way SourceFidelity is a learning tool. When used standalone by an instructor (or journal editor), it functions as analytical evidence for the reviewer's own judgment.
-- **Source verification, not AI-text detection.** Research consensus is that AI-text detectors have 16–61% false-positive rates and are biased against L2 and neurodivergent writers. SourceFidelity does not build one. Instead, it detects fabricated references and quotations and paraphrases that do not match their sources. These are reliable and verifiable signals that demonstrate a lack of engagement with sources regardless of whether the student used AI.
+- **Similarity reports** (e.g., Turnitin originality reports) find copied text. They do not check whether a cited source exists or whether it supports the sentence that cites it.
+- **AI-text detectors** flag writing, not source use, and cannot distinguish inappropriate AI use from acceptable or encouraged use.
+
+SourceFidelity targets source use directly. It does not try to detect AI use, but checking whether sources exist and are used accurately can discourage inappropriate reliance on AI, save instructors time spent locating and reading sources, and give institutions more control over where student data goes.
 
 ---
 
-## Features
+## What it does
 
 ### Working now
 
-- **Text extraction** — PDF (dual-backend: pdfplumber + PyMuPDF fallback) and DOCX, including bytes-based handling for direct uploads.
-- **Reference extraction** — LLM-first parsing of the reference list, format-aware (APA 7th, MLA 9th). Validated on 10 APA papers (99.3% reference recall) and 11 MLA papers (100%).
-- **In-text citation extraction** — hybrid regex + LLM extraction of quotations and paraphrases from the body, with author-surname and reference-title injection. The extractor distinguishes three citation types because they have very different difficulty levels:
-  - **Explicit quotations** (text in quote marks with citation markers) — highest recall, regex catches these directly.
-  - **Paraphrases with in-text citations in the sentence** (parenthetical or narrative markers like `(Smith, 2020)` or `Smith argues`).
-  - **Continuation paraphrases** (sentences with no marker that continue discussing a previously-cited source — "This reflects...", "He argues...") — hardest case, addressed via the LLM two-pass stage and title/topic injection.
-  - Per-type precision/recall numbers will be published once ground-truth annotation on a larger paper corpus is complete. The verifier also revises extraction using the retrieved sources: every sentence is embedded against retrieved sources, so over-extracted low-confidence continuations that don't match their cited source are silently removed from the attribution (rather than flagged), while genuine non-engagement at explicit citations is still caught. This keeps the "topical mismatch" verdict reserved for cases that actually signal non-engagement.
-- **Source retrieval** — resolution chain across Elsevier, OpenAlex, CORE, Semantic Scholar, and Crossref for academic texts, plus Project Gutenberg and Wikisource for public-domain primary texts. **Beyond academic databases:** direct PDF link/URL resolution, HTML page fetching, publisher-PDF URL construction for six major publishers (Springer, Taylor & Francis, Wiley, SAGE, OUP, Cambridge), and configurable retrieval-source priority.
-- **Source repository** — instructor uploads of articles, books, and book chapters to a local source cache, with edited-collection splitting, completeness checking, and N-up scan detection. **Optionally stores and vectorizes every retrieved source** so future papers citing the same source skip re-retrieval and re-verification — the sources are pre-indexed and ready for immediate use in judgment, making the app progressively faster and cheaper to run as the cache grows.
-- **Abstract verification** — when a paywalled source has only an abstract available, student citations are checked against the abstract at medium confidence.
-- **Website source verification** — in-memory fetch, verify, discard. Web content is never persisted to the repository.
-- **Link validation** — every URL in a reference list is checked and categorized (content_match / paywall / dead / redirect / mismatch / etc.) for the instructor report.
-- **Model-agnostic LLM** — provider config dict supports DeepSeek (default, cheapest), OpenAI GPT-4, Anthropic Claude, and local Ollama. No provider lock-in.
-- **Asynchronous jobs** — Celery + Redis with retry, time/memory limits, and a dead-letter queue.
-- **REST API** — FastAPI with Swagger UI at `/docs`.
-
-### In progress
-
-- **Verification engine** — 6-stage hybrid pipeline (similarity gate → atomic-claim extraction → NLI + AlignScore → RAGAS groundedness → LLM judge → aggregate). Uses BGE-M3 multilingual embeddings (chosen for multilingual support) and FAISS for passage retrieval.
-- **Reporting system** — individual and batch reports, HTML dashboard (Jinja2 + Chart.js), color-highlighted paper rendering, and a student-facing simplified report.
+- **Source identification, verification and retrieval** — the core feature. Each reference is parsed and searched across academic metadata services, book and public-domain catalogues, and web search. Located works are retrieved as full text where permitted. A reference that every search suited to its kind has failed to locate is reported as **Cannot be verified**; a failed or incomplete search is reported as incomplete, never as a negative result.
+- **Citation–source relationship judgment** — runs automatically on every checked paper. Each citation is compared with evidence sentences selected from the retrieved source and labelled **Supports**, **Qualified or Mixed**, **Contradicts** or **Insufficient Evidence**; when the model cannot decide, the citation is labelled **LLM Undecided**. Every judgment links to the source sentences it is based on, so students can see how they used a source and instructors can see where a source may have been used incorrectly.
+- **Academic-practice flags** — misquotation, patchwriting, secondary citation and related practices, with the student wording and source wording shown side by side.
+- **APA citation and referencing style checks** — for example, incorrect title formatting, missing quotation locators, and missing DOIs or URLs for references that should have them.
+- **Source upload** — students and instructors can upload sources the application could not retrieve.
+- **Source storage that respects copyright** — verified open-access academic sources are stored permanently; all other sources are stored temporarily. Stored sources do not need to be searched for again, so later papers citing them process faster and cost less.
+- **Reports** — a live report with source viewing and upload, and portable HTML/PDF exports.
 
 ### Planned
 
-- **Patchwriting and plagiarism detection** — Keck overlap thresholds for patchwriting against cited sources, Wikipedia plagiarism checks, within-batch and historical cross-paper comparison (FAISS index of anonymized papers).
-- **Moodle plugin** (`sourcefidelity-moodle`) — student submission, instructor report, and the formative student-facing experience described above.
-- **Authentication** — Student / Instructor / Admin roles, API key or JWT, optional LDAP.
+- **Cross-assessment comparison** and an **authorized student-paper repository**.
+- **Wikipedia similarity scoring**.
+- **Moodle plugin** — institutional sign-in, formative student self-checks with near-instant feedback, reports in the assessment marking area, batch reports that flag papers needing review, and upload of course texts and other course sources.
+- **Library platform integration** — links to library holdings in reports, metadata from services the institution already licenses, and full-text access where database providers' terms permit. Each library capability is enabled separately.
+- **Additional referencing systems** used in other disciplines.
 
 ---
 
-## How it works
+## Data handling
 
-```
-1. Text extraction          PDF/DOCX → plain text
-2. PII stripping            name, ID, email, university removed before LLM calls
-3. Reference parsing        LLM splits + parses the reference list
-4. Subject identification   LLM tags primary vs secondary sources, paper keywords
-5. Citation extraction      regex + LLM find attributed sentences in the body
-6. Reference-body check     phantom references, orphan citations (no LLM)
-7. Source retrieval         chain: Elsevier → OpenAlex → CORE → S2 → Crossref
-                            → Gutenberg → Wikisource → publisher PDF →
-                            direct PDF link → HTML fetch → web search
-8. Extraction revision      retrieved sources used to correct extraction:
-                            low-similarity low-confidence continuations
-                            removed from attribution; high-confidence
-                            extractions with low similarity kept (genuine
-                            non-engagement signal). Keeps "topical mismatch"
-                            verdict reserved for real cases.
-9. Verification             quotation exact-match → embedding retrieval →
-                            LLM judgement → patchwriting scan
-10. Integrity analysis      fabricated references, cross-paper, Wikipedia
-11. Report generation       individual + batch, HTML, color-coded
-```
+Only two kinds of text from a student's paper leave the application:
 
-The architecture is modular by design: each stage (extraction, parsing, retrieval, verification, reporting) is an independent service, so individual components can be replaced or extended without rewriting the pipeline.
+- **Reference-list entries**, sent to academic metadata services, web search providers and LLM providers.
+- **Citation passages**, sent to LLM providers together with excerpts of the cited source.
+
+The rest of the paper, including the student's name and other identifying details, is not sent. Complete source files are not sent to LLM providers. Credentials stay inside the configured process and are never written to logs or reports.
+
+## Security
+
+- Uploaded and retrieved PDFs are scanned for viruses (ClamAV) before they are stored.
+- Links are checked before they are fetched, and malicious links are blocked.
+- Student papers, retrieved sources and model outputs are treated as untrusted input, with prompt-injection defences in every LLM prompt that contains them.
+
+---
+
+## Deployment
+
+SourceFidelity has one shared core with two deployment profiles.
+
+| | Personal | Institutional |
+|---|---|---|
+| Who | An individual instructor or student | A university or department |
+| Where | Your own computer (or a rented server) | University servers |
+| Integration | None required | Moodle, institutional sign-in, library platform (planned) |
+| Main use | Checking individual papers | Formative student checking, deterrence, instructor review at scale |
+
+Personal deployment works on its own but takes some setup, because the application relies on several external services:
+
+- **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, Unpaywall, Elsevier (optional)
+- **Books and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource
+- **Web search:** Brave Search, Exa, Tavily, SearXNG (self-hosted, included)
+- **LLMs:** DeepSeek, GLM (Zhipu / Z.ai); other providers can be configured behind the same interface
 
 ---
 
 ## Tech stack
 
-- **Python 3.12**, FastAPI, Celery
-- **PostgreSQL** (job + report tracking), **Redis** (Celery broker), **MinIO / S3** (source text cache)
-- **pdfplumber + PyMuPDF** (PDF extraction), **python-docx** (DOCX)
-- **httpx** (HTTP client), **trafilatura** (HTML readable-text extraction)
-- **Pydantic + pydantic-settings** (schemas, config)
+- **Python 3.12**, FastAPI, Celery workers
+- **PostgreSQL** (jobs, reports, evidence packages), **Redis** (task broker), **MinIO / S3-compatible storage** (papers and sources)
+- **ClamAV** (virus scanning), **SearXNG** (self-hosted metasearch)
 - **Alembic** (database migrations)
 - **Docker Compose** (deployment)
 
@@ -99,87 +92,56 @@ The architecture is modular by design: each stage (extraction, parsing, retrieva
 
 ## Quick start
 
-### Option A — Docker Compose (recommended)
+Requirements: Docker with Docker Compose, and API keys for the services you want to use (see [Deployment](#deployment)).
+
+**1. Clone and configure**
 
 ```bash
 git clone https://github.com/sourcefidelity/sourcefidelity-api.git
 cd sourcefidelity-api
-cp .env.example .env          # fill in your LLM + retrieval API keys
-docker-compose up -d
+cp .env.example .env
 ```
 
-- API root: <http://localhost:8000>
-- Swagger UI: <http://localhost:8000/docs>
-- Health check: <http://localhost:8000/health>
-- MinIO console: <http://localhost:9001> (default credentials in `.env.example`)
+In `.env`:
 
-### Option B — Local development
+- Set `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD` and `SEARXNG_SECRET`, and use the same database password in `DATABASE_URL`.
+- Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY` and any search keys (`BRAVE_SEARCH_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_BOOKS_API_KEY`).
+- For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set. Use `ZAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4` for a key issued on that platform.
+- For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
+
+**2. Start the stack**
 
 ```bash
-git clone https://github.com/sourcefidelity/sourcefidelity-api.git
-cd sourcefidelity-api
-python3.12 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # fill in your keys
-
-# You'll need PostgreSQL + Redis running (or use docker-compose for just those)
-docker-compose up -d postgres redis minio
-
-alembic upgrade head          # apply database migrations
-uvicorn app.main:app --reload # API at http://localhost:8000
+docker compose up -d --build
 ```
 
-### Required API keys
+This starts the API, the paper and judgment workers, the scheduler, PostgreSQL, Redis, MinIO, ClamAV and SearXNG. ClamAV downloads its virus definitions on first start, which can take several minutes; the API waits for it.
 
-- **LLM_API_KEY** — DeepSeek (default), OpenAI, Anthropic, or point at a local Ollama instance.
-- **OPENALEX_API_KEY** — required since Feb 2025. Free at <https://openalex.org/settings/api>.
-- **CORE_API_KEY** — free at <https://core.ac.uk/services/api>.
-- Optional: Semantic Scholar, Google Books, Elsevier (for full-text retrieval).
+**3. Create the database tables** (first run, and after each update)
 
-See [`.env.example`](./.env.example) for the full configuration reference, including retrieval-source priority, strictness mode, and paywalled-PDF caching policy.
+```bash
+docker compose exec api alembic upgrade head
+```
 
----
+**4. Check a paper**
 
-## Deployment models
+- Health check: <http://localhost:8000/health/ready>
+- Swagger UI: <http://localhost:8000/docs> — submit a PDF or DOCX to `POST /check/`, follow progress at `GET /status/{job_id}`, and open the report at `http://localhost:8000/report/{report_id}`.
 
-| | Option A — Personal computer | Option B — Institutional server |
-|---|---|---|
-| Hardware | Any personal computer, no GPU | 16–32 GB RAM server, GPU optional |
-| LLM | Cloud API (DeepSeek/OpenAI/Claude) | Cloud or local (Ollama) |
-| Local models | None (LLM handles verification) | BGE-M3, FAISS, DeBERTa, AlignScore |
-| Patchwriting detection | Weaker (no lexical-overlap counting) | Strong (Keck + embeddings) |
-| Cross-paper comparison | Not practical | Full (FAISS index) |
-
-Per-paper cost figures will be published once measured against real batch runs, not estimates. Both deployments keep student data on the user's own infrastructure.
+The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_local` has no password. Use `personal_bearer` or an institutional sign-in for any shared deployment. See [`.env.example`](./.env.example) for all settings.
 
 ---
 
 ## Roadmap
 
-A high-level view:
-
-- ✅ Phases 0–2 — project setup, dev environment, core structure
-- ✅ Phase 3.1–3.5 — text/reference extraction, source repository, retrieval adapters
-- ✅ Phase 3.6–3.7 — download paths, publisher PDFs, website source verification
-- ✅ Phase 4 — in-text citation extraction (APA/MLA)
-- ⏳ Phase 3.8 — verification engine (6-stage hybrid pipeline)
-- ⏳ Phase 5 — reporting system + color-highlighted paper output
-- ⏳ Phase 6 — Celery parallelism (paper + reference level)
-- 📝 Phase 9 — Moodle plugin (`sourcefidelity-moodle`, GPLv3)
-- 📝 Phase 12 — authentication and roles
-
----
-
-## Contributing
-
-Contributions are welcome, especially around:
-
-- **Retrieval coverage** — additional adapters (CNKI is a known gap with no clean public API).
-- **Citation format support** — Chicago notes-bibliography, Harvard, Vancouver.
-- **Testing** — pytest coverage, real-paper test cases (with PII removed).
-
-A `CONTRIBUTING.md` with setup instructions and coding conventions is in progress. In the meantime, please open an issue before starting work on a non-trivial change.
+- ✅ Reference extraction, source identification and retrieval
+- ✅ In-text citation extraction (APA, MLA)
+- ✅ Evidence packages and live/exported reports
+- ✅ Citation–source relationship judgment
+- 📝 Moodle plugin (`sourcefidelity-moodle`, GPLv3)
+- 📝 Library platform integration
+- 📝 Cross-assessment comparison, student-paper repository, Wikipedia similarity scoring
+- 📝 Additional referencing systems
 
 ---
 
@@ -187,10 +149,4 @@ A `CONTRIBUTING.md` with setup instructions and coding conventions is in progres
 
 MIT. See [`LICENSE`](./LICENSE).
 
-The companion Moodle plugin (`sourcefidelity-moodle`, planned) will be GPLv3 to match Moodle's licensing requirements.
-
----
-
-## Acknowledgments
-
-SourceFidelity's verification model draws on research from writing studies, composition pedagogy, and applied linguistics — including work by Hyland, Keck, Howard, Swales, Graff & Birkenstein, and Teufel on paraphrase taxonomy, argumentative zoning, and academic attribution; on NLI / RAG-faithfulness / fact-checking research for the verification pipeline; and on academic-integrity principles from ICAI, QAA, and TEQSA.
+The planned Moodle plugin (`sourcefidelity-moodle`) will be GPLv3 to match Moodle's licensing requirements.

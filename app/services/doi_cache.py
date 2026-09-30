@@ -11,6 +11,8 @@ Cache structure:
 
 import hashlib
 import logging
+import re
+from urllib.parse import quote
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +28,29 @@ _cache_misses = 0
 # ---------------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------------
+
+
+_DOI_SHAPE = re.compile(r"^10\.\d{4,}(?:\.\d+)*/\S+$")
+
+
+def doi_request_segment(doi: str) -> str | None:
+    """Return a DOI as a safe URL path segment, or None if it is not a DOI.
+
+    A DOI arrives from parsed reference text, so it is untrusted: "?", "#" or
+    "/../" inside it would otherwise rewrite the request a provider receives,
+    and a legitimate DOI containing "#" or "?" (both permitted by the DOI
+    syntax) would be cut at the fragment or query boundary and looked up as a
+    different identifier. Normalize, require the registrant/suffix shape, then
+    percent-encode everything except the suffix separator.
+    """
+    normalized = normalize_doi(doi)
+    if not normalized or not _DOI_SHAPE.match(normalized):
+        return None
+    # A suffix may legitimately contain "/", so the separator stays unencoded;
+    # a "." or ".." segment is never part of a DOI and would climb the path.
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        return None
+    return quote(normalized, safe="/")
 
 
 def normalize_doi(doi: str) -> str:

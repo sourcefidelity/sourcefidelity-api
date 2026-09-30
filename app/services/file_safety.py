@@ -262,6 +262,41 @@ def scan_with_clamd(content: bytes) -> tuple[SafetyVerdict, str]:
     return _parse_clamd_reply(bytes(reply))
 
 
+def inspect_uploaded_html(content: bytes) -> FileSafetyReport:
+    """Inspect a supplied HTML page before parsing or durable admission.
+
+    Only the malware scan can reject here. HTML has no PDF-style action
+    dictionary to disarm, and ordinary publisher pages legitimately contain
+    scripts; the supplied bytes are parsed offline and never stored or served,
+    so active content cannot run. The caller records the observed markers.
+    """
+    try:
+        malware_verdict, scanner_detail = scan_with_clamd(content)
+    except FileSafetyUnavailable:
+        if settings.MALWARE_SCAN_REQUIRED:
+            raise
+        malware_verdict = SafetyVerdict.NOT_ASSESSED
+        scanner_detail = "clamd scan unavailable"
+
+    if malware_verdict is SafetyVerdict.REJECTED:
+        return FileSafetyReport(
+            verdict=SafetyVerdict.REJECTED,
+            structural_verdict=SafetyVerdict.NOT_ASSESSED,
+            malware_verdict=malware_verdict,
+            findings=("malware scanner rejected the upload",),
+            scanner_detail=scanner_detail,
+        )
+    if malware_verdict is SafetyVerdict.UNAVAILABLE and settings.MALWARE_SCAN_REQUIRED:
+        raise FileSafetyUnavailable(scanner_detail)
+
+    return FileSafetyReport(
+        verdict=malware_verdict,
+        structural_verdict=SafetyVerdict.NOT_ASSESSED,
+        malware_verdict=malware_verdict,
+        scanner_detail=scanner_detail,
+    )
+
+
 def inspect_uploaded_pdf(content: bytes) -> FileSafetyReport:
     """Inspect a PDF before bibliographic parsing or durable admission."""
     basic_verdict, basic_findings = _basic_pdf_check(content)

@@ -19,6 +19,11 @@ class PaperAnnotationError(ValueError):
 
 _ANNOTATION_TYPES = {"comment", "highlight"}
 _VISIBILITIES = {"private", "released"}
+
+
+def personal_annotation_export_enabled() -> bool:
+    from app.config import settings
+    return settings.REPORT_AUTH_MODE in {'personal_local', 'personal_bearer'}
 _STATES = {"active", "deleted"}
 
 

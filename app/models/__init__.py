@@ -20,3 +20,14 @@ from app.models.source_repository import (  # noqa: E402, F401
     SourceRepresentationRecord,
 )
 from app.models.verification_run import VerificationRunRecord  # noqa: E402, F401
+from app.models.edition_review import EditionReviewSnapshot, EditionReviewDecision  # noqa: E402, F401
+from app.models.judgment import (  # noqa: E402, F401
+    JudgmentAcknowledgement,
+    JudgmentArmResult,
+    JudgmentCoachingNote,
+    JudgmentCandidateResult,
+    JudgmentRun,
+    JudgmentSourceReserve,
+)
+from app.models.search_memo import SearchMemoRecord  # noqa: E402, F401
+from app.models.assessment_marks import AssessmentMarksRelease  # noqa: E402, F401

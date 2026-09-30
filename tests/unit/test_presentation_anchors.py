@@ -41,6 +41,16 @@ def test_unique_exact_tokens_create_stable_page_geometry():
     assert anchor.rectangles[0].x1 > anchor.rectangles[0].x0
 
 
+def test_missing_sentence_space_uses_exact_character_boundary():
+    sentence = 'The report describes the result (Smith, 2020).'
+    content = _pdf_with_text(sentence+'Another sentence follows.')
+    artifact = bind_citations_to_pdf(content, citations=[_citation(sentence)])
+    assert artifact.matched_citation_count == 1
+    with fitz.open(stream=content,filetype='pdf') as doc:
+        next_word=doc[0].search_for('Another')[0]
+        assert artifact.anchors[0].rectangles[-1].x1 <= next_word.x0+.01
+
+
 def test_duplicate_detections_of_one_exact_span_share_one_surface_anchor():
     sentence = "Careful verification improves accuracy (Smith, 2020)."
     citation = _citation(sentence)

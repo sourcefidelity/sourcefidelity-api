@@ -68,7 +68,63 @@ SOURCE_KIND_ALIASES = {
     "podcast": "podcast_episode",
     "audio": "podcast_episode",
     "film": "traditional_media",
+    # Broadcast and performance kinds collapse to "unknown" unless named here,
+    # and "unknown" is now searchable.  An unrecognised media descriptor must
+    # not be mistaken for an unclassified article.
+    "televisionseries": "traditional_media",
+    "tvseries": "traditional_media",
+    "televisionprogramme": "traditional_media",
+    "televisionprogram": "traditional_media",
+    "radioprogramme": "traditional_media",
+    "radioprogram": "traditional_media",
+    "radiobroadcast": "traditional_media",
+    "documentary": "traditional_media",
+    "motionpicture": "traditional_media",
+    "musicalbum": "traditional_media",
+    "album": "traditional_media",
+    "song": "traditional_media",
+    "artwork": "traditional_media",
+    "painting": "traditional_media",
+    "photograph": "traditional_media",
+    "performance": "traditional_media",
+    "play": "traditional_media",
+    "exhibition": "traditional_media",
+    "manuscript": "archival_source",
+    "archivalmaterial": "archival_source",
+    "personalcommunication": "archival_source",
+    "interview": "archival_source",
 }
+
+# Kinds a bibliographic search cannot settle from author, title and year.
+# Academic indexes either do not carry them or carry writing *about* them, so
+# an absent match is silence rather than evidence of fabrication.  Everything
+# not named here is searchable — including an unclassified reference, whose
+# missing kind is a parser gap, not a property of the cited work.
+BIBLIOGRAPHICALLY_UNSEARCHABLE_KINDS = frozenset(
+    {
+        "webpage",
+        "news_article",
+        "blog_post",
+        "social_media_post",
+        "video",
+        "podcast_episode",
+        "traditional_media",
+        "archival_source",
+        "dataset",
+        "software",
+    }
+)
+
+# Kinds whose identity is settled against a book catalogue rather than an
+# article index.  Deliberately excludes "unknown": an unclassified reference
+# must not inherit a book's evidence requirement on a guess.
+BOOK_CATALOGUE_KINDS = frozenset({"monograph", "edited_collection", "book_section"})
+
+
+def is_bibliographically_searchable(value: str | None) -> bool:
+    """Whether author/title/year can settle this kind's identity."""
+    return normalize_source_kind(value) not in BIBLIOGRAPHICALLY_UNSEARCHABLE_KINDS
+
 
 SOURCE_KIND_TO_DOCUMENT_KIND = {
     "journal_article": "article",
@@ -132,31 +188,101 @@ _BOOK_REVIEW_RE = re.compile(
     r"\breview\s+of\s+.{3,180},\s+by\s+[A-Z])",
     re.IGNORECASE,
 )
+# A journal page locator may carry a single-letter article/supplement prefix
+# (E276, S45, e1234). The letter must bind directly to the digits; a separated
+# word is not a locator.
+# Two accepted shapes. Volume(issue) followed by a page, where the issue may be
+# a range or carry a letter ("32(5-6)"); or volume followed by a page *range*
+# with no issue at all ("System, 93, 1-11"), which is ordinary APA and was
+# previously unclassifiable. The second shape requires the range: a bare
+# "volume, number" pair is not evidence of an article.
 _JOURNAL_STRUCTURE_RE = re.compile(
     r"(?:\b(?:journal|quarterly|review)\b.{0,100})?"
-    r"\b\d{1,4}\s*\(\s*\d{1,4}\s*\)\s*[,.:]?\s*(?:pp?\.\s*)?\d{1,6}",
+    # A magazine cites discontinuous pages as "pp. 34-36, 91-93". Without these
+    # guards the second branch reads "36" as a volume and "91-93" as its pages.
+    # Reject a volume that continues a page range or follows a page marker.
+    r"(?<![-\u2013\u2014])(?<!pp\. )(?<!p\. )"
+    r"\b\d{1,4}\s*(?:"
+    r"\(\s*[\dA-Za-z]{1,4}(?:\s*[-\u2013\u2014/]\s*[\dA-Za-z]{1,4})?\s*\)"
+    r"\s*[,.:]?\s*(?:pp?\.\s*|article\s+)?[A-Za-z]?\d{1,6}"
+    r"|,\s*[A-Za-z]?\d{1,6}\s*[-\u2013\u2014]\s*[A-Za-z]?\d{1,6}"
+    # Article-number journals cite an e-locator instead of pages: "Journal of
+    # English for Academic Purposes, 50, Article 100957". Ordinary modern APA,
+    # and previously unclassifiable because the locator is not a page number.
+    r"|,\s*article\s+\d{1,6}"
+    r")",
     re.IGNORECASE,
 )
 _JOURNAL_VOLUME_ISSUE_RE = re.compile(
     r",\s*\d{1,4}\s*\(\s*\d{1,4}\s*\)\s*\.?\s*(?=(?:https?://|www\.|$))",
     re.IGNORECASE,
 )
+# Literal emphasis around the journal or journal-plus-volume can survive in
+# submitted text. Require the complete container/volume/page-range structure;
+# an emphasized phrase alone is not evidence of an article.
+_MARKED_JOURNAL_STRUCTURE_RE = re.compile(
+    r'\*[^*\n]{2,180}(?:\*\s*,\s*\d{1,4}|,\s*\d{1,4}\*)\s*'
+    r'(?:\(\s*\d{1,4}\s*\))?\s*,\s*(?:pp?\.\s*)?'
+    r'\d{1,6}\s*[-–—]\s*\d{1,6}(?=[.\s]|$)',
+)
 _JOURNAL_FRONT_MATTER_RE = re.compile(
     r"(?:\bISSN\s*:|\bjournal\s+homepage\b|\bto\s+cite\s+this\s+article\b|"
     r"\bVolume\s+[A-Z0-9IVXLC]+\s*,?\s*(?:Number|No\.)\s*\d+\s*,?\s*pp?\.)",
     re.IGNORECASE,
 )
+# Imprint names, not places. A textbook publisher that does not put "Press" in
+# its name was read as no publisher at all, so a real book parsed as an unknown
+# kind and lost its catalog route entirely (Carlton & Perloff, "Pearson.").
+# Names that also occur as venue or title words — "harvard", "chicago" — are
+# deliberately excluded: "Harvard Law Review" must stay a journal.
 _BOOK_PUBLISHER_RE = re.compile(
-    r"\b(?:university\s+press|press|routledge|sage|springer|wiley|palgrave|"
+    r"\b(?:[A-Za-z]{2,60}UniversityPress|university\s+press|press|routledge|sage|springer|wiley|palgrave|"
     r"penguin|knopf|norton|bloomsbury|blackwell|elsevier|harpercollins|"
-    r"random\s+house|cambridge|oxford|columbia\s+global\s+reports)\b",
+    r"random\s+house|cambridge|oxford|columbia\s+global\s+reports|"
+    r"pearson|mcgraw[\s-]?hill|prentice[\s-]?hall|cengage|wadsworth|macmillan|"
+    r"pergamon|ashgate|edward\s+elgar|de\s+gruyter|rowman|"
+    # Submitted text loses spaces often enough that "New York UniversityPress"
+    # reached the classifier as one token and matched nothing.
+    r"university\s*press|universitet|"
+    # Institutional imprints. A body that publishes its own work is a publisher
+    # even when its name says nothing about publishing.
+    r"british\s+council|british\s+film\s+institute|kamera\s+books)\b",
     re.IGNORECASE,
 )
 _BOOK_EDITION_RE = re.compile(r"\(\s*\d+(?:st|nd|rd|th)\s+ed\.?(?:ition)?\s*\)", re.I)
 _BOOK_SECTION_RE = re.compile(
-    r"(?:\bIn\s+.{1,160}\((?:Ed|Eds)\.\)|\b(?:edited\s+by|chapter\s+\d+)\b)",
+    r"\bIn\s+.{1,160}\((?:Ed|Eds)\.\)"
+    # Editors omitted: "Chapter. In Book title (pp. 75-116)." (2026-09-29).
+    r"|\.\s+In\s+[^()]{3,300}?\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)",
     re.IGNORECASE,
 )
+_COLLECTION_LEAD_RE = re.compile(
+    r"^(?:[^()\n]{2,160}\(Eds?\.\)\s*\.?\s*\((?:18|19|20)\d{2}[a-z]?\)"
+    r"|[^.\n]{2,160},\s*editors?\.\s+\S)", re.I,
+)
+
+
+def _reference_component_kind(raw: str, title: str | None) -> SourceKindAssessment | None:
+    """Distinguish cited contribution from editor credit, not attribution guilt."""
+    # Ignore content-like cues inside a separately bound title and all URLs.
+    structural = re.sub(r'https?://\S+|www\.\S+', '', raw, flags=re.I)
+    if title and structural.count(title) == 1:
+        structural = structural.replace(title, ' ' * len(title))
+    apa_section = _BOOK_SECTION_RE.search(structural)
+    # MLA requires a distinct quoted contribution and a separate container,
+    # contributor credit and page range. "Edited by" alone can describe an
+    # edition of an entire authored work (e.g. Beowulf).
+    mla_section = re.search(
+        r'[“"][^”"]{3,300}[”"]\.?\s+[^“”"]{3,200}?\bEdited\s+by\s+'
+        r'.{2,180}?\b(?:pp?\.|pages)\s*\d+\s*[-–—]\s*\d+', raw, re.I)
+    collection = _COLLECTION_LEAD_RE.search(structural)
+    if collection and (apa_section or mla_section):
+        return _assessment('unknown', 'unknown', 'conflicting collection/contribution structure')
+    if apa_section or mla_section:
+        return _assessment('book_section', 'high', 'distinct contribution/container/editor structure v2')
+    if collection:
+        return _assessment('edited_collection', 'high', 'explicit leading editor role for whole work v1')
+    return None
 _REPORT_RE = re.compile(
     r"(?:\[(?:technical\s+)?report\]|\breport\s+(?:no\.?|number)\s*[A-Z0-9-]+|"
     r"\bworking\s+paper\s+(?:no\.?|number)\s*[A-Z0-9-]+)",
@@ -166,7 +292,7 @@ _OECD_REPORT_SERIES_RE = re.compile(
     r"\bOECD\b.{0,160}\b(?:economic\s+outlook|survey|statistics|indicators)\b",
     re.IGNORECASE,
 )
-_THESIS_RE = re.compile(r"\b(?:doctoral\s+dissertation|master'?s\s+thesis|phd\s+thesis)\b", re.I)
+_THESIS_RE = re.compile(r"\b(?:doctoral\s+dissertation|(?:master|bachelor|honou?rs)['’]?s?\s+thesis|phd\s+thesis)\b", re.I)
 _DATASET_RE = re.compile(r"(?:\[(?:data\s*set|dataset)\]|\bdata\s*set\s+version\b)", re.I)
 _SOFTWARE_RE = re.compile(r"(?:\[(?:computer\s+)?software\]|\bsoftware\s+version\b)", re.I)
 _VIDEO_RE = re.compile(r"(?:\[(?:video|webinar)\]|\bYouTube\b|\bVimeo\b)", re.I)
@@ -174,6 +300,63 @@ _PODCAST_RE = re.compile(r"(?:\[(?:audio\s+)?podcast(?:\s+episode)?\]|\bpodcast\
 _SOCIAL_RE = re.compile(r"(?:\[(?:tweet|social\s+media\s+post)\]|\b(?:twitter|x|mastodon|weibo)\.com/)", re.I)
 _BLOG_RE = re.compile(r"(?:\[blog\s+post\]|\bsubstack\.com/|\bmedium\.com/)", re.I)
 _NEWS_RE = re.compile(r"\[(?:news|newspaper|magazine)\s+article\]", re.I)
+
+
+# A body publishing a document about itself - a university language policy, a
+# ministry circular - is not deposited in a bibliographic index, so an absent
+# match is silence rather than evidence of fabrication. This holds whether or
+# not the document is still reachable online; going offline does not make it
+# newly searchable. Requires an organizational author AND no venue, publisher,
+# identifier or edition, all of which are tested earlier in the classifier.
+_ORGANIZATION_AUTHOR_RE = re.compile(
+    r"\b(?:universit(?:y|ies|e|ät|à)|college|institute|institution|ministry"
+    r"|department|association|council|commission|foundation|organi[sz]ation"
+    r"|agency|bureau|society|authority|board|centre|center|trust|office"
+    r"|school|academy|federation|committee|consortium|secretariat"
+    r"|directorate|parliament|government)\b",
+    re.I,
+)
+# APA personal authors carry initials: "Berg, S. V., & Forsyth, P." An
+# organization never does, and that is the cheapest reliable separator.
+_PERSONAL_AUTHOR_INITIALS_RE = re.compile(r"[A-Z][\w'\u2019-]+,\s*(?:[A-Z]\.\s*)")
+_AUTHOR_SEGMENT_RE = re.compile(r"^(.*?)\(\s*(?:n\.d\.|\d{4})", re.I)
+_ANY_DOI_RE = re.compile(r"\b10\.\d{4,}/", re.I)
+# An actual DOI statement, not any "10.NNNN/" that happens to occur in a URL
+# path. Only this may keep a web address from classifying as a webpage.
+_DOI_STATEMENT_RE = re.compile(r"\bdoi\.org/10\.\d{4,}/|\bdoi:\s*10\.\d{4,}/", re.I)
+# What follows the year: the title, and then any venue or publisher statement.
+_AFTER_YEAR_RE = re.compile(r"\(\s*(?:n\.d\.|\d{4}[a-z]?)\s*\)\.?\s*(.*)$", re.I | re.S)
+_STATEMENT_SPLIT_RE = re.compile(r"(?<=[.?!])\s+(?=[A-Z\u00C0-\u024F])")
+
+
+def _has_statement_after_title(raw: str) -> bool:
+    """Whether anything - a publisher, a venue - follows the title."""
+    match = _AFTER_YEAR_RE.search(raw)
+    if match is None:
+        return False
+    segments = [part for part in _STATEMENT_SPLIT_RE.split(match.group(1).strip()) if part.strip()]
+    return len(segments) > 1
+
+
+def _institutional_self_published(raw: str) -> bool:
+    """Whether an organization is citing a document it published about itself.
+
+    Requires an organizational author and *nothing after the title*: no
+    identifier, and no venue or publisher statement of any kind. "World Health
+    Organization (2021). Title. World Health Organization." names a publisher,
+    is held by the book catalogues, and must stay reviewable; the rule was
+    first written to exclude it, which removed org-authored grey literature -
+    including fabricated grey literature - from review altogether.
+    """
+    if _ANY_DOI_RE.search(raw) or _has_statement_after_title(raw):
+        return False
+    segment = _AUTHOR_SEGMENT_RE.match(raw)
+    if segment is None:
+        return False
+    author = segment.group(1).strip()
+    if not author or _PERSONAL_AUTHOR_INITIALS_RE.search(author):
+        return False
+    return bool(_ORGANIZATION_AUTHOR_RE.search(author))
 
 
 def classify_reference_source_kind(
@@ -217,11 +400,13 @@ def classify_reference_source_kind(
         return _assessment("report", "high", "explicit report or working-paper number")
     if _OECD_REPORT_SERIES_RE.search(combined):
         return _assessment("report", "high", "identified OECD report-series title")
-    if _BOOK_SECTION_RE.search(raw):
-        return _assessment("book_section", "high", "chapter container/editor structure")
+    component_kind = _reference_component_kind(raw, title)
+    if component_kind is not None:
+        return component_kind
     if is_traditional_media(raw):
         return _assessment("traditional_media", "high", "explicit media role or format marker")
-    if _JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_VOLUME_ISSUE_RE.search(raw):
+    if (_JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_VOLUME_ISSUE_RE.search(raw)
+            or _MARKED_JOURNAL_STRUCTURE_RE.search(raw)):
         return _assessment("journal_article", "high", "journal volume/issue/page structure")
     if re.search(r"\bISBN(?:-1[03])?\b", raw, re.I) or _BOOK_EDITION_RE.search(raw):
         return _assessment("monograph", "high", "ISBN or edition marker")
@@ -229,8 +414,18 @@ def classify_reference_source_kind(
     publisher_matches = list(_BOOK_PUBLISHER_RE.finditer(raw_without_url))
     if publisher_matches and len(raw_without_url) - publisher_matches[-1].end() <= 80:
         return _assessment("monograph", "high", "terminal book-publisher citation structure")
-    if re.search(r"https?://|www\.", combined, re.I):
+    # A DOI is a more specific work-type marker, not a bare URL: it says the
+    # work is registered and resolvable. Treating a doi.org link as a webpage
+    # classified the reference into the unsearchable set, so a fabricated
+    # reference carrying an invented DOI was never reviewed at all.
+    if re.search(r"https?://|www\.", combined, re.I) and not _DOI_STATEMENT_RE.search(combined):
         return _assessment("webpage", "low", "URL without a more specific work-type marker")
+    if _institutional_self_published(raw):
+        return _assessment(
+            "webpage",
+            "low",
+            "organizational author without venue, publisher, identifier or edition",
+        )
     return SourceKindAssessment()
 
 
@@ -323,11 +518,23 @@ def classify_content_source_kind(
     return SourceKindAssessment()
 
 
+def visible_journal_masthead(soup) -> bool:
+    """A compact volume/issue/article label immediately before the work title."""
+    heading = soup.find('h1')
+    if heading is None or (heading.find_parent('article') is None and heading.find_next('article') is None):
+        return False
+    return any(re.fullmatch(r'Vol(?:ume)?\.?\s*\d+\s+No\.?\s*\d+\s+Article',
+                           node.get_text(' ', strip=True), re.I)
+               for node in heading.find_all_previous(['div', 'p', 'span'], limit=24))
+
+
 def classify_html_source_kind(html: str, url: str) -> SourceKindAssessment:
     """Classify a web work from trusted structural metadata plus its URL."""
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "html.parser")
+    if visible_journal_masthead(soup):
+        return _assessment('journal_article', 'high', 'visible article masthead identifies journal volume and issue')
     candidates: list[str] = []
     for meta in soup.find_all("meta"):
         key = (meta.get("property") or meta.get("name") or "").casefold()
@@ -420,8 +627,8 @@ TRADITIONAL_MEDIA_RE = re.compile(
 
 # Director/artist/creator credits also signal traditional media.
 DIRECTOR_RE = re.compile(
-    r"\b(?:director|dir\.|performer|perf\.|artist|creator|choreographer|"
-    r"conductor|host|narrator)\b",
+    r"[\[(]\s*(?:director|dir\.|performer|perf\.|artist|creator|choreographer|"
+    r"conductor|host|narrator)s?\s*[\])]",
     re.IGNORECASE,
 )
 

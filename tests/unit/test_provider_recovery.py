@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
@@ -10,6 +11,15 @@ from app.models.job import Job, JobStatus
 from app.tasks import provider_recovery
 
 
+@pytest.fixture(autouse=True)
+def _institutional_deployment(monkeypatch):
+    """Automatic re-searching happens only in an Institutional deployment
+    (owner decision 2026-09-29); these tests exercise that behaviour."""
+    import app.services.assessment_marks as marks
+    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
+
+
+
 def _job(*, paper_version_id: str, provider: str | None) -> Job:
     result = {
         "reference_id": f"ref-{paper_version_id}",
@@ -17,6 +27,14 @@ def _job(*, paper_version_id: str, provider: str | None) -> Job:
         "reason_code": "source_not_found",
     }
     if provider:
+        from tests.unit.blocked_discovery import blocked_record
+        # The refresh recomputes from the stored record, so it must genuinely be
+        # blocked by `provider`: SearXNG as a required web route under the
+        # legacy policy, anything else as a failed required academic adapter.
+        result["reference_discovery"] = (
+            blocked_record(result["reference_id"], web_outcomes={provider: "cooldown_skipped"})
+            if provider == "searxng"
+            else blocked_record(result["reference_id"], adapter=provider))
         result["retryable_provider_dependencies"] = [provider]
     return Job(
         filename=f"{paper_version_id}.pdf",
@@ -92,6 +110,10 @@ def test_recovery_task_fails_closed_for_blank_provider() -> None:
 def test_due_health_probe_closes_incident_and_schedules_targeted_refresh(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(provider_recovery.settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", True)
+    # Pin the engine the probe looks for, so the test asserts probe behaviour
+    # rather than whichever engines happen to be configured today.
+    monkeypatch.setattr(provider_recovery.settings, "SEARXNG_ENGINE_GROUPS", "google cse")
     store = Mock()
     store.incident_providers.return_value = ["searxng:google cse"]
     store.cooldown_remaining.return_value = 0
@@ -124,6 +146,7 @@ def test_due_health_probe_closes_incident_and_schedules_targeted_refresh(
 
 
 def test_active_cooldown_is_not_probed(monkeypatch) -> None:
+    monkeypatch.setattr(provider_recovery.settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", True)
     store = Mock()
     store.incident_providers.return_value = ["searxng:brave"]
     store.cooldown_remaining.return_value = 30
@@ -140,6 +163,7 @@ def test_active_cooldown_is_not_probed(monkeypatch) -> None:
 
 
 def test_unconfigured_searx_engine_is_neither_probed_nor_cleared(monkeypatch):
+    monkeypatch.setattr(provider_recovery.settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", True)
     monkeypatch.setattr(provider_recovery.settings, "SEARXNG_ENGINE_GROUPS", "google cse;brave")
     store = Mock()
     store.incident_providers.return_value = ["searxng:example trial", "searxng:old group"]
@@ -156,15 +180,21 @@ def test_unconfigured_searx_engine_is_neither_probed_nor_cleared(monkeypatch):
     store.claim_recovery_probe.assert_not_called()
 
 
-def test_direct_duckduckgo_incident_uses_same_recovery_path(monkeypatch) -> None:
+def test_removed_provider_incident_generates_no_probe_traffic(monkeypatch) -> None:
+    """A stale incident for a removed provider is kept, never probed.
+
+    The DuckDuckGo adapter was removed on 2026-09-22 because it used an
+    endpoint its terms do not permit. Health records written before that
+    must not keep sending the application back to it.
+    """
+    monkeypatch.setattr(
+        provider_recovery.settings, "SEARCH_POLICY_VERSION", "configured-search-v1"
+    )
     store = Mock()
     store.incident_providers.return_value = ["duckduckgo"]
     store.cooldown_remaining.return_value = 0
     store.claim_recovery_probe.return_value = True
-    store.record_success.return_value = True
     search = Mock()
-    search.search.return_value = [Mock()]
-    search.last_status = "completed"
     scheduled = Mock()
     monkeypatch.setattr(provider_recovery, "ProviderHealthStore", lambda: store)
     monkeypatch.setattr(
@@ -174,8 +204,53 @@ def test_direct_duckduckgo_incident_uses_same_recovery_path(monkeypatch) -> None
 
     result = provider_recovery.probe_retrieval_provider_recovery.run()
 
-    assert result["incidents_recovered"] == 1
-    search.search.assert_called_once_with(
-        "sourcefidelity provider availability probe", num_results=1
-    )
-    scheduled.assert_called_once_with("duckduckgo")
+    assert result["incidents_probed"] == 0
+    search.search.assert_not_called()
+    store.claim_recovery_probe.assert_not_called()
+    scheduled.assert_not_called()
+
+
+def test_a_brave_recovery_requeues_a_job_brave_was_blocking(monkeypatch) -> None:
+    """Closes the chain added 2026-09-24: Brave reports its own recovery.
+
+    A reference held incomplete because Brave failed under `api-first-search-v2`
+    is re-run when Brave recovers. One that Brave did not block -- Exa failed
+    there, Brave answered -- is left alone.
+    """
+    from tests.unit.blocked_discovery import blocked_record
+
+    engine = create_engine("sqlite+pysqlite:///:memory:",
+                           connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as session:
+        blocked = _job(paper_version_id="brave-blocked", provider=None)
+        blocked.source_results = [{
+            "reference_id": "ref-brave", "status": "unavailable", "reason_code": "source_not_found",
+            "reference_discovery": blocked_record(
+                "ref-brave", policy="api-first-search-v2",
+                web_outcomes={"brave": "operational_failure", "exa": "results"})}]
+        other = _job(paper_version_id="exa-blocked", provider=None)
+        other.source_results = [{
+            "reference_id": "ref-exa", "status": "unavailable", "reason_code": "source_not_found",
+            "reference_discovery": blocked_record(
+                "ref-exa", policy="api-first-search-v2",
+                web_outcomes={"brave": "results", "exa": "timeout"})}]
+        session.add_all([blocked, other])
+        session.commit()
+        blocked_id, other_id = blocked.id, other.id
+
+    dispatch = Mock()
+    monkeypatch.setattr(provider_recovery, "SessionLocal", factory)
+    monkeypatch.setattr(provider_recovery, "dispatch_paper_workflow", dispatch)
+    monkeypatch.setattr(provider_recovery.settings, "PROVIDER_RECOVERY_MAX_JOBS", 25)
+    monkeypatch.setattr(provider_recovery.settings, "PROVIDER_RECOVERY_REFRESH_ENABLED", True)
+
+    result = provider_recovery.requeue_recovered_provider_work.run("brave")
+
+    assert result["jobs_requeued"] == 1
+    dispatch.assert_called_once()
+    with factory() as session:
+        assert session.get(Job, blocked_id).upload_evidence[
+            "provider_refresh_reference_ids"] == ["ref-brave"]
+        assert session.get(Job, other_id).status == JobStatus.COMPLETED

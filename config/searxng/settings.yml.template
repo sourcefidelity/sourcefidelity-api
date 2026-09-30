@@ -3,11 +3,17 @@
 # and writes the resulting untracked settings file into a persistent volume.
 use_default_settings: true
 
-# Keep the baseline at 3s. An explicit bounded timeout_limit may request up to
-# 6s; without max_request_timeout, SearXNG silently caps such requests at 3s.
+# Measured 2026-09-21 from this deployment's network: the engines SearXNG
+# queries answer their own front pages in 2.9-8.0s. At a 3s budget every one
+# of them timed out, SearXNG suspended them, and the suspension is sticky in
+# memory, so later queries returned nothing even when they would have
+# succeeded. That, not configuration, is why earlier attempts concluded
+# SearXNG did not work. An explicit bounded timeout_limit may request up to
+# max_request_timeout; without it SearXNG silently caps requests at the
+# baseline.
 outgoing:
-  request_timeout: 3.0
-  max_request_timeout: 6.0
+  request_timeout: 10.0
+  max_request_timeout: 20.0
 
 server:
   secret_key: "__SEARXNG_SECRET__"

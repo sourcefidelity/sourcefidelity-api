@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import hashlib
 from urllib.parse import urlsplit
 import re
 import uuid
@@ -11,7 +12,7 @@ from html import escape
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, Field, model_validator
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 import fitz
@@ -19,7 +20,6 @@ import fitz
 from app.database import get_db
 from app.security import (
     AuthenticatedPrincipal,
-    REPORT_ANNOTATION_CAPABILITY,
     REPORT_PAPER_CAPABILITY,
     REPORT_SOURCE_CAPABILITY,
     REPORT_SESSION_COOKIE,
@@ -39,7 +39,9 @@ from app.services.evidence_report import (
     EvidenceReportError,
     enable_authenticated_paper_actions,
     load_authorized_evidence_report_bundle,
+    member_search_incomplete,
     render_evidence_report_html,
+    project_reference_flags,
 )
 from app.services.storage.backend import StorageBackend, get_storage_backend
 from app.services.source_navigation import (
@@ -49,43 +51,16 @@ from app.services.source_navigation import (
 from app.services.verification_evidence import EvidenceAuthorizationError
 from app.routers.sources import upload_source as admit_uploaded_source
 from app.services.pdf_verifier import verify_instructor_upload
-from app.services.paper_annotations import (
-    PaperAnnotationError,
-    create_paper_annotation,
-    list_current_paper_annotations,
-    revise_paper_annotation,
-)
 from app.services.paper_workflow import (
     PaperWorkflowError,
     prepare_uploaded_source_refresh,
 )
 from app.services.report_export import ReportExportError, build_released_report_export
 from app.tasks.source_reanalysis import schedule_uploaded_source_reanalysis
+from app.services.search_retry import SearchAgainRateLimited, prepare_search_again_refresh
+from app.tasks.check_paper import dispatch_paper_workflow
 
 router = APIRouter()
-
-
-class AnnotationCreateRequest(BaseModel):
-    annotation_type: str
-    anchor_id: str | None = Field(default=None, min_length=64, max_length=64)
-    anchor: dict | None = None
-    content: str | None = Field(default=None, max_length=4000)
-    user_label: str | None = Field(default=None, max_length=100)
-    visibility: str = "private"
-
-    @model_validator(mode="after")
-    def require_one_anchor(self):
-        if (self.anchor_id is None) == (self.anchor is None):
-            raise ValueError("Provide exactly one annotation anchor")
-        return self
-
-
-class AnnotationRevisionRequest(BaseModel):
-    expected_revision: int = Field(ge=1)
-    content: str | None = Field(default=None, max_length=4000)
-    user_label: str | None = Field(default=None, max_length=100)
-    visibility: str | None = None
-    state: str = "active"
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -167,7 +142,7 @@ async def delete_browser_session(request: Request):
 @router.get("/{report_id}", response_class=HTMLResponse)
 def get_report(
     report_id: str,
-    audience: str = Query("student", pattern="^(student|instructor)$"),
+    audience: str | None = Query(None, include_in_schema=False),
     principal: AuthenticatedPrincipal = Depends(get_report_browser_principal),
     session: Session = Depends(get_db),
     backend: StorageBackend = Depends(get_storage_backend),
@@ -176,33 +151,25 @@ def get_report(
     principal.require(REPORT_VIEW_CAPABILITY)
     view, artifact, paper_content = _load_bundle(session, backend, report_id, principal)
     nonce = secrets.token_urlsafe(24)
-    view = enable_authenticated_paper_actions(view, report_id=report_id)
+    view = enable_authenticated_paper_actions(
+        view, report_id=report_id,
+        search_again_enabled=not _report_marks_released(session, report_id, principal))
     with fitz.open(stream=paper_content, filetype="pdf") as document:
+        view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
         view["paper_surface"]["selectable_words"] = {
             page.number: page.get_text("words", sort=True) for page in document
         }
-    view["audience"] = audience
-    try:
-        view["annotations"] = list_current_paper_annotations(
-            session,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            visibility=("released" if audience == "student" else None),
-        )
-    except PaperAnnotationError:
-        # The authorized bundle loader rejects malformed real report IDs. This
-        # fallback keeps isolated renderer tests with synthetic IDs annotation-free.
-        view["annotations"] = []
-    view["annotation_action"] = (
-        {
-            "create_href": f"/report/{report_id}/annotations",
-            "revision_href_template": f"/report/{report_id}/annotations/{{annotation_id}}",
-            "paper_artifact_id": str(artifact.id),
-        }
-        if audience == "instructor"
-        else {}
-    )
+        from app.services.report_member_navigation import marker_words
+        view['paper_surface']['marker_words'] = marker_words(document)
+    # Judgment is part of every report (owner decision 2026-09-28): claim
+    # underline geometry here; results are polled by the page.
+    from app.services.judgment_layer import build_judgment_layer
+    layer = build_judgment_layer(session, view, view["paper_surface"]["selectable_words"],
+                                 scope_type=principal.scope_type, scope_id=principal.scope_id)
+    layer.update(fake_panel=settings.JUDGMENT_FAKE_PANEL)
+    view["judgment_layer"] = layer
+    view.update(_run_details(session, report_id, principal))
+    # One report for everyone: an old ?audience= link is accepted and ignored.
     content = render_evidence_report_html(view, csp_nonce=nonce)
     return HTMLResponse(
         content,
@@ -210,30 +177,101 @@ def get_report(
     )
 
 
-@router.get("/{report_id}/annotations")
-def get_report_annotations(
-    report_id: str,
+def _report_marks_released(session: Session, report_id: str, principal) -> bool:
+    """Whether the report's paper belongs to an assessment with marks released."""
+    from app.services.assessment_marks import job_marks_released
+    if not isinstance(session, Session):
+        return False  # only a database session can hold the record
+    try:
+        report = session.get(Report, uuid.UUID(str(report_id)))
+    except ValueError:
+        return False
+    if not isinstance(report, Report):
+        return False
+    job = session.get(Job, report.job_id)
+    if (not isinstance(job, Job) or job.scope_type != principal.scope_type
+            or job.scope_id != principal.scope_id):
+        return False
+    return job_marks_released(session, job)
+
+
+def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id: str, principal) -> dict | None:
+    from app.services import judgment_runs as runs
+    from app.services.judgment_layer import build_judgment_layer
+    from app.services.judgment_results import all_result_items
+    try:
+        report_uuid = uuid.UUID(str(report_id))
+    except ValueError:
+        return None
+    with fitz.open(stream=paper, filetype="pdf") as document:
+        words = {page.number: page.get_text("words", sort=True) for page in document}
+    layer = build_judgment_layer(session, view, words, scope_type=principal.scope_type, scope_id=principal.scope_id)
+    run = runs.latest_run(session, report_uuid, principal)
+    layer.update(fake_panel=settings.JUDGMENT_FAKE_PANEL, static=True,
+                 static_results=all_result_items(session, run, principal))
+    return layer
+
+
+def _run_details(session: Session, report_id: str, principal) -> dict:
+    """Judged citations and single-run technical details (owner requests 2026-09-28)."""
+    from sqlalchemy import select
+    from app.models.job import Job
+    from app.models.judgment import JudgmentArmResult, JudgmentCandidateResult
+    from app.models.report import Report
+    from app.services import judgment_runs as runs
+    from app.services.report_run_metrics import judged_citations, judgment_states, single_run_metrics
+    try:
+        report = session.get(Report, uuid.UUID(str(report_id)))
+    except ValueError:
+        return {}
+    if not isinstance(report, Report):
+        return {}
+    job = session.get(Job, report.job_id)
+    if not isinstance(job, Job):
+        job = None
+    run = runs.latest_run(session, report.id, principal)
+    results = list(session.scalars(select(JudgmentCandidateResult).where(
+        JudgmentCandidateResult.run_id == run.id))) if run is not None else []
+    arm_ids = {uuid.UUID(str(i)) for r in results for i in (r.arm_result_ids or [])}
+    arms = list(session.scalars(select(JudgmentArmResult).where(JudgmentArmResult.id.in_(arm_ids)))) if arm_ids else []
+    details = {"judgment_summary": {"judged_citations": judged_citations(results),
+                                    "states": judgment_states(results)}}
+    if job is not None:
+        details["processing_metrics"] = single_run_metrics(job, results=results, arms=arms, settings=settings)
+    return details
+
+
+@router.get("/{report_id}/export.html")
+def get_interactive_report_download(
+    report_id: str, audience: str | None = Query(None, include_in_schema=False),
     principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
+    session: Session = Depends(get_db), backend: StorageBackend = Depends(get_storage_backend),
 ):
-    """Return the current exact-scope annotation overlay for one report."""
-    principal.require(REPORT_VIEW_CAPABILITY)
-    _load_bundle(session, backend, report_id, principal)
-    return {
-        "annotations": list_current_paper_annotations(
-            session,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-        )
-    }
+    principal.require(REPORT_PAPER_CAPABILITY)
+    from app.services.interactive_report_export import build_interactive_report_html
+    view, artifact, paper = _load_bundle(session, backend, report_id, principal)
+    view = {**view, 'paper_surface': {**view.get('paper_surface', {}),
+                                     'presentation_sha256': artifact.presentation_sha256}}
+    report_record=session.get(Report,uuid.UUID(report_id))
+    if report_record is not None:view['report_version']=report_record.report_version
+    view.update(_run_details(session, report_id, principal))
+    # The export is the same report as the connected one (owner request
+    # 2026-09-29): Judgment's underlines, windows and summary are carried in
+    # the file as finished results, since it cannot contact the server.
+    view['judgment_layer'] = _static_judgment_layer(session, view, paper, report_id, principal)
+    try:
+        content = build_interactive_report_html(view, paper)
+    except (ValueError, ReportExportError) as exc:
+        raise HTTPException(status_code=409, detail='Interactive export is unavailable') from exc
+    return Response(content, media_type='text/html', headers={
+        'Content-Disposition': 'attachment; filename="interactive-report.html"',
+        'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff'})
 
 
 @router.get("/{report_id}/export.pdf")
 def get_released_report_pdf(
     report_id: str,
-    inline: bool = Query(False),
+    audience: str | None = Query(None, include_in_schema=False),
     principal: AuthenticatedPrincipal = Depends(get_report_principal),
     session: Session = Depends(get_db),
     backend: StorageBackend = Depends(get_storage_backend),
@@ -250,14 +288,14 @@ def get_released_report_pdf(
         )
     except EvidenceReportAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, PaperAnnotationError, ReportExportError) as exc:
+    except (EvidenceReportError, ReportExportError) as exc:
         raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
     return Response(
         content=exported.content,
         media_type="application/pdf",
         headers={
             "Cache-Control": "no-store, private",
-            "Content-Disposition": ('inline' if inline else 'attachment') + '; filename="sourcefidelity-released-report.pdf"',
+            "Content-Disposition": 'attachment; filename="sourcefidelity-report.pdf"',
             "Content-Security-Policy": "sandbox",
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
@@ -270,6 +308,7 @@ def get_released_report_pdf(
 @router.get("/{report_id}/export/manifest")
 def get_released_report_manifest(
     report_id: str,
+    audience: str | None = Query(None, include_in_schema=False),
     principal: AuthenticatedPrincipal = Depends(get_report_principal),
     session: Session = Depends(get_db),
     backend: StorageBackend = Depends(get_storage_backend),
@@ -286,7 +325,7 @@ def get_released_report_manifest(
         )
     except EvidenceReportAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, PaperAnnotationError, ReportExportError) as exc:
+    except (EvidenceReportError, ReportExportError) as exc:
         raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
     return JSONResponse(
         {**exported.manifest, "manifest_sha256": exported.manifest_sha256},
@@ -296,19 +335,6 @@ def get_released_report_manifest(
             "X-Content-Type-Options": "nosniff",
         },
     )
-
-
-@router.get("/{report_id}/export/print", response_class=HTMLResponse)
-def get_released_report_print_view(
-    report_id: str,
-    principal: AuthenticatedPrincipal = Depends(get_report_browser_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Keep old print bookmarks pointed at the same released PDF as download."""
-    principal.require(REPORT_PAPER_CAPABILITY)
-    _load_bundle(session, backend, report_id, principal)
-    return RedirectResponse(f"/report/{report_id}/export.pdf?inline=true", status_code=303)
 
 
 @router.get("/{report_id}/successor")
@@ -350,87 +376,6 @@ def get_report_successor_status(
         ),
         "last_reanalysis_failure": failure or None,
     }
-
-
-@router.post("/{report_id}/annotations", status_code=201)
-def create_report_annotation(
-    report_id: str,
-    payload: AnnotationCreateRequest,
-    request: Request,
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Create one authored comment/highlight revision on a stable citation anchor."""
-    principal.require(REPORT_ANNOTATION_CAPABILITY)
-    require_same_origin_request(request)
-    view, artifact, paper_content = _load_bundle(session, backend, report_id, principal)
-    page_dimensions = None
-    if payload.anchor_id is not None:
-        anchor = _authorized_anchor(view, payload.anchor_id)
-    elif (payload.anchor or {}).get("anchor_kind") == "text_selection":
-        from app.services.paper_annotations import text_selection_anchor
-        try:
-            anchor, page_dimensions = text_selection_anchor(paper_content, payload.anchor)
-        except PaperAnnotationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    else:
-        anchor, page_dimensions = _authorized_page_region_anchor(view, payload.anchor)
-    try:
-        annotation = create_paper_annotation(
-            session,
-            artifact=artifact,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            author_provider=principal.provider,
-            author_subject=principal.subject,
-            annotation_type=payload.annotation_type,
-            anchor=anchor,
-            content=payload.content,
-            user_label=payload.user_label,
-            visibility=payload.visibility,
-            page_dimensions=page_dimensions,
-        )
-    except PaperAnnotationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return annotation
-
-
-@router.patch("/{report_id}/annotations/{annotation_id}")
-def revise_report_annotation(
-    report_id: str,
-    annotation_id: str,
-    payload: AnnotationRevisionRequest,
-    request: Request,
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Append an edit, visibility transition or deletion revision."""
-    principal.require(REPORT_ANNOTATION_CAPABILITY)
-    require_same_origin_request(request)
-    _load_bundle(session, backend, report_id, principal)
-    try:
-        annotation = revise_paper_annotation(
-            session,
-            report_id=report_id,
-            annotation_id=annotation_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            author_provider=principal.provider,
-            author_subject=principal.subject,
-            expected_revision=payload.expected_revision,
-            content=payload.content,
-            user_label=payload.user_label,
-            visibility=payload.visibility,
-            state=payload.state,
-        )
-    except PaperAnnotationError as exc:
-        message = str(exc)
-        status_code = 404 if message == "Annotation not found" else 409
-        raise HTTPException(status_code=status_code, detail=message) from exc
-    return annotation
 
 
 @router.get("/{report_id}/paper")
@@ -601,6 +546,19 @@ def upload_report_source(
     }
 
 
+@router.post("/{report_id}/source/upload")
+def upload_unassigned_report_source(
+    report_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    principal: AuthenticatedPrincipal = Depends(get_report_principal),
+    session: Session = Depends(get_db),
+    backend: StorageBackend = Depends(get_storage_backend),
+):
+    """Resolve an uploaded PDF uniquely inside this authorized report."""
+    return upload_citation_source(report_id, None, request, file, principal, session, backend)
+
+
 @router.post("/{report_id}/citation/{claim_id}/source/upload")
 def upload_citation_source(
     report_id: str,
@@ -631,13 +589,26 @@ def upload_citation_source(
         ),
         None,
     )
-    if citation is None:
+    if claim_id is not None and citation is None:
         raise HTTPException(status_code=404, detail="Citation not found")
+    from app.services.evidence_report import _member_accepts_upload
+    selected = [citation] if citation is not None else view.get("citations", [])
     candidates = [
         member
-        for member in citation.get("members", [])
+        for item in selected
+        for member in item.get("members", [])
         if member.get("coverage_level") != "full_text"
+        and _member_accepts_upload(member)
     ]
+    unique = {}
+    for member in candidates:
+        reference_id = member.get('reference_id')
+        if not reference_id:
+            continue
+        if reference_id in unique and unique[reference_id].get('source') != member.get('source'):
+            raise HTTPException(status_code=409, detail="Reference identity is inconsistent")
+        unique[reference_id] = member
+    candidates = list(unique.values())
     if not candidates:
         raise HTTPException(status_code=409, detail="This citation has no missing source")
     maximum = settings.MAX_FILE_SIZE_MB * 1024 * 1024
@@ -647,9 +618,44 @@ def upload_citation_source(
             status_code=413,
             detail=f"Source exceeds the {settings.MAX_FILE_SIZE_MB} MB upload limit",
         )
+    from app.services.supplied_html_source import (
+        SuppliedHtmlRejected,
+        looks_like_html_document,
+        qualify_supplied_html,
+    )
+    from app.services.source_type import SourceKindAssessment
+
+    supplied_page = looks_like_html_document(file_bytes, file.content_type)
+    if supplied_page and not settings.SUPPLIED_HTML_SOURCE_INTAKE_ENABLED:
+        raise HTTPException(
+            status_code=415,
+            detail="Supplied HTML source intake is disabled; upload a PDF",
+        )
     matches = []
     for member in candidates:
         source = member.get("source") or {}
+        if supplied_page:
+            # A supplied page is matched by the same qualification that will
+            # admit it, so a page that cannot be admitted never selects a
+            # member. No weaker matching rule exists for supplied files.
+            kind = str(source.get("source_kind") or "")
+            try:
+                qualify_supplied_html(
+                    file_bytes,
+                    expected_title=str(source.get("title") or "") or None,
+                    expected_author=str(source.get("author") or "") or None,
+                    expected_year=str(source.get("year") or "") or None,
+                    expected_doi=str(source.get("doi") or "") or None,
+                    expected_source_kind=(
+                        SourceKindAssessment(kind=kind, confidence="high")
+                        if kind and kind != "unknown"
+                        else SourceKindAssessment()
+                    ),
+                )
+            except SuppliedHtmlRejected:
+                continue
+            matches.append(member)
+            continue
         verified, _messages = verify_instructor_upload(
             file_bytes,
             provided_doi=str(source.get("doi") or "") or None,
@@ -659,17 +665,18 @@ def upload_citation_source(
         if verified:
             matches.append(member)
     if len(matches) != 1:
+        label = "page" if supplied_page else "PDF"
         detail = (
-            "The uploaded PDF does not match any missing source in this citation."
+            f"The uploaded {label} does not match an eligible reference in this report."
             if not matches
-            else "The uploaded PDF matches more than one citation member; select a source with clearer identity evidence."
+            else f"The uploaded {label} cannot be uniquely matched to one reference in this report."
         )
         raise HTTPException(status_code=422, detail=detail)
     member = matches[0]
     source = member.get("source") or {}
     checked_file = UploadFile(
         file=BytesIO(file_bytes),
-        filename=file.filename or "source.pdf",
+        filename=file.filename or ("source.html" if supplied_page else "source.pdf"),
         headers=file.headers,
     )
     result = admit_uploaded_source(
@@ -711,6 +718,72 @@ def upload_citation_source(
         "review_status": result.get("review_status"),
         "reference_id": reference_id,
         **refresh,
+    }
+
+
+@router.post("/{report_id}/reference/{reference_id}/search-again")
+def search_reference_again(
+    report_id: str,
+    reference_id: str,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_report_principal),
+    session: Session = Depends(get_db),
+    backend: StorageBackend = Depends(get_storage_backend),
+):
+    """Search one reference with an incomplete search again (owner decision 2026-09-29).
+
+    Starts a forced targeted refresh of that reference only; the page then
+    follows the successor report exactly as after a source upload.
+    """
+    principal.require(REPORT_SOURCE_CAPABILITY)
+    require_same_origin_request(request)
+    view, _, _ = _load_bundle(session, backend, report_id, principal)
+    members = [
+        member
+        for citation in view.get("citations", [])
+        for member in citation.get("members", [])
+        if member.get("reference_id") == reference_id
+    ]
+    if not members:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    if not any(member_search_incomplete(member) for member in members):
+        raise HTTPException(status_code=409, detail="This reference has no incomplete search")
+    try:
+        prepared = prepare_search_again_refresh(
+            session,
+            report_id=report_id,
+            reference_id=reference_id,
+            scope_type=principal.scope_type,
+            scope_id=principal.scope_id,
+        )
+    except SearchAgainRateLimited as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
+    except PaperWorkflowError as exc:
+        if exc.code == "assessment_marks_released":
+            # Marks were released after the page was opened: the page removes
+            # the button (owner decision 2026-09-29).
+            raise HTTPException(status_code=410, detail=exc.code) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    publication_pending = False
+    try:
+        task_id = dispatch_paper_workflow(prepared["job_id"], prepared["attempt_id"])
+    except Exception:
+        # The committed attempt is resumed by bounded workflow recovery.
+        task_id = None
+        publication_pending = True
+    return {
+        "reanalysis_status": "scheduled",
+        "base_report_id": prepared.get("report_id"),
+        "attempt_id": prepared["attempt_id"],
+        "task_id": task_id,
+        "publication_pending": publication_pending,
+        "status_url": f"/report/{report_id}/successor",
     }
 
 
@@ -928,69 +1001,6 @@ def _authorized_anchor(view: dict, anchor_id: str) -> dict:
     if len(matches) != 1 or not matches[0].get("page_indexes"):
         raise HTTPException(status_code=404, detail="Paper location not found")
     return matches[0]
-
-
-def _authorized_page_region_anchor(
-    view: dict,
-    supplied: dict | None,
-) -> tuple[dict, dict[int, tuple[float, float]]]:
-    if not isinstance(supplied, dict):
-        raise HTTPException(status_code=409, detail="Paper region is unavailable")
-    if (
-        supplied.get("anchor_version") != "page-region-anchor-v1"
-        or supplied.get("anchor_kind") not in {None, "page_region"}
-        or supplied.get("localization_level") != "exact_rectangle"
-    ):
-        raise HTTPException(status_code=409, detail="Paper region is invalid")
-    dimensions: dict[int, tuple[float, float]] = {}
-    for item in (view.get("paper_surface") or {}).get("page_dimensions") or []:
-        try:
-            page_index = int(item["page_index"])
-            width = float(item["width"])
-            height = float(item["height"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if page_index >= 0 and width > 0 and height > 0:
-            dimensions[page_index] = (width, height)
-    rectangles = supplied.get("rectangles") or []
-    if len(rectangles) != 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Select one paper region for each annotation",
-        )
-    try:
-        page_index = int(rectangles[0]["page_index"])
-        x0, y0, x1, y1 = (
-            float(rectangles[0][key]) for key in ("x0", "y0", "x1", "y1")
-        )
-    except (KeyError, TypeError, ValueError):
-        raise HTTPException(status_code=409, detail="Paper region is invalid") from None
-    if page_index not in dimensions:
-        raise HTTPException(status_code=409, detail="Paper page is unavailable")
-    width, height = dimensions[page_index]
-    if not (
-        0 <= x0 < x1 <= width
-        and 0 <= y0 < y1 <= height
-        and x1 - x0 >= 2
-        and y1 - y0 >= 2
-    ):
-        raise HTTPException(status_code=409, detail="Paper region is invalid")
-    anchor = {
-        "anchor_version": "page-region-anchor-v1",
-        "anchor_kind": "page_region",
-        "localization_level": "exact_rectangle",
-        "page_indexes": [page_index],
-        "rectangles": [
-            {
-                "page_index": page_index,
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1,
-            }
-        ],
-    }
-    return anchor, dimensions
 
 
 def _validate_overlay_rectangles(rectangles: list[dict], page_rect) -> None:

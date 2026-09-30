@@ -15,6 +15,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
+from app.services.assessment_configuration import AssessmentConfiguration
+from app.services.assessment_marks import AssessmentMarksError, normalize_assessment_id
 from app.models.job import Job, JobStage, JobStatus
 from app.services.paper_dispatch import prepare_dispatch, job_execution_lock, WorkflowBusy
 from app.services.file_safety import (
@@ -137,12 +139,22 @@ def create_paper_job(
     title: str | None = None,
     store_only: bool = False,
     paper_retention_mode: str | None = None,
+    require_reference_links: bool = False,
+    assessment_id: str | None = None,
     scope_type: str = "personal_owner",
     scope_id: str,
     now: datetime | None = None,
 ) -> Job:
     """Commit a recoverable locator before uploading immutable paper bytes."""
     safe_name = _safe_filename(filename)
+    try:
+        configuration = AssessmentConfiguration(require_reference_links=require_reference_links)
+    except ValueError as exc:
+        raise PaperUploadError('assessment_configuration_invalid', 'Reference-link requirement must be a boolean.') from exc
+    try:
+        normalized_assessment = normalize_assessment_id(assessment_id)
+    except AssessmentMarksError as exc:
+        raise PaperUploadError(exc.code, str(exc)) from exc
     evidence = inspect_paper_upload(content, filename=safe_name, media_type=media_type)
     requested_retention = paper_retention_mode or settings.PAPER_RETENTION_MODE
     try:
@@ -150,6 +162,7 @@ def create_paper_job(
     except PaperRetentionPolicyError as exc:
         raise PaperUploadError(exc.code, str(exc)) from exc
     evidence["paper_retention_mode"] = retention_policy.mode.value
+    evidence['assessment_configuration'] = configuration.model_dump(mode='json')
     evidence["paper_retention_policy_version"] = "paper-retention-v1"
     evidence["paper_input_upload_state"] = "pending"
     evidence["input_upload_confirmed"] = False
@@ -173,6 +186,7 @@ def create_paper_job(
         paper_version_id=f"paper:{job_id}:{digest[:16]}",
         scope_type=normalized_scope,
         scope_id=normalized_id,
+        assessment_id=normalized_assessment,
         input_storage_key=key,
         input_sha256=digest,
         input_media_type=media_type,

@@ -25,9 +25,16 @@ import re
 
 import httpx
 
-from app.config import settings
+from app.services.processing_metrics import record_provider_request
+from app.config import secret_value, settings
 from app.log_safety import private_value_id, safe_exception_code
+from app.services.retrieval.provider_runtime import (
+    ProviderHealthStore,
+    ProviderPolicy,
+    provider_policy,
+)
 from app.services.retrieval.base import (
+    SCHOLARLY_PAPER_KINDS,
     RepresentationKind,
     RetrievalResult,
     RetrievalSource,
@@ -51,20 +58,57 @@ def _is_elsevier_doi(doi: str) -> bool:
 
 
 class ElsevierRetriever(RetrievalSource):
+    # Entitlement-gated. Where it is not entitled it reports
+    # `lookup_applicable: False`, which already clears the requirement at
+    # the call site, so this does not make every off-campus run incomplete.
+    required_for_search_completion = True
     capabilities = frozenset({"doi", "metadata", "abstract", "locations"})
     """Retrieves articles from Elsevier via the Article Retrieval API."""
 
     name = "elsevier"
+    # Journals plus ScienceDirect book chapters.
+    supported_source_kinds = SCHOLARLY_PAPER_KINDS | {"book_section"}
+    # Entitlement is by institutional IP range, so a deployment may be
+    # entitled on campus and not at home with the same key. A long pause
+    # after an authorization failure lets one configuration serve both.
+    default_policy = ProviderPolicy(cooldown_seconds=3600,
+                                    max_cooldown_seconds=86_400)
+
+    def __init__(self, health_store: ProviderHealthStore | None = None) -> None:
+        self.policy = provider_policy(self.name, self.default_policy)
+        self._health_store = health_store or ProviderHealthStore()
 
     def _headers(self) -> dict:
         headers = {
-            "X-ELS-APIKey": settings.ELSEVIER_API_KEY,
+            "X-ELS-APIKey": secret_value(settings.ELSEVIER_API_KEY),
             "Accept": "application/json",
             "User-Agent": "SourceFidelity/0.1.0 (source-verification-bot)",
         }
         if settings.ELSEVIER_INST_TOKEN:
-            headers["X-ELS-Insttoken"] = settings.ELSEVIER_INST_TOKEN
+            headers["X-ELS-Insttoken"] = secret_value(settings.ELSEVIER_INST_TOKEN)
         return headers
+
+    def _unentitled(self) -> RetrievalResult:
+        """Entitlement, not the key, is what is missing.
+
+        Elsevier authorises full-text by institutional IP range; an API key
+        alone is entitled only from inside it. Off-campus access needs an
+        institutional token issued by Elsevier support, and proxied access is
+        not supported. Reporting this as an invalid key sent a reader looking
+        for a credential that is fine, and retrying it on every reference
+        spent latency on a route that cannot succeed from here -- measured
+        over the development corpus, every attempt failed. A cooldown lets the
+        same deployment use Elsevier on campus and stop paying for it away
+        from campus, without a configuration change either way.
+        """
+        cooldown = self._health_store.record_unavailable(
+            self.name, self.policy, status="access_restricted")
+        logger.info(
+            "Elsevier full text is not entitled from this network; pausing it "
+            "for %ss. An institutional token enables off-campus access.", cooldown)
+        return RetrievalResult(
+            source_name=self.name, success=False,
+            error="Not entitled from this network (institutional IP or token required)")
 
     def search_by_doi(self, doi: str) -> RetrievalResult:
         if not _is_elsevier_doi(doi):
@@ -79,14 +123,15 @@ class ElsevierRetriever(RetrievalSource):
             )
         try:
             # Step 1: Fetch metadata + abstract to check OA status
+            record_provider_request("elsevier")
             resp = httpx.get(
                 f"{ELSEVIER_BASE}/doi/{doi}",
                 headers=self._headers(),
                 params={"view": "META_ABS"},
                 timeout=20,
             )
-            if resp.status_code == 401:
-                return RetrievalResult(source_name=self.name, success=False, error="Unauthorized (invalid API key)")
+            if resp.status_code in (401, 403):
+                return self._unentitled()
             if resp.status_code == 404:
                 return RetrievalResult(source_name=self.name, success=False, error="Not found in Elsevier")
             resp.raise_for_status()
@@ -179,6 +224,8 @@ class ElsevierRetriever(RetrievalSource):
             source_name=self.name,
             success=False,
             error="Elsevier title search not supported (use DOI via OpenAlex/CORE first)",
+            # Nothing was sent: this is a deferral, not a failure.
+            metadata={"lookup_applicable": False},
         )
 
     def _fetch_full_text(self, doi: str) -> str | None:
@@ -187,6 +234,7 @@ class ElsevierRetriever(RetrievalSource):
         Returns clean text (XML stripped), or None if not entitled.
         """
         try:
+            record_provider_request("elsevier")
             resp = httpx.get(
                 f"{ELSEVIER_BASE}/doi/{doi}",
                 headers=self._xml_headers(),

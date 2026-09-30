@@ -8,6 +8,7 @@ the source repository.
 from difflib import SequenceMatcher
 import logging
 import re
+from typing import NamedTuple
 
 import fitz  # PyMuPDF
 
@@ -77,18 +78,66 @@ def extract_metadata_from_pdf(file_bytes: bytes) -> dict:
     }
 
 
-def _extract_title_from_first_page(file_bytes: bytes) -> str | None:
-    """Extract the likely title from the first page of a PDF.
+class TitleObservation(NamedTuple):
+    """What the front page showed, and when it showed nothing, why.
 
-    Uses a font-size heuristic: the title is usually among the largest
-    text spans. We collect the spans at (or near) the max font size and
-    join them in reading order.
+    A bare `None` conflated several different situations: a scanned cover with
+    no text layer, a uniformly typeset document where no span stands out, a
+    page whose largest text is a structural label, and an unreadable file. They
+    look identical to a caller but mean opposite things. Failing to read a page
+    is not evidence about what is on it, while reading a page and finding no
+    work title is.
+    """
+
+    title: str | None
+    reason: str
+
+    @property
+    def observed(self) -> bool:
+        return self.reason == "title_observed"
+
+    @property
+    def read_the_page(self) -> bool:
+        """Did we get far enough to say anything about this document?"""
+        return self.reason not in {"page_unreadable", "no_text_layer"}
+
+
+# Structural labels are the largest text on many front pages. "PART I
+# INTRODUCTION" is a section heading, not the title of a work.
+_FRONT_MATTER_LABELS = frozenset({
+    "part", "section", "chapter", "volume", "book", "introduction", "contents",
+    "table", "preface", "foreword", "afterword", "appendix", "index", "abstract",
+    "summary", "prologue", "epilogue", "acknowledgments", "acknowledgements",
+    "notes", "bibliography", "glossary", "references", "i", "ii", "iii", "iv",
+    "v", "vi", "vii", "viii", "ix", "x", "one", "two", "three", "four", "five",
+})
+
+
+def _is_front_matter_label(value: str) -> bool:
+    words = re.findall(r"[^\W\d_]+", value.casefold())
+    return bool(words) and all(word in _FRONT_MATTER_LABELS for word in words)
+
+
+def _is_illegible(value: str) -> bool:
+    """OCR of a stylised or handwritten cover returns characters, not words."""
+    letters = sum(character.isalpha() for character in value)
+    return letters < 0.6 * len(value)
+
+
+def describe_first_page_title(
+    file_bytes: bytes, *, page_index: int = 0
+) -> TitleObservation:
+    """Read the front page's title, or report why none could be read.
+
+    Uses a font-size heuristic: the title is usually among the largest text
+    spans. Spans at (or near) the max size are joined in reading order.
     """
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         try:
-            page = doc[0]
-            blocks = page.get_text("dict").get("blocks", [])
+            page = doc[page_index]
+            blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES).get("blocks", [])
+            page_has_text = bool(page.get_text().strip())
 
             # Find the max font size among reasonably long text spans
             spans: list[tuple[float, str]] = []
@@ -106,19 +155,33 @@ def _extract_title_from_first_page(file_bytes: bytes) -> str | None:
                                 max_size = size
 
             if not spans or max_size <= 0:
-                return None
+                # An image-only cover was never read; a uniformly typeset page
+                # was read and simply has no typographic title.
+                return TitleObservation(
+                    None, "no_text_layer" if not page_has_text else "uniform_typography"
+                )
 
             # Collect all spans within ~1pt of the max size (titles often
             # span several lines at the same size). This is more robust
             # than requiring an exact match.
             threshold = max_size - 1.0
             title_spans = [t for size, t in spans if size >= threshold]
-            return " ".join(title_spans)[:300]
+            title = " ".join(title_spans)[:300]
+            if _is_front_matter_label(title):
+                return TitleObservation(None, "front_matter_label_only")
+            if _is_illegible(title):
+                return TitleObservation(None, "illegible_title")
+            return TitleObservation(title, "title_observed")
         finally:
             doc.close()
     except Exception as e:
         logger.warning("Title extraction failed (type=%s)", type(e).__name__)
-        return None
+        return TitleObservation(None, "page_unreadable")
+
+
+def _extract_title_from_first_page(file_bytes: bytes, *, page_index: int = 0) -> str | None:
+    """Back-compatible title accessor; use describe_first_page_title for the reason."""
+    return describe_first_page_title(file_bytes, page_index=page_index).title
 
 
 def _normalize(s: str) -> str:
@@ -144,11 +207,39 @@ def _significant_tokens(value: str, *, stopwords: set[str]) -> list[str]:
     ]
 
 
+_TITLE_TAIL_BOUNDARY = re.compile(r"^\s*[-:;.,/?!|\u2013\u2014(\[]")
+_LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+")
+
+
+def _aligned_title_containment(expected: str, found: str) -> bool:
+    """True when one title extends the other at a subtitle boundary.
+
+    A cited title routinely drops its subtitle, so "The studio system" and
+    "The studio system: a history" are the same work. A cited title that merely
+    occurs as a phrase inside a longer, differently headed title is not: bare
+    containment matched Belton's chapter "The Studio System" against a thesis
+    titled "Working Below the Line in the Studio System: Exploring Labour
+    Processes in the UK Film Industry 1927-1950", and the report then offered a
+    stranger's thesis as a possible match for the chapter.
+    """
+    expected = _LEADING_ARTICLE.sub("", expected)
+    found = _LEADING_ARTICLE.sub("", found)
+    if not expected or not found:
+        return False
+    if expected == found:
+        return True
+    longer, shorter = (found, expected) if len(found) > len(expected) else (expected, found)
+    if not longer.startswith(shorter):
+        return False
+    return bool(_TITLE_TAIL_BOUNDARY.match(longer[len(shorter):]))
+
+
 def _title_matches(provided: str, metadata: dict) -> bool:
     expected = _normalize(provided)
     found_title = _normalize(metadata.get("title") or "")
     page_text = _normalize(metadata.get("first_page_text") or "")
-    if expected and (expected in found_title or expected in page_text):
+    if expected and (_aligned_title_containment(expected, found_title)
+                     or expected in page_text):
         return True
     if found_title and SequenceMatcher(None, expected, found_title).ratio() >= 0.82:
         return True

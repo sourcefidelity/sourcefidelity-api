@@ -20,7 +20,14 @@ import uuid
 from typing import Literal
 
 import fitz
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+
+from app.services.schemas import (
+    BoundedFieldsMixin,
+    bound_text_fields,
+    declared_max_length,
+    note_bounded,
+)
 from sqlalchemy.orm import Session
 
 from app.models.source_repository import SourceRepresentationRecord
@@ -30,10 +37,10 @@ from app.services.source_repository import representation_is_expired
 from app.services.storage.backend import StorageBackend
 
 
-ARTIFACT_VERSION = "phase3.8-evidence-v33"
-EXTRACTION_VERSION = "source-text-extraction-v3-ocr-derivative-labels"
-RETRIEVAL_RULE_VERSION = "all-channel-section-boundary-v12"
-CANDIDATE_RETRIEVAL_VERSION = "candidate-specific-union-v15"
+ARTIFACT_VERSION = "phase3.8-evidence-v40"
+EXTRACTION_VERSION = "source-text-extraction-v6-narrow-columns"
+RETRIEVAL_RULE_VERSION = "all-channel-section-boundary-v14"
+CANDIDATE_RETRIEVAL_VERSION = "candidate-specific-union-v19"
 SEMANTIC_RETRIEVAL_RESCUE_VERSION = "bm25-prefilter-local-nli-v1"
 MAX_SOURCE_PAGES = 2_000
 MAX_PAGE_CHARACTERS = 250_000
@@ -48,6 +55,10 @@ _NONSEMANTIC_C0_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 class EvidenceAuthorizationError(ValueError):
     """A stored representation is not authorized and usable for this request."""
+
+
+class SourceTextUnusable(EvidenceAuthorizationError):
+    """The source's damaged pages could not be repaired; its text is not used."""
 
 
 class IdentityStatus(str, Enum):
@@ -169,6 +180,7 @@ class ClaimAntecedentCandidateEvidence(BaseModel):
         "coordinated_named_group",
         "exact_head_phrase",
         "compatible_group_phrase",
+        "derived_verb_phrase",
     ]
 
 
@@ -211,7 +223,19 @@ class ClaimDiscourseDependency(BaseModel):
     method: str = Field(min_length=1, max_length=100)
 
 
-class ClaimEvidence(BaseModel):
+class ClaimEvidence(BoundedFieldsMixin):
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_text(cls, data):
+        """Student-supplied detail must not crash the run, and must say so.
+
+        A locator is whatever the paper wrote between the citation's brackets,
+        so a mis-parsed citation can put a sentence there. Owner decision,
+        2026-09-23: an unexpectedly long field must not crash a paper run. The
+        altered field names are recorded in `bounded_fields`.
+        """
+        return bound_text_fields(cls, data, ("page_locator", "citation_marker"))
+
     claim_id: str = Field(min_length=1, max_length=128)
     paper_version_id: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1, max_length=50_000)
@@ -243,12 +267,72 @@ class ClaimEvidence(BaseModel):
     passage_end: int = -1
 
 
-class CitationSourceBinding(BaseModel):
+CITED_AUTHOR_LABEL_LIMIT = 200
+
+
+def bounded_author_label(value: str) -> str:
+    """Keep an identifying prefix of an over-long author list.
+
+    The label exists to match a cited surname against an actor named in the
+    source, and the leading authors carry that. The cut falls on a comma, so a
+    surname is never halved into a fragment that was never cited; the trailing
+    entry may lose its initials, which surname matching does not use.
+    """
+    if len(value) <= CITED_AUTHOR_LABEL_LIMIT:
+        return value
+    clipped = value[:CITED_AUTHOR_LABEL_LIMIT]
+    boundary = clipped.rfind(",")
+    bounded = (clipped[:boundary] if boundary > 0 else clipped).rstrip(" ,;&.")
+    # A single overlong first token leaves nothing to cut back to; the hard
+    # clip is still better than failing the paper.
+    return bounded or clipped
+
+
+class CitationSourceBinding(BoundedFieldsMixin):
     """Exact source-specific binding for one fanned-out verification run."""
 
     status: Literal["exact", "unresolved"] = "exact"
     reference_id: str = Field(min_length=1, max_length=255)
-    cited_author_label: str = Field(min_length=1, max_length=200)
+    cited_author_label: str = Field(min_length=1, max_length=CITED_AUTHOR_LABEL_LIMIT)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _degrade_unrepresentable_marker(cls, data):
+        """A marker too long to store becomes unresolved, never a failed run.
+
+        `marker_text` is the in-text citation exactly as the student wrote it,
+        paired with the character offsets where it sits. Truncating it would
+        leave the offsets describing a span longer than the text they claim, so
+        a report highlight would land on the wrong words. Dropping to
+        `unresolved` instead says plainly that this citation could not be
+        pinned to an exact span, which is what the evidence actually supports.
+
+        Owner decision, 2026-09-23: an unexpectedly long field must not crash a
+        paper run; losing one citation's exact span is acceptable where losing
+        the whole submission is not.
+        """
+        if not isinstance(data, dict):
+            return data
+        out = None
+        text = data.get("marker_text")
+        limit = declared_max_length(cls, "marker_text")
+        if isinstance(text, str) and limit and len(text) > limit:
+            out = dict(data)
+            out.update(
+                status="unresolved", marker_text="",
+                marker_local_start=-1, marker_local_end=-1,
+            )
+            note_bounded(out, "marker_text")
+        # A reference with dozens of authors overruns the label: Wu et al.
+        # (2016) supplies 223 characters, and the resulting ValidationError
+        # once failed a 65-reference paper at persist time with no report.
+        # Bounding on the model means no construction path can reintroduce it.
+        label = data.get("cited_author_label")
+        if isinstance(label, str) and len(label) > CITED_AUTHOR_LABEL_LIMIT:
+            out = out or dict(data)
+            out["cited_author_label"] = bounded_author_label(label)
+            note_bounded(out, "cited_author_label")
+        return out if out is not None else data
     marker_text: str = Field(default="", max_length=1_000)
     marker_local_start: int = Field(default=-1, ge=-1)
     marker_local_end: int = Field(default=-1, ge=-1)
@@ -383,6 +467,15 @@ class StructuredJudgmentEvidence(BaseModel):
     direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
 
 
+class PassageDisplayObservation(BaseModel):
+    """Bounded selection clues, not facets or source-support judgments."""
+
+    model_config = {"extra": "forbid"}
+    basis: Literal["direct_attribution", "general_framework", "illustrative_example", "necessary_context", "unclear"]
+    claim_spans: list[str] = Field(default_factory=list, max_length=4)
+    source_span: str = Field(min_length=1, max_length=1400)
+
+
 class CandidatePassageRelevanceEvidence(BaseModel):
     """One bounded relevance assessment over an application-owned passage."""
 
@@ -407,6 +500,7 @@ class CandidatePassageRelevanceEvidence(BaseModel):
     assessed_text_offset_end: int | None = Field(default=None, gt=0)
     assessment_input_truncated: bool = False
     rationale: str = Field(default="", max_length=1_000)
+    display_observation: PassageDisplayObservation | None = None
 
 
 class ObligationPassageRelevanceEvidence(BaseModel):
@@ -439,6 +533,30 @@ class ObligationPassageRelevanceEvidence(BaseModel):
     direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
 
 
+class SourceScopeAssessmentEvidence(BaseModel):
+    """Scope comparison for a retrieved document, bound to the text assessed.
+
+    Until this existed the comparison ran only when the source could NOT be
+    obtained, so retrieving a document removed the check that a work about
+    somewhere or someone else is not evidence for the citation. The excerpt is
+    carried with its hash because the displayed passage answers a different
+    question -- what was cited, not what this work is about -- and a reader
+    must be able to see which text the judgment was made against.
+    """
+
+    status: Literal["not_run", "complete", "not_assessed"] = "not_run"
+    coverage: str = ""
+    excerpt: str = ""
+    excerpt_sha256: str = ""
+    assessment: dict = Field(default_factory=dict)
+    # How much of the citing sentence's vocabulary the COMPLETE document
+    # contains, counted locally over text the excerpt does not include. A work
+    # that discusses what was attributed to it is not a different subject,
+    # whatever its opening happens to mention.
+    claim_terms_present: int = 0
+    claim_terms_total: int = 0
+
+
 class PassageRelevanceGateEvidence(BaseModel):
     """Shadow-only gate between lexical retrieval and relationship judgment."""
 
@@ -468,6 +586,43 @@ class PassageRelevanceGateEvidence(BaseModel):
     obligation_findings: list[ObligationPassageRelevanceEvidence] = Field(
         default_factory=list, max_length=4
     )
+
+
+class JointEvidenceCandidate(BaseModel):
+    model_config = {"extra": "forbid"}
+    passage_id: str = Field(min_length=1, max_length=128)
+    source_span: str = Field(min_length=1)
+    source_span_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class JointEvidenceSelectedPassage(BaseModel):
+    model_config = {"extra": "forbid"}
+    passage_id: str = Field(min_length=1, max_length=128)
+    reason: Literal["primary", "distinct_aspect", "necessary_context"]
+    claim_spans: list[str] = Field(default_factory=list, max_length=4)
+    source_sentence_ids: list[str] = Field(default_factory=list)
+    source_span: str = Field(default="", max_length=1400)
+    source_span_sha256: str = ""
+
+
+class JointEvidenceSelection(BaseModel):
+    """Optional joint display advice; never a support assessment."""
+
+    model_config = {"extra": "forbid"}
+    status: Literal["not_run", "complete", "not_assessed"] = "not_run"
+    version: str = "joint-evidence-selection-v4"
+    model_id: str | None = None
+    source_title: str = ""
+    input_fingerprint: str = ""
+    model_input_sha256: str = ""
+    target_text_sha256: str = ""
+    candidates: list[JointEvidenceCandidate] = Field(default_factory=list)
+    selected: list[JointEvidenceSelectedPassage] = Field(default_factory=list, max_length=3)
+    limitation_codes: list[str] = Field(default_factory=list)
+    call_count: Literal[0, 1] = 0
+    processing_boundary: Literal["local", "configured_remote", "unknown"] = "unknown"
+    direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
+    support_assessed: Literal[False] = False
 
 
 class EvidenceObligation(BaseModel):
@@ -738,6 +893,8 @@ class CandidatePassageRetrievalEvidence(BaseModel):
     status: Literal["not_run", "complete", "incomplete", "not_assessed"] = "not_run"
     method: str = "not_run"
     retrieval_version: str | None = None
+    evidence_only_passage_ids: list[str] = Field(default_factory=list, max_length=10)
+    evidence_only_query_sha256: str | None = None
     selections: list[CandidatePassageSelection] = Field(
         default_factory=list, max_length=16
     )
@@ -944,7 +1101,8 @@ class CandidateFacetBundle(BaseModel):
 
     candidate_id: str = Field(min_length=1, max_length=128)
     facets: list[CandidateFacet] = Field(min_length=1, max_length=24)
-    evidence_sentence_ids: list[str] = Field(default_factory=list, max_length=48)
+    # Up to 128 per candidate plus document-scope sentences (foundation v11).
+    evidence_sentence_ids: list[str] = Field(default_factory=list, max_length=136)
     source_discourse_sentence_ids: list[str] = Field(
         default_factory=list, max_length=4
     )
@@ -961,7 +1119,7 @@ class FacetEvidenceFoundation(BaseModel):
     method: str = "not_run"
     foundation_version: str | None = None
     source_sentences: list[SourceEvidenceSentence] = Field(
-        default_factory=list, max_length=256
+        default_factory=list, max_length=1024
     )
     candidate_bundles: list[CandidateFacetBundle] = Field(
         default_factory=list, max_length=16
@@ -1248,7 +1406,44 @@ class DecisiveCriticEvaluation(BaseModel):
     direct_identifier_redactions: dict[str, int] = Field(default_factory=dict)
 
 
+class SentenceEvidenceItem(BaseModel):
+    """One source sentence the evidence selector chose, bound to its exact span."""
+
+    passage_id: str = Field(min_length=1, max_length=128)
+    passage_start: int = Field(ge=0)
+    passage_end: int = Field(ge=0)
+    page_index: int | None = None
+    text: str = Field(min_length=1, max_length=4_000)
+    reason: Literal["bears_on_statement", "qualifies_or_contradicts", "necessary_context"]
+
+
+class SentenceEvidenceSelection(BaseModel):
+    """The citation's displayed evidence: numbered source sentences chosen by GLM.
+
+    Owner decision 2026-09-28 (one evidence source per citation). `selected`
+    and `empty` are displayed; any other status falls back to the relevance
+    gate's passage display. Presentation only: the Evidence Package and its
+    passages are unchanged.
+    """
+
+    status: Literal["not_run", "selected", "empty", "unavailable", "over_budget", "invalid"] = "not_run"
+    version: str | None = None
+    model: str | None = None
+    endpoint_host: str | None = None
+    request_fingerprint: str | None = None
+    items: list[SentenceEvidenceItem] = Field(default_factory=list, max_length=8)
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cost_usd: float | None = None
+    limitations: list[str] = Field(default_factory=list, max_length=5)
+
+
 class VerificationEvidenceArtifact(BaseModel):
+    # Judgment layout sentence reserve (judgment_reserve.py). Private: never
+    # serialized, never part of the Evidence Package or its digest; persisted
+    # beside the verification report only when Judgment is enabled.
+    _judgment_reserve: dict | None = PrivateAttr(default=None)
+
     artifact_version: str = ARTIFACT_VERSION
     verification_id: str
     created_at: datetime
@@ -1270,6 +1465,15 @@ class VerificationEvidenceArtifact(BaseModel):
     relationship: ClaimRelationshipEvidence
     passage_relevance: PassageRelevanceGateEvidence = Field(
         default_factory=PassageRelevanceGateEvidence
+    )
+    source_scope_assessment: SourceScopeAssessmentEvidence = Field(
+        default_factory=SourceScopeAssessmentEvidence
+    )
+    joint_evidence_selection: JointEvidenceSelection = Field(
+        default_factory=JointEvidenceSelection
+    )
+    sentence_evidence: SentenceEvidenceSelection = Field(
+        default_factory=SentenceEvidenceSelection
     )
     evidence_obligations: EvidenceObligationSet = Field(
         default_factory=EvidenceObligationSet
@@ -1343,6 +1547,9 @@ class AuthorizedRepresentation:
     derivation_method: str | None = None
     derivation_manifest_sha256: str | None = None
     page_labels: tuple[str | None, ...] | None = None
+    # Pages whose damaged text was re-read by local OCR (page_ocr_repair receipt).
+    page_repairs: tuple[tuple[int, str], ...] = ()
+    page_repair_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1492,6 +1699,23 @@ def authorize_representation(
                 "OCR derivative immutable parent is unavailable or inconsistent"
             )
     page_labels = derivative_evidence.get("page_labels")
+    repairs = None
+    from app.config import settings as _settings
+    if record.representation_kind == "pdf" and _settings.SOURCE_TEXT_QUALITY_CHECK_ENABLED:
+        # Owner decision 2026-09-28: damaged pages are re-read by OCR; a source
+        # whose damaged pages cannot be repaired is not used at all.
+        from app.services.page_ocr_repair import ensure_receipt, validated_repairs
+        from app.services.text_quality import WordListUnavailable
+        try:
+            receipt = ensure_receipt(session, record.id, content, digest)
+        except WordListUnavailable as exc:
+            raise EvidenceAuthorizationError("Source text quality cannot be checked") from exc
+        if receipt.get("status") == "unusable":
+            raise SourceTextUnusable(
+                "Representation text is damaged and could not be repaired")
+        repairs = validated_repairs(receipt, digest)
+        if receipt.get("status") == "repaired" and repairs is None:
+            raise EvidenceAuthorizationError("Page repair receipt does not validate")
     return AuthorizedRepresentation(
         representation_id=str(record.id),
         canonical_work_id=str(record.canonical_work_id),
@@ -1520,6 +1744,8 @@ def authorize_representation(
             if isinstance(page_labels, list)
             else None
         ),
+        page_repairs=tuple(sorted(repairs.texts.items())) if repairs else (),
+        page_repair_manifest_sha256=repairs.manifest_sha256 if repairs else None,
     )
 
 
@@ -1609,6 +1835,8 @@ def build_passage_evidence(
     cited_author_label: str | None = None,
 ) -> VerificationEvidenceArtifact:
     """Retrieve bounded inspectable passages and safely abstain from judgment."""
+    if source.identity_verdict == 'possible_match' and not source.verification_run_id:
+        raise EvidenceAuthorizationError('Possible matches require a submission-scoped verification run')
     _validate_derivative_provenance(source)
     source_binding = _source_binding(
         claim,
@@ -1632,9 +1860,10 @@ def build_passage_evidence(
     ]
 
     identity = SourceIdentityEvidence(
-        status=IdentityStatus.VERIFIED,
-        confidence=_identity_confidence(source.identity_confidence),
+        status=IdentityStatus.UNCERTAIN if source.identity_verdict == 'possible_match' else IdentityStatus.VERIFIED,
+        confidence=ConfidenceLevel.MEDIUM if source.identity_verdict == 'possible_match' else _identity_confidence(source.identity_confidence),
         method=(
+            "submission-possible-match-v1" if source.identity_verdict == 'possible_match' else
             "transient_verification_run_record"
             if source.verification_run_id
             else "durable_admission_record"
@@ -1686,6 +1915,14 @@ def build_passage_evidence(
         pages=pages,
         passages=passages,
     )
+    if source.identity_verdict == 'possible_match':
+        identity.limitations.insert(0, 'Possible source match—identity not confirmed')
+        quotation_check = AcademicPracticeCheckEvidence(status='not_assessable',
+            outcome='source_identity_unconfirmed')
+        locator_check = AcademicPracticeCheckEvidence(status='not_assessable',
+            outcome='source_identity_unconfirmed')
+        verdict = VerificationVerdict.NOT_ASSESSED
+        reason_codes.append('source_identity_unconfirmed')
     verification_id = _stable_id(
         ARTIFACT_VERSION,
         claim.paper_version_id,
@@ -1744,6 +1981,15 @@ def _source_binding(
                     marker_type=claim.citation_marker_type,
                 )
             ]
+    if len(members) > 1:
+        # Repeated attribution to this same reference is not a second source.
+        # Keep every marker on the claim; bind this package to one occurrence.
+        for member in members:
+            if (member.local_end > len(claim.text)
+                    or claim.text[member.local_start:member.local_end] != member.text):
+                raise ValueError("Active citation marker member is not exact")
+        controlling = [m for m in members if m.text == claim.citation_marker]
+        members = [min(controlling or members, key=lambda m: (m.local_start, m.local_end))]
     if len(members) != 1:
         if len(claim.reference_ids) != 1:
             raise ValueError(
@@ -1792,14 +2038,52 @@ def _marker_author_label(marker_text: str) -> str:
     return value[:200]
 
 
+def _attach_evidence_only_fallback(source, artifact, *, top_k):
+    """Retrieve exact citation context without authorizing candidate judgment."""
+    if not _source_matches_artifact(source, artifact):
+        return artifact
+    pages, limitations = _extract_pages(source)
+    query = artifact.claim.text
+    broad = [p for p in artifact.passages if _passage_matches_source(source, p)]
+    ranked, _, _ = _candidate_union_candidates(
+        pages, query_text=query, page_locator=artifact.claim.page_locator,
+        broad_passages=broad, top_k=max(1, min(top_k, MAX_CANDIDATE_PASSAGES)),
+    )
+    passages = {p.passage_id: p for p in broad}
+    ids = []
+    for candidate, _ in ranked:
+        if candidate.passage_role != "body_prose":
+            continue
+        passage = _passage_evidence(source, candidate)
+        passages.setdefault(passage.passage_id, passage)
+        ids.append(passage.passage_id)
+    return artifact.model_copy(update={
+        "passages": list(passages.values()),
+        "candidate_passage_retrieval": CandidatePassageRetrievalEvidence(
+            status="not_assessed", method="exact_citation_evidence_only_fallback_v1",
+            retrieval_version=CANDIDATE_RETRIEVAL_VERSION,
+            evidence_only_passage_ids=ids,
+            evidence_only_query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            limitations=[
+                "Candidate judgment remains unavailable. Additional passages were retrieved only for manual comparison with the unchanged citation.",
+                *limitations,
+            ],
+        ),
+    })
+
+
 def attach_candidate_passage_retrieval(
     source: AuthorizedRepresentation,
     artifact: VerificationEvidenceArtifact,
     *,
     top_k: int = MAX_CANDIDATE_PASSAGES,
     accepted_facet_queries_by_candidate: dict[str, list[str]] | None = None,
+    excluded_passage_ids_by_candidate: dict[str, set[str]] | None = None,
 ) -> VerificationEvidenceArtifact:
     """Search the complete authorized source separately for each fixed candidate.
+
+    ``excluded_passage_ids_by_candidate`` (Judgment wider-search reserve only)
+    skips passages already selected, so the same ranking yields the next ones.
 
     Whole-citation passages remain in ``artifact.passages`` and continue to feed
     the broad relevance assessment. This pass adds an explicit per-candidate
@@ -1849,6 +2133,16 @@ def attach_candidate_passage_retrieval(
         if candidate.relationship_eligible and candidate.candidate_id in routed_ids
     ]
     if not eligible:
+        # Failed decomposition is not a prohibition on retrieving evidence for
+        # the unchanged single-source citation. Never promote rejected proposals
+        # or create candidate selections that could authorize a judgment.
+        redundant_only = any(
+            "candidate_integrity:materially_redundant_candidate" in c.limitations
+            for c in candidate_set.candidates
+        )
+        binding = artifact.source_binding
+        if redundant_only and binding and binding.status == "exact" and len(artifact.claim.reference_ids) == 1:
+            return _attach_evidence_only_fallback(source, artifact, top_k=top_k)
         return artifact.model_copy(
             update={
                 "candidate_passage_retrieval": CandidatePassageRetrievalEvidence(
@@ -1914,20 +2208,25 @@ def attach_candidate_passage_retrieval(
     incomplete = False
     for candidate in eligible:
         query_text = _candidate_retrieval_text(artifact.claim, candidate)
+        skip = (excluded_passage_ids_by_candidate or {}).get(candidate.candidate_id, set())
         ranked, rescue_applied, facet_queries = _candidate_union_candidates(
             pages,
             query_text=query_text,
             page_locator=artifact.claim.page_locator,
             broad_passages=list(broad_by_id.values()),
-            top_k=bounded_top_k,
-            include_document_metadata=len(artifact.claim.reference_ids) > 1,
+            top_k=bounded_top_k + len(skip),
+            include_document_metadata=len(set(artifact.claim.reference_ids)) > 1,
             accepted_facet_queries=(accepted_facet_queries_by_candidate or {}).get(
                 candidate.candidate_id, []
             ),
         )
         items: list[CandidatePassageSelectionItem] = []
-        for rank, (passage_candidate, channels) in enumerate(ranked, start=1):
+        rank = 0
+        for passage_candidate, channels in ranked:
             passage = _passage_evidence(source, passage_candidate)
+            if passage.passage_id in skip or len(items) >= bounded_top_k:
+                continue
+            rank += 1
             evidence_by_id.setdefault(passage.passage_id, passage)
             items.append(
                 CandidatePassageSelectionItem(
@@ -2656,7 +2955,39 @@ def _pdf_reading_order_text_and_spans(
 
     page_width = float(page.rect.width)
     page_height = float(page.rect.height)
-    headers = [block for block in raw_blocks if float(block[3]) <= page_height * 0.12]
+    # Newspaper/pressbook pages can have four narrow columns. Treating each
+    # half as one column interleaves unrelated articles at equal y positions.
+    seeds = [b for b in raw_blocks if len(str(b[4]).strip()) >= 80
+             and page_width * .10 <= float(b[2])-float(b[0]) <= page_width * .23]
+    clusters = []
+    for block in sorted(seeds, key=lambda b: float(b[0])):
+        if not clusters or float(block[0])-float(clusters[-1][0][0]) > page_width*.04:
+            clusters.append([])
+        clusters[-1].append(block)
+    if 3 <= len(clusters) <= 5 and all(len(c) >= 3 for c in clusters):
+        bounds = [(min(float(b[0]) for b in c), max(float(b[2]) for b in c)) for c in clusters]
+        if all(a[1] < b[0] for a,b in zip(bounds,bounds[1:])):
+            groups = [[] for _ in bounds]; furniture = []
+            for block in raw_blocks:
+                owners = [i for i,(left_edge,right_edge) in enumerate(bounds)
+                          if left_edge-page_width*.025 <= float(block[0]) <= right_edge]
+                if owners and float(block[1]) < page_height*.94:
+                    groups[owners[0]].append(block)
+                else:
+                    furniture.append(block)
+            ordered = [b for group in groups for b in sorted(group,key=lambda b:(float(b[1]),float(b[0])))] + furniture
+            text = ''; spans = []
+            for block in ordered:
+                block_text = str(block[4]); start = len(text); text += block_text + '\n'
+                spans.append(_PdfLayoutSpan(page_index=page_index,start=start,end=start+len(block_text),text=block_text,
+                    x0=float(block[0]),y0=float(block[1]),x1=float(block[2]),y1=float(block[3]),
+                    page_width=page_width,page_height=page_height))
+            return text, spans, True
+    # A short body fragment at the top of each column is not a running header.
+    # Require the block to start in the actual upper margin as well as end high.
+    headers = [block for block in raw_blocks
+               if float(block[1]) <= page_height * 0.065
+               and float(block[3]) <= page_height * 0.12]
     footers = [block for block in raw_blocks if float(block[1]) >= page_height * 0.88]
     body = [block for block in raw_blocks if block not in headers and block not in footers]
     left = [
@@ -2744,14 +3075,107 @@ def _visible_pdf_page_label(
 ) -> str | None:
     """Recover one printed page number from high-confidence margin furniture."""
     candidates: set[str] = set()
+    bracketed_candidates: set[str] = set()
     for span in structural_spans:
         if span.role != "page_furniture":
             continue
         for line in text[span.start : span.end].splitlines():
-            match = re.fullmatch(r"\s*[-–—]?\s*(\d{1,4})\s*[-–—]?\s*", line)
+            bracketed = re.fullmatch(r'\s*\[\s*(\d{1,4})\s*\]\s*',line)
+            if bracketed: bracketed_candidates.add(bracketed[1])
+            match = re.fullmatch(r"\s*(?:[-–—]\s*)?(?:\[\s*)?(\d{1,4})(?:\s*\])?(?:\s*[-–—])?\s*", line)
             if match:
                 candidates.add(match.group(1))
+    if len(bracketed_candidates)==1:return next(iter(bracketed_candidates))
     return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _resolved_pdf_page_labels(
+    pages: list[_SourcePage],
+    structural_by_page: dict[int, tuple[_SourceStructuralSpan, ...]],
+) -> dict[int, str | None]:
+    """Prefer corroborated printed pagination over conflicting numeric labels.
+
+    Never infer a missing printed number from an offset. Non-numeric embedded
+    labels (e.g. appendix prefixes) retain their explicit document meaning.
+    """
+    visible = {
+        page.index: _visible_pdf_page_label(
+            page.text, structural_by_page.get(page.index, ())
+        )
+        for page in pages if page.index is not None
+    }
+    resolved = {}
+    for page in pages:
+        if page.index is None:
+            continue
+        printed = visible.get(page.index)
+        embedded = page.label
+        corroborated = bool(printed) and any(
+            visible.get(page.index + delta) is not None
+            and int(visible[page.index + delta]) == int(printed) + delta
+            for delta in (-1, 1)
+        )
+        resolved[page.index] = (
+            printed
+            if printed and (
+                not embedded or embedded == printed
+                or (embedded.isdecimal() and corroborated)
+            )
+            else embedded
+        )
+    return resolved
+
+
+def _byline_first_opening_roles(page_index, spans):
+    """Bounded author/affiliation → large title → abstract opening layout.
+
+    Require an independent DOI masthead and geometric alignment. A large
+    section heading or a person's name alone must never exclude body text.
+    """
+    if page_index not in range(3) or not any(
+        s.y1 < s.page_height * .15 and
+        re.search(r"\bdoi\s*:\s*10\.\d{4,9}/", s.text, re.I)
+        for s in spans
+    ):
+        return {}
+    for bi, byline in enumerate(spans):
+        lines = [line.strip() for line in byline.text.splitlines() if line.strip()]
+        if len(lines) < 2 or len(lines) > 4:
+            continue
+        words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’\-]+", lines[0])
+        if not (2 <= len(words) <= 8 and all(w[0].isupper() for w in words)
+                and re.search(r"\b(?:university|institute|college|department)\b", ' '.join(lines[1:]), re.I)
+                and byline.y1 - byline.y0 <= 55):
+            continue
+        for ti, title in enumerate(spans):
+            height = (title.y1-title.y0)/max(1, len(title.text.splitlines()))
+            if not (3 <= len(title.text.split()) <= 60 and height >= 18
+                    and 0 <= title.y0-byline.y1 <= title.page_height*.08
+                    and abs(title.x0-byline.x0) <= title.page_width*.04
+                    and title.y1 < title.page_height*.65):
+                continue
+            abstracts = [(i,s) for i,s in enumerate(spans)
+                         if re.fullmatch(r"\s*abstract\s*", s.text, re.I)
+                         and 0 <= s.y0-title.y1 <= title.page_height*.08
+                         and abs(s.x0-title.x0) <= title.page_width*.04]
+            if len(abstracts) != 1:
+                continue
+            ai, abstract = abstracts[0]
+            result = {bi: 'publication_metadata', ti: 'document_metadata', ai: 'abstract'}
+            # The abstract and optional keyword column are independent blocks;
+            # never absorb another column by text-stream adjacency.
+            for hi, heading in [(ai, abstract), *[(i,s) for i,s in enumerate(spans)
+                    if re.fullmatch(r"\s*keywords\s*", s.text, re.I)
+                    and abs(s.y0-abstract.y0) <= 8 and s.x0 > abstract.x0]]:
+                role = 'abstract' if hi == ai else 'publication_metadata'
+                result[hi] = role
+                followers = [(i,s) for i,s in enumerate(spans)
+                             if 0 <= s.y0-heading.y1 <= 15
+                             and abs(s.x0-heading.x0) <= heading.page_width*.03]
+                if len(followers) == 1:
+                    result[followers[0][0]] = role
+            return result
+    return {}
 
 
 def _pdf_structural_spans(
@@ -2774,6 +3198,7 @@ def _pdf_structural_spans(
 
     roles: dict[tuple[int, int], str] = {}
     for page_index, spans in layout_by_page.items():
+        opening_roles = _byline_first_opening_roles(page_index, spans)
         article_header_indices = _probable_article_header_indices(page_index, spans)
         article_title_indices = _probable_article_title_indices(
             spans, article_header_indices
@@ -2786,7 +3211,7 @@ def _pdf_structural_spans(
                 or span.x1 <= span.page_width * 0.12
                 or span.x0 >= span.page_width * 0.88
             )
-            standalone_page_number = bool(re.fullmatch(r"[-–—]?\s*\d{1,4}\s*[-–—]?", normalized))
+            standalone_page_number = bool(re.fullmatch(r"(?:[-–—]\s*)?(?:\[\s*)?\d{1,4}(?:\s*\])?(?:\s*[-–—])?", normalized))
             repeated_margin = (
                 near_margin
                 and len(signature_pages.get(_layout_signature(span.text), set())) >= 2
@@ -2798,7 +3223,9 @@ def _pdf_structural_spans(
                 any(pattern.search(normalized) for pattern in _PAGE_FURNITURE_MARKERS)
                 and (near_margin or span.y0 >= span.page_height * 0.65)
             )
-            if index in article_title_indices:
+            if index in opening_roles:
+                roles[(page_index, index)] = opening_roles[index]
+            elif index in article_title_indices:
                 roles[(page_index, index)] = "document_metadata"
             elif index in article_header_indices:
                 roles[(page_index, index)] = "publication_metadata"
@@ -2824,11 +3251,15 @@ def _pdf_structural_spans(
                 roles[(page_index, index)] = "page_furniture"
 
         for index, span in enumerate(spans):
-            if _AUTHOR_BIOGRAPHY_START.search(span.text):
+            if _AUTHOR_BIOGRAPHY_START.search(span.text) or re.fullmatch(
+                r"\s*Notes? on (?:the )?contributors?\s*", span.text, re.IGNORECASE
+            ):
                 roles[(page_index, index)] = "author_biography"
                 prior = span
-                for continuation_index in range(index + 1, min(index + 4, len(spans))):
+                for continuation_index in range(index + 1, len(spans)):
                     continuation = spans[continuation_index]
+                    if _REFERENCE_HEADING.search(continuation.text):
+                        break
                     gap = continuation.y0 - prior.y1
                     if gap > max(7.0, (prior.y1 - prior.y0) * 0.8):
                         break
@@ -2864,7 +3295,14 @@ def _pdf_structural_spans(
             )
             narrow_margin_note = (
                 numbered >= 1
-                and span.y0 >= span.page_height * 0.10
+                and (
+                    span.y0 >= span.page_height * 0.10
+                    # Some journal side notes begin beside the first body
+                    # paragraph. Keep the column geometry gate and require
+                    # substantive note text, not a running page/issue number.
+                    or (span.y0 >= span.page_height * 0.02
+                        and len(span.text.split()) >= 8)
+                )
                 and adjacent_main_column
             )
             if (
@@ -2967,10 +3405,16 @@ def _extract_pages(
                 total_characters = 0
                 normalized_control_characters = False
                 reordered_two_column_pages = 0
+                repaired_text = dict(getattr(source, "page_repairs", ()) or ())
                 for index, page in enumerate(document):
-                    raw_text, layout_spans, reading_order_rebuilt = (
-                        _pdf_reading_order_text_and_spans(page, index)
-                    )
+                    if index in repaired_text:
+                        # Receipt-bound OCR text replaces a damaged text layer; the
+                        # layer's layout does not describe it, so none is kept.
+                        raw_text, layout_spans, reading_order_rebuilt = repaired_text[index], [], False
+                    else:
+                        raw_text, layout_spans, reading_order_rebuilt = (
+                            _pdf_reading_order_text_and_spans(page, index)
+                        )
                     reordered_two_column_pages += int(reading_order_rebuilt)
                     text, substitutions = _normalize_pdf_extracted_text(raw_text)
                     normalized_control_characters = (
@@ -3005,6 +3449,15 @@ def _extract_pages(
                     if source_limit_reached:
                         break
                 structural_by_page = _pdf_structural_spans(layout_by_page)
+                resolved_labels = _resolved_pdf_page_labels(pages, structural_by_page)
+                if any(
+                    page.label and resolved_labels.get(page.index) != page.label
+                    for page in pages
+                ):
+                    limitations.append(
+                        "Conflicting numeric PDF labels were replaced by "
+                        "printed page numbers corroborated on adjacent pages."
+                    )
                 if normalized_control_characters:
                     limitations.append(
                         "PDF text contained nonsemantic control characters that "
@@ -3015,16 +3468,15 @@ def _extract_pages(
                         "PDF visual column order was reconstructed on "
                         f"{reordered_two_column_pages} page(s)."
                     )
+                if repaired_text:
+                    limitations.append(
+                        f"Damaged PDF text on {len(repaired_text)} page(s) was re-read by local OCR "
+                        f"(receipt {getattr(source, 'page_repair_manifest_sha256', None)})."
+                    )
                 return [
                     _SourcePage(
                         index=page.index,
-                        label=page.label
-                        or _visible_pdf_page_label(
-                            page.text,
-                            structural_by_page.get(
-                                page.index if page.index is not None else 0, ()
-                            ),
-                        ),
+                        label=resolved_labels.get(page.index),
                         text=page.text,
                         structural_spans=structural_by_page.get(
                             page.index if page.index is not None else 0, ()
@@ -3195,6 +3647,18 @@ def _candidate_union_candidates(
     ] = {}
 
     def add(candidate: _PassageCandidate, channel: str) -> None:
+        # A title/byline block is admissible only through its own
+        # document-metadata channel, which runs for multi-reference claims.
+        # Ordinary lexical and BM25 channels rank it highly because it repeats
+        # the cited title, but its bare words cannot reproduce that layout, so
+        # its role is not text-derivable and it is not usable candidate
+        # evidence. Admitting it elsewhere also overwrote the dedicated
+        # channel's retrieval method whenever a lexical score was higher.
+        if (
+            candidate.passage_role == "document_metadata"
+            and channel != "candidate_document_metadata"
+        ):
+            return
         key = (candidate.page_index, candidate.start, candidate.end)
         current = entries.get(key)
         if current is None:
@@ -3212,6 +3676,10 @@ def _candidate_union_candidates(
     if include_document_metadata:
         for page, start, end, text, role in _source_blocks(pages):
             if role != "document_metadata":
+                continue
+            if not document_metadata_member_admissible(
+                page_index=page.index, text=text.strip()
+            ):
                 continue
             add(
                 _PassageCandidate(
@@ -3345,6 +3813,20 @@ def _candidate_union_candidates(
                 "candidate_explicit_note" if _has_explicit_note_locator(page_locator)
                 else "candidate_note_fallback",
             )
+    else:
+        # A body hit does not imply that explanatory notes lack useful context.
+        # Keep notes labelled and bounded; never promote bibliography-only notes.
+        linked_notes = _linked_explanatory_notes(
+            pages, [candidate for candidate, _channels in entries.values()]
+        )
+        for candidate in linked_notes[:1]:
+            add(candidate, "candidate_explanatory_note_context")
+            add(candidate, "candidate_same_page_note_link")
+        for candidate in ([] if linked_notes else _citation_note_candidates(
+            pages, query_text=query_text, page_locator=page_locator, top_k=1,
+            substantive_only=True,
+        )):
+            add(candidate, "candidate_explanatory_note_context")
 
     consolidated = _consolidate_nested_passage_entries(
         list(entries.values()),
@@ -3356,9 +3838,76 @@ def _candidate_union_candidates(
         facet_queries=facet_queries,
         top_k=top_k,
     )
+    note = next((item for item in consolidated
+                 if "candidate_explanatory_note_context" in item[1]), None)
+    if note is not None and note not in ranked:
+        if len(ranked) < top_k:
+            ranked.append(note)
+        elif top_k > 1:
+            # Preserve the leading candidate and every exact/locator channel.
+            for index in range(len(ranked) - 1, 0, -1):
+                if not any("exact" in channel or "equivalent" in channel
+                           or "locator" in channel for channel in ranked[index][1]):
+                    ranked[index] = note
+                    break
+    continuation = _following_body_context(pages, ranked, query_text=query_text)
+    if continuation is not None:
+        candidate, anchor_key = continuation
+        if not any(c.page_index == candidate.page_index and c.start <= candidate.start
+                   and c.end >= candidate.end for c, _channels in ranked):
+            item = (candidate, {"candidate_following_body_context"})
+            if len(ranked) < top_k:
+                ranked.append(item)
+            else:
+                for index in range(len(ranked) - 1, 1, -1):
+                    current, channels = ranked[index]
+                    if (current.page_index, current.start, current.end) == anchor_key:
+                        continue
+                    if any(any(token in channel for token in ("exact", "equivalent", "locator", "note"))
+                           for channel in channels):
+                        continue
+                    ranked[index] = item
+                    break
     return [
         (candidate, sorted(channels)) for candidate, channels in ranked
     ], rescue_applied, facet_queries
+
+
+def _following_body_context(pages, ranked, *, query_text):
+    """One non-recursive, same-page continuation within existing source windows.
+
+    Context must have a positive lexical connection and immediately follow a
+    selected body window. No section crossing, arbitrary neighbours, or increased
+    excerpt budget. Keep the originating window in the selection.
+    """
+    tokens = _meaningful_tokens(query_text)
+    if not tokens:
+        return None
+    candidates = []
+    for page, start, end, text, role in _source_blocks(pages):
+        if role != "body_prose" or len(text) > MAX_PASSAGE_CHARACTERS:
+            continue
+        if _passage_boundary_status(text) != "sentence_complete":
+            continue
+        if _NUMBERED_SECTION_HEADING_LINE.search(text):
+            continue
+        score = _lexical_score(tokens, query_text, text)
+        if score <= 0:
+            continue
+        for anchor, _channels in ranked:
+            if anchor.passage_role != "body_prose" or page.index != anchor.page_index:
+                continue
+            if not 0 <= start - anchor.end <= 2:
+                continue
+            if page.text[anchor.end:start].strip():
+                continue
+            candidate = _PassageCandidate(
+                page_index=page.index, page_label=page.label, start=start, end=end,
+                text=text.strip(), method="following_body_context", score=score,
+                passage_role="body_prose",
+            )
+            candidates.append((candidate, (anchor.page_index, anchor.start, anchor.end)))
+    return max(candidates, key=lambda item: (item[0].score, -item[0].start), default=None)
 
 
 def _has_explicit_note_locator(locator: str) -> bool:
@@ -3367,14 +3916,56 @@ def _has_explicit_note_locator(locator: str) -> bool:
     )
 
 
+def _linked_explanatory_notes(
+    pages: list[_SourcePage], body_candidates: list[_PassageCandidate],
+) -> list[_PassageCandidate]:
+    """Follow only unique same-page printed markers from retrieved body context.
+
+    The anchor, not semantic similarity or source-wide proximity, authorizes the
+    context link. Ambiguous numbering and bibliography-only notes abstain.
+    """
+    notes: dict[tuple[int | None, str], list[tuple]] = {}
+    for page, start, end, text, role in _source_blocks(pages):
+        if role != "citation_notes":
+            continue
+        markers = list(re.finditer(r"(?m)^\s*(\d{1,3})[.)]?\s+(?=[A-Za-z])", text))
+        if len(markers) != 1 or markers[0].start() != 0:
+            continue
+        notes.setdefault((page.index, markers[0].group(1)), []).append(
+            (page, start, end, text)
+        )
+    found: dict[tuple[int | None, int, int], _PassageCandidate] = {}
+    for body in body_candidates:
+        if body.passage_role not in {"body_prose", "unknown"}:
+            continue
+        # Require attached sentence-end markers, not years, decimals or list items.
+        for marker in re.finditer(r"[A-Za-z][.!?](\d{1,3})(?=\s|$)", body.text):
+            matches = notes.get((body.page_index, marker.group(1)), [])
+            if len(matches) != 1:
+                continue
+            page, start, end, text = matches[0]
+            if not _is_explanatory_note(text):
+                continue
+            key = (page.index, start, end)
+            candidate = _PassageCandidate(
+                page_index=page.index, page_label=page.label, start=start, end=end,
+                text=text.strip(), method="explanatory_note_context",
+                score=min(0.90, body.score), passage_role="citation_notes",
+            )
+            if key not in found or candidate.score > found[key].score:
+                found[key] = candidate
+    return sorted(found.values(), key=lambda item: (item.score, -item.start), reverse=True)
+
+
 def _citation_note_candidates(
     pages: list[_SourcePage],
     *,
     query_text: str,
     page_locator: str,
     top_k: int,
+    substantive_only: bool = False,
 ) -> list[_PassageCandidate]:
-    """Search labelled notes only by explicit locator or after body retrieval fails."""
+    """Search labelled notes; optional conservative prose gate for body coexistence."""
     query_tokens = _meaningful_tokens(query_text)
     if not query_tokens:
         return []
@@ -3382,6 +3973,8 @@ def _citation_note_candidates(
     candidates: list[_PassageCandidate] = []
     for page, start, end, text, role in _source_blocks(pages):
         if role != "citation_notes":
+            continue
+        if substantive_only and not _is_explanatory_note(text):
             continue
         score = _lexical_score(query_tokens, query_text, text)
         if score <= 0:
@@ -3393,13 +3986,36 @@ def _citation_note_candidates(
                 start=start,
                 end=end,
                 text=text.strip(),
-                method="citation_note_fallback",
+                method="explanatory_note_context" if substantive_only else "citation_note_fallback",
                 score=min(0.90, score + _page_boost(page, locator_pages)),
                 passage_role="citation_notes",
             )
         )
     candidates.sort(key=lambda item: (item.score, -item.start), reverse=True)
     return _deduplicate_candidates(candidates)[:top_k]
+
+
+def _is_explanatory_note(text: str) -> bool:
+    """Conservative deterministic eligibility, not a relevance/accuracy judgment.
+
+    Require a prose predicate outside parenthetical citations and URLs. Bibliographic
+    titles alone and bare cross-references remain ineligible; ambiguity abstains.
+    """
+    prose = re.sub(r"https?://\S+|\([^)]*\)", " ", text)
+    if len(list(re.finditer(r"(?m)^\s*\d{1,3}[.)]?\s+(?=[A-Za-z])", text))) > 1:
+        return False
+    if re.search(r"\b(?:cf\.|see\s+also|op\.\s*cit)", prose, re.IGNORECASE):
+        return False
+    if re.match(r"\s*(?:\d+[.)]?\s*)?(?:see|cf\.?|ibid\.?|op\.\s*cit)\b", text, re.IGNORECASE):
+        return False
+    if re.match(r"\s*(?:\d+[.)]?\s*)?[A-Z][\w’-]+,\s*[A-Z]\.", text):
+        return False
+    if len(re.findall(r"\b[A-Za-z]+\b", prose)) < 10:
+        return False
+    return bool(re.search(
+        r"\b(?:was|were|is|are|had|has|have|documents|shows|describes|"
+        r"reports|demonstrates|broadcast|aired|released)\b", prose, re.IGNORECASE
+    ))
 
 
 def _candidate_entry_rank_key(item: tuple[_PassageCandidate, set[str]]):
@@ -3625,6 +4241,18 @@ def _consolidate_nested_passage_entries(
             while union_end > union_start and page_text[union_end - 1].isspace():
                 union_end -= 1
             union_text = page_text[union_start:union_end]
+            # The union covers page text neither candidate was scored on. When
+            # the combined span reads as a different structural role it has
+            # crossed a boundary - body prose running into a reference list -
+            # and the inherited role would no longer describe the passage.
+            # Keep the attested candidate instead of inventing a wider one.
+            # A geometry-derived document_metadata role is exempt: its words
+            # cannot reproduce it, so a text comparison says nothing.
+            if broader.passage_role != "document_metadata" and (
+                passage_role_from_text(union_text) != broader.passage_role
+            ):
+                union_start, union_end = broader.start, broader.end
+                union_text = broader.text
         else:
             union_start = broader.start
             union_end = broader.end
@@ -4136,8 +4764,10 @@ _NUMBERED_SECTION_HEADING_LINE = re.compile(
     r"(?m)^\s*\d+(?:\.\d+)*\.?\s+[A-Z][^\n.!?]{2,120}\s*$"
 )
 _REFERENCE_ENTRY_LINE = re.compile(
-    r"(?m)^\s*(?:\[?\d+\]?\.?\s+)?[A-Z][^\n]{0,140}"
+    r"(?m)^(?:\s*(?:\[?\d+\]?\.?\s+)?[A-Z][^\n]{0,140}"
     r"\((?:18|19|20)\d{2}[a-z]?\)"
+    r"|[ \t]*[A-Z][\w’'\-]+,[ \t]+(?:[A-Z]\.[ \t]*){1,4}"
+    r"(?:18|19|20)\d{2}[a-z]?\.[ \t]+\S)"
 )
 _NUMBERED_NOTE_LINE = re.compile(r"(?m)^\s*\d{1,3}[.)]?\s+(?=\S)")
 _PARENTHETICAL_YEAR = re.compile(
@@ -4194,6 +4824,14 @@ def _is_metadata_noise_block(text: str) -> bool:
     standard = re.search(r"\bWCAG\s+2\.[012]\b", normalized, re.I)
     if platform_statement and conformance and standard:
         return True
+    # A copyright/cataloging leaf may contain substantial permissions prose.
+    # Require the cataloging heading, an actual ISBN-shaped identifier and
+    # copyright evidence together; discussion of ISBNs/cataloging alone is not
+    # metadata. Do not apply the compact-boilerplate sentence ceiling here.
+    if (re.search(r"\b(?:Library of Congress )?Cataloging[- ]in[- ]Publication Data\b", normalized, re.I)
+            and re.search(r"\bISBN(?:-1[03])?\s*:?[\s-]*[0-9][0-9Xx\s-]{8,20}", normalized)
+            and re.search(r"(?:©\s*(?:18|19|20)\d{2}|\bcopyright\b|\ball rights reserved\b)", normalized, re.I)):
+        return True
     marker_count = sum(bool(pattern.search(normalized)) for pattern in _METADATA_NOISE_MARKERS)
     sentence_count = len(re.findall(r"[.!?](?:\s|$)", normalized))
     word_count = len(re.findall(r"\b\w+\b", normalized))
@@ -4245,6 +4883,33 @@ def passage_role_from_text(text: str) -> Literal[
     if word_count >= 8 and sentence_count >= 2:
         return "body_prose"
     return "unknown"
+
+
+DOCUMENT_METADATA_MEMBER_PAGE_LIMIT = 3
+
+# A title/byline block carries a geometry-derived role that its bare words
+# cannot reproduce. Reading as publication metadata is the *expected* plain-text
+# result for such a block, not evidence that the role was supplied from outside
+# the application, so it belongs here beside the two weaker readings. Provenance
+# is established by the producing method and retrieval channel, which only this
+# module sets.
+_DOCUMENT_METADATA_MEMBER_TEXT_ROLES = frozenset(
+    {"unknown", "body_prose", "publication_metadata"}
+)
+
+
+def document_metadata_member_admissible(*, page_index: int | None, text: str) -> bool:
+    """Whether an opening-page title block may stand as document-level evidence.
+
+    Producer and validator share this rule. When only the validator held it, a
+    block the producer had already offered could be refused at persist time,
+    failing the whole paper instead of simply not being offered.
+    """
+    return bool(
+        page_index is not None
+        and 0 <= page_index < DOCUMENT_METADATA_MEMBER_PAGE_LIMIT
+        and passage_role_from_text(text) in _DOCUMENT_METADATA_MEMBER_TEXT_ROLES
+    )
 
 
 def _is_retrieval_noise_block(text: str) -> bool:
@@ -5126,14 +5791,22 @@ def _lexical_score(claim_tokens: list[str], claim_text: str, passage: str) -> fl
 
 
 def _page_locator_values(locator: str) -> set[int]:
-    numbers = [int(value) for value in re.findall(r"\d+", locator or "")]
-    if not numbers:
+    value = re.sub(r"^\s*(?:pages?|pp?\.?)\s*(?=\d)", "", locator or "", flags=re.IGNORECASE)
+    if len(value) > 512 or not re.fullmatch(
+        r"\s*\d{1,5}(?:\s*[-–—]\s*\d{1,5})?(?:\s*,\s*\d{1,5}(?:\s*[-–—]\s*\d{1,5})?)*\s*",
+        value,
+    ):
         return set()
-    if len(numbers) >= 2 and re.search(r"[-–—]", locator):
-        start, end = numbers[0], numbers[1]
-        if 0 < start <= end and end - start <= 50:
-            return set(range(start, end + 1))
-    return {numbers[0]}
+    pages: set[int] = set()
+    for item in value.split(","):
+        numbers = [int(number) for number in re.findall(r"\d+", item)]
+        start, end = numbers[0], numbers[-1]
+        if not 0 < start <= end or end - start > 50:
+            return set()
+        pages.update(range(start, end + 1))
+        if len(pages) > 100:
+            return set()
+    return pages
 
 
 def _page_boost(page: _SourcePage, locator_pages: set[int]) -> float:
@@ -5184,3 +5857,149 @@ def _deduplicate_candidates(
 def _stable_id(*parts: str) -> str:
     payload = "\x1f".join(parts).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+# Matched to the report's bound on stored source text. The judgment must be
+# made on exactly the text the report can keep and a reader can see: assessing
+# more than is stored would leave the comparison unverifiable, and storing more
+# would widen how much of a source the report retains.
+MAX_SCOPE_EXCERPT_CHARACTERS = 1_200
+
+
+def leading_source_excerpt(
+    source: AuthorizedRepresentation,
+    *,
+    limit: int = MAX_SCOPE_EXCERPT_CHARACTERS,
+) -> str:
+    """The opening of a retrieved document, where a work states what it covers.
+
+    A later passage says what was cited; only the opening states the work's own
+    subject and the limits it sets for itself, which is what a scope comparison
+    needs. Extraction failures return an empty string, which is abstention.
+    """
+    try:
+        pages, _ = _extract_pages(source)
+    except Exception:  # extraction failure is abstention, never a judgment
+        return ""
+    collected: list[str] = []
+    total = 0
+    for page in pages:
+        text = re.sub(r"\s+", " ", str(getattr(page, "text", "") or "")).strip()
+        if not text:
+            continue
+        collected.append(text)
+        total += len(text) + 1
+        if total >= limit:
+            break
+    return " ".join(collected)[:limit].strip()
+
+
+# Stopwords plus the reporting verbs a citing sentence uses about its source;
+# neither tells us what the source is about.
+_CLAIM_TERM_STOPWORDS = frozenset("""
+the a an and or of in on for to with by from as is are was were be been being this that these
+those it its their his her they he she we you at not no but if then than so such which who whom
+whose what when where how why can could may might will would shall should must have has had do
+does did done also more most other another some any each every both few many much own same very
+just only about into over under between during through above below states stated state according
+meanwhile however therefore thus because while although though new used using use make makes made
+known argues argued stated said claim claims claimed show shows showed suggest suggests suggested
+note notes noted write writes wrote point points pointed follow follows followed
+found finds finding report reports reported describe describes described
+""".split())
+MAX_CLAIM_TERMS = 12
+CLAIM_TERM_MIN_LENGTH = 5
+
+
+def claim_topic_terms(claim_text: str) -> list[str]:
+    """The distinctive vocabulary a citing sentence attributes to its source."""
+    words = re.findall(r"[a-z][a-z\-']*", (claim_text or "").lower())
+    terms = []
+    for word in words:
+        # A possessive is the same topic: "hero's journey" is about heroes.
+        word = re.sub(r"'s?$", "", word)
+        if len(word) < CLAIM_TERM_MIN_LENGTH or word in _CLAIM_TERM_STOPWORDS:
+            continue
+        if word not in terms:
+            terms.append(word)
+    return terms[:MAX_CLAIM_TERMS]
+
+
+def claim_terms_present_in_source(
+    source: AuthorizedRepresentation, claim_text: str,
+) -> tuple[int, int]:
+    """How much of the claim's vocabulary the WHOLE document actually contains.
+
+    The scope judgment sees a bounded opening -- 1,200 characters of a work
+    that may run to 126 pages -- so "the source does not discuss this" cannot
+    be concluded from it. Measured 2026-09-22, both full-text different-subject
+    marks were exactly that mistake: Pallant's opening omitted narrative and
+    Khan's omitted the Telecommunications Act, and both works discuss them at
+    length. This reads the complete extracted text locally, sends nothing to a
+    model and retains no document text, and returns counts only.
+    """
+    if source is None or not isinstance(claim_text, str):
+        return 0, 0
+    terms = claim_topic_terms(claim_text)
+    if not terms:
+        return 0, 0
+    try:
+        pages, _ = _extract_pages(source)
+    except Exception:
+        # A total of zero reads as not measured, and the gate abstains.
+        # Returning "none of them present" would turn an extraction
+        # failure into evidence that the source discusses nothing.
+        return 0, 0
+    document = " ".join(
+        str(getattr(page, "text", "") or "") for page in pages).lower()
+    if not document:
+        return 0, 0
+    present = 0
+    for term in terms:
+        # A prefix match absorbs plurals and simple inflection; a work that
+        # discusses "narratives" discusses "narrative".
+        stem = re.escape(term[:max(CLAIM_TERM_MIN_LENGTH, len(term) - 2)])
+        if re.search(r"\b" + stem, document):
+            present += 1
+    return present, len(terms)
+
+
+# The opening states what a work covers; the passages show what it discusses.
+# Measured 2026-09-23 over 409 retained documents, a clear geographic scope was
+# evident in 63% of document text and in only 3% of openings, which is why a
+# judgment made from the opening alone missed that Khan's article is United
+# States law throughout while the citing sentence concerned Canada.
+MAX_SCOPE_EVIDENCE_CHARACTERS = 1_800
+_SCOPE_EVIDENCE_HEADING = "\n\nFurther passages from the same document:\n"
+
+
+def scope_evidence_block(passages, *, limit: int = MAX_SCOPE_EVIDENCE_CHARACTERS) -> str:
+    """Bounded further text from the same document, in document order.
+
+    These passages were retrieved because they match the citation, so their
+    agreement with it proves little. Their DISAGREEMENT is what counts: text
+    selected to match a claim that still speaks about somewhere else is
+    evidence the retrieval could not find what was attributed to the source.
+    Ordering is by position, never by score, so the sample does not shift with
+    the claim beyond the selection already made.
+    """
+    if not isinstance(passages, (list, tuple)):
+        return ""
+    ordered = sorted(
+        (p for p in passages if str(getattr(p, "text", "") or "").strip()),
+        key=lambda p: (getattr(p, "page_index", None) is None,
+                       getattr(p, "page_index", 0) or 0,
+                       getattr(p, "character_start", 0) or 0),
+    )
+    collected: list[str] = []
+    used = 0
+    for passage in ordered:
+        text = re.sub(r"\s+", " ", str(passage.text)).strip()
+        if not text:
+            continue
+        room = limit - used
+        if room <= 0:
+            break
+        collected.append(text[:room])
+        used += min(len(text), room) + 1
+    return " ".join(collected).strip()

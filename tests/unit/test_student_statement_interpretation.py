@@ -284,7 +284,7 @@ def test_candidate_one_semantic_repair_allows_coverage_but_not_accuracy():
         interpretation=result,
     )
     assert composition.status == "complete"
-    assert composition.contract_version == "complete-proposition-scope-composition-v3"
+    assert composition.contract_version == "complete-proposition-scope-composition-v7"
     assert composition.interpretation_id == result.interpretation_id
     assert composition.interpretation_status == "semantic_repair"
     assert composition.accuracy_judgment_allowed is False

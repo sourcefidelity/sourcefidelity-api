@@ -70,9 +70,37 @@ services:
       CLAMD_PORT: 3310
       MALWARE_SCAN_REQUIRED: "true"
       DOCX_PRESENTATION_RENDERING_ENABLED: "true"
-    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+    # 4 workers: the host has 8 CPUs and retrieval is provider-bound rather
+    # than CPU-bound. Same-provider calls still serialize on the
+    # ProviderRequestPacer lock, so this parallelises across providers and
+    # papers, not within one provider.
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping --destination \"celery@$${HOSTNAME}\" --timeout 5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Judgment runs (ARCHITECTURE §7) on their own queue, so a Judgment run
+  # never occupies one of the four paper-check slots.
+  judgment_worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - provider_health_state:/app/.sourcefidelity
+    environment:
+      <<: *app-internal-environment
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2 -Q judgment -n judgment@%h
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping --destination \"judgment@$${HOSTNAME}\" --timeout 5 | grep -q pong"]
       interval: 30s
       timeout: 10s
       retries: 3
