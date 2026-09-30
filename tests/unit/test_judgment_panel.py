@@ -201,6 +201,7 @@ def test_a_single_judge_result_through_the_panel():
 
 def test_a_transient_failure_is_retried_once(monkeypatch):
     monkeypatch.setattr(panel, "_RETRY_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(panel.settings, "JUDGMENT_SAMPLES", 1)
     calls = []
     def flaky(system_prompt, user_prompt, *, route, receipt, **_):
         calls.append(1)
@@ -340,3 +341,38 @@ def test_notes_use_deepseek_whichever_model_judges():
     from app.services.judge_arms import coaching_route
     assert coaching_route(_settings(JUDGMENT_JUDGES="zai_glm")).arm_id == "deepseek"
     assert coaching_route(_settings(LLM_BASE_URL="https://other.example/v1")) is None
+
+
+# ---- majority of repeated answers (owner decision 2026-09-30) -------------------
+
+@pytest.mark.parametrize(("labels", "state", "reason", "flags"), [
+    (["supports", "supports", "qualifies"], "supported", "judge_supports", [True, True, False]),
+    (["qualifies", "mixed", "supports"], "qualified", "judge_qualifies", [True, True, False]),
+    (["contradicts", None, "contradicts"], "contradicts", "judge_contradicts", [True, False, True]),
+    (["uncertain", "uncertain", "none"], "not_judged", "judge_undecided", [True, True, False]),
+    (["supports", "none", "contradicts"], "not_judged", "samples_split", [False, False, False]),
+    (["supports", None, "none"], "not_judged", "samples_split", [False, False, False]),
+    (["supports", None, None], "not_judged", "judge_failed", [False, False, False]),
+])
+def test_the_majority_of_one_judges_answers_is_shown(labels, state, reason, flags):
+    assert panel.majority_display_state(labels) == (state, reason, flags)
+
+
+def test_a_single_judge_answers_three_times_and_reuses_its_first_cached_answer(monkeypatch):
+    monkeypatch.setattr(panel.settings, "JUDGMENT_SAMPLES", 3)
+    answers = iter(["contradicts", "supports"])
+    calls = []
+
+    def call(system_prompt, user_prompt, *, route, receipt, **_):
+        calls.append(1)
+        return _response(user_prompt, next(answers))
+    artifact, prepared, item = _prepared_candidate()
+    first_key = panel.arm_cache_key(ROUTES[0], "p", item)
+    cache = {first_key: _response(item.user_prompt, "supports")}
+    stored = []
+    result = panel.judge_candidate(item, artifact, prepared.sentences, ROUTES[:1], "p", call=call,
+                                   cache_lookup=cache.get, cache_store=stored.append)
+    assert len(calls) == 2 and result.display_state == "supported"
+    assert [a.arm_id for a in result.arms] == ["deepseek", "deepseek:s2", "deepseek:s3"]
+    assert [a.in_majority for a in result.arms] == [True, False, True]
+    assert len({a.cache_key for a in result.arms}) == 3 and len(stored) == 2

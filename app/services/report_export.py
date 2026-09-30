@@ -22,7 +22,7 @@ from app.services.evidence_report import (
 )
 from app.services.storage.backend import StorageBackend
 from app.services.report_member_navigation import member_targets, marker_words
-from app.services.highlight_priority import SUBMITTED_LINK_FINDINGS
+from app.services.highlight_priority import LINK_MARKER_FINDINGS, SUBMITTED_LINK_FINDINGS
 
 
 REPORT_EXPORT_VERSION = "released-report-pdf-v30"
@@ -167,7 +167,7 @@ def _render_pdf(
         unverified_ids = {f.get('reference_id') for f in reference_practice
             if f.get('finding_type') in UNVERIFIED_FINDINGS}
         for finding in reference_practice:
-            if (finding.get('finding_type') not in SUBMITTED_LINK_FINDINGS
+            if (finding.get('finding_type') not in LINK_MARKER_FINDINGS
                     and finding.get('finding_type') not in REFERENCE_DIFFERENCE_FINDINGS):
                 priority = (1.5 if finding.get('finding_type') == 'source_topical_mismatch' else
                             3 if finding.get('finding_type') in ACADEMIC_FINDINGS | UNVERIFIED_FINDINGS else 2)
@@ -242,7 +242,7 @@ def _render_pdf(
             for page_index, rectangle in rectangles:
                 if finding.get('finding_type') == 'source_topical_mismatch':
                     paint_highlight(page_index, rectangle, (.937,.510,.729), .38, 1.5)
-                if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+                if finding.get('finding_type') in LINK_MARKER_FINDINGS:
                     if (page_index,rectangle) == rectangles[-1]:
                         cx,cy=rectangle.x1+10,(rectangle.y0+rectangle.y1)/2
                         if cx+8>document[page_index].rect.width:
@@ -308,7 +308,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
         'Select a source highlight to open its source-specific entry; the underline opens the complete citation entry. '
         'Pink highlights indicate a possible topical mismatch. Soft red marks a reference that cannot be verified and its citations; '
         'a blue outline marks reference details that differ from the located record. '
-        'Orange highlights identify formatting issues, purple diamonds identify submitted-link issues, '
+        'Orange highlights identify formatting issues, purple diamonds identify link issues, '
         'and yellow highlights indicate Academic Practice issues.</p>',
     ]
     blocks.append('<h2>Patterns and issues</h2>')
@@ -380,7 +380,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
         if finding.get('finding_type') == 'source_topical_mismatch':
             heading = f'Potential topical mismatch {index}'
         rectangles = finding.get('rectangles') or []
-        if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+        if finding.get('finding_type') in LINK_MARKER_FINDINGS:
             rectangles = [{**r,'x0':r['x1']+2,'x1':r['x1']+12,
                            'y0':(r['y0']+r['y1'])/2-5,'y1':(r['y0']+r['y1'])/2+5} for r in rectangles[-1:]]
         elif finding.get('finding_type') != 'source_topical_mismatch':

@@ -15,11 +15,17 @@ from app.services.report_export import _render_pdf
 from app.services.evidence_report import _render_how_to_read
 
 
-def test_reading_guide_explains_purple_diamond_under_academic_practice():
+def test_reading_guide_explains_purple_diamond_under_citation_and_reference_format_checking():
+    # Owner decision 2026-09-30: every link issue, including a missing DOI or link.
     from bs4 import BeautifulSoup
     guide=BeautifulSoup(_render_how_to_read({}),'html.parser')
-    heading=next(h for h in guide.select('details h2') if h.get_text()=='Poor academic practice')
-    assert 'A purple diamond marks an issue with a submitted link or DOI' in heading.find_next_sibling('p').get_text()
+    heading=next(h for h in guide.select('details h2') if h.get_text()=='Citation and reference format checking')
+    assert heading.find_next_sibling('p').get_text() == (
+        'Orange highlights mark citation and reference style and layout issues. A purple diamond marks a link or '
+        'DOI issue: a link that is dead or incorrect, a DOI registered to a different source, or a DOI or link '
+        'the reference should include but does not.')
+    academic=next(h for h in guide.select('details h2') if h.get_text()=='Poor academic practice')
+    assert 'purple diamond' not in academic.find_next_sibling('p').get_text()
 
 
 def test_how_to_read_is_the_owners_revised_text_in_order():

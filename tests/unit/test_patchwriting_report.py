@@ -238,8 +238,8 @@ def test_summary_lines_singular_and_plural_link_to_the_windows_and_highlights():
 def test_how_to_read_adds_the_full_text_sentence_after_the_yellow_highlights():
     text = BeautifulSoup(_how_to_read_sections(), 'html.parser').select('p')[1].get_text()
     assert text.startswith('Yellow highlights mark attribution issues')
-    assert ('quoted wording that differs from the source. Patchwriting is checked only against sources '
-            'whose full text was retrieved. A purple diamond') in text
+    assert text.endswith('quoted wording that differs from the source. Patchwriting is checked only against sources '
+                         'whose full text was retrieved.')
 
 
 def test_paper_overlay_uses_the_academic_highlight_without_badge_and_opens_the_citation_at_its_source():

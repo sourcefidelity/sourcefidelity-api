@@ -47,8 +47,8 @@ def test_judgment_summary_lists_only_results_that_occur():
         "1/2 statements are supported by the sources, and 1/2 cannot be decided upon by the LLM.")
     # "statements" goes with whichever part comes first.
     assert judgment_summary_sentence({"qualified": 1, "insufficient": 2, "undecided": 1}, 3, 9) == (
-        "1/4 statements have qualified or mixed support in the sources, 2/4 have insufficient evidence to be "
-        "attributed to the source, 1/4 cannot be decided upon by the LLM, and 3/9 citations lack full texts "
+        "1/4 statements have qualified or mixed support in the sources, 2/4 are not supported by the "
+        "sources, 1/4 cannot be decided upon by the LLM, and 3/9 citations lack full texts "
         "and are not judged.")
     script = Path("app/services/report_judgment.js").read_text()
     assert "i === 0 ? ' statements' : ''" in script and "statements are supported" not in script

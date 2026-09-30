@@ -35,7 +35,7 @@ def _row(state, reason, label="supports", coaching=None, rationale="The <i>sourc
 
 def test_owner_approved_labels():
     assert LABELS == {"supported": "Supports", "qualified": "Qualified or Mixed", "contradicts": "Contradicts",
-                      "insufficient": "Insufficient Evidence", "undecided": "LLM Undecided",
+                      "insufficient": "Not Supported", "undecided": "LLM Undecided",
                       "not_judged": "Not Judged"}
 
 

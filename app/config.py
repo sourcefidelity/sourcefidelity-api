@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     # API); DeepSeek keeps every other model task, including the notes. The
     # three-arm panel ("deepseek,glm,qwen") is kept as a post-prototype option.
     JUDGMENT_JUDGES: str = "zai_glm"
+    # Owner decision 2026-09-30: a single judge answers each claim this many
+    # times and the majority result is shown (1 restores one call per claim).
+    JUDGMENT_SAMPLES: int = 3
     # Owner decision 2026-09-29: Judgment runs on every checked paper. The
     # route still fails closed without a key and a terms-verified date.
     ZAI_ENABLED: bool = True

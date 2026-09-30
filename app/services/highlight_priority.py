@@ -7,6 +7,12 @@ ACADEMIC_FINDINGS = frozenset({'duplicate_reference_entry', 'reference_author_co
 # check noticed it (owner decision 2026-09-24).
 SUBMITTED_LINK_FINDINGS = frozenset({'submitted_link_issue', 'reference_identifier_conflict',
                                      'doi_registers_a_different_title'})
+# Every link issue is drawn as the purple diamond (owner decisions 2026-09-30),
+# including a DOI or link the reference should include but does not, and an
+# unfinished identifier; those stay Citation and reference formatting findings
+# in windows and summaries.
+LINK_MARKER_FINDINGS = SUBMITTED_LINK_FINDINGS | {'required_doi_missing', 'assessment_link_missing',
+                                                  'reference_identifier_placeholder'}
 # Reference findings about the evidence for the cited work: whether it could be
 # located, and how the located record's details differ from the reference.
 # The former review flag is a legacy name for the same presentation.

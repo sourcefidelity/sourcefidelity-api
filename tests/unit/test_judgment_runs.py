@@ -247,6 +247,7 @@ def test_a_checked_paper_is_judged_straight_away_and_scheduling_never_fails_the_
 def test_a_judge_that_keeps_failing_is_not_called_for_every_claim(store, monkeypatch):
     session, report, _ = store
     monkeypatch.setattr("app.services.judgment_panel._RETRY_PAUSE_SECONDS", 0)
+    monkeypatch.setattr("app.services.judgment_panel.settings.JUDGMENT_SAMPLES", 1)
     calls = []
     def down(*a, **k):
         calls.append(1)
@@ -260,3 +261,24 @@ def test_a_judge_that_keeps_failing_is_not_called_for_every_claim(store, monkeyp
     assert len(failed) <= 3 and len(calls) == 2 * len(failed)     # one retry each, then stop
     assert len(failed) + len(skipped) == len([r for r in rows if r.candidate_id != runs.WHOLE_CITATION
                                               and r.reason_code not in {"antecedent_unresolved", "prompt_over_budget"}])
+
+
+def test_an_uncertain_reading_gets_an_undecided_note_and_the_result_is_unchanged(store):
+    """Owner decision 2026-09-30: DeepSeek explains an undecided judge whose readings name the part."""
+    session, report, _ = store
+    judge = _fake_call({"deepseek": "uncertain", "glm": "uncertain", "qwen": "uncertain"})
+    systems = []
+
+    def call(system_prompt, user_prompt, **kwargs):
+        if '"coaching_request"' in user_prompt:
+            systems.append(system_prompt)
+            return {"note": "It is unclear whether the source addresses this.", "facet_ids": [], "sentence_ids": []}
+        return judge(system_prompt, user_prompt, **kwargs)
+    run = _run(session, report, call=call)
+    judged = [r for r in _rows(session, run) if r.citation_index == 1]
+    assert judged and all((r.display_state, r.reason_code) == ("not_judged", "judges_undecided") for r in judged)
+    assert all(r.coaching["status"] == "model" and r.coaching["version"] == "judgment-undecided-note-v2"
+               for r in judged)
+    assert systems and all("could not decide" in s for s in systems)
+    arm = judged[0].panel["arms"][0]
+    assert arm["context_resolution"] == "not_required"

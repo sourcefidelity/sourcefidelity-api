@@ -37,7 +37,7 @@ from app.services.paper_extraction import (
 from app.services.sentence_splitter import split_sentences
 from app.services.storage.backend import StorageBackend
 from app.services.highlight_priority import (
-    SUBMITTED_LINK_FINDINGS, REFERENCE_DIFFERENCE_FINDINGS, UNVERIFIED_FINDINGS, finding_category,
+    SUBMITTED_LINK_FINDINGS, LINK_MARKER_FINDINGS, REFERENCE_DIFFERENCE_FINDINGS, UNVERIFIED_FINDINGS, finding_category,
 )
 
 
@@ -1607,13 +1607,13 @@ def _retrieval_sentence(overview: dict) -> str:
             f"and {none}/{total} unretrieved texts.")
 
 
-# Owner wording 2026-09-29 (second revision); a part is shown only when its count is not zero.
+# Owner wording 2026-09-29 (second revision; "not supported" 2026-09-30); a part is shown only when its count is not zero.
 # "statements" appears once, in the first part shown (owner request 2026-09-29).
 _JUDGMENT_PARTS = (
     ("supported", "{n}/{x}{s} are supported by the sources"),
     ("qualified", "{n}/{x}{s} have qualified or mixed support in the sources"),
     ("contradicts", "{n}/{x}{s} contradict the sources"),
-    ("insufficient", "{n}/{x}{s} have insufficient evidence to be attributed to the source"),
+    ("insufficient", "{n}/{x}{s} are not supported by the sources"),
     ("undecided", "{n}/{x}{s} cannot be decided upon by the LLM"),
 )
 
@@ -1722,14 +1722,15 @@ def _how_to_read_sections() -> str:
         '<h2>Poor academic practice</h2>'
         '<p>Yellow highlights mark attribution issues, missing or duplicate reference entries, patchwriting, '
         'secondary citation, and quoted wording that differs from the source. Patchwriting is checked only '
-        'against sources whose full text was retrieved. A purple diamond marks an issue '
-        'with a submitted link or DOI, including a DOI registered to a different source.</p>'
+        'against sources whose full text was retrieved.</p>'
         '<h2>Citation and reference format checking</h2>'
-        '<p>Orange highlights mark citation and reference style and layout issues.</p>'
+        '<p>Orange highlights mark citation and reference style and layout issues. '
+        'A purple diamond marks a link or DOI issue: a link that is dead or incorrect, a DOI registered to a '
+        'different source, or a DOI or link the reference should include but does not.</p>'
         '<h2>Source use judgment</h2>'
         '<p>When the full text of a source has been retrieved, an AI model assesses whether each citation '
         'statement is backed by that source. The underline styles show the results: supports, qualified or '
-        'mixed, contradicts, insufficient evidence, and not judged.</p>'
+        'mixed, contradicts, not supported, and not judged.</p>'
         '<p>AI can make mistakes. Check the sources to verify judgments.</p>'
     )
 
@@ -1879,7 +1880,7 @@ def _render_report_gauges(gauges: list[dict]) -> str:
 
 
 def _formatting_overlaps(citation: dict, finding: dict) -> bool:
-    if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS | {'source_topical_mismatch'}:
+    if finding.get('finding_type') in LINK_MARKER_FINDINGS | {'source_topical_mismatch'}:
         return False
     return any(a.get('page_index') == b.get('page_index')
         and max(a['x0'],b['x0']) < min(a['x1'],b['x1'])
@@ -1915,7 +1916,7 @@ KEY_HTML = (
     '<span class="jk state-supported">Supported</span>'
     '<span class="jk state-qualified">Qualified or Mixed</span>'
     '<span class="jk state-contradicts">Contradicts</span>'
-    '<span class="jk state-insufficient">Insufficient evidence</span>'
+    '<span class="jk state-insufficient">Not Supported</span>'
     '<span class="jk state-undecided">LLM Undecided</span>'
     '<span class="jk state-not_judged">Not judged</span></div>'
     '<div class="key-line"><span class="key-title">Issues:</span>'
@@ -1923,7 +1924,7 @@ KEY_HTML = (
     '<span class="key-mark key-reference">Citation/Reference Issue</span>'
     '<span class="key-mark key-unverified">Unverifiable Reference</span>'
     '<span class="key-mark key-record">Source Record Conflict</span>'
-    '<span class="key-link"><i class="submitted-link-key"></i>Submitted-Link</span></div></div>'
+    '<span class="key-link"><i class="submitted-link-key"></i>Link</span></div></div>'
 )
 KEY_CSS = (
     '.legend{display:flex;flex-direction:column;gap:.45rem}'
@@ -2161,12 +2162,12 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
     rendered = rendered.replace('orange underlines indicate', 'orange highlights indicate').replace('issue underlines and affected-word highlights', 'affected-word highlights')
     rendered = rendered.replace(' Availability is not a correctness judgment.', '')
     rendered = rendered.replace(' full-text references', ' full-text retrieval(s)').replace(' abstract/limited-text references', ' abstract/limited-text retrieval(s)').replace(' unretrieved references', ' unretrieved sources')
-    rendered = rendered.replace('Purple underline: submitted-link issue.', 'Purple diamond: submitted-link issue.').replace('Purple underline', 'Purple diamond')
+    rendered = rendered.replace('Purple underline: submitted-link issue.', 'Purple diamond: link issue.').replace('Purple underline', 'Purple diamond')
     rendered = rendered.replace('purple underlines indicate', 'purple diamonds indicate').replace('an orange or purple underline', 'an orange highlight or purple diamond')
     rendered = rendered.replace('</style>', '.reference-practice-overlay .reference-formatting-hit{fill:#ff9a38;fill-opacity:.3;stroke:none;pointer-events:all}.reference-practice-overlay .mark-relevance{fill:#ef82ba;fill-opacity:.38;stroke:none;pointer-events:all}.reference-practice-overlay .topical-reference-hit{fill:transparent;fill-opacity:1;stroke:none;pointer-events:all}.issue-heading.topical{text-decoration:none;background:rgba(239,130,186,.38)}.reference-key{height:.75rem;background:#ff9a384d}.indicator-reference{fill:#ff9a38;fill-opacity:.3;stroke:none}.issue-heading.formatting{text-decoration:none}</style>', 1)
     rendered = rendered.replace('</style>', '.issue-heading{font-weight:700;text-decoration:none;padding:.1em .2em;box-decoration-break:clone;color:inherit}.issue-heading.formatting{text-decoration-color:#d95f02;background:rgba(255,154,56,.3)}.issue-heading.academic{text-decoration-color:#b99b00;background:rgba(255,228,92,.4)}.submitted-link-marker{fill:#7651a8;stroke:white;stroke-width:1;pointer-events:all}.submitted-link-key{width:.7rem;height:.7rem;transform:rotate(45deg);background:#7651a8}.paper-reference-link rect{fill:transparent;pointer-events:all}</style>', 1)
     rendered = rendered.replace('<h2>Submitted paper</h2>', '')
-    rendered = rendered.replace('<span>Light-grey underline:', '<span data-key="reference"><i class="submitted-link-key"></i>purple diamond: submitted-link issue</span><span>Light-grey underline:')
+    rendered = rendered.replace('<span>Light-grey underline:', '<span data-key="reference"><i class="submitted-link-key"></i>purple diamond: link issue</span><span>Light-grey underline:')
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.unverified-highlight,.reference-practice-overlay .reference-formatting-hit.unverified-highlight{fill:#f28b82;fill-opacity:.42;stroke:none}.reference-practice-overlay .reference-formatting-hit.reference-difference-highlight{fill:transparent;stroke:#0a7cff;stroke-width:1.8;stroke-dasharray:none;pointer-events:all}.issue-heading.unverified{text-decoration-color:#c5221f;background:rgba(242,139,130,.42)}.issue-heading.evidence{text-decoration-color:#2f62a8}.unverified-key,.difference-key{display:inline-block;width:1.3rem;height:.75rem}.unverified-key{background:#f28b826b}.difference-key{border:2px solid #0a7cff}.reference-finding .finding-item+.finding-item{margin-top:.6rem;padding-top:.6rem;border-top:1px solid #e4e7ec}</style>', 1)
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}.submitted-link-hit{fill:transparent;pointer-events:all}.submitted-link-key{width:.85rem;height:.85rem;transform:rotate(45deg);background:#7651a8}.focus-relevance .topical-reference-hit{display:block}</style>', 1)
     rendered = rendered.replace('</style>', '/* One connected workspace: a single control bar over the paper and the evidence window. */.workspace-bar{grid-column:1/-1;grid-row:1;display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.3rem .6rem;background:#fff;border-bottom:1px solid var(--line);min-width:0}.workspace-bar .toolbar{position:static;margin:0;padding:0;background:transparent;border:0;box-shadow:none;height:auto;flex-wrap:nowrap;overflow-x:auto;gap:.25rem;min-width:0}.evidence-controls{margin-left:auto}.evidence-controls>*{flex:none;white-space:nowrap}.evidence-controls .group{display:inline-flex;gap:.3rem}.toolbar button,.toolbar label{padding:.35rem .45rem}.toolbar button:disabled{opacity:.45;cursor:default}.layout>.paper{grid-row:2;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0;border:0;border-radius:0;background:transparent}.layout .paper-viewport{flex:1;min-height:0;overflow:auto;padding:.75rem}/* Skipped content-visibility pages report their last-rendered width; a flexible track stops it holding the column open. */.paper-pages{grid-template-columns:minmax(0,1fr)}.paper>.report-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}.side-pane{grid-row:2;min-height:0;min-width:0;display:grid;grid-template-columns:.75rem minmax(0,1fr);background:#fff;border-left:1px solid var(--line);transition:transform .22s ease}.side-pane .splitter{height:auto;position:static;background:var(--page)}.side-pane .evidence-column{min-height:0;min-width:0;display:flex;flex-direction:column}.side-pane .panel{flex:1;min-height:0;max-height:none;position:static;margin:0;border:0;border-radius:0}.layout.panel-sliding .side-pane{transform:translateX(100%)}.layout.panel-collapsed{grid-template-columns:minmax(0,1fr)}.layout.panel-collapsed .side-pane{display:none}@media(prefers-reduced-motion:reduce){.side-pane{transition:none}}.page-container{content-visibility:auto}.text-selection-off .page-container,.text-selection-off .page-container *{user-select:none!important;-webkit-user-select:none!important}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:auto auto auto;height:auto;overflow:visible}.workspace-bar{flex-wrap:wrap}.layout>.paper{grid-row:auto}.layout .paper-viewport{max-height:calc(100dvh - 3rem)}.side-pane{grid-row:auto;grid-template-columns:1fr;border-left:0;border-top:1px solid var(--line)}.side-pane .splitter{display:none}.side-pane .panel{max-height:none}}@media print{.workspace-bar,.side-pane{display:none}.layout{display:block;height:auto;overflow:visible;border:0;margin:0}.layout .paper-viewport{max-height:none;overflow:visible;padding:0}.page-container{content-visibility:visible}}/* Margin numbers and whole-entry reference targets. */.paper-badge{cursor:pointer}.paper-badge .badge-bg{fill:#fff;stroke:#7b8794;stroke-width:.6;vector-effect:non-scaling-stroke}.paper-badge .badge-number{font:600 7px system-ui,-apple-system,sans-serif;fill:#34404c;pointer-events:none}.paper-badge:hover .badge-bg,.paper-badge.selected .badge-bg{fill:#dcecff;stroke:var(--blue)}body.layout-paper .paper-badge{display:none}.style-guidance-links{margin-top:.8rem;padding-top:.5rem;border-top:1px solid #e4e7ec;font-size:.85rem;color:var(--muted)}body.layout-judgment .citation-overlay,body.layout-judgment .reference-practice-overlay,body.layout-judgment .reference-entry-overlay,body.layout-judgment .paper-badge{display:none}@media print{.paper-badge{display:none}}.reference-entry-overlay{cursor:pointer}.reference-entry-hit{fill:transparent;stroke:none;pointer-events:all}.reference-entry-overlay:hover .reference-entry-hit{fill:#b9dcff;fill-opacity:.12}.reference-entry-overlay.selected .reference-entry-hit{fill:#b9dcff;fill-opacity:.22}.reference-entry-overlay:focus{outline:none}.reference-entry-overlay:focus .reference-entry-hit{stroke:var(--blue);stroke-width:1;vector-effect:non-scaling-stroke}.badge-key{display:inline-flex;align-items:center;justify-content:center;min-width:1.05rem;height:.85rem;padding:0 .2rem;border:1px solid #7b8794;background:#fff;font-size:.62rem;font-style:normal;font-weight:600;color:#34404c}.citation-badge-key{border-radius:.45rem}.reference-badge-key{border-radius:2px}/* Linked summary instances and the Reference window. */.summary-instance{color:var(--blue)}.reference-availability{font-size:.95rem;margin:.6rem 0 .3rem}.reference-citations button{border:1px solid var(--line);background:#fff;border-radius:4px;padding:.1rem .45rem;margin:.1rem .15rem;font:inherit;font-size:.86rem;cursor:pointer}.reference-finding{border-top:1px solid var(--line);margin-top:.75rem;padding-top:.25rem}' + '</style>', 1)
@@ -4652,7 +4653,7 @@ def _render_continuous_paper(
             if 0 <= coords[0] < coords[2] and 0 <= coords[1] < coords[3]:
                 by_page.setdefault(page_index, []).append(coords)
         for page_index, rectangles in by_page.items():
-            marker_class = ('reference-field-marker submitted-link-marker' if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS
+            marker_class = ('reference-field-marker submitted-link-marker' if finding.get('finding_type') in LINK_MARKER_FINDINGS
                             else 'reference-field-marker')
             label = {'required_doi_missing':'Required DOI missing', 'required_author_missing':'Required author missing',
                      'duplicate_reference_entry':'Academic Practice: duplicate reference entry',
@@ -4668,7 +4669,7 @@ def _render_continuous_paper(
                      'assessment_link_missing':'Assessment-required link missing', 'submitted_link_issue':'Submitted-link issue'
                      }.get(finding.get('finding_type'), 'Citation/reference formatting issue')
             marks = ''
-            if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
+            if finding.get('finding_type') in LINK_MARKER_FINDINGS:
                 if page_index != max(by_page):
                     continue
                 x0,y0,x1,y1=rectangles[-1]
@@ -4686,7 +4687,7 @@ def _render_continuous_paper(
                     f'<rect class="reference-field-marker layer-mark mark-relevance" style="fill:#ef82ba;fill-opacity:.38;stroke:none;pointer-events:all" '
                     f'x="{x0-1.5:.3f}" y="{y0-1.5:.3f}" width="{x1-x0+3:.3f}" height="{y1-y0+3:.3f}" />'
                     for x0,y0,x1,y1 in rectangles)
-            elif finding.get('finding_type') not in SUBMITTED_LINK_FINDINGS:
+            elif finding.get('finding_type') not in LINK_MARKER_FINDINGS:
                 from app.services.highlight_priority import ACADEMIC_FINDINGS
                 kind = finding.get('finding_type')
                 # Soft red with a darker outline for "Cannot be verified", so

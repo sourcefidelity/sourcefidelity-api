@@ -55,7 +55,7 @@ from app.services.verification_evidence import (
 from app.services.text_quality import readable_text
 
 FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v12"
-FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v6"
+FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v7"
 # Measured 2026-09-28 over 824 stored claims: a median of 114 real sentences
 # (p90 163) were merged into 24 paragraph-length units. 128 keeps most claims
 # at real sentences; longer ones are merged far less.
@@ -114,6 +114,11 @@ An exact source_attribution_relation supplies separate actor, cue, and governed
 content spans. Only a resolved relation can establish a different proposition
 holder; a named-person mention or unresolved cue cannot. Unmarked scholarly
 prose is document voice unless exact quotation/reporting cues say otherwise.
+The document is the cited work, so document voice is the cited author's own
+voice; no sentence needs to name the author. Unmarked prose stating the
+proposition establishes the author as its holder. Unmarked prose stating a
+different or incompatible position shows the author holding that position,
+which still contradicts or qualifies attribution of the proposition.
 preceding_external_actor_context is a bounded anaphoric
 continuation from a named actor; honor it unless exact wording changes voice.
 Voice annotations are cues to check, not conclusions.
@@ -791,8 +796,15 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
     return PreparedFacetJudgment(items=items, sentences=sentences, redactions=redactions)
 
 
-def interpret_candidate_response(artifact, prepared: PreparedCandidate, raw, sentences):
+def interpret_candidate_response(
+    artifact, prepared: PreparedCandidate, raw, sentences, *, source_voice_overrides: bool = True,
+):
     """Validate one judge's response and derive the candidate outcome in code.
+
+    ``source_voice_overrides=False`` keeps the judge's own source-attribution
+    reading: the Judgment layout judges the statement on the evidence, and the
+    separate secondary-citation flag reports attribution to another work
+    (owner decision 2026-09-30).
 
     Raises ValidationError, ValueError, TypeError or RuntimeError when the
     response violates the fixed-ID contract; callers record the failure.
@@ -816,12 +828,15 @@ def interpret_candidate_response(artifact, prepared: PreparedCandidate, raw, sen
             context_resolution=context_resolution,
         )
     mappings = _validated_mappings(bundle, response)
-    mappings = normalize_source_attribution_mappings(
-        bundle,
-        mappings,
-        sentences,
-        cited_author_label=_active_cited_author_label(artifact),
-    )
+    if source_voice_overrides:
+        mappings = normalize_source_attribution_mappings(
+            bundle,
+            mappings,
+            sentences,
+            cited_author_label=_active_cited_author_label(artifact),
+        )
+    else:
+        mappings = silent_source_attribution_mappings(bundle, mappings)
     mappings = normalize_inherited_scope_mappings(
         bundle,
         mappings,
@@ -1461,6 +1476,33 @@ def _aggregate_compound_components(mappings):
     if all(direction == "contradicts" for direction in directions):
         return "contradicts"
     return "mixed_or_qualified"
+
+
+def silent_source_attribution_mappings(bundle, mappings):
+    """Silence is not contradiction (owner decision 2026-09-30, Judgment only).
+
+    When the judge finds no evidence for the statement as written, its
+    source-attribution reading cannot make the statement contradicted or
+    undecided: the attribution reading becomes absent evidence too, so the
+    statement goes to the wider search as insufficient evidence.
+    """
+    facets = {facet.facet_id: facet for facet in bundle.facets}
+    guard = next((m for m in mappings if facets[m.facet_id].kind == "candidate_as_written"), None)
+    if guard is None or guard.direction != "none":
+        return mappings
+    return [
+        mapping.model_copy(update={
+            "direction": "none",
+            "evidence_sentence_ids": [],
+            "limitations": [
+                *mapping.limitations[:4],
+                "No evidence for the statement as written; its attribution is not assessed.",
+            ],
+        })
+        if facets[mapping.facet_id].kind == "source_attribution" and mapping.direction != "none"
+        else mapping
+        for mapping in mappings
+    ]
 
 
 def normalize_source_attribution_mappings(

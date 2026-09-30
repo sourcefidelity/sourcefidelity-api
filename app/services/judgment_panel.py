@@ -16,6 +16,10 @@ state follows only from that assessment:
     agreement on {none}                -> insufficient evidence (red), but only
                                           after a wider search agrees again
 
+A single judge (owner decision 2026-09-27) answers each claim
+`JUDGMENT_SAMPLES` times (owner decision 2026-09-30: three) and the result at
+least two answers share is shown; answers that share none are undecided.
+
 Nothing here writes to the Evidence Package, the Sources report, summaries,
 counts or exports. No provider is called unless the caller passes routes
 built by `judge_arms.formal_judge_arms`, which a run does when the paper is
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+from collections import Counter
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -44,7 +49,7 @@ from app.services.judge_arms import call_cost_usd
 from app.services.judicial_proximity import JudicialPanelAssessment, assess_judicial_panel
 from app.services.llm_service import LLMCallFailure, LLMRoute, chat_completion_json
 
-PANEL_VERSION = "three-judge-panel-v1"
+PANEL_VERSION = "three-judge-panel-v4"
 REQUIRED_ARMS = 3
 DisplayState = Literal["supported", "qualified", "contradicts", "insufficient", "not_judged"]
 # Owner decision 10: the most serious judged result is shown for a claim that
@@ -67,6 +72,7 @@ class ArmResult:
     cost_basis: str = "unpriced"
     cache_key: str = ""
     cached: bool = False
+    in_majority: bool = True              # a single judge's sample that the shown result rests on
 
 
 @dataclass
@@ -196,7 +202,8 @@ def _run_arm(route, key, cached, prepared, context, sentences, call, temperature
     else:
         result.cached = True
     try:
-        finding = interpret_candidate_response(context, prepared, raw, sentences)
+        # The judge's own attribution reading stands (owner decision 2026-09-30).
+        finding = interpret_candidate_response(context, prepared, raw, sentences, source_voice_overrides=False)
     except (ValidationError, ValueError, TypeError, RuntimeError):
         result.failure = "invalid_response"
         return result
@@ -223,6 +230,10 @@ def judge_candidate(
     """Run the configured judges in parallel on the identical prompt and derive the state."""
     if not routes:
         raise ValueError("Judgment needs at least one judge")
+    samples = max(1, int(settings.JUDGMENT_SAMPLES or 1))
+    if len(routes) == 1 and samples > 1:
+        return _judge_by_majority(prepared, context, sentences, routes[0], policy_hash, samples,
+                                  cache_lookup=cache_lookup, cache_store=cache_store, call=call)
     keys = [arm_cache_key(route, policy_hash, prepared) for route in routes]
     # Cache reads and writes stay on the calling thread.
     cached = [cache_lookup(key) if cache_lookup else None for key in keys]
@@ -241,6 +252,63 @@ def judge_candidate(
     return CandidatePanelResult(candidate_id=prepared.bundle.candidate_id, display_state=state,
                                 reason_code=reason, arms=arms, assessment=assessment,
                                 prompt_sha256=prompt_sha256(prepared))
+
+
+# The shown result each label counts toward when one judge's answers are pooled.
+_SAMPLE_CATEGORY = {"supports": "supported", "qualifies": "qualified", "mixed": "qualified",
+                    "contradicts": "contradicts", "none": "insufficient", "uncertain": "undecided"}
+
+
+def sample_cache_key(base_key: str, index: int) -> str:
+    """The first answer keeps the ordinary key, so an earlier single-call result is reused."""
+    return base_key if index == 1 else hashlib.sha256(f"{base_key}\x1fsample-{index}".encode()).hexdigest()
+
+
+def majority_display_state(labels: list[str | None]) -> tuple[DisplayState, str, list[bool]]:
+    """(state, reason, which answers the result rests on) for one judge's repeated answers.
+
+    Fewer than two valid answers is a failed judge; answers with no shared
+    result, or a tie, are undecided (`samples_split`).
+    """
+    valid = [label for label in labels if label is not None]
+    if len(valid) < 2:
+        return "not_judged", "judge_failed", [False] * len(labels)
+    ranked = Counter(_SAMPLE_CATEGORY[label] for label in valid).most_common()
+    category, votes = ranked[0]
+    if votes < 2 or (len(ranked) > 1 and ranked[1][1] == votes):
+        return "not_judged", "samples_split", [False] * len(labels)
+    flags = [label is not None and _SAMPLE_CATEGORY[label] == category for label in labels]
+    agreeing = [label for label, flag in zip(labels, flags) if flag]
+    if category == "qualified":
+        label = "mixed" if agreeing.count("mixed") > agreeing.count("qualifies") else "qualifies"
+    else:
+        label = agreeing[0]
+    state, reason = _SINGLE_JUDGE[label]
+    return state, reason, flags
+
+
+def _judge_by_majority(prepared, context, sentences, route, policy_hash, samples, *,
+                       cache_lookup, cache_store, call) -> CandidatePanelResult:
+    base = arm_cache_key(route, policy_hash, prepared)
+    keys = [sample_cache_key(base, index) for index in range(1, samples + 1)]
+    cached = [cache_lookup(key) if cache_lookup else None for key in keys]
+    parent = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=samples) as pool:
+        futures = [pool.submit(parent.copy().run, _run_arm, route, key, hit, prepared, context, sentences, call)
+                   for key, hit in zip(keys, cached)]
+        arms = [future.result() for future in futures]
+    for index, arm in enumerate(arms, start=1):
+        if index > 1:
+            arm.arm_id = f"{route.arm_id}:s{index}"
+    if cache_store:
+        for arm in arms:
+            if arm.status == "valid" and not arm.cached:
+                cache_store(arm)
+    state, reason, flags = majority_display_state([arm.label if arm.status == "valid" else None for arm in arms])
+    for arm, flag in zip(arms, flags):
+        arm.in_majority = flag
+    return CandidatePanelResult(candidate_id=prepared.bundle.candidate_id, display_state=state,
+                                reason_code=reason, arms=arms, prompt_sha256=prompt_sha256(prepared))
 
 
 def not_judged(candidate_id: str, reason_code: str) -> CandidatePanelResult:

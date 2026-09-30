@@ -18,7 +18,7 @@
   const SEVERITY = {insufficient: 4, contradicts: 3, qualified: 2, supported: 1, undecided: 0.5};
   // Owner-approved labels (2026-09-28).
   const NAMES = {supported: 'Supports', qualified: 'Qualified or Mixed', contradicts: 'Contradicts',
-                 insufficient: 'Insufficient Evidence', undecided: 'LLM Undecided', not_judged: 'Not Judged', pending: ''};
+                 insufficient: 'Not Supported', undecided: 'LLM Undecided', not_judged: 'Not Judged', pending: ''};
   const byKey = new Map(data.marks.map(mark => [mark.key, mark]));
   const groups = new Map();
   for (const mark of data.marks) {
@@ -126,6 +126,12 @@
           const q = document.createElement('q'); q.textContent = sentence.text; li.append(q); list.append(li);
         }
       }
+      // A Supports result shows its key sentence outside the list (owner decision 2026-09-30).
+      for (const shown of slot.querySelectorAll('[data-key-evidence]')) {
+        list.querySelector(`[data-evidence-key="${CSS.escape(shown.dataset.keyEvidence)}"]`)?.remove();
+      }
+      const disclosure = list.closest('details');
+      if (disclosure) disclosure.hidden = !list.children.length;
     }
   }
   function fillPanel() {
@@ -234,7 +240,7 @@
       const parts = [['supported', (n, s) => `${n}/${x}${s} are supported by the sources`],
                      ['qualified', (n, s) => `${n}/${x}${s} have qualified or mixed support in the sources`],
                      ['contradicts', (n, s) => `${n}/${x}${s} contradict the sources`],
-                     ['insufficient', (n, s) => `${n}/${x}${s} have insufficient evidence to be attributed to the source`],
+                     ['insufficient', (n, s) => `${n}/${x}${s} are not supported by the sources`],
                      ['undecided', (n, s) => `${n}/${x}${s} cannot be decided upon by the LLM`]]
         .filter(([key]) => counts[key]).map(([key, text], i) => text(counts[key], i === 0 ? ' statements' : ''));
       const lacking = Number(summary.dataset.withoutFullText || 0);

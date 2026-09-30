@@ -37,6 +37,8 @@ from app.services.judgment_input import JudgmentInputUnavailable, judgment_eligi
 from app.services.judgment_coaching import COACHED_STATES, coach
 from app.services.judgment_report import candidate_text
 from app.services.judgment_panel import PANEL_VERSION, ArmResult, CandidatePanelResult, judge_candidate
+
+UNDECIDED_REASONS = frozenset({"judge_undecided", "judges_undecided"})
 from app.services.llm_service import chat_completion_json
 
 logger = logging.getLogger(__name__)
@@ -111,10 +113,11 @@ def _panel_json(result: CandidatePanelResult) -> dict:
     for arm in result.arms:
         item = {"arm_id": arm.arm_id, "model": arm.model, "status": arm.status, "label": arm.label,
                 "failure": arm.failure, "cached": arm.cached, "cost_usd": arm.cost_usd,
-                "cost_basis": arm.cost_basis}
+                "cost_basis": arm.cost_basis, "in_majority": arm.in_majority}
         if arm.finding is not None:
             item.update(derived_outcome=arm.finding.derived_outcome,
                         evidence_coverage=arm.finding.evidence_coverage,
+                        context_resolution=arm.finding.context_resolution,
                         locator_status=arm.finding.locator_status,
                         mappings=[m.model_dump(mode="json") for m in arm.finding.mappings])
         arms.append(item)
@@ -297,14 +300,21 @@ def execute_run(
                     spend += outcome.get("spend_usd", 0.0)
                     result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]
             coaching = None
-            if result.display_state in COACHED_STATES:
+            note_state = result.display_state
+            if (result.display_state == "not_judged" and result.reason_code in UNDECIDED_REASONS
+                    and any(a.finding is not None and a.finding.status == "uncertain"
+                            for a in result.arms if a.status == "valid" and a.in_majority)):
+                # A judge left part of the statement uncertain: the note says why
+                # (owner decision 2026-09-30). An unresolved statement keeps its fixed note.
+                note_state = "undecided"
+            if note_state in COACHED_STATES or note_state == "undecided":
                 wider_record = wider or {}
                 sentences = {sid: sentence.text for sid, sentence in prepared.sentences.items()}
                 sentences.update((wider_record.get("sentences") or {}))
                 facets = {f.facet_id: {"kind": f.kind, "text": f.text,
                                        "material_to_aggregate": f.material_to_aggregate}
                           for f in item.bundle.facets}
-                coaching = coach(result.display_state, candidate_text(payload, item.bundle.candidate_id),
+                coaching = coach(note_state, candidate_text(payload, item.bundle.candidate_id),
                                  context.claim.citation_marker or "", facets,
                                  wider_record.get("panel") or _panel_json(result), sentences,
                                  route=note_route, call=call, cache_lookup=cache.coaching_lookup,
