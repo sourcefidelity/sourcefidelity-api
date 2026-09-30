@@ -25,11 +25,11 @@ SourceFidelity targets source use directly. It does not try to detect AI use, bu
 
 ### Working now
 
-- **Source identification, verification and retrieval** — the core feature. Each reference is parsed and searched across academic metadata services, book and public-domain catalogues, and web search. Located works are retrieved as full text where permitted. A reference that every search suited to its kind has failed to locate is reported as **Cannot be verified**; a failed or incomplete search is reported as incomplete, never as a negative result.
+- **Source identification, verification and retrieval** — the core feature. Each reference is parsed and searched across academic metadata services, book and public-domain catalogues, and web search. Located works are retrieved as full text where permitted. A reference that every search suited to its kind has failed to locate is reported as **Cannot be verified**; a failed or incomplete search is reported as incomplete, never as a negative result. A retrieved web page counts as full text only when it shows no sign of being cut off and its length fits the kind of source cited.
 - **Citation–source relationship judgment** — runs automatically on every checked paper. Each citation is compared with evidence sentences selected from the retrieved source and labelled **Supports**, **Qualified or Mixed**, **Contradicts** or **Insufficient Evidence**; when the model cannot decide, the citation is labelled **LLM Undecided**. Every judgment links to the source sentences it is based on, so students can see how they used a source and instructors can see where a source may have been used incorrectly.
-- **Academic-practice flags** — misquotation, patchwriting, secondary citation and related practices, with the student wording and source wording shown side by side.
-- **APA citation and referencing style checks** — for example, incorrect title formatting, missing quotation locators, and missing DOIs or URLs for references that should have them.
-- **Source upload** — students and instructors can upload sources the application could not retrieve.
+- **Academic-practice flags** — misquotation, patchwriting, secondary citation and related practices, with the student's wording shown above the source wording and copied words in bold.
+- **APA citation and referencing style checks** — for example, incorrect title formatting, missing quotation locators, missing DOIs or URLs for references that should have them, parenthetical citations placed after a sentence's final punctuation, and references that are not cited in the paper.
+- **Source upload** — in Personal deployments, users can upload sources the application could not retrieve.
 - **Source storage that respects copyright** — verified open-access academic sources are stored permanently; all other sources are stored temporarily. Stored sources do not need to be searched for again, so later papers citing them process faster and cost less.
 - **Reports** — a live report with source viewing and upload, and portable HTML/PDF exports.
 
@@ -76,7 +76,7 @@ Personal deployment works on its own but takes some setup, because the applicati
 - **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, Unpaywall, Elsevier (optional)
 - **Books and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource
 - **Web search:** Brave Search, Exa, Tavily, SearXNG (self-hosted, included)
-- **LLMs:** DeepSeek, GLM (Zhipu / Z.ai); other providers can be configured behind the same interface
+- **LLMs:** DeepSeek, GLM (Z.ai); other providers can be configured behind the same interface
 
 ---
 
@@ -106,7 +106,7 @@ In `.env`:
 
 - Set `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD` and `SEARXNG_SECRET`, and use the same database password in `DATABASE_URL`.
 - Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY` and any search keys (`BRAVE_SEARCH_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_BOOKS_API_KEY`).
-- For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set. Use `ZAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4` for a key issued on that platform.
+- For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
 - For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
 
 **2. Start the stack**
@@ -138,6 +138,7 @@ The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_lo
 - ✅ In-text citation extraction (APA, MLA)
 - ✅ Evidence packages and live/exported reports
 - ✅ Citation–source relationship judgment
+- ✅ Academic-practice flags and APA style checks
 - 📝 Moodle plugin (`sourcefidelity-moodle`, GPLv3)
 - 📝 Library platform integration
 - 📝 Cross-assessment comparison, student-paper repository, Wikipedia similarity scoring
