@@ -363,3 +363,26 @@ def test_a_same_titled_record_with_another_publisher_names_the_publisher_too():
                                              'located_value': 'Greenwood'}
     assert 'publisher_difference' not in same_title_author_difference(ref, record('Palgrave'))
     assert 'publisher_difference' not in same_title_author_difference(ref, record(''))
+
+
+def _with_web_query(found, engine, outcome):
+    qid = f'x-{engine}-{outcome}'
+    found['queries'].append(query(qid, 'web_search', f'"{TITLE}" river', outcome=outcome, engine=engine))
+    found['attempts'].append(attempt(f'y-{engine}', 'bounded_web', 'web_search', [qid]))
+    return found
+
+
+def test_a_web_provider_skipped_by_our_own_budget_leaves_the_search_incomplete():
+    """Owner decision 2026-10-01: Exa skipped by our budget while Brave completed is not complete coverage."""
+    result = assess_reference_verification(ref(), _with_web_query(discovery(web=('brave',)), 'exa', 'budget_skipped'))
+    assert result['status'] == 'search_incomplete' and result['reason_code'] == 'web_search_skipped_by_budget'
+    assert result['incomplete_routes'] == ['Exa'] and result['findings'] == []
+
+
+def test_a_provider_failure_or_a_completed_retry_still_counts_as_before():
+    # A provider-side failure keeps the quorum: Brave alone completes the web search.
+    failed = assess_reference_verification(ref(), _with_web_query(discovery(web=('brave',)), 'exa', 'timeout'))
+    assert failed['status'] == 'cannot_be_verified'
+    # A skipped query does not matter when the same provider completed another title search.
+    retried = assess_reference_verification(ref(), _with_web_query(discovery(web=('brave', 'exa')), 'exa', 'budget_skipped'))
+    assert retried['status'] == 'cannot_be_verified'

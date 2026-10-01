@@ -30,8 +30,10 @@ from app.services.reference_review_scope import text_key
 from app.services.source_type import is_bibliographically_searchable, normalize_source_kind
 
 # v2 (2026-09-29): structured title queries (`query.title`, `title.search`)
-# count as title-led unless confined to one journal. v1 values stay readable;
-# nothing parses this string back.
+# count as title-led unless confined to one journal. Amended 2026-09-30 (Google
+# Books title searches) and 2026-10-01 (a required web provider skipped by our
+# own budget leaves the search incomplete). v1 values stay readable; nothing
+# parses this string back.
 POLICY = 'reference-verification-v2'
 POLICY_VERSIONS = ('reference-verification-v1', POLICY)
 FINDING_TYPE = 'unverified_reference'
@@ -58,6 +60,11 @@ WEB_PROVIDERS = frozenset({'brave', 'exa'})
 BOOK_CATALOGUES = frozenset({'google_books', 'open_library', 'internet_archive'})
 COMPLETED_ROUTE = frozenset({'no_match', 'candidate_found', 'candidates_processed'})
 COMPLETED_QUERY = frozenset({'results', 'no_results'})
+# Skipped by this application's own search or elapsed budget, not by the
+# provider. A required web provider skipped this way leaves the web search
+# incomplete even when the other one completed (owner decision 2026-10-01:
+# both genuine regional articles flagged on the owner's paper had Exa skipped).
+SELF_SKIPPED_QUERY = frozenset({'budget_skipped'})
 CONFIRMED = frozenset({'confirmed', 'confirmed_with_minor_differences'})
 PROVIDER_NAMES = {
     'crossref': 'Crossref', 'openalex': 'OpenAlex', 'datacite': 'DataCite',
@@ -247,7 +254,7 @@ def assess_reference_verification(reference, discovery: dict | None) -> dict:
 
     queries = {q.get('query_id'): q for q in discovery.get('queries') or []}
     title = text_key(expected.get('title') or getattr(reference, 'title', '') or '')
-    completed, failed, web = set(), set(), set()
+    completed, failed, web, self_skipped = set(), set(), set(), set()
     for attempt in discovery.get('attempts') or []:
         category, provider = attempt.get('route_category'), attempt.get('provider')
         attempted = [queries[q] for q in attempt.get('query_ids') or [] if q in queries]
@@ -269,6 +276,8 @@ def assess_reference_verification(reference, discovery: dict | None) -> dict:
                     web.add(engine)
                 elif q.get('execution_outcome') not in COMPLETED_QUERY:
                     failed.add(engine)
+                    if q.get('execution_outcome') in SELF_SKIPPED_QUERY:
+                        self_skipped.add(engine)
     required = required_adapters(kind)
     missing = [p for p in required if p not in completed]
     result.update(required_routes=list(required), completed_routes=sorted(completed & set(required)),
@@ -277,6 +286,12 @@ def assess_reference_verification(reference, discovery: dict | None) -> dict:
         result.update(status='search_incomplete',
                       reason_code='required_route_incomplete' if missing else 'title_web_search_incomplete',
                       incomplete_routes=missing + ([] if web else ['web search']),
+                      failed_routes=sorted(failed))
+        return result
+    budget_skipped = sorted(self_skipped - web)
+    if budget_skipped:
+        result.update(status='search_incomplete', reason_code='web_search_skipped_by_budget',
+                      incomplete_routes=[PROVIDER_NAMES[p] for p in budget_skipped],
                       failed_routes=sorted(failed))
         return result
     searched = [PROVIDER_NAMES.get(p, p) for p in required] + [PROVIDER_NAMES[p] for p in sorted(web)]
