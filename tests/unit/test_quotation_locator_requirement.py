@@ -82,7 +82,7 @@ def test_omission_is_localized_to_quote_not_reference_list():
     _attach_reference_field_geometry({'reference_practice':findings},doc,'a'*64)
     assert findings[0]['localization_status']=='exact_field'
     assert all(r['y1']<150 for r in findings[0]['rectangles'])
-    assert 'Citation and reference formatting' in _render_reference_panel_template(findings[0],1)
+    assert 'Citation and Reference Formatting' in _render_reference_panel_template(findings[0],1)
 
 
 def test_explicit_narrative_quotation_has_versioned_omission():

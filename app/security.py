@@ -21,7 +21,7 @@ from app.config import settings
 REPORT_VIEW_CAPABILITY = "report:view"
 REPORT_PAPER_CAPABILITY = "report:paper:view"
 REPORT_SOURCE_CAPABILITY = "authorized_source_content"
-# Starting the experimental Judgment layout (paid model calls, after notice acceptance).
+# Starting or retrying a Judgment run (paid model calls; no notice since 2026-09-28).
 REPORT_JUDGMENT_CAPABILITY = "report:judgment:run"
 PAPER_CHECK_CAPABILITY = "paper:check"
 PAPER_STATUS_CAPABILITY = "paper:status:view"

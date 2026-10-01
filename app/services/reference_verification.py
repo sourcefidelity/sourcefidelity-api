@@ -1,6 +1,7 @@
 """Whether the application could confirm that a cited work exists.
 
-Owner-approved 2026-09-24, `reference-verification-v1`. This replaces the
+Owner-approved 2026-09-24 as `reference-verification-v1`; the current policy is
+v2 (2026-09-29/30, see POLICY). This replaces the
 former "potentially fabricated" review flag. The application cannot decide
 fabrication; it can say, truthfully, that the searches suited to the kind of
 work did not locate it. That statement is an Evidence finding, not an Academic

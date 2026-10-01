@@ -226,6 +226,6 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         note = UNDECIDED_NOTE if reason == "samples_split" else UNDECIDED_WORDING_NOTE
         parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
     if reason in _RETRY_REASONS:
-        parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try again</button></p>')
+        parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')
     parts.append("</section>")
     return {"state": state, "label": LABELS[state], "html": "".join(p for p in parts if p), "evidence": evidence}

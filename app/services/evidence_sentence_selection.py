@@ -9,8 +9,9 @@ the judge's references point into them.
 
 Measured before adoption (STATE §5): owner review of the seven-case picks, and
 no picks in 30 real citation/unrelated-source pairs. Without a usable GLM route,
-or when the response fails its checks, the status says so and the report falls
-back to the relevance gate's passage display. An empty selection means no
+or when the response fails its checks, the status says so and the window shows
+no selection; for a judged claim the sentences the judge relied on form the
+list. The PDF export keeps the relevance gate's passage display. An empty selection means no
 sentence was chosen from the retrieved passages, not that the source lacks
 evidence. Presentation only: the Evidence Package is unchanged.
 """

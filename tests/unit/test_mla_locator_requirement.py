@@ -77,7 +77,7 @@ def test_mla_panel_and_body_geometry():
     _attach_reference_field_geometry({'reference_practice':findings}, doc, 'a'*64)
     assert findings[0]['rectangles'] and all(r['y1'] < 150 for r in findings[0]['rectangles'])
     panel = _render_reference_panel_template(findings[0], 1)
-    assert 'Citation and reference formatting' in panel and 'MLA citation guidance' not in panel
+    assert 'Citation and Reference Formatting' in panel and 'MLA citation guidance' not in panel
     assert 'APA quotation guidance' not in panel
 
 

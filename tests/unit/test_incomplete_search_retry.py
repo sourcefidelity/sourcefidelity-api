@@ -1,4 +1,4 @@
-"""Automatic retries of incomplete searches and the "Search again" button.
+"""Automatic retries of incomplete searches and the "Search Again" button.
 
 Synthetic throughout: no student or source text.
 """
@@ -294,7 +294,7 @@ def test_button_is_offered_only_for_incomplete_members_in_the_connected_report()
     soup = BeautifulSoup(_render_member(members[0]), "html.parser")
     form = soup.select_one("form.search-again")
     assert form["method"] == "post" and form["action"].endswith("/ref-text/search-again")
-    assert form.button.get_text() == "Search again" and form.button["type"] == "submit"
+    assert form.button.get_text() == "Search Again" and form.button["type"] == "submit"
     assert form.select_one(".upload-status").get_text() == ""
     # The Reference N window showing the same member offers the same button.
     from app.services.evidence_report import _render_reference_window_template
@@ -303,7 +303,7 @@ def test_button_is_offered_only_for_incomplete_members_in_the_connected_report()
     template = BeautifulSoup(_render_reference_window_template(entry, [], [{"members": members}]),
                              "html.parser").template
     window = BeautifulSoup(template.decode_contents(), "html.parser")
-    assert [b.get_text() for b in window.select("form.search-again button")] == ["Search again"]
+    assert [b.get_text() for b in window.select("form.search-again button")] == ["Search Again"]
     # The persisted (export) projection carries no action, so no button.
     assert "search-again" not in _render_member(view["citations"][0]["members"][0])
     assert _render_search_again({}) == ""
@@ -322,12 +322,12 @@ def test_exports_never_contain_the_button(export_store, monkeypatch):  # noqa: F
     portable["reference_practice"] = []
     portable["paper_surface"]["presentation_sha256"] = hashlib.sha256(paper).hexdigest()
     html = build_interactive_report_html(portable, paper).decode()
-    assert "Search again" not in html and "search-again\"" not in html
+    assert "Search Again" not in html and "search-again\"" not in html
     monkeypatch.setattr("app.services.report_export.project_reference_flags", lambda value, *a: value)
     exported = build_released_report_export(session, storage, report_id=report.id,
                                             scope_type="personal_owner", scope_id="owner-1")
     with fitz.open(stream=exported.content, filetype="pdf") as document:
-        assert "Search again" not in " ".join(page.get_text() for page in document)
+        assert "Search Again" not in " ".join(page.get_text() for page in document)
 
 
 @pytest.fixture

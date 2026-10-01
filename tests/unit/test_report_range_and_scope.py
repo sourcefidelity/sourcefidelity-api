@@ -19,12 +19,12 @@ def test_reading_guide_explains_purple_diamond_under_citation_and_reference_form
     # Owner decision 2026-09-30: every link issue, including a missing DOI or link.
     from bs4 import BeautifulSoup
     guide=BeautifulSoup(_render_how_to_read({}),'html.parser')
-    heading=next(h for h in guide.select('details h2') if h.get_text()=='Citation and reference format checking')
+    heading=next(h for h in guide.select('details h2') if h.get_text()=='Citation and Reference Format Checking')
     assert heading.find_next_sibling('p').get_text() == (
         'Orange highlights mark citation and reference style and layout issues. A purple diamond marks a link or '
         'DOI issue: a link that is dead or incorrect, a DOI registered to a different source, or a DOI or link '
         'the reference should include but does not.')
-    academic=next(h for h in guide.select('details h2') if h.get_text()=='Poor academic practice')
+    academic=next(h for h in guide.select('details h2') if h.get_text()=='Poor Academic Practice')
     assert 'purple diamond' not in academic.find_next_sibling('p').get_text()
 
 
@@ -32,8 +32,8 @@ def test_how_to_read_is_the_owners_revised_text_in_order():
     from bs4 import BeautifulSoup
     guide=BeautifulSoup(_render_how_to_read({}),'html.parser')
     assert [h.get_text() for h in guide.select('details h2')]==[
-        'Source identification, verification and retrieval','Poor academic practice',
-        'Citation and reference format checking','Source use judgment']
+        'Source Identification, Verification and Retrieval','Poor Academic Practice',
+        'Citation and Reference Format Checking','Source Use Judgment']
     # The same text is shown once in the dialog before the report.
     assert [h.get_text() for h in guide.select('dialog h2')]==[h.get_text() for h in guide.select('details h2')]
     assert guide.select_one('dialog [data-close-guide]').get_text()=='Close'
@@ -94,7 +94,7 @@ def test_bibliography_outline_reuses_bound_advisory_and_exact_geometry():
         assert finding['finding_type'] == 'source_topical_mismatch'
         assert finding['rectangles'] and not view['reference_practice']
         panel = _render_reference_panel_template(finding,1)
-        assert 'possible topical mismatch' in panel and 'fish' in panel and 'birds' in panel
+        assert 'Possible Topical Mismatch' in panel and 'fish' in panel and 'birds' in panel
         html,_ = _render_continuous_paper({'page_dimensions':[{'page_index':0,'width':612,'height':792}],
             'page_href_template':'page-{page_index}.png'},[],reference_practice=[finding])
         assert 'reference-field-marker layer-mark mark-relevance' in html
@@ -103,7 +103,7 @@ def test_bibliography_outline_reuses_bound_advisory_and_exact_geometry():
         with fitz.open(stream=output,filetype='pdf') as rendered:
             assert any(d['fill'] and all(abs(a-b)<.002 for a,b in zip(d['fill'],(.937,.510,.729)))
                        for d in rendered[0].get_drawings())
-            assert 'Potential topical mismatch' in ''.join(p.get_text() for p in rendered)
+            assert 'Potential Topical Mismatch' in ''.join(p.get_text() for p in rendered)
         broken = deepcopy(result)
         broken['citations'][0]['student_text'] += ' Changed.'
         assert not project_reference_flags(broken,doc,'hash')['reference_practice']

@@ -1,10 +1,10 @@
-"""Revision coaching for the Judgment layout (Phase D; owner decision 9).
+"""Judgment notes (ARCHITECTURE §7).
 
-One DeepSeek note for every claim shown amber (qualified or mixed), purple
-(contradicts) or red (insufficient evidence), and for an undecided judge whose
+One DeepSeek note for every claim shown amber (Qualified or Mixed), purple
+(Contradicts) or red (Not Supported), and for an undecided judge whose
 readings name the undecided part (owner decision 2026-09-30); that note must
-not decide the result itself. The note explains the result and
-says what to check. Application checks reject a note that quotes words found
+not decide the result itself. Since v4 a note describes the result only, with
+no advice or instructions. Application checks reject a note that quotes words found
 in neither the statement nor the evidence, writes replacement wording, points
 to other sources, cites evidence the judges did not bind, or runs long. A
 rejected note is retried once, then a fixed note for the state is shown.

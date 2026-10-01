@@ -29,7 +29,7 @@ def test_role_boilerplate_suppressed_in_legacy_projection():
 def test_cost_label_has_no_explanatory_notes():
     # Owner request 2026-09-28: the cost figure without the partial-pricing note.
     text = _render_technical_details({'estimated_cost_usd':.12, 'cost_estimate_partial':True})
-    assert 'Estimated cost (before credits)' in text and 'US$0.1200' in text
+    assert 'Estimated Cost (Before Credits)' in text and 'US$0.1200' in text
     assert 'Partial: usage with no price on record is excluded' not in text
     assert 'total API cost' not in text
 

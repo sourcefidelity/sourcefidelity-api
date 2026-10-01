@@ -58,7 +58,7 @@ def credibility_records_html(finding):
         explanation = str(finding.get('evidence_explanation') or '')
         limits = ''.join('<p class="muted">' + escape(str(item)) + '</p>'
                          for item in finding.get('limitations') or [])
-        return ('<details><summary>Search details</summary><p>' + escape(explanation) +
+        return ('<details><summary>Search Details</summary><p>' + escape(explanation) +
                 '</p>' + limits + '</details>') if explanation else ''
     rows = []
     if finding.get('evidence_explanation'):

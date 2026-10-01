@@ -52,8 +52,8 @@ def build_interactive_report_html(view: dict, paper_content: bytes) -> bytes:
             image_bytes+=len(encoded)
             if image_bytes>60*1024*1024:raise ValueError('Portable page images exceed export size')
             images[f'offline-page-{p.number}']='data:image/png;base64,'+encoded
-    # No Judgment layout offline: a forwarded file can reach someone who never
-    # accepted its notice (ARCHITECTURE §7).
+    # Judgment travels as finished results drawn statically (ARCHITECTURE §7);
+    # the live run/poll script is not part of the portable file.
     result['portable_export']=True
     # Remove server operations recursively before serialization, not just visually.
     def clean(value):
@@ -71,7 +71,7 @@ def build_interactive_report_html(view: dict, paper_content: bytes) -> bytes:
     nonce=secrets.token_urlsafe(24)
     soup=BeautifulSoup(render_evidence_report_html(result,csp_nonce=nonce),'html.parser')
     if not soup.find(id='select-text'):
-        select=soup.new_tag('button',id='select-text');select['type']='button';select['aria-pressed']='false';select.string='Select text'
+        select=soup.new_tag('button',id='select-text');select['type']='button';select['aria-pressed']='false';select.string='Select Text'
         soup.select_one('.paper-toolbar').append(select)
     for node in soup.select('image'):
         href=node.get('href','')
@@ -79,8 +79,6 @@ def build_interactive_report_html(view: dict, paper_content: bytes) -> bytes:
         node['href']=images[href]
     for node in soup.select('form, .technical-export'):
         node.decompose()
-    judgment=soup.find(id='judgment-layout')
-    if judgment:judgment.decompose()
     for node in soup.find_all(True):
         for key in list(node.attrs):
             if key.startswith('data-') and any(s in key for s in ('href','url')):

@@ -2538,7 +2538,7 @@ class SourceResolver:
                 if source not in public_domain_sources and source not in web_sources
             ]
             # An index that cannot hold this kind of work is not asked about
-            # it (reference-verification-v1). The adapter declares what it
+            # it (reference-verification). The adapter declares what it
             # holds; an unclassified reference still consults every index.
             unsuited_sources = [
                 source for source in structured_sources

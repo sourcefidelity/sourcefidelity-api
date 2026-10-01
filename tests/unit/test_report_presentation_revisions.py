@@ -58,4 +58,4 @@ def test_help_is_style_specific_in_windows_not_summaries_and_not_source_evidence
 def test_panel_heading_uses_citation_number():
     html = _render_panel_template({'members': [], 'student_text': 'Text.'}, 17)
     assert '<h2>Citation 17<span data-proposition-suffix></span></h2>' in html
-    assert 'Selected citation</h2>' not in html
+    assert 'Selected Citation</h2>' not in html

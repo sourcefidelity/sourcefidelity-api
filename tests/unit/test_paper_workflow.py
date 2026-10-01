@@ -902,7 +902,7 @@ def test_unbound_continuation_preserves_anchor_without_blocking_explicit_evidenc
     assert not member["show_quotation_check"]
     html = _render_member(member)
     assert "Continuation not assessed" in html
-    assert "Source not retrieved" not in html
+    assert "Source Not Retrieved" not in html
     panel = _render_panel_template(citation, 1)
     assert '<h3 class="member-label">Not assessed</h3>' in panel
     assert "<h3>Not retrieved</h3>" not in panel
@@ -1109,7 +1109,7 @@ def test_submitted_link_observations_checkpoint_and_report_data(monkeypatch, fai
         for audience in ('student', 'instructor'):
             html = render_evidence_report_html({**view, 'audience': audience}, csp_nonce='link-check-test-nonce')
             assert 'Submitted links in uncited references' not in html
-            assert 'Submitted link check' not in html  # No localized reference flag in this raw view.
+            assert 'Submitted Link Check' not in html  # No localized reference flag in this raw view.
     engine.dispose()
 
 
@@ -1435,9 +1435,9 @@ def test_evidence_report_renders_continuous_page_surface_with_typed_overlay():
     assert 'class="selected-citation"' in rendered
     assert "View in paper" not in rendered
     assert "Citation evidence</h2>" not in rendered
-    assert "Submitted paper</h2>" not in rendered
+    assert "Submitted Paper</h2>" not in rendered
     assert 'href="#citation-location-1">Citation 1</a><span data-proposition-suffix></span></h2>' in rendered
-    assert "Citations without exact page geometry" not in rendered
+    assert "Citations Without Exact Page Geometry" not in rendered
     assert "mouseenter" not in rendered
     assert 'id="paper-layout"' not in rendered and 'id="sources-layout"' not in rendered
     assert 'id="sources-layout"' not in rendered   # one layout (2026-09-28)
@@ -1446,10 +1446,10 @@ def test_evidence_report_renders_continuous_page_surface_with_typed_overlay():
     assert 'id="report-splitter"' in rendered
     assert 'aria-valuemin="30" aria-valuemax="80" aria-valuenow="68"' in rendered
     assert 'aria-label="Resize paper and evidence panels"' in rendered
-    assert "Paper view" not in rendered
+    assert "Paper View" not in rendered
     assert "Citation spans represented" not in rendered
-    assert "How to read this report" in rendered
-    assert "Patterns and issues" not in rendered and "Priorities for revision" not in rendered
+    assert "How to Read This Report" in rendered
+    assert "Patterns and Issues" not in rendered and "Priorities for revision" not in rendered
     assert "Repeated patterns" not in rendered
     assert "Report Counts and Evidence Breakdown" not in rendered
     assert "Facet Fidelity" not in rendered

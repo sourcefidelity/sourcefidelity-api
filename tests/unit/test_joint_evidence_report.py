@@ -85,10 +85,10 @@ def test_conditional_short_extracts_one_heading_and_bounded_context(count):
     html = _render_member(value)
     # The window shows only GLM-selected sentences now (owner decision
     # 2026-09-28); the relevance gate's extracts remain in the PDF.
-    assert '<blockquote' not in html and 'Additional evidence and context' not in html
+    assert '<blockquote' not in html and 'Additional Evidence and Context' not in html
     pdf_html = _portable_member_html(value)
     assert pdf_html.count('<blockquote') == 2 * count
-    assert pdf_html.count('Additional evidence and context') == 1
+    assert pdf_html.count('Additional Evidence and Context') == 1
     assert 'Full context for the selected excerpt' not in pdf_html
     assert value == before
 

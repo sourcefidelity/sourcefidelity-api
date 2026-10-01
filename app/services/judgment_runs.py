@@ -1,16 +1,16 @@
-"""On-demand Judgment runs over one report (ARCHITECTURE §7).
+"""Judgment runs over one report (ARCHITECTURE §7).
 
-A run walks the report's citations in paper order. For each cited source with
-a stored verification record it checks eligibility (complete full text,
-verified identity), rebuilds the exact prompts from the stored record, and
-judges each clause candidate with the three-arm panel. Results are written one
-row per candidate in arrival order (`seq`), so the viewer can show them as
-they finish. Nothing is written to the report, the Evidence Package or any
-Sources output.
+A run starts when the paper is checked (or when Judgment is first opened on a
+report checked earlier). It walks the report's citations in paper order. For
+each cited source with a stored verification record it checks eligibility
+(complete full text, verified identity), rebuilds the exact prompts from the
+stored record, and judges each clause candidate with the configured judges
+(one GLM judge answering three times since 2026-09-30). Results are written one
+row per candidate in arrival order (`seq`), so the viewer can show them as they
+finish. Nothing is written to the Evidence Package.
 
-No provider is called unless the run was started after the viewer accepted
-the current notice (the router enforces that) and every arm's policy gate
-passes here; otherwise the run ends `unavailable` with no call made.
+No provider is called unless every judge's policy gate passes (key, verified
+terms date, price ceiling); otherwise the run ends `unavailable` with no call.
 """
 from __future__ import annotations
 

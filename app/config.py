@@ -121,11 +121,9 @@ class Settings(BaseSettings):
     # Bounded structured judgment is shadow-only until a fixed-corpus
     # calibration justifies allowing its validated outputs to change verdicts.
     PAPER_EXPERIMENTAL_RELATIONSHIP_JUDGMENTS_ENABLED: bool = False
-    # Input bound for one Judgment panel prompt (all three judges get the same
-    # bytes). Measured 2026-09-25 over 295 stored candidates: estimated input
-    # median 7,092, p90 8,659, max 10,920 tokens, each with the full 24
-    # selected sentences; the paper run's 4,000 would admit 8 of them. Still a
-    # bounded excerpt, never a complete source file.
+    # Input bound for one Judgment prompt (up to 128 real sentences per claim
+    # since foundation v11; measured median about 7,800 and max about 11,100
+    # tokens, STATE). Still a bounded excerpt, never a complete source file.
     JUDGMENT_MAX_INPUT_TOKENS: int = 16_000
     # Development only: the three Judgment arms answer from a deterministic
     # local stand-in instead of any provider (no network, no spend), so the
@@ -460,7 +458,8 @@ class Settings(BaseSettings):
     # `force_search` bypasses it. 0 disables reuse.
     # Patchwriting detector (patchwriting-v3) run during each paper check while
     # every retrieved source's text is authorized (owner decision 2026-09-29).
-    # Results are stored under the verification summary and shown nowhere yet.
+    # Results are stored under the verification summary and shown in the report
+    # (yellow Academic Practice marks and window lines).
     PATCHWRITING_AT_CHECK_ENABLED: bool = True
     SEARCH_REUSE_PAUSE_DAYS: int = Field(default=30, ge=0)
     # Comma-separated paid/bounded fallbacks, tried only when the primary

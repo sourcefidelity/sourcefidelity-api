@@ -56,7 +56,7 @@ def test_factual_identifier_error_is_purple_link_issue_in_academic_summary():
     assert not summary['reference_formatting']
     assert not summary['evidence']
     panel=_render_reference_panel_template(f,1)
-    assert 'Submitted-link issue' in panel and 'issue-heading formatting' not in panel
+    assert 'Submitted-Link Issue' in panel and 'issue-heading formatting' not in panel
     surface=dict(page_dimensions=[dict(page_index=0,width=612,height=792)],page_href_template='p-{page_index}')
     html,_=_render_continuous_paper(surface,[],[f])
     soup=BeautifulSoup(html,'html.parser')
@@ -69,7 +69,7 @@ def test_factual_identifier_error_is_purple_link_issue_in_academic_summary():
         doc.new_page().insert_text((40,60),'Author. Title. doi:10.1234/a')
         rendered,_=_render_pdf(doc.tobytes(),citations=[],reference_practice=[f],export_binding='test',view=None)
     with fitz.open(stream=rendered,filetype='pdf') as doc:
-        assert 'Submitted-link issue' in '\n'.join(p.get_text() for p in doc)
+        assert 'Submitted-Link Issue' in '\n'.join(p.get_text() for p in doc)
         strokes=[d['color'] for d in doc[0].get_drawings() if d['color']]
         assert any(all(abs(a-b)<.001 for a,b in zip(color,(.463,.318,.659))) for color in strokes)
         assert doc[0].get_links()

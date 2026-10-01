@@ -1,4 +1,4 @@
-"""Three-judge panel for the Judgment layout (ARCHITECTURE §7, owner decisions 2026-09-24/25).
+"""Judges for the Judgment layout (ARCHITECTURE §7): one GLM judge answering three times, or the post-prototype three-judge panel.
 
 For one clause-level candidate, every arm receives the identical prepared
 prompt (`facet_evidence_judgment.prepare_candidate_prompts`). Each response is

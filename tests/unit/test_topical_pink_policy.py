@@ -63,7 +63,7 @@ def test_both_audiences_summarize_and_window_heading_identifies_mismatch():
     assert any('1 source is possibly not related to the citation' in row for row in map(summary_text, result['evidence']))
     html=_render_panel_template(citation,1)
     soup=BeautifulSoup(html,'html.parser')
-    assert BeautifulSoup(str(soup.select_one('h3')),'html.parser').get_text()=='Not Judged - Abstract Retrieved – possible topical mismatch'
+    assert BeautifulSoup(str(soup.select_one('h3')),'html.parser').get_text()=='Not Judged - Abstract Retrieved – Possible Topical Mismatch'
     assert soup.select_one('h3 mark.topical')
     result=_build_report_summary(citations=[citation],overview={},pervasive_hanging_indent=False,require_paper_flags=True)
     assert not result['evidence']

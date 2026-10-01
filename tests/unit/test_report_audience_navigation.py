@@ -22,7 +22,7 @@ def test_one_report_keeps_every_issue_type_without_a_cap():
 def test_combined_headings_are_explicit_without_repeated_source():
     issue={'source':{},'finding':'Title lacks italics.','finding_type':'reference_title_style'}
     panel=BeautifulSoup(_render_reference_panel_template(issue,1,combined=True),'html.parser')
-    assert str(panel.select_one('strong').string) == 'Citation and reference formatting'
+    assert str(panel.select_one('strong').string) == 'Citation and Reference Formatting'
     assert not panel.select('.full-reference')
     citation={'student_text':'A claim (Writer, 2020).','members':[],
               'missing_reference_members':['Writer, 2020'],'boundary_reason':'No reference-list entry was found.'}

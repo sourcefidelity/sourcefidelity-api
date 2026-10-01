@@ -105,7 +105,7 @@ def render_link_checks(values):
                 f'<br>{escape(page)} {escape(identity)} {escape(content)}</p>')
         if row.observations_truncated:
             entries.append('<p>Further request details exceeded the recording limit.</p>')
-    return '<details class="submitted-link-check"><summary>Submitted link check</summary>' + ''.join(entries) + '</details>'
+    return '<details class="submitted-link-check"><summary>Submitted Link Check</summary>' + ''.join(entries) + '</details>'
 
 
 def reference_link_findings(values, sources):

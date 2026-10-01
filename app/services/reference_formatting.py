@@ -658,8 +658,7 @@ def contribution_editor_findings(references, container_records: dict | None = No
             finding=(
                 f'The located work{" " + located if located else ""} is a single-authored '
                 'book, not an edited collection, so this reference cites a part of it as '
-                'though it were a chapter in an edited volume. Cite the book itself and '
-                'give the page range of the part used.'),
+                'though it were a chapter in an edited volume.'),  # no advice (owner decision 2026-10-01)
             rule_id='apa7_contribution_author_is_editor_v1',
             rule_source=APA_CONTRIBUTION_RULE_SOURCE,
             located_record={**{k: record.get(k) for k in ('title', 'authors', 'provider')},

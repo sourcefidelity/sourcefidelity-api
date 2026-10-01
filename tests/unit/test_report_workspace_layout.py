@@ -40,8 +40,8 @@ def test_key_is_static_and_how_to_read_uses_current_names():
     assert 'Show report' not in guide and 'Paper only' not in guide
     # The owner's revised text (2026-09-28), without columns.
     headings = [h.get_text() for h in soup.select('.read-guide h2')]
-    assert headings == ['Source identification, verification and retrieval', 'Poor academic practice',
-                        'Citation and reference format checking', 'Source use judgment']
+    assert headings == ['Source Identification, Verification and Retrieval', 'Poor Academic Practice',
+                        'Citation and Reference Format Checking', 'Source Use Judgment']
     assert not soup.select('.read-guide .guide-grid')
     key = soup.select_one('#active-key').get_text()
     assert 'citation number' not in key and 'Issues:' in key

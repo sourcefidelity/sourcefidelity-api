@@ -1672,7 +1672,7 @@ def _render_report_summary(summary: dict, *, placed_citations: frozenset = froze
             f'<div class="summary-grid">{"".join(sections)}</div></div></section>')
 
 
-HOW_TO_READ_TITLE = 'How to read this report'
+HOW_TO_READ_TITLE = 'How to Read This Report'
 # Patchwriting passages: the Academic Practice yellow; light-blue hover and
 # selection like citations, drawn over the yellow; no outline. In the window,
 # the student's and the source's words carry no background (owner request 2026-09-29).
@@ -1713,21 +1713,21 @@ def _how_to_read_script(nonce: str, *, persist: bool) -> str:
 def _how_to_read_sections() -> str:
     """The owner's text (revised 2026-09-28, second revision; patchwriting sentence 2026-09-29)."""
     return (
-        '<h2>Source identification, verification and retrieval</h2>'
+        '<h2>Source Identification, Verification and Retrieval</h2>'
         '<p>Each cited work is identified, its reference details are checked against scholarly indexes, '
         'library catalogues and web search, and the source is retrieved where possible. Soft red highlights '
         'mark a reference that cannot be verified and its citations; a blue outline marks reference '
         'details that differ from the located record; and pink highlights indicate a possible topical mismatch '
         'between citation and source.</p>'
-        '<h2>Poor academic practice</h2>'
+        '<h2>Poor Academic Practice</h2>'
         '<p>Yellow highlights mark attribution issues, missing or duplicate reference entries, patchwriting, '
         'secondary citation, and quoted wording that differs from the source. Patchwriting is checked only '
         'against sources whose full text was retrieved.</p>'
-        '<h2>Citation and reference format checking</h2>'
+        '<h2>Citation and Reference Format Checking</h2>'
         '<p>Orange highlights mark citation and reference style and layout issues. '
         'A purple diamond marks a link or DOI issue: a link that is dead or incorrect, a DOI registered to a '
         'different source, or a DOI or link the reference should include but does not.</p>'
-        '<h2>Source use judgment</h2>'
+        '<h2>Source Use Judgment</h2>'
         '<p>When the full text of a source has been retrieved, an AI model assesses whether each citation '
         'statement is backed by that source. The underline styles show the results: supports, qualified or '
         'mixed, contradicts, not supported, and not judged.</p>'
@@ -1781,8 +1781,8 @@ def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
 
     recorded = metrics.get('metrics_version') == 'processing-metrics-v2'
     sections = []
-    runtime = table(('Measure', 'Value'), [('Processing time', seconds(metrics.get('wall_seconds'))),
-                                           ('CPU time', seconds(metrics.get('cpu_seconds')))])
+    runtime = table(('Measure', 'Value'), [('Processing Time', seconds(metrics.get('wall_seconds'))),
+                                           ('CPU Time', seconds(metrics.get('cpu_seconds')))])
     sections.append('<section><h2>Runtime</h2>' + runtime + '</section>')
     if recorded:
         adapters = [(_ADAPTER_NAMES.get(row['provider'], row['provider']), f"{int(row['requests']):,}")
@@ -1790,11 +1790,11 @@ def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
         body = table(('Source', 'Requests'), sorted(adapters)) if adapters else '<p>No academic-source requests were recorded.</p>'
     else:
         body = f'<p>Per-source requests: {unrecorded}.</p>'
-    sections.append('<section><h2>Academic sources</h2>' + body + '</section>')
+    sections.append('<section><h2>Academic Sources</h2>' + body + '</section>')
     if recorded:
         fetches = [(str(row['kind']).capitalize(), f"{int(row['requests']):,}") for row in metrics.get('direct_fetches') or []]
         body = table(('Kind', 'Requests'), sorted(fetches)) if fetches else '<p>No direct web fetches were recorded.</p>'
-        sections.append('<section><h2>Direct web fetches</h2>' + body + '</section>')
+        sections.append('<section><h2>Direct Web Fetches</h2>' + body + '</section>')
     if recorded:
         rows = []
         for row in metrics.get('search_by_provider') or []:
@@ -1805,11 +1805,11 @@ def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
             else:
                 cost = usd(row['cost_usd'])
             rows.append((_SEARCH_NAMES.get(row['provider'], row['provider']), f"{int(row['calls']):,}", cost))
-        body = table(('Search API', 'Requests', 'Estimated cost'), rows) if rows else '<p>No search API requests were recorded.</p>'
+        body = table(('Search API', 'Requests', 'Estimated Cost'), rows) if rows else '<p>No search API requests were recorded.</p>'
     else:
         legacy = metrics.get('search_calls_by_provider') or {}
         rows = [(_SEARCH_NAMES.get(name, name), f'{int(count):,}', unrecorded) for name, count in sorted(legacy.items())]
-        body = (table(('Search API', 'Requests', 'Estimated cost'), rows) if rows else
+        body = (table(('Search API', 'Requests', 'Estimated Cost'), rows) if rows else
                 f'<p>Search API requests: {metrics.get("search_api_calls", "not recorded")}.</p>')
     sections.append('<section><h2>Search APIs</h2>' + body + '</section>')
     if recorded:
@@ -1823,19 +1823,19 @@ def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
             rows.append((row.get('model') or 'unnamed model', row.get('endpoint_host') or 'not recorded', calls,
                          f"{int(row.get('prompt_tokens') or 0):,}", f"{int(row.get('prompt_cache_hit_tokens') or 0):,}",
                          f"{int(row.get('completion_tokens') or 0):,}", cost))
-        body = (table(('Model', 'Endpoint', 'Calls', 'Input tokens', 'of which cached', 'Output tokens', 'Estimated cost'), rows)
+        body = (table(('Model', 'Endpoint', 'Calls', 'Input Tokens', 'Of Which Cached', 'Output Tokens', 'Estimated Cost'), rows)
                 if rows else '<p>No language-model calls were recorded.</p>')
     else:
         calls, tokens = metrics.get('llm_calls'), metrics.get('total_tokens')
         body = (f'<p>Calls: {calls if calls is not None else "not recorded"} · Tokens: '
                 f'{f"{tokens:,}" if isinstance(tokens, int) else "not recorded"} · Per-model detail: {unrecorded}.</p>')
-    sections.append('<section class="wide"><h2>Language models</h2>' + body + '</section>')
+    sections.append('<section class="wide"><h2>Language Models</h2>' + body + '</section>')
     total = usd(metrics.get('estimated_cost_usd'))
-    sections.append('<section><h2>Estimated cost (before credits)</h2>'
+    sections.append('<section><h2>Estimated Cost (Before Credits)</h2>'
                     f'<p><strong>{total or "not recorded"}</strong></p></section>')
     link = (f'<p class="verification-record"><a href="{escape(manifest_href.split("?")[0], quote=True)}">'
-            'Download verification record (JSON)</a></p>' if manifest_href else '')
-    return ('<details class="technical-details"><summary><strong>Technical details</strong></summary>'
+            'Download Verification Record (JSON)</a></p>' if manifest_href else '')
+    return ('<details class="technical-details"><summary><strong>Technical Details</strong></summary>'
             f'<div class="tech-grid">{"".join(sections)}</div>{link}</details>')
 
 
@@ -1918,7 +1918,7 @@ KEY_HTML = (
     '<span class="jk state-contradicts">Contradicts</span>'
     '<span class="jk state-insufficient">Not Supported</span>'
     '<span class="jk state-undecided">LLM Undecided</span>'
-    '<span class="jk state-not_judged">Not judged</span></div>'
+    '<span class="jk state-not_judged">Not Judged</span></div>'
     '<div class="key-line"><span class="key-title">Issues:</span>'
     '<span class="key-mark key-practice">Academic-Practice</span>'
     '<span class="key-mark key-reference">Citation/Reference Issue</span>'
@@ -1965,7 +1965,7 @@ def _render_upload_priorities(citations: list[dict], locations: dict | None = No
     if upload_href:
         upload_html = (f'<form class="source-upload upload-priority-form" method="post" enctype="multipart/form-data" action="{escape(upload_href, quote=True)}">'
             '<input type="file" name="file" accept="application/pdf,.pdf" aria-label="Choose source PDF" hidden required>'
-            '<button type="button" data-choose-source>Upload sources</button>'
+            '<button type="button" data-choose-source>Upload Sources</button>'
             '<span class="upload-status" aria-live="polite"></span></form>')
     intro = ''
     if judgments is not None:
@@ -2073,18 +2073,18 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     export_links = ""
     if export_action:
         export_links = (
-            f'<a href="{escape(str(export_action.get("report_href") or "#").split("?")[0], quote=True)}/export.html">Download interactive report</a>'
+            f'<a href="{escape(str(export_action.get("report_href") or "#").split("?")[0], quote=True)}/export.html">Download Interactive Report</a>'
             f'<a href="{escape(str(export_action.get("pdf_href") or "#").split("?")[0], quote=True)}">Download PDF</a>'
 
         )
     print_links = (
-        f'<a href="{escape(str(export_action.get("report_href") or "#"), quote=True)}">Interactive report</a>'
+        f'<a href="{escape(str(export_action.get("report_href") or "#"), quote=True)}">Interactive Report</a>'
         if export_mode == "released_print" else ''
     )
     # Select text is the one paper tool: copying a passage. Comment, highlight
     # and pen tools were removed (owner decision 2026-09-25).
     paper_tools = ('<span class="group" aria-label="Paper tools">'
-        '<button type="button" id="select-text" aria-pressed="false">Select text</button></span>')
+        '<button type="button" id="select-text" aria-pressed="false">Select Text</button></span>')
     # Judgments: judged statements (each proposition and source).
     judgment_count = sum(int(v or 0) for v in ((view.get('judgment_summary') or {}).get('states') or {}).values())
     rendered = f"""<!doctype html>
@@ -2138,7 +2138,7 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
 {KEY_HTML}</header>
 <main class="layout" id="report-layout"><div class="workspace-bar"><div class="toolbar paper-toolbar"><span class="group" aria-label="Paper zoom"><button type="button" id="zoom-out" aria-label="Zoom out">−</button><button type="button" id="zoom-in" aria-label="Zoom in">＋</button><span id="zoom-value">100%</span></span>{paper_tools}</div><div class="toolbar evidence-controls" aria-label="Report layout"><span class="group" aria-label="Citation and flag navigation"><button type="button" data-report-step="-1" aria-label="Previous citation or flag">←</button><button type="button" data-report-step="1" aria-label="Next citation or flag">→</button></span></div></div>
 <section class="paper" aria-label="Submitted paper with SourceFidelity overlays"><p class="report-status" id="report-status" role="status"></p><div class="paper-viewport">{paper_pages}</div></section>
-<div class="side-pane"><div class="splitter" id="report-splitter" role="separator" aria-label="Resize paper and evidence panels" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="80" aria-valuenow="68" tabindex="0"></div><div class="evidence-column"><aside class="panel" id="evidence-panel" tabindex="-1" aria-live="polite"><h2>Select a citation</h2><p>Choose a marked span while reading the paper to inspect its source-specific evidence.</p></aside></div></div></main>
+<div class="side-pane"><div class="splitter" id="report-splitter" role="separator" aria-label="Resize paper and evidence panels" aria-orientation="vertical" aria-valuemin="30" aria-valuemax="80" aria-valuenow="68" tabindex="0"></div><div class="evidence-column"><aside class="panel" id="evidence-panel" tabindex="-1" aria-live="polite"><h2>Select a Citation</h2><p>Choose a marked span while reading the paper to inspect its source-specific evidence.</p></aside></div></div></main>
 {gauges}<div hidden>{panel_templates}</div>
 <script nonce="{nonce}">{Path(__file__).with_name("report_interactions.js").read_text()}</script>
 </body></html>"""
@@ -2166,7 +2166,7 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
     rendered = rendered.replace('purple underlines indicate', 'purple diamonds indicate').replace('an orange or purple underline', 'an orange highlight or purple diamond')
     rendered = rendered.replace('</style>', '.reference-practice-overlay .reference-formatting-hit{fill:#ff9a38;fill-opacity:.3;stroke:none;pointer-events:all}.reference-practice-overlay .mark-relevance{fill:#ef82ba;fill-opacity:.38;stroke:none;pointer-events:all}.reference-practice-overlay .topical-reference-hit{fill:transparent;fill-opacity:1;stroke:none;pointer-events:all}.issue-heading.topical{text-decoration:none;background:rgba(239,130,186,.38)}.reference-key{height:.75rem;background:#ff9a384d}.indicator-reference{fill:#ff9a38;fill-opacity:.3;stroke:none}.issue-heading.formatting{text-decoration:none}</style>', 1)
     rendered = rendered.replace('</style>', '.issue-heading{font-weight:700;text-decoration:none;padding:.1em .2em;box-decoration-break:clone;color:inherit}.issue-heading.formatting{text-decoration-color:#d95f02;background:rgba(255,154,56,.3)}.issue-heading.academic{text-decoration-color:#b99b00;background:rgba(255,228,92,.4)}.submitted-link-marker{fill:#7651a8;stroke:white;stroke-width:1;pointer-events:all}.submitted-link-key{width:.7rem;height:.7rem;transform:rotate(45deg);background:#7651a8}.paper-reference-link rect{fill:transparent;pointer-events:all}</style>', 1)
-    rendered = rendered.replace('<h2>Submitted paper</h2>', '')
+    rendered = rendered.replace('<h2>Submitted Paper</h2>', '')
     rendered = rendered.replace('<span>Light-grey underline:', '<span data-key="reference"><i class="submitted-link-key"></i>purple diamond: link issue</span><span>Light-grey underline:')
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.unverified-highlight,.reference-practice-overlay .reference-formatting-hit.unverified-highlight{fill:#f28b82;fill-opacity:.42;stroke:none}.reference-practice-overlay .reference-formatting-hit.reference-difference-highlight{fill:transparent;stroke:#0a7cff;stroke-width:1.8;stroke-dasharray:none;pointer-events:all}.issue-heading.unverified{text-decoration-color:#c5221f;background:rgba(242,139,130,.42)}.issue-heading.evidence{text-decoration-color:#2f62a8}.unverified-key,.difference-key{display:inline-block;width:1.3rem;height:.75rem}.unverified-key{background:#f28b826b}.difference-key{border:2px solid #0a7cff}.reference-finding .finding-item+.finding-item{margin-top:.6rem;padding-top:.6rem;border-top:1px solid #e4e7ec}</style>', 1)
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}.submitted-link-hit{fill:transparent;pointer-events:all}.submitted-link-key{width:.85rem;height:.85rem;transform:rotate(45deg);background:#7651a8}.focus-relevance .topical-reference-hit{display:block}</style>', 1)
@@ -2196,7 +2196,7 @@ def enable_authenticated_paper_actions(
     """Add same-origin paper/source links without mutating the projection.
 
     ``search_again_enabled`` is False once marks are released for the paper's
-    assessment (assessment_marks.py): no "Search again" action is attached.
+    assessment (assessment_marks.py): no "Search Again" action is attached.
     """
     result = deepcopy(view)
     result["paper_surface"] = {
@@ -2236,7 +2236,7 @@ def enable_authenticated_paper_actions(
         ):
             citation["upload_action"] = {
                 "enabled": True,
-                "label": "Upload source",
+                "label": "Upload Source",
                 "href": (
                     f"/report/{report_id}/citation/"
                     f"{quote(str(citation.get('claim_id') or ''), safe='')}/source/upload"
@@ -3223,7 +3223,7 @@ def _render_paper_surface(surface: dict) -> str:
             f'rel="noopener">{escape(action["label"])}</a>'
         )
     return (
-        '<div class="notice"><strong>Paper view</strong><br>'
+        '<div class="notice"><strong>Paper View</strong><br>'
         f'{escape(surface["message"])}{action_html}</div>'
     )
 
@@ -3317,7 +3317,7 @@ def _unavailable_member(member: dict, reference, claim, reference_layout=None) -
         "availability": (
             "This is a media reference. Automated source retrieval and checks are not available."
             if getattr(reference, "source_kind", "") == "traditional_media"
-            else "" if abstract_available else "Source not retrieved"
+            else "" if abstract_available else "Source Not Retrieved"
         ),
         "best_evidence": abstract_evidence,
         "additional_evidence": [],
@@ -4655,19 +4655,19 @@ def _render_continuous_paper(
         for page_index, rectangles in by_page.items():
             marker_class = ('reference-field-marker submitted-link-marker' if finding.get('finding_type') in LINK_MARKER_FINDINGS
                             else 'reference-field-marker')
-            label = {'required_doi_missing':'Required DOI missing', 'required_author_missing':'Required author missing',
-                     'duplicate_reference_entry':'Academic Practice: duplicate reference entry',
-                     'reference_author_conflict':'Academic Practice: incorrect author attribution',
-                     'unverified_reference':'Evidence: cannot be verified',
-                     'bibliographic_conflict':'Evidence: differs from the located record',
-                     'bibliographic_field_conflict':'Evidence: differs from the located record',
-                     'publication_year_discrepancy':'Evidence: differs from the located record',
-                     'reference_identifier_conflict':'DOI identifies a different work',
-                     'doi_registers_a_different_title':'DOI identifies a different work',
-                     'reference_identifier_placeholder':'Unfinished identifier',
-                     'source_topical_mismatch':'Potential topical mismatch',
-                     'assessment_link_missing':'Assessment-required link missing', 'submitted_link_issue':'Submitted-link issue'
-                     }.get(finding.get('finding_type'), 'Citation/reference formatting issue')
+            label = {'required_doi_missing':'Required DOI Missing', 'required_author_missing':'Required Author Missing',
+                     'duplicate_reference_entry':'Academic Practice: Duplicate Reference Entry',
+                     'reference_author_conflict':'Academic Practice: Incorrect Author Attribution',
+                     'unverified_reference':'Cannot Be Verified',
+                     'bibliographic_conflict':'Differs from the Located Record',
+                     'bibliographic_field_conflict':'Differs from the Located Record',
+                     'publication_year_discrepancy':'Differs from the Located Record',
+                     'reference_identifier_conflict':'DOI Identifies a Different Work',
+                     'doi_registers_a_different_title':'DOI Identifies a Different Work',
+                     'reference_identifier_placeholder':'Unfinished Identifier',
+                     'source_topical_mismatch':'Potential Topical Mismatch',
+                     'assessment_link_missing':'Assessment-Required Link Missing', 'submitted_link_issue':'Submitted-Link Issue'
+                     }.get(finding.get('finding_type'), 'Citation/Reference Formatting Issue')
             marks = ''
             if finding.get('finding_type') in LINK_MARKER_FINDINGS:
                 if page_index != max(by_page):
@@ -4856,7 +4856,7 @@ def _render_unplaced_citations(citations: list[dict], placed: set[int]) -> str:
     if not rows:
         return ""
     return (
-        '<details class="unplaced"><summary>Citations without exact page geometry</summary>'
+        '<details class="unplaced"><summary>Citations Without Exact Page Geometry</summary>'
         f'<p class="muted">These items remain not assessed and are not placed speculatively.</p>{rows}</details>'
     )
 
@@ -4930,7 +4930,7 @@ def _render_upload(upload: dict) -> str:
     return (
         f'<form class="source-upload" method="post" enctype="multipart/form-data" action="{escape(upload["href"], quote=True)}">'
         '<input type="file" name="file" accept="application/pdf,.pdf" aria-label="Choose source PDF" hidden required>'
-        '<button type="button" data-choose-source>Upload source</button>'
+        '<button type="button" data-choose-source>Upload Source</button>'
         '<span class="upload-status" aria-live="polite"></span></form>'
     )
 
@@ -4941,7 +4941,7 @@ def _render_search_again(action: dict) -> str:
     # Owner-approved label (2026-09-29).
     return (
         f'<form class="search-again" method="post" action="{escape(action["href"], quote=True)}">'
-        '<button type="submit">Search again</button>'
+        '<button type="submit">Search Again</button>'
         '<span class="upload-status" aria-live="polite"></span></form>'
     )
 
@@ -4950,10 +4950,10 @@ def _render_export_details(action: dict) -> str:
     if not action.get("manifest_href"):
         return ""
     return (
-        '<details class="technical-export"><summary>Technical export record</summary>'
+        '<details class="technical-export"><summary>Technical Export Record</summary>'
         '<p>For verification and support: identifies the report version, original paper and PDF fingerprint. '
         'These details help an owner or administrator establish which version was shared; they are not academic findings.</p>'
-        f'<a href="{escape(action["manifest_href"].split("?")[0], quote=True)}">Download verification record (JSON)</a></details>'
+        f'<a href="{escape(action["manifest_href"].split("?")[0], quote=True)}">Download Verification Record (JSON)</a></details>'
     )
 
 
@@ -5006,7 +5006,7 @@ def _member_label(item: dict, citation: dict | None = None) -> str:
     elif citation is not None:
         from app.services.report_layers import topical_mismatch
         if topical_mismatch(item, citation):
-            heading += ' – <mark class="issue-heading topical">possible topical mismatch</mark>'
+            heading += ' – <mark class="issue-heading topical">Possible Topical Mismatch</mark>'
     return heading
 
 
@@ -5022,7 +5022,7 @@ def _member_coverage_heading(item: dict, citation: dict | None = None) -> str:
     if citation is not None:
         from app.services.report_layers import topical_mismatch
         if topical_mismatch(item, citation):
-            heading += ' – <mark class="issue-heading topical">possible topical mismatch</mark>'
+            heading += ' – <mark class="issue-heading topical">Possible Topical Mismatch</mark>'
     return heading
 
 
@@ -5202,7 +5202,7 @@ def _source_version_label(value: str) -> str:
     return value.replace("_", " ")
 
 
-_CATEGORY_LABELS = {'evidence': 'Evidence', 'formatting': 'Citation and reference formatting',
+_CATEGORY_LABELS = {'evidence': 'Evidence', 'formatting': 'Citation and Reference Formatting',
                     'academic': 'Academic Practice'}
 _CATEGORY_ORDER = ('evidence', 'formatting', 'academic')
 
@@ -5229,7 +5229,7 @@ def _finding_body(finding: dict, index: int, *, combined: bool = False) -> str:
     inner = _render_reference_panel_template(finding, index, combined=combined)
     inner = inner.split('>', 1)[1].rsplit('</template>', 1)[0]
     inner = _LEADING_HEADING.sub('', inner, count=1)
-    inner = re.sub(r'<h3 class="own-reference-heading">Submitted reference</h3>', '', inner)
+    inner = re.sub(r'<h3 class="own-reference-heading">Submitted Reference</h3>', '', inner)
     inner = re.sub(r'<p class="full-reference own-reference">.*?</p>', '', inner, flags=re.S)
     if finding.get('finding_type') == 'source_topical_mismatch':
         inner = '<p><mark class="issue-heading topical">Possible topical mismatch.</mark></p>' + inner
@@ -5285,7 +5285,7 @@ def _render_reference_panel_template(finding: dict, index: int, *, combined: boo
         return content
     category = finding_category(kind)
     if combined:
-        return content.replace('<p><strong>Citation and reference formatting</strong></p>', _category_heading(category,'p'), 1)
+        return content.replace('<p><strong>Citation and Reference Formatting</strong></p>', _category_heading(category,'p'), 1)
     return re.sub(r'<h2>.*?</h2>', _category_heading(category), content, count=1)
 
 
@@ -5299,9 +5299,9 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         # to the cited one. These records stay audit-only.
         source = {**finding['source'], 'reference_findings': [finding]}
         reference = '' if combined else f'<p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'
-        heading = '<p><strong>Citation and reference formatting</strong></p>' if combined else '<h2>Reference information</h2>'
+        heading = '<p><strong>Citation and Reference Formatting</strong></p>' if combined else '<h2>Reference Information</h2>'
         if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
-            heading = '<h2>Submitted-link issue</h2>'
+            heading = '<h2>Submitted-Link Issue</h2>'
         records = credibility_records_html(finding)
         if finding.get('finding_type') == 'reference_identifier_conflict':
             # The identified record completes "The submitted DOI identifies:".
@@ -5321,16 +5321,16 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
     source = finding["source"]
     if combined:
         # The citation panel already supplies the student text and source.
-        return (f'<template id="reference-panel-{index}"><p><strong>Citation and reference formatting</strong></p>'
+        return (f'<template id="reference-panel-{index}"><p><strong>Citation and Reference Formatting</strong></p>'
                 f'<p class="reference-issue">{escape(finding["finding"])}</p></template>')
     if finding.get('finding_type') == 'source_topical_mismatch':
-        return (f'<template id="reference-panel-{index}"><h2>Abstract only retrieved – <mark class="issue-heading topical">possible topical mismatch</mark></h2>'
+        return (f'<template id="reference-panel-{index}"><h2>Abstract Retrieved – <mark class="issue-heading topical">Possible Topical Mismatch</mark></h2>'
                 f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
-                f'<p>{escape(finding["finding"])}</p><h3>Selected citation</h3>'
+                f'<p>{escape(finding["finding"])}</p><h3>Selected Citation</h3>'
                 f'<blockquote>{escape(finding["citation_text"])}</blockquote><h3>Abstract</h3>'
                 f'<blockquote>{escape(finding["abstract_text"])}</blockquote></template>')
     if finding.get('finding_type') == 'submitted_link_issue':
-        return (f'<template id="reference-panel-{index}"><h2>Submitted-link issue</h2>'
+        return (f'<template id="reference-panel-{index}"><h2>Submitted-Link Issue</h2>'
                 f'<p>{escape(finding["finding"])}</p><p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'
                 + '</template>')
     if finding.get('finding_type') == 'required_quotation_locator_missing':
@@ -5348,19 +5348,19 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
                 f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
                 '</template>')
     if finding.get('finding_type') == 'assessment_link_missing':
-        return (f'<template id="reference-panel-{index}"><h2>Assessment-required link missing</h2>'
+        return (f'<template id="reference-panel-{index}"><h2>Assessment-Required Link Missing</h2>'
                 f'<p>{escape(finding["finding"])}</p><p>This is an assessment requirement, not a universal citation-style rule. '
                 'A DOI, ordinary URL, or library permalink satisfies the presence check; public full-text access is not required.</p>'
                 f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
     if finding.get('finding_type') == 'required_author_missing':
-        return (f'<template id="reference-panel-{index}"><h2>Required author missing</h2>'
+        return (f'<template id="reference-panel-{index}"><h2>Required Author Missing</h2>'
                 f'<p>{escape(finding["finding"])}</p>'
                 '<p>The author is verified from bibliographic registration metadata, not citation evidence.</p>'
                 f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
     if finding.get('finding_type') == 'required_doi_missing':
         from urllib.parse import quote
         doi = str(finding['verified_doi'])
-        return (f'<template id="reference-panel-{index}"><h2>Required DOI missing</h2>'
+        return (f'<template id="reference-panel-{index}"><h2>Required DOI Missing</h2>'
                 f'<p>{escape(finding["finding"])}</p>'
                 f'<p>Verified DOI: <a href="https://doi.org/{escape(quote(doi, safe="/"), quote=True)}" target="_blank" rel="noopener noreferrer">{escape(doi)}</a></p>'
                 f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
@@ -5382,13 +5382,13 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         # the field list, located value and provider line were removed
         # (owner decision 2026-09-30).
         return (
-            f'<template id="reference-panel-{index}"><h2>Reference information</h2>'
+            f'<template id="reference-panel-{index}"><h2>Reference Information</h2>'
             f'<p>{escape(finding["finding"])}</p>'
             + (f'<p><strong>In your reference:</strong> {escape(str(difference.get("submitted_value") or "Not retained"))}</p>'
                if difference else '') +
-            '<h3 class="own-reference-heading">Submitted reference</h3>'
+            '<h3 class="own-reference-heading">Submitted Reference</h3>'
             f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>'
-            '<h3>Located record</h3>'
+            '<h3>Located Record</h3>'
             f'<p class="full-reference">{escape(located_text or "No displayable located-record fields were retained.")}</p>'
             '</template>'
         )
@@ -5397,7 +5397,7 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         for peer in finding.get("related_references") or []
     )
     return (
-        f'<template id="reference-panel-{index}"><h2>Reference practice</h2>'
+        f'<template id="reference-panel-{index}"><h2>Reference Practice</h2>'
         f'<p>{escape(finding["finding"])}</p>'
         + (related or f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>') + '</template>'
     )
@@ -5591,10 +5591,10 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
             f'{escape(_panel_statement(member["scope_disagreement"]["note"]))}</p>'
         )
     availability = (
-        '<p class="source-unavailable"><strong>Source not retrieved</strong></p>'
-        if member.get("availability") == "Source not retrieved" and not grouped
+        '<p class="source-unavailable"><strong>Source Not Retrieved</strong></p>'
+        if member.get("availability") == "Source Not Retrieved" and not grouped
         else f'<p>{escape(member["availability"])}</p>'
-        if member.get("availability") and member.get("availability") != "Source not retrieved"
+        if member.get("availability") and member.get("availability") != "Source Not Retrieved"
         else ""
     )
     if _member_is_media(member):

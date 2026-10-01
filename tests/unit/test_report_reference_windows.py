@@ -67,7 +67,7 @@ def test_reference_window_shows_entry_links_citations_and_grouped_findings():
     assert len(sections) == 2                          # the body-title finding keeps its own window
     # One heading per category; a submitted-link issue is Academic Practice.
     assert [s.select_one('.issue-heading').get_text() for s in sections] == [
-        'Citation and reference formatting', 'Academic Practice']
+        'Citation and Reference Formatting', 'Academic Practice']
     assert 'The submitted link returned a missing page.' in sections[1].get_text()
     # The complete reference appears once; each finding drops its own copy.
     assert len(win.select('.full-reference')) == 1

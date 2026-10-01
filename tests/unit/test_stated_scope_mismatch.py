@@ -156,6 +156,9 @@ def test_only_an_identified_monograph_makes_the_chapter_form_wrong(raw, author, 
     if expected:
         assert findings[0]['finding_type'] == 'contribution_author_is_volume_editor'
         assert 'single-authored' in findings[0]['finding']
+        # No advice in the finding itself (owner decision 2026-10-01).
+        assert findings[0]['finding'].endswith('as though it were a chapter in an edited volume.')
+        assert 'Cite ' not in findings[0]['finding']
 
 
 def test_the_short_title_merge_needs_corroboration():

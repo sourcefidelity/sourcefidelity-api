@@ -5,7 +5,7 @@ Two routes start the same targeted refresh (`begin_reference_search_refresh`):
 * automatic retries: a scheduled scan retries a reference whose search ended
   incomplete after each configured delay (default 1 hour, 1 day, 3 days),
   measured from the incomplete search being retried, at most once per delay;
-* "Search again": the report reader asks for one reference to be searched
+* "Search Again": the report reader asks for one reference to be searched
   again, with ``force_search``, at most once per day per reference.
 
 An incomplete search is a discovery outcome of ``search_incomplete`` or a

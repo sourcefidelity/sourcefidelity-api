@@ -203,7 +203,7 @@ def test_personal_login_exchanges_bearer_for_bounded_http_only_session(monkeypat
 
         report = client.get("/report/report-1")
         assert report.status_code == 200
-        assert '<strong>Paper view</strong>' not in report.text
+        assert '<strong>Paper View</strong>' not in report.text
         paper = client.get("/report/report-1/paper")
         assert paper.status_code == 200
         assert paper.content.startswith(b"%PDF")

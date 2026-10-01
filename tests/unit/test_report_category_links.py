@@ -12,8 +12,8 @@ def test_standalone_and_combined_formatting_categories_match():
              'source':{'author':'Writer','year':'2020','title':'Work','raw_reference':'Writer. Work.'}}
     for combined in (False,True):
         h=_render_reference_panel_template(finding,1,combined=combined)
-        assert 'class="issue-heading formatting"' in h and 'Citation and reference formatting' in h
-        assert 'Reference practice' not in h
+        assert 'class="issue-heading formatting"' in h and 'Citation and Reference Formatting' in h
+        assert 'Reference Practice' not in h
     finding.update(finding_type='missing_reference_entry')
     assert 'class="issue-heading academic"' in _render_reference_panel_template(finding,1)
 

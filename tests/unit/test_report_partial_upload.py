@@ -32,7 +32,7 @@ def test_upload_full_reference_link_and_deliberate_target():
     soup=BeautifulSoup(_render_upload_priorities([citation]),'html.parser')
     assert soup.li.get_text().startswith('1 citation – ') and 'Publisher.' in soup.li.get_text()
     assert soup.li.a['href']=='https://example.org/book'
-    assert soup.button.text=='Upload sources'
+    assert soup.button.text=='Upload Sources'
     assert soup.select_one('select') is None
     assert soup.form['action']=='/report/id/source/upload'
     citation.pop('upload_action')

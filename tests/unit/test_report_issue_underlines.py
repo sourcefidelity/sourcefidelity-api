@@ -65,5 +65,5 @@ def test_an_unfinished_identifier_is_located_and_drawn_as_a_diamond_after_it():
     rendered,_=_render_continuous_paper(surface,[],result['reference_practice'])
     soup=BeautifulSoup(rendered,'html.parser')
     marker=soup.select_one('path.submitted-link-marker')
-    assert marker is not None and marker.find('title').get_text()=='Unfinished identifier'
+    assert marker is not None and marker.find('title').get_text()=='Unfinished Identifier'
     assert float(marker['d'].split()[1])>rectangles[-1]['x1']

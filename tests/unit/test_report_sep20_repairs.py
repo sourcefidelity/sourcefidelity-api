@@ -58,13 +58,13 @@ def test_fabrication_search_details_collapsed_without_similar_work_list():
     html=credibility_records_html(dict(finding_type='potentially_fabricated_reference',
         evidence_explanation='Title searches completed.',records=[{'observed':{'title':'Unrelated title'}}]))
     soup=BeautifulSoup(html,'html.parser')
-    assert soup.select_one('details summary').text=='Search details'
+    assert soup.select_one('details summary').text=='Search Details'
     assert 'Unrelated title' not in html
 
 
 def test_unverified_member_heading_uses_soft_red_without_claiming_retrieval():
     member=dict(reference_id='r',unverified=True,coverage_level='unavailable',
-        availability='Source not retrieved',source=dict(author='Writer',year='2020',title='Title',raw_reference='Writer. Title.'))
+        availability='Source Not Retrieved',source=dict(author='Writer',year='2020',title='Title',raw_reference='Writer. Title.'))
     html=_render_panel_template(dict(student_text='A claim.',members=[member]),1)
     soup=BeautifulSoup(html,'html.parser')
     assert soup.select_one('h3 mark.unverified').string=='Cannot be verified'

@@ -420,7 +420,7 @@ def test_the_citation_window_explains_a_citation_after_the_final_punctuation():
     soup = BeautifulSoup(render_evidence_report_html(view, csp_nonce="patchwriting-report-nonce"), "html.parser")
     window = BeautifulSoup(soup.select_one("template#citation-panel-1").decode_contents(), "html.parser")
     assert "This parenthetical citation is placed after the sentence's final punctuation." in window.get_text()
-    assert window.select_one(".issue-heading.formatting").get_text() == "Citation and reference formatting"
+    assert window.select_one(".issue-heading.formatting").get_text() == "Citation and Reference Formatting"
 
 
 def test_windows_carry_no_coaching_sentences():

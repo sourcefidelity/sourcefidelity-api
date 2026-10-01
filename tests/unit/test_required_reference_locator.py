@@ -140,7 +140,7 @@ def test_chip_uses_existing_panel_without_highlighting_missing_text():
     view={'title':'DOI chip control','citation_format':'APA','citations':[],
         'reference_practice':[finding], 'paper_surface':{'page_dimensions':[{'page_index':0,'width':612,'height':792}], 'page_href_template':'/page-{page_index}.png'}}
     html=render_evidence_report_html(view,csp_nonce='doi-chip-test-nonce')
-    assert '<title>Required DOI missing</title>' in html
+    assert '<title>Required DOI Missing</title>' in html
     # A reference-list finding opens its reference's single Reference N window.
     assert 'data-panel-template="reference-entry-panel-1"' in html
     assert 'id="reference-panel-1"' not in html

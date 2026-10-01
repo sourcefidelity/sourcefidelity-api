@@ -1,7 +1,7 @@
 """Assessment-level "marks released" setting (owner decision 2026-09-29).
 
 Once marks are released for an assessment, further searching can no longer
-affect it: the automatic retries of incomplete searches and "Search again"
+affect it: the automatic retries of incomplete searches and "Search Again"
 stop for every paper of that assessment, and a Judgment reserve kept
 ``until_grades_released`` is purged.
 

@@ -29,7 +29,7 @@ def test_assessment_rule_renders_distinct_from_style_rule():
           'assessment_configuration':{'require_reference_links':True},'reference_practice':[finding],
           'paper_surface':{'page_dimensions':[{'page_index':0,'width':612,'height':792}], 'page_href_template':'/page-{page_index}.png'}}
     html=render_evidence_report_html(view,csp_nonce='assessment-test-nonce')
-    assert 'Assessment-required link missing' in html
+    assert 'Assessment-Required Link Missing' in html
     assert 'not a universal citation-style rule' in html
     assert 'APA requires' not in html
 

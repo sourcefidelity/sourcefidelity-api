@@ -311,14 +311,14 @@ def _append_evidence(document, citations, findings, view) -> dict:
         'Orange highlights identify formatting issues, purple diamonds identify link issues, '
         'and yellow highlights indicate Academic Practice issues.</p>',
     ]
-    blocks.append('<h2>Patterns and issues</h2>')
+    blocks.append('<h2>Patterns and Issues</h2>')
     from app.services.report_style_guidance import guidance_links
     from app.services.evidence_report import _citation_guidance_kinds
     citation_format = str(view.get('citation_format') or '')
     from app.services.evidence_report import report_summary, summary_text
     for category, priorities in report_summary(view).items():
         if priorities:
-            label = 'Citation and reference formatting' if category == 'reference_formatting' else category.replace('_',' ').capitalize()
+            label = 'Citation and Reference Formatting' if category == 'reference_formatting' else category.replace('_',' ').capitalize()
             # The PDF keeps the complete count-only sentence: it has no side
             # window for instance links to open (ARCHITECTURE §8).
             blocks.append('<h3>'+escape(label)+'</h3><ul>'+''.join('<li>'+escape(summary_text(item))+'</li>' for item in priorities)+'</ul>')
@@ -366,7 +366,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
                               +escape(scope['rationale'])+'</p>')
         from app.services.evidence_report import citation_after_punctuation
         if citation_after_punctuation(citation):
-            blocks.append("<h3>Citation and reference formatting</h3><p>This parenthetical citation is placed after "
+            blocks.append("<h3>Citation and Reference Formatting</h3><p>This parenthetical citation is placed after "
                           "the sentence's final punctuation.</p>")
         blocks.append(_render_citation_information(citation, index).replace('<details>', '<div>').replace('</details>', '</div>').replace('<summary>', '<h4>').replace('</summary>', '</h4>'))
         blocks.append(guidance_links(_citation_guidance_kinds(citation), citation_format))
@@ -374,11 +374,11 @@ def _append_evidence(document, citations, findings, view) -> dict:
         key = f"reference-{index}"
         from app.services.highlight_priority import finding_category
         heading = {'evidence': 'Evidence', 'academic': 'Academic Practice'}.get(
-            finding_category(finding.get('finding_type')), 'Citation and reference formatting') + f' {index}'
+            finding_category(finding.get('finding_type')), 'Citation and Reference Formatting') + f' {index}'
         if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
-            heading = f'Submitted-link issue {index}'
+            heading = f'Submitted-Link Issue {index}'
         if finding.get('finding_type') == 'source_topical_mismatch':
-            heading = f'Potential topical mismatch {index}'
+            heading = f'Potential Topical Mismatch {index}'
         rectangles = finding.get('rectangles') or []
         if finding.get('finding_type') in LINK_MARKER_FINDINGS:
             rectangles = [{**r,'x0':r['x1']+2,'x1':r['x1']+12,
@@ -406,7 +406,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
         if finding.get('finding_type') in {'potentially_fabricated_reference', 'unverified_reference'}:
             blocks.append(credibility_records_html(finding))
         if finding.get('finding_type') == 'source_topical_mismatch':
-            blocks.append('<h3>Selected citation</h3><blockquote>'+escape(finding['citation_text'])+
+            blocks.append('<h3>Selected Citation</h3><blockquote>'+escape(finding['citation_text'])+
                 '</blockquote><h3>Abstract</h3><blockquote>'+escape(finding['abstract_text'])+
                 '</blockquote>')
         difference = finding.get('field_difference') or {}
@@ -471,7 +471,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
     finally:
         appendix.close()
     links = 0
-    toc = [[1, "Submitted paper", 1], [1, "Evidence", paper_pages + 1]]
+    toc = [[1, "Submitted Paper", 1], [1, "Evidence", paper_pages + 1]]
     # Position callbacks can report an element that the layout engine never
     # paints. Bind destinations to actual rendered headings, not callbacks.
     rendered_headings = {}
@@ -551,7 +551,7 @@ def _portable_member_html(member: dict) -> str:
     media = _member_is_media(member)
     parts = ['<h3>Media Reference - Cannot Retrieve</h3>'] if media else []
     parts.append('<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or 'Reference unavailable'))+'</p>')
-    if not media and member.get('availability') and member['availability'] != 'Source not retrieved':
+    if not media and member.get('availability') and member['availability'] != 'Source Not Retrieved':
         parts.append('<p>'+escape(_panel_statement(member['availability']))+'</p>')
     disagreement = member.get('scope_disagreement') or {}
     if not media and disagreement.get('note'):
@@ -565,7 +565,7 @@ def _portable_member_html(member: dict) -> str:
                     parts.append('<p class="muted">'+escape(note)+'</p>')
     contexts = _member_evidence_contexts(member)
     if contexts:
-        parts.append('<h4>Additional evidence and context</h4>')
+        parts.append('<h4>Additional Evidence and Context</h4>')
     for item in contexts:
         parts.append('<blockquote>'+escape(str(item['context_text']))+_inline_locator(item)+'</blockquote>')
         note = _display_evidence_note(member, item)

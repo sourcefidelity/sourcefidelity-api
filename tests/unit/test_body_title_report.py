@@ -77,7 +77,7 @@ def test_exact_body_highlight_panel_and_localized_summary(duplicate):
         box = fitz.Rect(*[findings[0]['rectangles'][0][k] for k in ('x0','y0','x1','y1')])
         assert page.get_textbox(box) == 'Example Film'
         assert any('lacks required italics' in s for s in map(summary_text, summaries()['reference_formatting']))
-    assert 'Citation and reference formatting' in _render_reference_panel_template(findings[0], 1)
+    assert 'Citation and Reference Formatting' in _render_reference_panel_template(findings[0], 1)
 
 
 def test_export_body_title_destinations_and_repeatability():
@@ -97,7 +97,7 @@ def test_export_body_title_destinations_and_repeatability():
     assert counts['reference_practice_findings'] == 1
     with fitz.open(stream=output, filetype='pdf') as pdf:
         text = ' '.join(unicodedata.normalize('NFKC', ''.join(p.get_text() for p in pdf)).split())
-        assert 'Citation and reference formatting 1' in text
+        assert 'Citation and Reference Formatting 1' in text
         assert 'Back to marked passage' in text
         assert 'Italicize this film or book title' in text
         assert all(0 <= link['page'] < len(pdf) for p in pdf for link in p.get_links() if link['kind'] == fitz.LINK_GOTO)

@@ -52,7 +52,7 @@ def test_the_window_no_longer_shows_relevance_gate_passages():
                 {'text':'Third omitted passage'}]}
     html=_render_member(member)
     # Owner decision 2026-09-28: GLM-selected sentences are the window's one evidence source.
-    assert 'Additional evidence and context' not in html and '<blockquote' not in html
+    assert 'Additional Evidence and Context' not in html and '<blockquote' not in html
     assert not any(text in html for text in ['primary','Primary longer context','First longer context'])
 
 

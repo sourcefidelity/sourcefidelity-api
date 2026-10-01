@@ -123,8 +123,8 @@ def test_older_reports_say_not_recorded_rather_than_zero():
     text = BeautifulSoup(html, 'html.parser').get_text(' ')
     assert 'Per-source requests: not recorded for this report.' in text
     assert 'Per-model detail: not recorded for this report.' in text and 'Tokens: not recorded' in text
-    assert 'Estimated cost (before credits) not recorded' in ' '.join(text.split())
-    assert 'Direct web fetches' not in text
+    assert 'Estimated Cost (Before Credits) not recorded' in ' '.join(text.split())
+    assert 'Direct Web Fetches' not in text
 
 
 def test_section_is_in_the_one_report_collapsed_and_after_how_to_read():

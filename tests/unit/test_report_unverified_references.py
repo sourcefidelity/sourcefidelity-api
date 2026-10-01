@@ -77,10 +77,10 @@ def test_reference_window_groups_findings_under_one_heading_per_category():
                 {**formatting('doi_registers_a_different_title', text='The DOI is registered to a different title.')}]
     win = window(render(findings), 'reference-entry-panel-1')
     headings = [h.get_text() for h in win.select('section.reference-finding > h3 .issue-heading')]
-    assert headings == ['Citation and reference formatting', 'Academic Practice']  # no "Evidence" label (2026-09-30)
+    assert headings == ['Citation and Reference Formatting', 'Academic Practice']  # no "Evidence" label (2026-09-30)
     formatting_section = win.select('section.reference-finding')[1]
     assert len(formatting_section.select('.finding-item')) == 3 and len(formatting_section.select('h3')) == 1
-    assert 'Search details' in win.select('section.reference-finding')[0].get_text()
+    assert 'Search Details' in win.select('section.reference-finding')[0].get_text()
 
 
 def test_wrong_doi_is_a_submitted_link_issue_never_formatting_and_stated_once():
