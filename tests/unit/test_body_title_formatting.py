@@ -24,3 +24,21 @@ def test_exact_title_year_style_with_conservative_boundaries(mode,expected):
     result=assess_body_title_italics(content=stream.getvalue(),body=body,references=refs,citation_format='mla' if mode=='mla' else 'apa')
     assert [o['status'] for o in result['observations']]==([] if expected is None else [expected])
     assert not result['automatic_findings_enabled']
+
+
+def test_a_quoted_full_film_title_is_a_mention_and_the_film_owns_a_title_shared_with_a_review():
+    # Owner decision 2026-10-02 (paper 1): "The Last Temptation of Christ" in quotes,
+    # the film marked [Motion Picture], and a review titled with the film's name.
+    d=Document();p=d.add_paragraph('"The Lasting Example of Film" is the film I analyse here.')
+    film=ParsedReference(reference_id='film',title='The lasting example of film [Motion Picture]',year='1988',
+        raw_ref='Director, A. (Director). (1988). The lasting example of film [Motion Picture]. Studio.',
+        source_kind='traditional_media',source_kind_confidence='high')
+    review=ParsedReference(reference_id='review',title='The Lasting Example of Film',year='1988',
+        raw_ref='Critic, R. (1988). The Lasting Example of Film. Example.com. https://example.com/r',
+        source_kind='webpage',source_kind_confidence='high')
+    stream=io.BytesIO();d.save(stream)
+    result=assess_body_title_italics(content=stream.getvalue(),body=p.text,references=[film,review])
+    assert [(o['reference_id'],o['status']) for o in result['observations']]==[('film','difference')]
+    book=film.model_copy(update={'reference_id':'book','source_kind':'monograph','raw_ref':'Writer, B. (1988). The lasting example of film. Example Press.'})
+    result=assess_body_title_italics(content=stream.getvalue(),body=p.text,references=[film,book])
+    assert result['observations']==[]

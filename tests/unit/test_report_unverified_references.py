@@ -40,10 +40,11 @@ def render(findings, members=None, audience='instructor'):
 
 
 def test_cannot_be_verified_is_an_evidence_summary_not_academic_practice():
-    summaries = _build_report_summary(citations=[], overview={}, pervasive_hanging_indent=False,
+    summaries = _build_report_summary(citations=[], overview={'reference_count': 7}, pervasive_hanging_indent=False,
                                       reference_practice=[unverified()])
     [item] = summaries['evidence']
-    assert item['kind'] == 'unverified_reference' and item['text'].startswith('1 reference(s) cannot be verified.')
+    # Owner wording 2026-10-02.
+    assert item['kind'] == 'unverified_reference' and item['text'] == '1/7 sources cannot be verified and may not exist.'
     assert not summaries['academic_practice']
 
 
@@ -156,3 +157,63 @@ def test_the_identified_record_completes_the_doi_sentence_in_the_pdf():
         text = ' '.join(' '.join(page.get_text() for page in exported).split())
     start = text.index('The submitted DOI identi')
     assert text.index('other work', start) < text.index('Reference as submitted: Writer', start)
+
+
+def test_citation_window_heading_links_its_reference_in_the_reference_colour():
+    soup = render([])
+    template = BeautifulSoup(soup.find('template', id='citation-panel-1').decode_contents(), 'html.parser')
+    link = template.find('h2').find('button', class_='reference-heading-link')
+    assert link.get_text() == 'Reference 1' and link['data-go-to'] == 'reference-entry-panel-1'
+    window = BeautifulSoup(soup.find('template', id='reference-entry-panel-1').decode_contents(), 'html.parser')
+    assert window.find('h2').find(class_='reference-heading-link').get_text() == 'Reference 1'
+
+
+def test_a_wrapped_url_with_its_submitted_link_is_written_once():
+    from app.services.evidence_report import _render_formatted_reference
+    render_source = lambda source: _render_formatted_reference(source, '')
+    full = "https://example.test/publication/1_Theorising_the_Practice_of_Media"
+    html = render_source({"raw_reference": "Adams, A. (2020). A study. https://example.test/publication/1_Theorising_the_P ractice_of_Media",
+                          "submitted_hyperlinks": [full]})
+    assert html.count(f'>{full}</a>') == 1 and "ractice_of_Media" not in html.replace(full, "")
+
+
+def test_a_refused_submitted_link_explains_the_missing_text():
+    from app.services.evidence_report import _submitted_link_refused
+    refused = {'coverage_level': 'unavailable', 'submitted_link_observations': [
+        {'state': 'observed', 'requests': [{'completed_at': '2026-10-01T00:00:00Z', 'outcome': 'access_refused'}]}]}
+    assert _submitted_link_refused(refused)
+    assert not _submitted_link_refused({**refused, 'coverage_level': 'full_text'})
+    ok = {'coverage_level': 'unavailable', 'submitted_link_observations': [
+        {'state': 'observed', 'requests': [{'completed_at': '2026-10-01T00:00:00Z', 'outcome': 'response'}]}]}
+    assert not _submitted_link_refused(ok)
+
+
+def test_reference_findings_are_counted_in_three_broad_lines():
+    from app.services.evidence_report import broad_reference_summary, _summary_item
+    ref = lambda n: {'type': 'reference', 'number': n, 'target': f'reference-entry-panel-{n}'}
+    summary = {'evidence': [], 'academic_practice': [
+        _summary_item('submitted_link_issue', 'x', instances=[ref(3)], count=1)],
+        'reference_formatting': [
+        _summary_item('required_doi_missing', 'x', instances=[ref(5), ref(3)], count=2),
+        _summary_item('publication_year_discrepancy', 'x', instances=[ref(2)], count=1),
+        _summary_item('chapter_pages_missing', 'x', instances=[ref(6)], count=1)]}
+    findings = [{'finding_type': 'reference_title_missing', 'reference_id': 'r7', 'rectangles': [{}]}]
+    grouped = broad_reference_summary(summary, findings, {'r7': 7})
+    assert [(i['kind'], i['lead'], [x['number'] for x in i['instances']]) for i in grouped['academic_practice']] == [
+        ('reference_links', '2 references have incorrect or missing links', [3, 5])]
+    assert [(i['kind'], i['lead']) for i in grouped['reference_formatting']] == [
+        ('reference_incorrect_information', '1 reference contains incorrect information'),
+        ('reference_missing_information', '2 references are missing information')]
+    assert broad_reference_summary(grouped, findings, {'r7': 7}) == grouped
+
+
+def test_a_possible_match_copy_of_an_unverifiable_reference_is_not_its_text():
+    from app.services.evidence_report import withdraw_unverified_possible_matches
+    member = {'reference_id': 'r1', 'identity_status': 'possible_match', 'coverage_level': 'partial',
+              'best_evidence': {'text': 'x'}}
+    view = {'overview': {'verified_full_text_sources': 0, 'abstract_or_limited_sources': 1, 'unavailable_sources': 6}}
+    out = withdraw_unverified_possible_matches(view, [{'members': [member]}], {'r1'})
+    assert member['coverage_level'] == 'unavailable' and member['best_evidence'] is None
+    assert out['overview']['abstract_or_limited_sources'] == 0 and out['overview']['unavailable_sources'] == 7
+    kept = {'reference_id': 'r2', 'identity_status': 'possible_match', 'coverage_level': 'partial'}
+    assert withdraw_unverified_possible_matches(view, [{'members': [kept]}], {'r1'}) is view and kept['coverage_level'] == 'partial'

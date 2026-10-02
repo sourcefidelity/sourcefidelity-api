@@ -73,15 +73,18 @@ def test_supports_shows_the_sentence_most_supporting_readings_cite():
                 {"facet_id": "q", "direction": "supports", "evidence_sentence_ids": ["s2"], "rationale": ""}]
     html = judgment_result(_row("supported", "judge_supports", mappings), PAYLOAD, None)["html"]
     assert TEMPLATE_NOTES["supported"] in html
-    assert '<ul class="evidence-sentences jw-key-evidence"><li data-key-evidence="2:531:552">' in html
-    assert "<q>Most teachers agreed.</q>" in html and "raised" not in html
+    assert '<ul class="evidence-sentences jw-key-evidence"><li data-key-evidence="2:531:552" ' in html
+    shown = html.split('jw-key-evidence', 1)[1]
+    assert "<q>Most teachers agreed.</q>" in shown and "<q>Feedback" not in shown
     assert '<span class="ev-page">p. 7</span>' in html
 
 
 def test_a_tie_goes_to_the_whole_statement_readings_first_sentence_and_text_is_escaped():
     mappings = [{"facet_id": "g", "direction": "supports", "evidence_sentence_ids": ["s1", "s3"], "rationale": ""}]
     html = judgment_result(_row("supported", "judge_supports", mappings), PAYLOAD, None)["html"]
-    assert "<q>Feedback &lt;b&gt;raised&lt;/b&gt; motivation.</q>" in html and "sample" not in html
+    assert "<q>Feedback &lt;b&gt;raised&lt;/b&gt; motivation.</q>" in html
+    assert "sample" not in html.split('"></span>', 1)[-1].split('data-key-alternatives', 1)[0]
+    assert "<q>" in html and "sample</q>" not in html
 
 
 def test_other_results_show_no_key_sentence():
@@ -158,3 +161,17 @@ def test_split_answers_are_undecided_with_the_fixed_note_and_only_majority_answe
         {"facet_id": "g", "direction": "contradicts", "evidence_sentence_ids": ["s1"], "rationale": ""}]})
     result = judgment_result(row, PAYLOAD, None)
     assert [s["text"] for s in result["evidence"]] == ["Teachers in the sample said feedback helped."]
+
+
+def test_a_split_after_the_wider_search_is_undecided_not_unjudged():
+    from app.services.judgment_report import display_state
+    assert display_state("not_judged", "wider_search_samples_split") == "undecided"
+    assert display_state("not_judged", "wider_search_judge_undecided") == "undecided"
+    assert display_state("not_judged", "wider_search_unavailable") == "not_judged"
+
+
+def test_repeat_judge_samples_are_counted_under_one_endpoint():
+    from types import SimpleNamespace
+    from app.services.report_run_metrics import _judge_base_url
+    settings = SimpleNamespace(ZAI_BASE_URL="https://open.example.cn/api", LLM_BASE_URL="https://api.example.com")
+    assert _judge_base_url("zai_glm:s2", settings) == _judge_base_url("zai_glm", settings) == "https://open.example.cn/api"

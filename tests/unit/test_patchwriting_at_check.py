@@ -71,7 +71,7 @@ def test_result_is_persisted_with_bounded_fields_and_labels(checker):
     check = checker()
     check.run(_source(), "ref-1")
     block = check.summary_block()
-    assert block["policy_version"] == "patchwriting-v3" and block["decision_applied"] is False
+    assert block["policy_version"] == "patchwriting-v4" and block["decision_applied"] is False
     assert block["body"]["status"] == "ready"
     entry = block["sources"]["ref-1"]
     assert entry["status"] == "compared"
@@ -171,3 +171,16 @@ def test_only_the_report_projection_reads_the_result():
         path = root / name
         if path.exists():
             assert not reads.search(path.read_text(encoding="utf-8")), name
+
+
+def test_a_long_source_sentence_keeps_the_stretch_around_its_matched_words():
+    from app.services import patchwriting as pw
+    from app.services.patchwriting_at_check import MAX_SOURCE_TEXT, _source_sentence
+    text = "x " * 600 + "copied words here" + " y" * 300
+    at = 10_000 + text.index("copied")
+    row = _source_sentence(pw.MatchedSourceSentence(
+        sentence_key="k", page_index=0, page_label="1", absolute_start=10_000, absolute_end=10_000 + len(text),
+        role="body", text=text, matched_spans=[pw.SourceSpan(absolute_start=at, absolute_end=at + 17)]))
+    assert "copied words here" in row["text"] and len(row["text"]) == MAX_SOURCE_TEXT
+    assert row["absolute_end"] - row["absolute_start"] == len(row["text"]) and not row["text_truncated"]
+    assert row["cut_before"] and row["cut_after"]

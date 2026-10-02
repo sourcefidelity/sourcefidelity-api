@@ -242,9 +242,12 @@ def test_parenthetical_exact_film_title_links_without_title_variants():
 def test_second_explicit_surname_without_initials_still_links_exactly():
     ref = ParsedReference(reference_id='book',author='Smith, J. & Jones',year='1984',
         title='A complete title',raw_ref='Smith, J. & Jones (1984). A complete title. Example Press.')
-    for marker, expected in [('(Smith & Jones, 1984)', ['book']), ('(Smith & James, 1984)', [])]:
+    # Owner decision 2026-10-01 (citation-reference-tolerance-v1): a differing second
+    # author still links the one matching reference, and the difference is kept.
+    for marker, expected, differences in [('(Smith & Jones, 1984)', ['book'], []),
+                                          ('(Smith & James, 1984)', ['book'], ['coauthor:Jones'])]:
         found=extract_citations('The claim is stated '+marker+'.',[ref],format_hint='apa',use_llm_boundaries=False)
-        assert found[0].reference_ids==expected
+        assert found[0].reference_ids==expected and found[0].link_differences==differences
 
 
 def test_explicit_unmatched_narrative_attribution_is_retained_without_identity():

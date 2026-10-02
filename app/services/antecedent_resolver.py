@@ -33,6 +33,11 @@ _MENTION_BOUNDARY_WORDS = {
     "creates", "create", "causes", "cause", "results", "result", "shows",
     "show", "supports", "support", "limits", "limit", "derails", "derail",
     "affects", "affect", "encourages", "encourage",
+    # Reporting verbs: "This suggests that …" refers back like "This shows"
+    # (paper 4 citation 23 went unjudged; 2026-10-02).
+    "suggests", "suggest", "indicates", "indicate", "implies", "imply", "means", "mean",
+    "demonstrates", "demonstrate", "highlights", "highlight", "reflects", "reflect",
+    "illustrates", "illustrate", "reveals", "reveal",
 }
 _DEMONSTRATIVE_WORD = (
     rf"(?!(?:{'|'.join(sorted(_MENTION_BOUNDARY_WORDS))})\b)"

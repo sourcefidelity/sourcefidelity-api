@@ -344,6 +344,23 @@ class SemanticScholarRetriever(RetrievalSource):
             error="DOI not prefetched; individual Semantic Scholar fallback disabled",
         )
 
+    def paper_by_id(self, paper_id: str) -> RetrievalResult:
+        """The registered record for one Semantic Scholar paper ID (40 hex characters).
+
+        Used to read a submitted semanticscholar.org paper link whose page
+        answers automated requests with a challenge (2026-10-02).
+        """
+        if not re.fullmatch(r"[0-9a-f]{40}", str(paper_id or "")):
+            return RetrievalResult(source_name=self.name, success=False, error="invalid paper id")
+        resp = self._request("GET", f"{SEMANTIC_SCHOLAR_BASE}/paper/{paper_id}", {"fields": self._fields()})
+        if resp is None or resp.status_code != 200:
+            return RetrievalResult(source_name=self.name, success=False,
+                                   error=self._circuit_error() if resp is None else f"HTTP {resp.status_code}")
+        try:
+            return self._parse_paper(resp.json())
+        except ValueError:
+            return RetrievalResult(source_name=self.name, success=False, error="response_invalid")
+
     def search_by_title_author(self, title: str, author: str | None = None) -> RetrievalResult:
         """Search by title alone, deliberately ignoring the supplied author.
 

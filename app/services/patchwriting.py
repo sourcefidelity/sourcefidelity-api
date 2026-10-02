@@ -1,4 +1,4 @@
-"""Deterministic unquoted-wording and close-paraphrase comparison (patchwriting-v3).
+"""Deterministic unquoted-wording and close-paraphrase comparison (patchwriting-v4).
 
 Compares student wording with the sentences of authorized source texts and
 reports exact matched wording on both sides, the measures that produced each
@@ -39,7 +39,7 @@ from typing import Any, Iterable, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
-POLICY_VERSION = "patchwriting-v3"
+POLICY_VERSION = "patchwriting-v4"
 
 # --- Provisional thresholds (for owner calibration) ------------------------
 # unquoted_verbatim: a contiguous shared word run (exact word forms).
@@ -54,6 +54,12 @@ PARAPHRASE_MIN_MATCHED = 5          # matched content words in the region
 # student and the source side alike (the structural_retention measure).
 PARAPHRASE_MIN_RETAINED = 0.6
 PARAPHRASE_MIN_ORDER_AGREEMENT = 0.5  # Kendall-tau style, 1 = same order
+# Shared wording (owner request 2026-10-02): similar words in the same order are
+# not patchwriting without copied runs. A close paraphrase also needs one shared
+# run of 4+ identical words, or two runs of 2+, each holding a content word.
+PARAPHRASE_MIN_LONG_RUN = 4
+PARAPHRASE_MIN_SHORT_RUN = 2
+PARAPHRASE_MIN_SHORT_RUNS = 2
 # Local alignment scores over content words (function words are free).
 ALIGN_MATCH = 2.0
 ALIGN_SUBSTITUTION = -1.0   # one-for-one replacement in the same slot
@@ -91,6 +97,9 @@ THRESHOLDS = {
     "paraphrase_min_matched": PARAPHRASE_MIN_MATCHED,
     "paraphrase_min_retained": PARAPHRASE_MIN_RETAINED,
     "paraphrase_min_order_agreement": PARAPHRASE_MIN_ORDER_AGREEMENT,
+    "paraphrase_min_long_run": PARAPHRASE_MIN_LONG_RUN,
+    "paraphrase_min_short_run": PARAPHRASE_MIN_SHORT_RUN,
+    "paraphrase_min_short_runs": PARAPHRASE_MIN_SHORT_RUNS,
     "align_match": ALIGN_MATCH,
     "align_substitution": ALIGN_SUBSTITUTION,
     "align_gap": ALIGN_GAP,
@@ -314,7 +323,7 @@ class PatchwritingCoverage(BaseModel):
 
 
 class PatchwritingResult(BaseModel):
-    policy_version: Literal["patchwriting-v1", "patchwriting-v2", "patchwriting-v3"] = POLICY_VERSION
+    policy_version: Literal["patchwriting-v1", "patchwriting-v2", "patchwriting-v3", "patchwriting-v4"] = POLICY_VERSION
     status: Literal["compared", "not_assessed"]
     reason: str | None = None
     claim_id: str | None = None
@@ -339,6 +348,15 @@ class _Token:
     content: bool
     clause_break_after: bool = False   # clause punctuation follows (student side)
     capitalized: bool = False
+
+
+def _shared_content_runs(student: list, source: list) -> list[int]:
+    """Lengths of identical word runs shared by the two regions that hold a
+    content word, longest first."""
+    from difflib import SequenceMatcher
+    matcher = SequenceMatcher(None, [t.norm for t in student], [t.norm for t in source], autojunk=False)
+    return sorted((block.size for block in matcher.get_matching_blocks()
+                   if block.size and any(student[block.a + k].content for k in range(block.size))), reverse=True)
 
 
 def _normalize_word(value: str) -> str:
@@ -1062,9 +1080,14 @@ def _evaluate(unit: _StudentSentence, candidate: _Candidate) -> _Evaluated | Non
         # Matched words of a title or name capitalized on both sides do not
         # count toward the minimum (2026-09-30).
         own_words = sum(1 for i, n in matched if not (i in titles and source_tokens[n].capitalized))
+        runs = _shared_content_runs([t for t in unit.stream[s_first:s_last + 1] if t is not None],
+                                    source_tokens[t_first:t_last + 1])
+        copied = bool(runs) and (runs[0] >= PARAPHRASE_MIN_LONG_RUN
+                                 or sum(1 for r in runs if r >= PARAPHRASE_MIN_SHORT_RUN) >= PARAPHRASE_MIN_SHORT_RUNS)
         if (own_words >= PARAPHRASE_MIN_MATCHED
                 and measures.structural_retention >= PARAPHRASE_MIN_RETAINED
-                and measures.order_agreement >= PARAPHRASE_MIN_ORDER_AGREEMENT):
+                and measures.order_agreement >= PARAPHRASE_MIN_ORDER_AGREEMENT
+                and copied):
             kind = "close_paraphrase"
             region = (_extend_left(unit.stream, s_first), s_last)
             student_spans = _merge_adjacent(unit.stream, sorted(i for i, _ in matched))

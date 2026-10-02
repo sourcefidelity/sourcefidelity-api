@@ -23,7 +23,7 @@ def _scope_coverage_agrees(member: dict, scope: dict) -> bool:
         return False
     if coverage == 'abstract_only':
         return scope.get('scope_policy_version') in {
-            'abstract-topic-v4', 'abstract-topic-v5', 'abstract-topic-v6'}
+            'abstract-topic-v4', 'abstract-topic-v5', 'abstract-topic-v6', 'abstract-topic-v7'}
     return scope.get('scope_policy_version') == 'fulltext-topic-v1'
 
 
@@ -71,7 +71,7 @@ def _qualifying_scope_ground(scope: dict) -> bool:
                          and scope.get('plausible_connection') == 'absent')
     if version == 'abstract-topic-v4':
         return different_subject
-    if version not in {'abstract-topic-v5', 'abstract-topic-v6', 'fulltext-topic-v1'}:
+    if version not in {'abstract-topic-v5', 'abstract-topic-v6', 'abstract-topic-v7', 'fulltext-topic-v1'}:
         return False
     if scope.get('abstract_truncated'):
         # The assessment saw a prefix, not the abstract the reader is shown.

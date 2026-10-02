@@ -76,7 +76,8 @@ def test_selected_sentences_are_the_windows_collapsed_evidence_list():
                            "best_evidence": {"text": "OLD PASSAGE", "display_text": "OLD PASSAGE"}}, grouped=True)
     # Collapsed under "Evidence", unnumbered, page kept (owner request 2026-09-28).
     assert ('<details class="evidence-disclosure"><summary>Evidence</summary><ul class="evidence-sentences" '
-            'data-evidence-list><li data-evidence-key="4:1010:1040"><span class="ev-page">p. 12</span>') in html
+            'data-evidence-list><li data-evidence-key="4:1010:1040" data-reason="bears_on_statement">'
+            '<span class="ev-page">p. 12</span>') in html
     assert "&lt;b&gt;films&lt;/b&gt;" in html and "OLD PASSAGE" not in html
     # The note comes before the evidence.
     assert html.index('data-judgment-record="rec-1"') < html.index('evidence-disclosure')

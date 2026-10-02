@@ -168,6 +168,7 @@ def extract_paper_job(
         artifact = extract_paper_evidence(
             text,
             docx_content=content if job.filename.lower().endswith('.docx') else None,
+            link_targets=_pdf_link_targets(content) if job.filename.lower().endswith('.pdf') else frozenset(),
             paper_version_id=job.paper_version_id,
             reference_text=reference_candidate.text,
             reference_layout_text=reference_candidate.layout_text,
@@ -326,6 +327,11 @@ def retrieve_paper_sources(
         scope_type=getattr(job, "scope_type", None) or "", scope_id=getattr(job, "scope_id", None) or "",
         store=SearchMemoStore(session), force_search=bool(targeted_refresh.get("force_search")),
     )
+    # An unchanged reference already searched by an earlier run of this paper
+    # reuses that result instead of paying again (paper-search-reuse-v1). A
+    # targeted refresh never reuses: it exists to search again.
+    from app.services.search.rerun_reuse import prior_results_index, reused_result
+    rerun_index = {} if targeted_refresh else prior_results_index(session, job)
 
     def checkpoint(result_record: dict) -> None:
         results.append(result_record)
@@ -377,6 +383,16 @@ def retrieve_paper_sources(
         identity_only = reference.reference_id not in cited_reference_ids
         if identity_only:
             result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
+        reused = reused_result(rerun_index, reference, identity_only=identity_only)
+        if reused is not None and reused.get("status") == "durable_authorized":
+            try:
+                authorize_representation(session, backend, representation_id=reused["representation_id"],
+                                         scope_type=job.scope_type, scope_id=job.scope_id)
+            except Exception:
+                reused = None   # the stored source is no longer usable here: search again
+        if reused is not None:
+            checkpoint(reused)
+            continue
         try:
             with search_memo_scope(memo_context):
                 result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
@@ -540,7 +556,8 @@ def retrieve_paper_sources(
             # Independently verified acquisition provenance, not a retained
             # search result or a promise to retain transient source bytes.
             from urllib.parse import urlsplit
-            source_url = representation.source_url or ''
+            # A repository's reader page (Europe PMC) rather than its XML API.
+            source_url = (representation.metadata or {}).get('reader_url') or representation.source_url or ''
             try:
                 parsed_url = urlsplit(source_url)
             except ValueError:
@@ -556,6 +573,23 @@ def retrieve_paper_sources(
             if isinstance(stated, dict):
                 result_record['stated_page_completeness'] = dict(stated)
         checkpoint(result_record)
+    # Uncited references are not searched, but their own links are visited so
+    # a dead or wrong link is reported (owner decision 2026-10-02).
+    check_links = getattr(active_resolver, "check_submitted_links", None)
+    searched = {reference.reference_id for reference in discovery_references}
+    for reference in artifact.references:
+        if (check_links is None or reference.reference_id in searched
+                or reference.reference_id in completed_reference_ids
+                or not (getattr(reference, "url", None) or getattr(reference, "doi", None))):
+            continue
+        record = {"reference_id": reference.reference_id, "status": "link_check_only",
+                  "reason_code": "uncited_reference"}
+        try:
+            checked = check_links(reference)
+            record["submitted_link_observations"] = (checked.metadata or {}).get("submitted_link_observations")
+        except Exception as exc:  # noqa: BLE001 - a failed visit is recorded, never fatal
+            record["submitted_link_observations"] = getattr(exc, "submitted_link_observations", None)
+        checkpoint(record)
     job.source_results = results
     job.stage = JobStage.RETRIEVED
     job.updated_at = datetime.now(timezone.utc)
@@ -1917,6 +1951,17 @@ def _extraction(job: Job) -> PaperExtractionArtifact:
     if not job.extraction_payload:
         raise PaperWorkflowError("extraction_missing", "Paper extraction checkpoint is missing")
     return PaperExtractionArtifact.model_validate(job.extraction_payload)
+
+
+def _pdf_link_targets(content: bytes) -> frozenset[str]:
+    """The paper's own web link targets, which prove a wrapped URL's joined form."""
+    try:
+        import fitz
+        with fitz.open(stream=content, filetype="pdf") as document:
+            return frozenset(link["uri"] for page in document for link in page.get_links()
+                             if str(link.get("uri") or "").lower().startswith(("http://", "https://")))
+    except Exception:
+        return frozenset()
 
 
 def _select_reference_candidate(

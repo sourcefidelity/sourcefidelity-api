@@ -167,3 +167,24 @@ def stated_page_completeness(html: str, text: str, kind: str | None) -> dict:
         return {**result, "reason": "length_does_not_fit_kind"}
     return {**result, "verdict": "complete", "reason": "stated_work_whole_page",
             "html_sha256": hashlib.sha256((html or "").encode()).hexdigest()}
+
+
+WEB_PAGE_KINDS = frozenset({"webpage", "news_article", "blog_post"})
+
+
+def uploaded_page_completeness(text: str, kind: str | None) -> dict:
+    """Completeness of an owner-uploaded PDF of a web page (owner decision 2026-10-01).
+
+    The upload already passed identity matching, so the stated-page minimum of
+    1,000 words does not apply: the page is complete when it shows no sign of
+    being cut off and its length fits a web page.
+    """
+    words = len(re.findall(r"\w+", text or ""))
+    result = {"version": "uploaded-web-page-coverage-v1", "verdict": "not_assessed", "words": words}
+    if str(kind or "") not in WEB_PAGE_KINDS:
+        return {**result, "reason": "not_a_web_page"}
+    if _CUT_OFF.search(text or ""):
+        return {**result, "reason": "cut_off_signal"}
+    if not length_fits_kind(words, kind):
+        return {**result, "reason": "length_does_not_fit_kind"}
+    return {**result, "verdict": "complete", "reason": "uploaded_web_page_whole"}

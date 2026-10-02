@@ -152,8 +152,19 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
     archive_item = parsed_url.hostname in {"archive.org", "www.archive.org"} and parsed_url.path.startswith("/details/")
     date = next(iter(meta.get("citation_publication_date", []) or meta.get("citation_date", [])
                      or meta.get("article:published_time", [])), None)
+    generic_date = not date and bool(fields.get("date"))
     date = date or fields.get("date")
     date_method = "metadata" if date else None
+    # A byline slot holding interface text ("Author Notes Loading Author Notes",
+    # "Name") is page furniture, not a credit; on such a page the generic date
+    # describes the page, not the work (paper 5, Bond, 2026-10-01).
+    labels = [a for a in authors if _label_only_author(str(a))]
+    if labels:
+        authors = [a for a in authors if not _label_only_author(str(a))]
+        if not authors:
+            author_method = "interface_label_rejected"
+        if generic_date:
+            date, date_method = None, "page_furniture_date_rejected"
     if archive_item:
         # The item webpage's date is often its upload/scan date, not the
         # publication year of the described book. Require the labelled field.
@@ -266,3 +277,13 @@ def _without_job_title(author: str) -> str:
     """The name without a trailing job title; unchanged when none is present."""
     match = _JOB_TITLE.match(author)
     return match.group("name").rstrip(" ,") if match else author
+
+
+# Words that make up interface labels rather than names.
+_AUTHOR_LABEL_WORDS = frozenset({"author", "authors", "note", "notes", "loading", "name", "names",
+                                 "by", "unknown", "details", "more", "information", "info"})
+
+
+def _label_only_author(value: str) -> bool:
+    words = re.findall(r"[a-z]+", value.casefold())
+    return bool(words) and all(word in _AUTHOR_LABEL_WORDS for word in words)

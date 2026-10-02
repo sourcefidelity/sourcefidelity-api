@@ -264,11 +264,13 @@ class TestClassifierBoundaries:
         from app.services.source_type import classify_reference_source_kind
 
         raw = "World Health Organization (2021). Global status report on alcohol. World Health Organization."
-        assert classify_reference_source_kind(raw).kind == "unknown"
+        # Owner decision 2026-10-02: an organisation's dated, titled document is a searchable report.
+        assert classify_reference_source_kind(raw).kind == "report"
 
-    def test_a_document_with_nothing_after_its_title_is_still_institutional(self):
+    def test_a_document_with_nothing_after_its_title_is_now_a_report(self):
+        """Owner decision 2026-10-02 reverses 2026-09-23: such documents are online and searched."""
         from app.services.source_type import classify_reference_source_kind
 
         for raw in ("Northfield State University (2015). NSU language policy.",
                     "Ministry of Education (2019). National curriculum framework."):
-            assert classify_reference_source_kind(raw).kind == "webpage", raw
+            assert classify_reference_source_kind(raw).kind == "report", raw

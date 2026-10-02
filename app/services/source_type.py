@@ -253,7 +253,10 @@ _BOOK_EDITION_RE = re.compile(r"\(\s*\d+(?:st|nd|rd|th)\s+ed\.?(?:ition)?\s*\)",
 _BOOK_SECTION_RE = re.compile(
     r"\bIn\s+.{1,160}\((?:Ed|Eds)\.\)"
     # Editors omitted: "Chapter. In Book title (pp. 75-116)." (2026-09-29).
-    r"|\.\s+In\s+[^()]{3,300}?\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)",
+    r"|\.\s+In\s+[^()]{3,300}?\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)"
+    # Editors after the book title: "Chapter. In Book title (A. Name & B. Name,
+    # Eds.)." A common student variant (paper 5, Bordwell, 2026-10-01).
+    r"|\.\s+In\s+[^()]{3,300}?\([^()]{2,160}?,\s*Eds?\.\s*\)",
     re.IGNORECASE,
 )
 _COLLECTION_LEAD_RE = re.compile(
@@ -338,6 +341,19 @@ def _has_statement_after_title(raw: str) -> bool:
     return len(segments) > 1
 
 
+def _organisation_report(raw: str) -> bool:
+    """An organizational author, a four-digit year and a title of three words or more."""
+    segment = _AUTHOR_SEGMENT_RE.match(raw)
+    after = _AFTER_YEAR_RE.search(raw)
+    if segment is None or after is None or not re.search(r"\(\s*\d{4}", raw[:segment.end() + 2]):
+        return False
+    author = segment.group(1).strip()
+    if not author or _PERSONAL_AUTHOR_INITIALS_RE.search(author) or not _ORGANIZATION_AUTHOR_RE.search(author):
+        return False
+    title = _STATEMENT_SPLIT_RE.split(after.group(1).strip())[0] if after.group(1).strip() else ""
+    return len(re.findall(r"[^\W\d_]{2,}", title)) >= 3 and not re.match(r"(?i)retrieved|available|https?://", title)
+
+
 def _institutional_self_published(raw: str) -> bool:
     """Whether an organization is citing a document it published about itself.
 
@@ -418,14 +434,13 @@ def classify_reference_source_kind(
     # work is registered and resolvable. Treating a doi.org link as a webpage
     # classified the reference into the unsearchable set, so a fabricated
     # reference carrying an invented DOI was never reviewed at all.
+    # An organisation's titled, dated document is a report, searched and
+    # assessed like one (owner decision 2026-10-02, reversing 2026-09-23:
+    # almost every report a student cites is online).
+    if _organisation_report(raw):
+        return _assessment("report", "medium", "organizational author with a dated, titled document")
     if re.search(r"https?://|www\.", combined, re.I) and not _DOI_STATEMENT_RE.search(combined):
         return _assessment("webpage", "low", "URL without a more specific work-type marker")
-    if _institutional_self_published(raw):
-        return _assessment(
-            "webpage",
-            "low",
-            "organizational author without venue, publisher, identifier or edition",
-        )
     return SourceKindAssessment()
 
 
@@ -689,4 +704,29 @@ def is_archive_source(raw_ref: str) -> bool:
     bibliographic_text = re.sub(
         r"\bInternet\s+Archive\b", " ", bibliographic_text, flags=re.I
     )
-    return bool(ARCHIVE_RE.search(bibliographic_text))
+    if not ARCHIVE_RE.search(bibliographic_text):
+        return False
+    # An organisation named "... Archive" can publish an ordinary web page
+    # (UCLA Film & Television Archive, paper 5, 2026-10-01). When the archive
+    # wording is only in the author segment and the reference is marked as
+    # online, it cites a web page, not a physical holding.
+    author, rest = _author_segment(bibliographic_text)
+    online = bool(_ONLINE_MARKER_RE.search(raw_ref))
+    return not (online and ARCHIVE_RE.search(author) and not ARCHIVE_RE.search(rest))
+
+
+# Online markers, including MLA's scheme-less addresses ("hammer.ucla.edu/...").
+_ONLINE_MARKER_RE = re.compile(
+    r"https?://|www\.|\[online\]|\bretrieved\b[^.]{0,80}\bfrom\b"
+    r"|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:edu|org|com|net|gov|ac\.[a-z]{2}|co\.[a-z]{2})/\S", re.IGNORECASE)
+
+
+def _author_segment(text: str) -> tuple[str, str]:
+    """(author, remainder): before an APA date in parentheses, else before the first full stop."""
+    date = re.search(r"\(\s*(?:(?:18|19|20)\d{2}[a-z]?|n\.\s*d\.)[^)]{0,40}\)", text, re.IGNORECASE)
+    if date and date.start() <= 200:
+        return text[:date.start()], text[date.end():]
+    stop = re.search(r"\.\s", text)
+    if stop and stop.start() <= 160:
+        return text[:stop.start()], text[stop.end():]
+    return "", text

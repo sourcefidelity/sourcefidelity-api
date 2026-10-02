@@ -45,7 +45,8 @@ def test_semantic_scholar_and_core_are_the_non_blocking_routes() -> None:
     assert _RETRIEVER_CLASSES["core"].blocks_search_completion() is False
     others = {name for name, cls in _RETRIEVER_CLASSES.items()
               if not cls.blocks_search_completion()}
-    assert others == {"semantic_scholar", "core"}
+    # Europe PMC: positive-only repository copies (owner decision 2026-10-02).
+    assert others == {"semantic_scholar", "core", "europepmc"}
 
 
 def test_the_declaration_no_longer_rides_on_the_batching_flag() -> None:
@@ -82,8 +83,8 @@ def test_the_current_declarations_preserve_the_previous_routing() -> None:
     outcome moves. Changing any of them is a separate, measured decision.
     """
     for name, cls in _RETRIEVER_CLASSES.items():
-        if name == "core":
-            continue  # Changed by owner decision 2026-09-29 (see above).
+        if name in {"core", "europepmc"}:
+            continue  # Owner decisions 2026-09-29 and 2026-10-02 (see above).
         assert cls.blocks_search_completion() is not getattr(cls, "deferred", False), name
 
 

@@ -56,8 +56,10 @@ def credibility_records_html(finding):
     """Shared live/portable/PDF metadata explanation; no source-text evidence."""
     if finding.get('finding_type') in {'unverified_reference', 'potentially_fabricated_reference'}:
         explanation = str(finding.get('evidence_explanation') or '')
+        # Owner decision 2026-10-02: the bounded-coverage sentence is not shown.
         limits = ''.join('<p class="muted">' + escape(str(item)) + '</p>'
-                         for item in finding.get('limitations') or [])
+                         for item in finding.get('limitations') or []
+                         if str(item) != 'Search coverage is bounded, not an exhaustive catalog of published works.')
         return ('<details><summary>Search Details</summary><p>' + escape(explanation) +
                 '</p>' + limits + '</details>') if explanation else ''
     rows = []

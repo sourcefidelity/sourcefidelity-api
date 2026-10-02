@@ -378,6 +378,14 @@ class InTextCitation(BaseModel):
         default="high",
         description="Extraction confidence: high (regex) / medium (LLM) / low (ambiguous)",
     )
+    link_differences: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Set when a tolerant rule linked a marker that differs from its reference "
+            "(citation-reference-tolerance-v1): each item is '<kind>:<reference value>', "
+            "kind one of year, author_count, author_spelling, coauthor"
+        ),
+    )
     drop_reason: Optional[str] = Field(
         default=None,
         description=(

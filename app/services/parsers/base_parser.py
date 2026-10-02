@@ -193,6 +193,9 @@ class BaseParser(ABC):
             and not cls._CONTINUATION_PATTERN.match(stripped)
         )
 
+    # A full line after a line ending in a DOI or URL starts a new entry.
+    TERMINATOR_SPLIT = False
+
     @classmethod
     def _merge_lines(cls, lines: List[str]) -> List[str]:
         """Merge consecutive lines into reference blocks.
@@ -207,6 +210,7 @@ class BaseParser(ABC):
 
         blocks: List[str] = []
         current: List[str] = []
+        opened_after_terminator = False
 
         for line in lines:
             stripped = line.strip()
@@ -217,11 +221,27 @@ class BaseParser(ABC):
                 continue
 
             is_new_ref = cls._starts_new_reference(stripped, current)
+            # A title-first entry opened after a DOI/URL keeps its next line
+            # until its year appears ("Title … Web" / "Site.com. (2023)").
+            if (is_new_ref and opened_after_terminator and current
+                    and not re.search(r'\((?:19|20)\d{2}|\(n\.\s?d\b', ' '.join(current))):
+                is_new_ref = False
+            elif (not is_new_ref and cls.TERMINATOR_SPLIT and current
+                    and re.search(r'(?:https?://|doi\.org/)\S+$', current[-1])
+                    and len(stripped.split()) >= 4 and stripped[0].isupper()
+                    and not re.match(r'(?:https?://|doi|Retrieved|Available|Accessed)', stripped, re.I)):
+                # A DOI or URL ends an APA entry; a full line after it starts
+                # the next one (paper 4: a title line joined to Stein; 2026-10-02).
+                blocks.append(' '.join(current))
+                current = [stripped]
+                opened_after_terminator = True
+                continue
 
             if is_new_ref:
                 if current:
                     blocks.append(' '.join(current))
                 current = [stripped]
+                opened_after_terminator = False
             else:
                 # Always add non-matching lines to current, even if empty.
                 # Multi-line references may have the year on line 2+.

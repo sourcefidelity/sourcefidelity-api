@@ -122,7 +122,34 @@ def _copied_runs(student: list, source: list, student_spans: list, source_spans:
     return marked_student, marked_source
 
 
-def _source_clause(sentence: dict, student: list, student_spans: list) -> tuple[str, set]:
+def _segments(text: str, bold: list[tuple[int, int]]) -> list[dict]:
+    """Text in order with the given character ranges marked as copied."""
+    segments: list[dict] = []
+
+    def add(value: str, copied: bool) -> None:
+        if not value:
+            return
+        if segments and segments[-1]["copied"] == copied:
+            segments[-1]["text"] += value
+        else:
+            segments.append({"text": value, "copied": copied})
+
+    position = 0
+    for low, high in sorted(bold):
+        low = max(low, position)
+        if high <= low:
+            continue
+        if segments and segments[-1]["copied"] and not text[position:low].strip():
+            add(text[position:high], True)
+        else:
+            add(text[position:low], False)
+            add(text[low:high], True)
+        position = high
+    add(text[position:], False)
+    return segments
+
+
+def _source_clause(sentence: dict, student: list, student_spans: list) -> tuple[str, set, list]:
     """The part of a source sentence the student follows, with ellipses where cut.
 
     The clause runs from the first to the last copied word; a sentence whose
@@ -135,7 +162,7 @@ def _source_clause(sentence: dict, student: list, student_spans: list) -> tuple[
     whole = readable_text(text.strip())
     if (sentence.get("text_truncated") or not isinstance(origin, int) or not isinstance(stop, int)
             or len(text) != stop - origin):
-        return whole, set()
+        return whole, set(), [{"text": whole, "copied": False}]
     spans = [(span["absolute_start"] - origin, span["absolute_end"] - origin)
              for span in sentence.get("matched_spans") or []
              if isinstance(span, dict) and isinstance(span.get("absolute_start"), int)
@@ -145,12 +172,20 @@ def _source_clause(sentence: dict, student: list, student_spans: list) -> tuple[
     bounds = [(token[1], token[2]) for index, token in enumerate(source)
               if index in marked_source or _inside(token, spans)]
     if not bounds:
-        return whole, marked_student
+        return whole, marked_student, [{"text": whole, "copied": False}]
     low, high = min(b[0] for b in bounds), max(b[1] for b in bounds)
     clause = readable_text(text[low:high])
-    lead = "… " if text[:low].strip() else ""
-    tail = " …" if text[high:].strip(_CLOSING) else ""
-    return lead + clause + tail, marked_student
+    lead = "… " if text[:low].strip() or sentence.get("cut_before") else ""
+    tail = " …" if text[high:].strip(_CLOSING) or sentence.get("cut_after") else ""
+    # The source's copied words in bold, as on the student side (owner request
+    # 2026-10-02). Bold only when the clause is the stored text unchanged.
+    if clause == text[low:high]:
+        segments = _segments(clause, [(a - low, b - low) for a, b in bounds])
+    else:
+        segments = [{"text": clause, "copied": False}]
+    segments = ([{"text": lead, "copied": False}] if lead else []) + segments + (
+        [{"text": tail, "copied": False}] if tail else [])
+    return lead + clause + tail, marked_student, segments
 
 
 def _student_segments(row: dict, marked: set, student: list) -> list[dict]:
@@ -201,15 +236,16 @@ def _comparison(row: dict) -> dict:
         s.get("page_index") if isinstance(s.get("page_index"), int) else -1,
         s.get("absolute_start") if isinstance(s.get("absolute_start"), int) else -1))
     for sentence in ordered:
-        clause, copied = _source_clause(sentence, student, spans)
+        clause, copied, segments = _source_clause(sentence, student, spans)
         marked |= copied
         page_index = sentence.get("page_index")
         page = sentence.get("page_label") or (page_index + 1 if isinstance(page_index, int) else None)
         page = str(page) if page not in (None, "") else None
         if excerpts and excerpts[-1]["page"] == page:
             excerpts[-1]["text"] += " " + clause
+            excerpts[-1]["segments"] += [{"text": " ", "copied": False}] + segments
         else:
-            excerpts.append({"page": page, "text": clause})
+            excerpts.append({"page": page, "text": clause, "segments": segments})
     return {"student": _student_segments(row, marked, student), "excerpts": excerpts}
 
 

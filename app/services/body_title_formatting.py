@@ -72,6 +72,10 @@ def body_title_findings(assessment, references, paper_sha256):
     return findings
 
 
+_FILM_MARKER = re.compile(r'\[(?:Film|Documentary|Motion\s+picture|Movie)\]', re.I)
+_WEB_KINDS = frozenset({'webpage', 'news_article', 'blog_post', 'video'})
+
+
 def assess_body_title_italics(*, content: bytes, body: str, references,
                              citation_format: str = 'apa') -> dict:
     """Inspect exact title + year mentions in uniquely mapped body paragraphs.
@@ -85,15 +89,21 @@ def assess_body_title_italics(*, content: bytes, body: str, references,
     if citation_format!='apa':return result
     groups=defaultdict(list)
     for ref in references:
-        title=re.sub(r'\s+\[(?:Film|Documentary)\]$', '', ref.title, flags=re.I).strip()
+        title=re.sub(r'\s+\[(?:Film|Documentary|Motion\s+picture|Movie)\]$', '', ref.title, flags=re.I).strip()
         if title:groups[title.casefold()].append((title,ref))
     eligible=[]
     for entries in groups.values():
+        # A film owns a title it shares only with web pages, such as a review
+        # titled with the film's name (owner decision 2026-10-02).
+        films=[(t,r) for t,r in entries if r.source_kind=='traditional_media' and _FILM_MARKER.search(r.raw_ref)]
+        if (len(entries)>1 and len(films)==1
+                and all(r.source_kind in _WEB_KINDS for t,r in entries if (t,r) not in films)):
+            entries=films
         if len(entries)!=1:continue
         title,ref=entries[0]
         if ref.needs_review or ref.source_kind_confidence!='high':continue
         if any(char in title for char in '“”"[]'):continue
-        film=ref.source_kind=='traditional_media' and re.search(r'\[(?:Film|Documentary)\]',ref.raw_ref,re.I)
+        film=ref.source_kind=='traditional_media' and _FILM_MARKER.search(ref.raw_ref)
         if not (film or ref.source_kind=='monograph') or not re.fullmatch(r'(?:19|20)\d{2}',ref.year or ''):continue
         if ref.source_kind == 'monograph':
             # Reuse the reference-title rule's independent book premise.
@@ -112,6 +122,10 @@ def assess_body_title_italics(*, content: bytes, body: str, references,
         styles=[flag for run in runs for flag in [_docx_run_italic(run)]*len(run.text)]
         for title,ref in eligible:
             pattern=r'(?<!\w)'+re.escape(title)+r'(?!\w)(?=\s*[（(]\s*'+re.escape(ref.year)+r'\s*[)）])'
+            # A film's full title set off by quotation marks, with or without a
+            # year ("The Last Temptation of Christ"), is a mention of the film.
+            if ref.source_kind=='traditional_media' and len(title.split())>=3:
+                pattern+=r'|(?<=[“"‘])'+re.escape(title)+r'(?=[”"’])'
             for match in re.finditer(pattern,text,re.I):
                 s,e=match.span();observed=[styles[i] for i in range(s,e) if not text[i].isspace()]
                 surroundings=[styles[i] for i in range(len(text)) if not s<=i<e and not text[i].isspace()]

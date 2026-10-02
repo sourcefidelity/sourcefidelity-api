@@ -11,6 +11,7 @@ already hold. Every model-, student- and source-derived string is escaped.
 """
 from __future__ import annotations
 
+import json
 import re
 from html import escape
 
@@ -40,7 +41,9 @@ UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported
 
 def display_state(state: str | None, reason: str | None) -> str:
     """The shown state: an undecided judge is its own result (owner decision 2026-09-29)."""
-    if state == "not_judged" and reason in {"judge_undecided", "samples_split"}:
+    # The same results after a wider evidence search carry a "wider_search_"
+    # prefix (paper 4 citation 8 showed Not Judged; 2026-10-02).
+    if state == "not_judged" and str(reason or "").removeprefix("wider_search_") in {"judge_undecided", "samples_split"}:
         return "undecided"
     return state if state in LABELS else "not_judged"
 JUDGED = frozenset({"supported", "qualified", "contradicts", "insufficient"})
@@ -159,14 +162,20 @@ def _key_sentence(arms: list[dict], facets: dict, sentences: dict) -> dict | Non
     supporting readings cite; a tie goes to the whole-statement reading's first.
     """
     supporting = [m for arm in arms for m in arm.get("mappings") or [] if m.get("direction") == "supports"]
-    whole = [sid for m in supporting if (facets.get(m.get("facet_id")) or {}).get("kind") == "candidate_as_written"
-             for sid in m.get("evidence_sentence_ids") or []]
+    whole_readings = [m for m in supporting if (facets.get(m.get("facet_id")) or {}).get("kind") == "candidate_as_written"]
+    whole = [sid for m in whole_readings for sid in m.get("evidence_sentence_ids") or []]
     order = [sid for sid in dict.fromkeys(whole or [sid for m in supporting for sid in m.get("evidence_sentence_ids") or []])
              if sid in sentences]
     if not order:
         return None
-    votes = {sid: sum(sid in (m.get("evidence_sentence_ids") or []) for m in supporting) for sid in order}
-    return sentences[max(order, key=lambda sid: (votes[sid], -order.index(sid)))]
+    # A sentence cited only for whose claim it is (attribution or discourse
+    # scope) does not outvote one that bears on the statement (citation 21,
+    # 2026-10-02).
+    voters = [m for m in supporting if (facets.get(m.get("facet_id")) or {}).get("kind")
+              not in {"source_attribution", "inherited_discourse_scope"}] or supporting
+    votes = {sid: sum(sid in (m.get("evidence_sentence_ids") or []) for m in voters) for sid in order}
+    ranked = sorted(order, key=lambda sid: (-votes[sid], order.index(sid)))
+    return dict(sentences[ranked[0]], alternatives=[sentences[sid] for sid in ranked])
 
 
 def _with_references(tokenized: str) -> str:
@@ -218,12 +227,13 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         if key is not None:
             # Shown outside the collapsed list; the page script leaves it out of that list.
             parts.append(
-                f'<ul class="evidence-sentences jw-key-evidence"><li data-key-evidence="{escape(key["key"], quote=True)}">'
+                f'<ul class="evidence-sentences jw-key-evidence"><li data-key-evidence="{escape(key["key"], quote=True)}" '
+                f'data-key-alternatives="{escape(json.dumps([{"key": a["key"], "text": a["text"], "page": a.get("page")} for a in key["alternatives"]]), quote=True)}">'
                 + (f'<span class="ev-page">p. {escape(str(key["page"]))}</span> ' if key.get("page") else "")
                 + f'<q>{escape(key["text"])}</q></li></ul>')
     elif state == "undecided":
         # Answers with no shared result keep the fixed note; otherwise the statement was unresolved.
-        note = UNDECIDED_NOTE if reason == "samples_split" else UNDECIDED_WORDING_NOTE
+        note = UNDECIDED_NOTE if str(reason or "").removeprefix("wider_search_") == "samples_split" else UNDECIDED_WORDING_NOTE
         parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
     if reason in _RETRY_REASONS:
         parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')

@@ -85,6 +85,13 @@ def build_released_report_export(
     if paper_sha256 != artifact.presentation_sha256:
         raise ReportExportError("Retained paper presentation does not match its hash")
 
+    from app.services.evidence_report import normalize_reference_findings, withdraw_unverified_possible_matches
+    from app.services.highlight_priority import UNVERIFIED_FINDINGS
+    from copy import deepcopy
+    view = deepcopy(view)
+    unverified = {f.get('reference_id') for f in normalize_reference_findings(view.get('reference_practice') or [])
+                  if f.get('finding_type') in UNVERIFIED_FINDINGS}
+    view = withdraw_unverified_possible_matches(view, view.get('citations') or [], unverified)
     manifest = _base_manifest(
         report=report,
         view=view,
@@ -315,8 +322,9 @@ def _append_evidence(document, citations, findings, view) -> dict:
     from app.services.report_style_guidance import guidance_links
     from app.services.evidence_report import _citation_guidance_kinds
     citation_format = str(view.get('citation_format') or '')
-    from app.services.evidence_report import report_summary, summary_text
-    for category, priorities in report_summary(view).items():
+    from app.services.evidence_report import broad_reference_summary, report_summary, summary_text
+    from app.services.report_references import reference_numbers
+    for category, priorities in broad_reference_summary(report_summary(view), findings, reference_numbers(view)).items():
         if priorities:
             label = 'Citation and Reference Formatting' if category == 'reference_formatting' else category.replace('_',' ').capitalize()
             # The PDF keeps the complete count-only sentence: it has no side
@@ -390,8 +398,9 @@ def _append_evidence(document, citations, findings, view) -> dict:
                         else 'Back to marked reference')
         blocks.append(f'<h2 id="{key}">{heading}</h2><p id="return-{key}" class="return">{return_label}</p>')
         from app.services.reference_credibility import credibility_finding_html, credibility_records_html
-        from app.services.evidence_report import _panel_statement
-        # No coaching text in the PDF either (owner decision 2026-09-30).
+        # No coaching text in the PDF either (owner decision 2026-09-30). The
+        # module-level import serves; a local one here made every earlier use
+        # in this function fail (PDF export unavailable, found 2026-10-02).
         blocks.append('<p>'+credibility_finding_html({**finding, 'finding': _panel_statement(finding.get('finding') or '')})+'</p>')
         if finding.get('finding_type') == 'required_quotation_locator_missing':
             blocks.append('<blockquote>'+escape(str(finding.get('quote_text') or ''))+'</blockquote>')

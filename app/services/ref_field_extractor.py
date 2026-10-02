@@ -303,6 +303,14 @@ _CONTAINER_IN_NO_EDITOR_RE = re.compile(
     re.IGNORECASE)
 
 
+# "Chapter title. In Book title (A. Name & B. Name, Eds.) (pp. 5-20)." The
+# editors follow the book title inside its parentheses; pages are optional.
+_CONTAINER_IN_EDITORS_AFTER_RE = re.compile(
+    r'\.\s+In\s+(?P<container>[^()]{3,300}?)\s*\([^()]{2,160}?,\s*Eds?\.\s*\)'
+    r'(?:\s*\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\))?',
+    re.IGNORECASE)
+
+
 # "… article title. Journal Name, 40(2), 125-139." The journal is the other
 # half of the identity combination for an article, and it was never extracted:
 # `_CONTAINER_IN_RE` recognises only the edited-collection shape, so all 155
@@ -389,7 +397,8 @@ def _container_and_pages(ref: str) -> tuple[str, str]:
     edited collection carries its own page range, and its container is named
     after an explicit "In ... (Ed.),". An article names its journal instead.
     """
-    match = _CONTAINER_IN_RE.search(ref or '') or _CONTAINER_IN_NO_EDITOR_RE.search(ref or '')
+    match = (_CONTAINER_IN_RE.search(ref or '') or _CONTAINER_IN_NO_EDITOR_RE.search(ref or '')
+             or _CONTAINER_IN_EDITORS_AFTER_RE.search(ref or ''))
     if not match:
         return _journal_and_pages(ref)
     container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')

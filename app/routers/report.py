@@ -466,6 +466,22 @@ def get_report_source(
     )
 
 
+def _stated_page_range(source: dict) -> tuple[int | None, int | None]:
+    """The page range the reference itself states ("(pp. 64-86)", "53(3),
+    152-177"), so an uploaded chapter or article is checked against it
+    (2026-10-02: report uploads passed no range, so a complete chapter stayed
+    "uncertain")."""
+    import re
+    raw = str(source.get("raw_reference") or "")
+    match = (re.search(r"\bpp?\.\s*(\d{1,5})\s*[-–—]\s*(\d{1,5})", raw)
+             or re.search(r"\)\s*,\s*(\d{1,5})\s*[-–—]\s*(\d{1,5})\b", raw))
+    if match:
+        first, last = int(match.group(1)), int(match.group(2))
+        if 0 < first < last <= first + 2000:
+            return first, last
+    return None, None
+
+
 @router.post("/{report_id}/source/{reference_id}/upload")
 def upload_report_source(
     report_id: str,
@@ -518,8 +534,8 @@ def upload_report_source(
         author=str(source.get("author") or "") or None,
         year=str(source.get("year") or "") or None,
         expected_pages=None,
-        expected_first_page=None,
-        expected_last_page=None,
+        expected_first_page=_stated_page_range(source)[0],
+        expected_last_page=_stated_page_range(source)[1],
         document_kind=None,
         source_kind=(
             str(source.get("source_kind") or "")
@@ -661,6 +677,7 @@ def upload_citation_source(
             provided_doi=str(source.get("doi") or "") or None,
             provided_title=str(source.get("title") or "") or None,
             provided_author=str(source.get("author") or "") or None,
+            web_page=str(source.get("source_kind") or "") == "webpage",
         )
         if verified:
             matches.append(member)
@@ -688,8 +705,8 @@ def upload_citation_source(
         author=str(source.get("author") or "") or None,
         year=str(source.get("year") or "") or None,
         expected_pages=None,
-        expected_first_page=None,
-        expected_last_page=None,
+        expected_first_page=_stated_page_range(source)[0],
+        expected_last_page=_stated_page_range(source)[1],
         document_kind=None,
         source_kind=(
             str(source.get("source_kind") or "")
@@ -821,7 +838,26 @@ def _start_uploaded_source_reanalysis(
             reference_id=reference_id,
             representation_id=str(accepted[0].get("id") or ""),
         )
-    except (PaperWorkflowError, ValueError) as exc:
+    except PaperWorkflowError as exc:
+        if exc.code != "report_reanalysis_busy":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # The source is stored and accepted; another upload's refresh is running.
+        # Queue this refresh to start when that one ends instead of refusing it
+        # (2026-10-01: Langford was stored but reported as refused).
+        from app.tasks.source_reanalysis import schedule_busy_upload_refresh
+        task_id = schedule_busy_upload_refresh(report_id, reference_id, str(accepted[0].get("id") or ""))
+        return {
+            "reanalysis_status": "scheduled",
+            "base_report_id": report_id,
+            "task_id": task_id,
+            "publication_pending": False,
+            "status_url": f"/report/{report_id}/successor",
+            "message": (
+                "Source uploaded and checked. The affected citation is being reanalyzed; "
+                "other citations will not be rerun."
+            ),
+        }
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not prepared.get("scheduled"):
         status = str(prepared.get("status") or "already_current")

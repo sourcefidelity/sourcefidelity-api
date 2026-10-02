@@ -88,3 +88,14 @@ def test_paper_boundary_applies_repair_without_models():
     assert new.references[0].url == "https://example.test/find?a=xrecord&b=2"
     assert new.references[0].reference_id == old.references[0].reference_id
     assert new.references[0].raw_ref == old.references[0].raw_ref
+
+
+def test_an_opaque_continuation_joins_only_when_the_pdf_link_target_proves_it():
+    layout = ("References\nAdams, A. (2020). A study. Press. https://example.test/publication/1_Theorising_the_P\n"
+              "ractice_of_Media\nBaker, B. (2021). Another study. Press.")
+    full = "https://example.test/publication/1_Theorising_the_Practice_of_Media"
+    refs = parse(layout)
+    assert repair_reference_urls(refs, _clean_text(layout))[0].url != full
+    assert repair_reference_urls(refs, _clean_text(layout), link_targets=frozenset({full}))[0].url == full
+    other = frozenset({"https://example.test/publication/1_Theorising_the_Practice_of_Media_extra"})
+    assert repair_reference_urls(refs, _clean_text(layout), link_targets=other)[0].url != full

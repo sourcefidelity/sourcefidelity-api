@@ -190,6 +190,15 @@ def upload_source(
             },
         )
 
+    # Facing book pages scanned side by side become one page each, so page
+    # counts, printed page numbers and completeness describe book pages
+    # (`two-up-split-v1`, owner request 2026-10-02). The split copy is stored.
+    from app.services.two_up_pages import split_two_up
+    two_up = split_two_up(file_bytes)
+    two_up_record = None
+    if two_up is not None:
+        file_bytes, two_up_record = two_up
+
     # Verify the PDF matches the provided metadata.
     verified, messages = verify_instructor_upload(
         file_bytes,
@@ -198,6 +207,7 @@ def upload_source(
         provided_author=author,
         provided_year=year,
         provided_isbn=isbn,
+        web_page=normalized_source_kind == "webpage",
     )
     upload_inspection = None
     if not verified:
@@ -264,8 +274,19 @@ def upload_source(
         )
         completeness_verdict = report.verdict
         logical_pages = report.n_up_layout.logical_pages if report.n_up_layout else None
+        if report.verdict in (INCOMPLETE, UNCERTAIN) and normalized_source_kind:
+            # Book and article rules cannot judge a printed web page; use the
+            # web-page rule instead (owner decision 2026-10-01).
+            import fitz
+            from app.services.web_completeness import uploaded_page_completeness
+            with fitz.open(stream=file_bytes, filetype="pdf") as document:
+                page_text = "\n".join(page.get_text() for page in document)
+            web = uploaded_page_completeness(page_text, normalized_source_kind)
+            if web["verdict"] == "complete":
+                completeness_verdict = "COMPLETE"
+                warnings.append("web_page_completeness: " + web["reason"])
 
-        flagged = report.verdict in (INCOMPLETE, UNCERTAIN)
+        flagged = completeness_verdict in (INCOMPLETE, UNCERTAIN)
         if flagged:
             warnings.extend(report.messages)
             warnings.extend(f"signal: {s}" for s in report.signals)
@@ -283,7 +304,7 @@ def upload_source(
                 status_code=422,
                 detail={
                     "error": "Upload rejected (strict mode): completeness check flagged this PDF",
-                    "completeness_verdict": report.verdict,
+                    "completeness_verdict": completeness_verdict,
                     "messages": warnings,
                 },
             )
@@ -377,6 +398,7 @@ def upload_source(
                         "logical_pages": logical_pages,
                         "source_kind": resolved_source_kind,
                         **({'source_inspection': upload_inspection} if upload_inspection else {}),
+                        **({'two_up_split': two_up_record} if two_up_record else {}),
                         **item_evidence,
                     },
                     request_acceptance=(review_status == "accepted"),

@@ -537,3 +537,53 @@ def test_no_container_record_when_the_book_search_found_nothing_usable(monkeypat
         metadata={'reference_discovery': {'outcome': outcome}}), raising=False)
     reference = parsed(BELTON, 'Belton, J').model_copy(update={'container_title': 'American cinema/American culture'})
     assert resolver._identify_container_work(reference) is None
+
+
+def test_a_chapter_with_editors_after_the_book_title_is_read_as_a_chapter():
+    """Paper 5, 2026-10-01: read as a whole book, the chapter title was searched as a book and flagged."""
+    from app.services.ref_field_extractor import extract_fields_apa
+    raw = ("Bordwell, D. (1985). Classical Hollywood Cinema: Narrational Principles and Procedure. "
+           "In The classical Hollywood cinema: Film style & mode of production to 1960 "
+           "(J. Staiger & K. Thompson, Eds.). Columbia University Press.")
+    parsed = extract_fields_apa(raw)
+    assert parsed.source_kind == 'book_section'
+    assert parsed.title == 'Classical Hollywood Cinema: Narrational Principles and Procedure'
+    assert parsed.container_title == 'The classical Hollywood cinema: Film style & mode of production to 1960'
+    with_pages = extract_fields_apa(raw.replace('Eds.).', 'Eds.) (pp. 1-84).'))
+    assert with_pages.container_title.startswith('The classical Hollywood cinema') and with_pages.pages == '1-84'
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    # Owner requests 2026-10-01 (paper 5): no editors; no page range.
+    ("de Luca, T., & Jorge, N. B. (2016). Introduction: From slow cinema to slow cinemas. In Slow cinema "
+     "(pp. 1–21). Edinburgh University Press.", ['chapter_editors_missing']),
+    ("Bordwell, D. (1985). Classical Hollywood Cinema: Narrational Principles and Procedure. In The classical "
+     "Hollywood cinema (J. Staiger & K. Thompson, Eds.). Columbia University Press.", ['chapter_pages_missing']),
+    ("Smith, A. (2019). Introduction. In A. Smith (Ed.), The handbook of things (pp. 1-10). Routledge.", []),
+])
+def test_chapter_references_report_missing_editors_or_page_range(raw, expected):
+    from types import SimpleNamespace
+    from app.services.reference_formatting import chapter_form_findings
+    ref = SimpleNamespace(raw_ref=raw, source_kind='book_section', needs_review=False, reference_id='ref-1')
+    assert [f['finding_type'] for f in chapter_form_findings([ref], 'apa')] == expected
+    assert chapter_form_findings([ref], 'mla') == []
+
+
+def test_a_repeated_publisher_and_a_web_reference_without_a_title_are_reported():
+    from app.services.reference_formatting import (PUBLISHER_REPEATED_TEXT, TITLE_MISSING_TEXT,
+                                                   reference_element_findings)
+    from app.services.schemas import ParsedReference
+    blom = ParsedReference(reference_id="r1", author="Blom, J.", year="2023", source_kind="monograph",
+                           title="Video game characters",
+                           raw_ref="Blom, J. (2023). Video game characters. In Example University Press eBooks. "
+                                   "Example University Press. https://doi.org/10.1/x")
+    site = ParsedReference(reference_id="r2", author="Example Data Service Platform", year="2023",
+                           source_kind="webpage", title="Exampledata.com.cn", url="https://d.exampledata.com.cn/p/1",
+                           raw_ref="Example Data Service Platform. (2023). Exampledata.com.cn. https://d.exampledata.com.cn/p/1")
+    titled = ParsedReference(reference_id="r3", author="A Long Page Title: About Something", year="2023",
+                             source_kind="webpage", title="Example.com", url="https://www.example.com/p",
+                             raw_ref="A Long Page Title: About Something. (2023). Example.com. https://www.example.com/p")
+    chapter = ParsedReference(reference_id="r4", author="Lee, K.", year="2020", source_kind="book_section", title="A chapter",
+                              raw_ref="Lee, K. (2020). A chapter. In A. Editor (Ed.), Example Press handbook. Example Press.")
+    found = {f["reference_id"]: f["finding"] for f in reference_element_findings([blom, site, titled, chapter], "apa")}
+    assert found == {"r1": PUBLISHER_REPEATED_TEXT, "r2": TITLE_MISSING_TEXT}

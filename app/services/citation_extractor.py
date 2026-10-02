@@ -85,7 +85,8 @@ _APA_PAGE_ITEM = r"\d+(?:\s*[-–—]\s*\d+)?"
 # to its first page or allow it to consume another semicolon-delimited source.
 _APA_LOCATOR = rf"(?:p|pp)\.\s*{_APA_PAGE_ITEM}(?:\s*,\s*{_APA_PAGE_ITEM})*"
 APA_MEMBER_RE = re.compile(
-    rf"^\s*(?:see\s+)?(?P<author>{_NAME_TOKEN}(?:\s+(?:&|and)\s+"
+    # A particle surname may precede "&": "de Luca & Jorge" (paper 5, 2026-10-01).
+    rf"^\s*(?:see\s+)?(?P<author>{_NAME_TOKEN}(?:(?:\s+{_NAME_TOKEN}){{0,2}}\s+(?:&|and)\s+"
     rf"{_NAME_TOKEN}(?:\s+{_NAME_TOKEN})?|(?:\s+{_NAME_TOKEN}){{0,3}}\s+et\.?\s+al\.?|"
     rf"(?:\s+{_NAME_TOKEN}){{1,4}})?)\s*,?\s*"
     r"(?P<year>(?:19|20)\d{2}[a-z]?(?:\s*[-–—]\s*(?:19|20)\d{2})?)"
@@ -423,6 +424,32 @@ def _reference_author_count(ref: ParsedReference) -> int:
     return max(1, len(_reference_lead_surnames(ref)))
 
 
+def spelling_distance(a: str, b: str) -> int:
+    """Optimal-string-alignment distance: insertions, deletions, substitutions, adjacent swaps."""
+    rows = [list(range(len(b) + 1))]
+    for i, ca in enumerate(a, 1):
+        row = [i]
+        for j, cb in enumerate(b, 1):
+            row.append(min(rows[-1][j] + 1, row[j - 1] + 1, rows[-1][j - 1] + (ca != cb)))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                row[j] = min(row[j], rows[-2][j - 2] + 1)
+        rows.append(row)
+    return rows[-1][-1]
+
+
+def close_surname(observed: str, expected: str) -> bool:
+    """A misspelt surname: one edit for five or more letters, two for seven or more."""
+    observed, expected = _surname_key(observed), _surname_key(expected)
+    if observed == expected or min(len(observed), len(expected)) < 5:
+        return False
+    allowed = 2 if min(len(observed), len(expected)) >= 7 else 1
+    return spelling_distance(observed, expected) <= allowed
+
+
+def _count_word(n: int) -> str:
+    return {1: "one author", 2: "two authors"}.get(n, f"{n} authors")
+
+
 def _extract_ref_surnames(ref: ParsedReference) -> list[str]:
     """Extract surname(s) from a ParsedReference for matching."""
     surnames: list[str] = []
@@ -482,7 +509,15 @@ def _find_citations_in_paragraph(
         # Preserve explicitly printed multiword family/group names before
         # falling back to the conventional first surname of a coauthor list.
         exact_author = re.sub(r"['’]s$", "", author.strip(), flags=re.IGNORECASE)
-        candidates = list(ref_index.get(_surname_key(exact_author), []) or ref_index.get(_surname_key(surname), []))
+        # The whole lead name before "&"/"and" ("de Luca & Jorge" -> "de Luca"),
+        # then the first word, so particle surnames resolve (2026-10-01).
+        lead_name = re.split(r"\s+(?:&|and)\s+", exact_author, maxsplit=1, flags=re.IGNORECASE)[0]
+        candidates = list(ref_index.get(_surname_key(exact_author), [])
+                          or (ref_index.get(_surname_key(lead_name), []) if not et_al_lead else [])
+                          or ref_index.get(_surname_key(surname), []))
+        if not et_al_lead and _surname_key(lead_name) != _surname_key(surname) and ref_index.get(_surname_key(lead_name)):
+            surname = lead_name
+        name_candidates = list(candidates)
         if not candidates:
             # An explicitly printed final component of a compound family name
             # can identify a work. Retain all candidates so year/ambiguity checks
@@ -494,6 +529,7 @@ def _find_citations_in_paragraph(
             candidates = [
                 ref for ref in candidates if _year_key(ref.year) == _year_key(year)
             ]
+        year_candidates = list(candidates)
         if re.search(r"\bet\.?\s+al\.?\b", author, re.IGNORECASE):
             conventional = [ref for ref in candidates if _reference_author_count(ref) >= 3]
             candidates = conventional or [ref for ref in candidates if _reference_author_count(ref) >= 2]
@@ -531,6 +567,44 @@ def _find_citations_in_paragraph(
                         {ref.reference_id: ref for ref in fuzzy}.values()
                     )
 
+        link_differences: list[str] = []
+        if not candidates and exact_candidates is None and not unresolved_candidates:
+            # citation-reference-tolerance-v1 (owner decision 2026-10-01): when the
+            # strict match finds nothing, one reference that differs in a single
+            # recognisable way is linked, and the difference is kept so the report
+            # still states it. Each rule requires exactly one reference.
+            et_al = bool(re.search(r"\bet\.?\s+al\.?\b", author, re.IGNORECASE))
+            if year and not year_candidates and len(name_candidates) == 1:
+                candidates = name_candidates
+                link_differences.append(f"year:{name_candidates[0].year or 'n.d.'}")
+                if et_al and _reference_author_count(name_candidates[0]) < 3:
+                    link_differences.append(f"author_count:{_count_word(_reference_author_count(name_candidates[0]))}")
+            elif year_candidates and len(year_candidates) == 1 and et_al:
+                candidates = year_candidates
+                link_differences.append(f"author_count:{_count_word(_reference_author_count(year_candidates[0]))}")
+            elif year_candidates and len(year_candidates) == 1:
+                lead = _reference_lead_surnames(year_candidates[0])
+                candidates = year_candidates
+                # An organisation whose name contains "&" ("UCLA Film & Television
+                # Archive") is the same author, not a differing second author.
+                if _surname_key(exact_author) != _surname_key(year_candidates[0].author):
+                    link_differences.append(f"coauthor:{lead[1] if len(lead) > 1 else 'none'}")
+            elif not name_candidates:
+                close = {ref.reference_id: ref for refs in ref_index.values() for ref in refs
+                         if _reference_lead_surnames(ref) and close_surname(surname, _reference_lead_surnames(ref)[0])
+                         and (not year or _year_key(ref.year) == _year_key(year))}
+                if len(close) == 1:
+                    match = next(iter(close.values()))
+                    candidates = [match]
+                    link_differences.append(f"author_spelling:{_reference_lead_surnames(match)[0]}")
+                elif year:
+                    # An organisation named with one word different ("Australian
+                    # Film Council" for the Commission), same year (owner decision
+                    # 2026-10-02). The words before the marker complete the name.
+                    organisation = _organisation_match(para_text[:marker_start], author, year, ref_index)
+                    if organisation is not None:
+                        candidates = [organisation]
+                        link_differences.append(f"author_spelling:{organisation.author.strip().rstrip('.')}")
         if exact_candidates is not None:
             candidates = exact_candidates
         # A printed-page citation can distinguish an article from a same-year
@@ -589,6 +663,7 @@ def _find_citations_in_paragraph(
             is_secondary=is_secondary,
             original_author=original_author,
             confidence=confidence,
+            link_differences=link_differences if linked else [],
         ))
 
     # Check for secondary citations first ("as cited in")
@@ -639,7 +714,17 @@ def _find_citations_in_paragraph(
             if (block.start(), block.end()) in secondary_spans:
                 continue
             raw_marker = block.group(0)
-            for parsed, member in apa_parenthetical_members(block.group(1)):
+            members = list(apa_parenthetical_members(block.group(1)))
+            if not any(parsed for parsed, _member in members):
+                titled = _title_author_reference(block.group(1), references)
+                if titled is not None:
+                    reference, author, year = titled
+                    append_linked(author=author, year=year, raw_marker=raw_marker,
+                                  marker_member=" ".join(block.group(1).split()),
+                                  marker_start=block.start(), marker_end=block.end(),
+                                  marker_type="parenthetical", exact_candidates=[reference])
+                    continue
+            for parsed, member in members:
                 if parsed:
                     locator = parsed.group("locator") or ""
                     title_key = ' '.join(parsed.group('author').casefold().split())
@@ -786,6 +871,50 @@ def _find_citations_in_paragraph(
     return citations
 
 
+def _organisation_match(before: str, author: str, year: str, ref_index: dict) -> ParsedReference | None:
+    """The one same-year organisation reference whose name differs from the
+    cited name in exactly one word, the cited name being the capitalised words
+    before the marker plus its own first word."""
+    lead = re.search(r"((?:[A-Z][\w&'’-]*\s+){1,5})$", before)
+    cited = ((lead.group(1) if lead else "") + author).split()
+    if len(cited) < 2:
+        return None
+    key = lambda words: [re.sub(r"\W+", "", w).casefold() for w in words]
+    found = {}
+    for refs in ref_index.values():
+        for ref in refs:
+            name = (ref.author or "").strip().rstrip(".")
+            if "," in name or _year_key(ref.year) != _year_key(year):
+                continue
+            words = name.split()
+            if len(words) != len(cited) or len(words) < 2:
+                continue
+            differing = sum(1 for a, b in zip(key(words), key(cited)) if a != b)
+            if differing == 1:
+                found[ref.reference_id] = ref
+    return next(iter(found.values())) if len(found) == 1 else None
+
+
+def _title_author_reference(content: str, references: list[ParsedReference]):
+    """A title used as the author, "(Long Title of a Page_Site.com, 2023)", names
+    the one same-year reference whose author (or opening words) it ends with
+    (paper 4, 2026-10-02). None unless exactly one reference qualifies."""
+    match = re.fullmatch(r"(.{8,250}),\s*((?:19|20)\d{2}[a-z]?)", " ".join(content.split()))
+    if not match:
+        return None
+    key = lambda value: re.sub(r"[\W_]+", "", str(value or "")).casefold()
+    cited = key(match[1])
+    found = []
+    for reference in references:
+        if _year_key(reference.year) != _year_key(match[2]):
+            continue
+        opening = key(re.split(r"\(\s*(?:19|20)\d{2}", reference.raw_ref or "", maxsplit=1)[0])
+        author = key(reference.author)
+        if (len(author) >= 6 and cited.endswith(author)) or (len(opening) >= 12 and cited == opening):
+            found.append(reference)
+    return (found[0], match[1], match[2]) if len(found) == 1 else None
+
+
 def _reference_contains_locator(reference: ParsedReference, locator: str) -> bool:
     """Corroborate a printed-page locator against explicit bibliographic pages."""
     wanted = re.fullmatch(r"\s*(\d+)(?:\s*[-–—]\s*(\d+))?\s*", locator)
@@ -820,7 +949,10 @@ def _recover_year_only_narrative_reference(
             window_start += offset
             prefix = prefix[offset:]
     matches: list[tuple[int, int, ParsedReference]] = []
-    normalized_prefix, normalized_offsets = _surname_key_with_offsets(prefix)
+    # "Rodriguez, A., & Davis, B. (2022)": initials sit between the surnames.
+    # Blanking them keeps every offset (paper 7, 2026-10-01).
+    unspaced = re.sub(r"(?<![^\W\d_])[A-Z]\.(?:\s*-?[A-Z]\.)*", lambda m: " " * len(m.group(0)), prefix)
+    normalized_prefix, normalized_offsets = _surname_key_with_offsets(unspaced)
     for reference in references:
         if _year_key(reference.year) != _year_key(year):
             continue

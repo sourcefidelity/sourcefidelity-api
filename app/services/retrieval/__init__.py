@@ -27,6 +27,7 @@ from app.services.retrieval.elsevier import ElsevierRetriever
 from app.services.retrieval.open_library import OpenLibraryRetriever
 from app.services.retrieval.datacite import DataCiteRetriever
 from app.services.retrieval.eric import EricRetriever
+from app.services.retrieval.europe_pmc import EuropePmcRetriever
 from app.services.retrieval.web_search import WebSearchRetriever
 
 from app.config import settings
@@ -66,6 +67,9 @@ _RETRIEVER_CLASSES: dict[str, type[RetrievalSource]] = {
     # Positive-only: education literature, whose silence about any other
     # field is not evidence. See positive-only-corroboration-v1.
     "eric": EricRetriever,
+    # Open-access repository copies (PubMed Central) when the publisher
+    # refuses automated access; positive-only (owner decision 2026-10-02).
+    "europepmc": EuropePmcRetriever,
     # Web-search fallback: searches configured discovery providers after the
     # academic-DB chain fails. Only active when SEARCH_PROVIDER is configured.
     # Add "web_search" to RETRIEVAL_SOURCES in .env to enable.
@@ -88,6 +92,10 @@ def installed_retrieval_providers() -> dict[str, dict]:
 def get_retrieval_sources() -> list[RetrievalSource]:
     """Return configured retrieval sources in priority order."""
     names = [s.strip().lower() for s in settings.RETRIEVAL_SOURCES.split(",") if s.strip()]
+    # Europe PMC joins after Crossref unless the configuration names it or
+    # EUROPE_PMC_ENABLED is off (owner decision 2026-10-02).
+    if getattr(settings, "EUROPE_PMC_ENABLED", True) and "europepmc" not in names:
+        names.insert(names.index("crossref") + 1 if "crossref" in names else len(names), "europepmc")
     sources: list[RetrievalSource] = []
     for name in names:
         cls = _RETRIEVER_CLASSES.get(name)

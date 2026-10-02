@@ -252,6 +252,32 @@ def _title_matches(provided: str, metadata: dict) -> bool:
     return coverage >= 0.9
 
 
+# APA bracketed descriptors after a web title: "[Online]", "[Web log post]".
+_BRACKET_DESCRIPTOR = re.compile(r"\s*\[[^\]]{2,40}\]\s*")
+
+
+def _web_title_near_match(provided: str, metadata: dict) -> bool:
+    """A web page's printed heading often drops words the student added
+    ("Star Trek: The Motion Picture movie review" vs the film title): accept
+    similarity 0.75 or 80% word coverage once bracketed descriptors are removed.
+    Only used with an author match (owner decision 2026-10-01)."""
+    expected = _normalize(_BRACKET_DESCRIPTOR.sub(" ", provided))
+    if not expected:
+        return False
+    found_title = _normalize(metadata.get("title") or "")
+    page_text = _normalize(metadata.get("first_page_text") or "")
+    if _aligned_title_containment(expected, found_title) or expected in page_text:
+        return True
+    if found_title and SequenceMatcher(None, expected, found_title).ratio() >= 0.75:
+        return True
+    tokens = set(_significant_tokens(expected, stopwords=_TITLE_STOPWORDS))
+    if len(tokens) < 3:
+        return False
+    found = set(_significant_tokens(found_title, stopwords=_TITLE_STOPWORDS)) | set(
+        _significant_tokens(page_text[:2500], stopwords=_TITLE_STOPWORDS))
+    return len(tokens & found) / len(tokens) >= 0.8
+
+
 def _author_matches(provided: str, metadata: dict) -> bool:
     expected = set(_significant_tokens(provided, stopwords=_AUTHOR_STOPWORDS))
     if not expected:
@@ -272,8 +298,12 @@ def verify_instructor_upload(
     provided_author: str | None = None,
     provided_year: str | None = None,
     provided_isbn: str | None = None,
+    web_page: bool = False,
 ) -> tuple[bool, list[str]]:
     """Verify that an instructor-uploaded PDF matches provided metadata.
+
+    ``web_page`` (a reference typed as a web page) allows a near title match
+    when the author also matches.
 
     Returns:
         (verified: bool, messages: list of human-readable status strings)
@@ -319,6 +349,11 @@ def verify_instructor_upload(
             messages.append("author_match")
         else:
             messages.append("author_not_corroborated")
+
+    if (web_page and provided_title and "title" not in corroborated and "author" in corroborated
+            and _web_title_near_match(provided_title, metadata)):
+        corroborated.add("title")
+        messages.append("web_page_title_near_match")
 
     if provided_year:
         normalized_year = provided_year.strip()

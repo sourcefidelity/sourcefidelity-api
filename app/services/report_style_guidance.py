@@ -53,10 +53,15 @@ FINDING_GUIDANCE = {
     'required_author_missing': 'reference',
     'reference_identifier_placeholder': 'reference',
     'contribution_author_is_volume_editor': 'reference',
+    'chapter_editors_missing': 'reference',
+    'reference_publisher_repeated': 'reference',
+    'reference_title_missing': 'reference',
+    'chapter_pages_missing': 'reference',
     'required_quotation_locator_missing': 'quotation',
     'quotation_difference': 'quotation',
     'indirect_source': 'indirect',
     'missing_reference_entry': 'citation',
+    'citation_reference_mismatch': 'citation',
 }
 
 

@@ -96,3 +96,26 @@ def test_mixed_full_name_author_list_wrapped_before_year():
     refs = ApaParser.split_references(raw)
     assert len(refs) == 2
     assert refs[1].startswith('Alex Example, Other')
+
+
+def test_a_full_line_after_a_doi_starts_the_next_title_first_entry():
+    # Paper 4 (2026-10-02): a title-first entry's first line was joined to the
+    # entry before it, which ended with its DOI.
+    raw = """Stone, L. (2014). Spreadable worlds. Cinema Journal, 53(3), 152-177. https://doi.org/10.1/cj.2014.0021
+Transmedia Narrative: A Creative Discussion on Adapting Web Novels to Web
+Dramas_Reference.com. (2023). Example Site. https://www.example.test/page/1
+Vale, D. (2015). The ludic subject. Example University.
+"""
+    references = ApaParser.split_references(raw)
+    assert len(references) == 3
+    assert references[0].endswith("cj.2014.0021")
+    assert references[1].startswith("Transmedia Narrative") and "Dramas_Reference.com. (2023)" in references[1]
+
+
+def test_a_wrapped_url_line_after_a_url_stays_with_its_entry():
+    raw = """Adams, A. (2020). A study. https://example.test/publication/1_Theorising_the_P
+ractice_of_Media
+Baker, B. (2021). Another study. Example Press.
+"""
+    references = ApaParser.split_references(raw)
+    assert len(references) == 2 and "ractice_of_Media" in references[0]

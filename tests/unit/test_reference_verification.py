@@ -112,6 +112,20 @@ def test_a_borrowed_doi_record_or_a_titleless_record_is_not_a_possible_match():
     assert result['status'] == 'cannot_be_verified'
 
 
+def test_the_same_doi_author_and_year_is_a_possible_match_whatever_the_title():
+    # Sanchez-Lopez and Bakulev (paper 4, 2026-10-02): a parsed title cut at a
+    # full stop or carrying volume and pages; DOI, author and year agree.
+    same = candidate('material_conflict', 'agreement', plausible=False)
+    same['comparisons'] += [{'field_name': 'doi', 'outcome': 'agreement'}, {'field_name': 'year', 'outcome': 'agreement'}]
+    result = assess_reference_verification(ref(), discovery(outcome='bibliographic_conflict', candidates=[same]))
+    assert result['status'] == 'possible_match' and not result['findings']
+    other_year = candidate('material_conflict', 'agreement')
+    other_year['comparisons'] += [{'field_name': 'doi', 'outcome': 'agreement'},
+                                  {'field_name': 'year', 'outcome': 'material_conflict'}]
+    result = assess_reference_verification(ref(), discovery(outcome='bibliographic_conflict', candidates=[other_year]))
+    assert result['status'] == 'cannot_be_verified'
+
+
 @pytest.mark.parametrize('kind', ['webpage', 'news_article', 'video', 'archival_source', 'dataset', 'software'])
 def test_kinds_academic_indexes_do_not_hold_are_not_assessed(kind):
     result = assess_reference_verification(ref(kind), discovery(kind=kind))

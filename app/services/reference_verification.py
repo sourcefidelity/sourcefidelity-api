@@ -146,7 +146,14 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
     conflicts is not one, including the record a borrowed DOI resolves to, and
     neither is a record that observed no title at all.
     """
-    if _outcomes(candidate).get('title') in {'agreement', 'minor_difference'}:
+    outcomes = _outcomes(candidate)
+    if outcomes.get('title') in {'agreement', 'minor_difference'}:
+        return True
+    # The same DOI with the same author and year is the cited work whatever
+    # its title: a title cut at a full stop or carrying the volume and pages
+    # (Sanchez-Lopez, Bakulev; paper 4, 2026-10-02) is a parsing difference.
+    if (outcomes.get('doi') == 'agreement' and outcomes.get('author') in {'agreement', 'minor_difference'}
+            and outcomes.get('year') == 'agreement'):
         return True
     if not expected:
         return False

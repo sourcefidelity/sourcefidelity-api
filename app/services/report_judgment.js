@@ -118,20 +118,59 @@
         details.append(summary, list); slot.after(details);
       }
       if (!list) continue;
+      // The window is filled again on each visit: restore the sentence the
+      // last pass lifted out as the key sentence before choosing again.
+      for (const li of list.querySelectorAll('[data-key-lifted]')) { li.hidden = false; delete li.dataset.keyLifted; }
+      // One sentence split two ways by overlapping passages ("p:12090:12246"
+      // and "p:12090:12375") is listed once, with the longer text (2026-10-02).
+      const span = key => { const m = /^(.*):(\d+):(\d+)$/.exec(key || ''); return m ? [m[1], +m[2], +m[3]] : null; };
+      const overlapping = key => {
+        const a = span(key); if (!a) return null;
+        for (const li of list.querySelectorAll('[data-evidence-key]')) {
+          const b = span(li.dataset.evidenceKey);
+          if (b && a[0] === b[0] && a[1] < b[2] && b[1] < a[2]) return li;
+        }
+        return null;
+      };
       for (const item of items) {
         for (const sentence of item.evidence || []) {
           if (list.querySelector(`[data-evidence-key="${CSS.escape(sentence.key)}"]`)) continue;
+          const same = overlapping(sentence.key);
+          if (same) {
+            const q = same.querySelector('q');
+            if (q && (sentence.text || '').length > q.textContent.length) q.textContent = sentence.text;
+            continue;
+          }
           const li = document.createElement('li'); li.dataset.evidenceKey = sentence.key;
           if (sentence.page) { const page = document.createElement('span'); page.className = 'ev-page'; page.textContent = `p. ${sentence.page}`; li.append(page, ' '); }
           const q = document.createElement('q'); q.textContent = sentence.text; li.append(q); list.append(li);
         }
       }
       // A Supports result shows its key sentence outside the list (owner decision 2026-09-30).
+      // A Supports result leads with the judge-cited sentence the evidence
+      // selector marked as bearing on the statement, when there is one
+      // (owner decision 2026-10-02); otherwise the most-cited sentence.
       for (const shown of slot.querySelectorAll('[data-key-evidence]')) {
-        list.querySelector(`[data-evidence-key="${CSS.escape(shown.dataset.keyEvidence)}"]`)?.remove();
+        let alternatives = [];
+        try { alternatives = JSON.parse(shown.dataset.keyAlternatives || '[]'); } catch (e) { alternatives = []; }
+        const bears = alternatives.find(a => {
+          const li = list.querySelector(`[data-evidence-key="${CSS.escape(a.key)}"]`) || overlapping(a.key);
+          return li && li.dataset.reason === 'bears_on_statement';
+        });
+        if (bears && bears.key !== shown.dataset.keyEvidence) {
+          shown.dataset.keyEvidence = bears.key;
+          shown.textContent = '';
+          if (bears.page) { const page = document.createElement('span'); page.className = 'ev-page'; page.textContent = `p. ${bears.page}`; shown.append(page, ' '); }
+          const q = document.createElement('q'); q.textContent = bears.text; shown.append(q);
+        }
+      }
+      for (const shown of slot.querySelectorAll('[data-key-evidence]')) {
+        const lifted = list.querySelector(`[data-evidence-key="${CSS.escape(shown.dataset.keyEvidence)}"]`)
+          || overlapping(shown.dataset.keyEvidence);
+        if (lifted) { lifted.hidden = true; lifted.dataset.keyLifted = ''; }
       }
       const disclosure = list.closest('details');
-      if (disclosure) disclosure.hidden = !list.children.length;
+      if (disclosure) disclosure.hidden = !list.querySelector('li:not([hidden])');
     }
   }
   function fillPanel() {

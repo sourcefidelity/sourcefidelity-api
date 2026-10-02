@@ -565,6 +565,7 @@ def _with_anchors(
         prepared.presentation_bytes,
         citations=citations,
         paragraphs=paragraphs,
+        body_text=semantic_text,
     )
     evidence = {
         **(prepared.presentation_evidence or {}),

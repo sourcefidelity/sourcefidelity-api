@@ -618,6 +618,92 @@ def _surname_and_initial(name: str) -> tuple[str, str]:
     return surname.strip().casefold(), (initials[0].casefold() if initials else '')
 
 
+# APA chapter form: "In A. Editor (Ed.), Book (pp. x-y)." (owner requests 2026-10-01).
+_CHAPTER_IN_RE = re.compile(r'\bIn\s+\S')
+_CHAPTER_EDITORS_RE = re.compile(r'\(\s*Eds?\.?\s*\)|,\s*Eds?\.\s*\)|\bedited\s+by\b', re.IGNORECASE)
+_CHAPTER_PAGES_RE = re.compile(r'\bpp?\.\s*[\dixvlc]{1,6}|\bchapter\s+\d', re.IGNORECASE)
+# Owner-approved wording (2026-10-01).
+CHAPTER_EDITORS_MISSING_TEXT = 'This reference cites a chapter in the form used for edited books but names no editors.'
+CHAPTER_PAGES_MISSING_TEXT = 'This reference cites a chapter but gives no page range for it.'
+
+
+def chapter_form_findings(references, citation_format: str) -> list[dict]:
+    """APA chapter references that omit the book's editors or the chapter's page range.
+
+    Only references parsed as book sections in the "In <book>" form are
+    assessed; the finding states what the reference lacks, without advice.
+    """
+    if citation_format != 'apa':
+        return []
+    findings = []
+    for reference in references:
+        raw = getattr(reference, 'raw_ref', '') or ''
+        if (getattr(reference, 'source_kind', '') != 'book_section' or getattr(reference, 'needs_review', False)
+                or not _CHAPTER_IN_RE.search(raw)):
+            continue
+        for finding_type, text, present in (
+                ('chapter_editors_missing', CHAPTER_EDITORS_MISSING_TEXT, _CHAPTER_EDITORS_RE.search(raw)),
+                ('chapter_pages_missing', CHAPTER_PAGES_MISSING_TEXT, _CHAPTER_PAGES_RE.search(raw))):
+            if present:
+                continue
+            findings.append(dict(
+                finding_type=finding_type, reference_id=reference.reference_id, finding=text,
+                rule_id='apa7_chapter_reference_elements_v1', rule_source=APA_CONTRIBUTION_RULE_SOURCE,
+                field_difference={'field_name': 'editors' if finding_type == 'chapter_editors_missing' else 'pages',
+                                  'submitted_value': ''},
+                rectangles=[], localization_status='not_assessed'))
+    return findings
+
+
+# Owner-approved wording (2026-10-02).
+PUBLISHER_REPEATED_TEXT = 'This reference repeats the publisher in place of the title.'
+TITLE_MISSING_TEXT = 'This reference gives no title.'
+# "In Amsterdam University Press eBooks. Amsterdam University Press."
+_IN_THEN_PUBLISHER_RE = re.compile(r'\bIn\s+([^.()]{3,120}?)\.\s+([^.()]{3,120}?)\.(?=\s|$)')
+_DOMAIN_RE = re.compile(r'^(?:www\.)?[\w-]+(?:\.[\w-]+)+$', re.IGNORECASE)
+
+
+def _plain(value: str) -> str:
+    return ' '.join(re.sub(r'[^\w]+', ' ', value or '').casefold().split())
+
+
+def reference_element_findings(references, citation_format: str) -> list[dict]:
+    """A publisher written where the title of the larger work belongs, and a
+    web reference whose only "title" is the site's address (owner-approved
+    wording 2026-10-02; Blom and Wanfang in paper 4)."""
+    if citation_format != 'apa':
+        return []
+    from urllib.parse import urlsplit
+    findings = []
+    for reference in references:
+        raw = getattr(reference, 'raw_ref', '') or ''
+        if getattr(reference, 'needs_review', False):
+            continue
+        found = None
+        repeated = _IN_THEN_PUBLISHER_RE.search(raw)
+        if (repeated and not _CHAPTER_EDITORS_RE.search(raw) and len(_plain(repeated[2])) >= 8
+                and _plain(repeated[2]) in _plain(repeated[1])):
+            found = ('reference_publisher_repeated', PUBLISHER_REPEATED_TEXT, 'title', repeated[1])
+        title = (getattr(reference, 'title', '') or '').strip().rstrip('.')
+        author = getattr(reference, 'author', '') or ''
+        url = getattr(reference, 'url', '') or ''
+        host = (urlsplit(url).hostname or '').casefold() if url else ''
+        if (not found and getattr(reference, 'source_kind', '') == 'webpage' and _DOMAIN_RE.match(title)
+                and host and re.sub(r'^www\.', '', title.casefold()) in host
+                and ':' not in author and len(author.split()) <= 8):
+            # An author slot holding the work's title (an APA no-author entry)
+            # is a titled reference; a platform name is not.
+            found = ('reference_title_missing', TITLE_MISSING_TEXT, 'title', title)
+        if found:
+            finding_type, text, field, value = found
+            findings.append(dict(
+                finding_type=finding_type, reference_id=reference.reference_id, finding=text,
+                rule_id='apa7_reference_elements_v1', rule_source=APA_CONTRIBUTION_RULE_SOURCE,
+                field_difference={'field_name': field, 'submitted_value': value},
+                rectangles=[], localization_status='not_assessed'))
+    return findings
+
+
 def contribution_editor_findings(references, container_records: dict | None = None) -> list[dict]:
     """Report a chapter cited from a monograph as though the book were edited.
 

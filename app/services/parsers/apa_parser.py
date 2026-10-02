@@ -65,6 +65,7 @@ _APA_START = re.compile(
 class ApaParser(BaseParser):
     """Parser for APA (7th edition) references."""
 
+    TERMINATOR_SPLIT = True
     HEADINGS = [
         r'(?:\d+(?:\.\d+)*\s*[\.\)]?\s*)?references?',
         r'(?:\d+(?:\.\d+)*\s*[\.\)]?\s*)?reference list',

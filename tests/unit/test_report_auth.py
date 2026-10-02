@@ -344,7 +344,7 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
             "documents": [{"id": str(uuid.uuid4()), "admission_state": "accepted"}],
         }
 
-    def fake_verify(_content, *, provided_doi, provided_title, provided_author):
+    def fake_verify(_content, *, provided_doi, provided_title, provided_author, web_page=False):
         return provided_title == "Second work", []
 
     monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_bearer")

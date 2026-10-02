@@ -125,6 +125,9 @@ CandidateAcquisitionOutcome = Literal[
 ]
 
 
+_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "tavily", "searxng", "bright_data", "mojeek"})
+
+
 class ExpectedBibliographicFields(BaseModel):
     author_normalization_policy_version: Literal['author-etal-comparison-v1'] | None = None
 
@@ -415,6 +418,10 @@ class ReferenceDiscoveryCandidate(BaseModel):
     # the development audit of Exa/Tavily candidates is `candidate_audit` on
     # the route attempt (SEARCH_CANDIDATE_AUDIT_URLS).
     development_location_url: str | None = Field(default=None, max_length=2000)
+    # The address of a page the application itself opened and read (owner
+    # decision 2026-10-02: a displayed record keeps its public link). Never a
+    # search provider's result list: only a page this application fetched.
+    page_url: str | None = Field(default=None, max_length=2000)
     # Why this candidate reported no title. "We read the page and it names no
     # work" and "we never read the page" are different facts, and the bounded
     # review may only act on the first.
@@ -819,6 +826,14 @@ def build_reference_discovery_candidate(
                 title_outcome: FieldComparisonOutcome = "agreement"
                 title_reason = "normalized_title_match"
                 title_relevant = True
+            elif _web_title_furniture_only(expected.title, result.title, author_match=bool(
+                    expected.authors and result.authors
+                    and verify_authors(expected_author_names, observed_author_names)[0])):
+                # "Title [Online]" against "Title | Hammer Museum": the bracketed
+                # medium and the site name are not title words (2026-10-01).
+                title_outcome = "minor_difference"
+                title_reason = "web_title_furniture_removed"
+                title_relevant = True
             else:
                 relevance = score_title_relevance(expected.title, result.title)
                 # Semantic proximity finds candidates; it is not bibliographic
@@ -1035,6 +1050,13 @@ def build_reference_discovery_candidate(
             else None
         ),
         title_absence_reason=_title_absence_reason(result, acquisition_outcome),
+        # A web-search result's address is never kept (provider terms,
+        # ARCHITECTURE retention rule), even for a page the application opened.
+        page_url=(location_url if location_url and location_url.lower().startswith(("http://", "https://"))
+                  and acquisition_outcome not in {"metadata_only", "not_attempted", "transport_failure",
+                                                  "access_restricted", "unavailable", "unknown"}
+                  and not ({provider, discovery_provider or "", *(origin_providers or [])} & _SEARCH_RESULT_PROVIDERS)
+                  and len(location_url) <= 2000 else None),
         location_rank=location_rank,
         origin_providers=list(dict.fromkeys(origin_providers or [provider])),
         acquisition_outcome=acquisition_outcome,
@@ -1160,6 +1182,27 @@ def _field_materially_conflicts(field: str, submitted: str, observed: str) -> bo
     if _conflict_tokens(left) == _conflict_tokens(right):
         return False
     return not _abbreviation_compatible(left, right)
+
+
+# APA bracketed descriptors ("[Online]", "[Video]") and a page's trailing
+# site name ("Title | Hammer Museum", "Title - BBC News").
+_BRACKET_DESCRIPTOR = re.compile(r"\s*\[[^\]]{2,40}\]\s*")
+_SITE_SUFFIX = re.compile(r"\s+(?:\||\u2013|\u2014|-)\s+[^|\u2013\u2014]{2,60}$")
+
+
+def _web_title_furniture_only(expected: str, observed: str, *, author_match: bool) -> bool:
+    """The cited title equals the page title once the citation's bracketed
+    descriptors and the page's one short trailing site name are removed. A
+    dash can also open a subtitle, so a dash suffix needs matching authors."""
+    cited = _normalize_text(_BRACKET_DESCRIPTOR.sub(" ", expected or ""))
+    if len(cited.split()) < 3:
+        return False
+    page = _BRACKET_DESCRIPTOR.sub(" ", observed or "")
+    forms = {_normalize_text(page)}
+    match = _SITE_SUFFIX.search(page)
+    if match and len(match.group(0).split()) <= 6 and (author_match or match.group(0).strip().startswith("|")):
+        forms.add(_normalize_text(page[:match.start()]))
+    return cited in forms
 
 
 def _normalize_text(value: str) -> str:

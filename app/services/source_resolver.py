@@ -398,6 +398,86 @@ def _web_identity_comparison(result, *, title=None, author=None, year=None, doi=
     return identity, comparisons, confirmed
 
 
+def _cited_title_on_front_pages(content: bytes, title: str | None, pages: int = 3) -> bool:
+    """The cited title, at least ten characters, appears in the file's first pages."""
+    import fitz
+    wanted = re.sub(r"[^\w]+", " ", str(title or "")).casefold().split()
+    if len(" ".join(wanted)) < 10:
+        return False
+    try:
+        with fitz.open(stream=content, filetype="pdf") as document:
+            text = " ".join(page.get_text() for page in document[:pages])
+    except Exception:  # noqa: BLE001 - an unreadable file shows no title
+        return False
+    return " ".join(wanted) in " ".join(re.sub(r"[^\w]+", " ", text).casefold().split())
+
+
+def _record_link_title_conflict(url, resp, title, page_titles, *, expected_author=None,
+                                expected_year=None, expected_doi=None) -> None:
+    """A linked page titled with a different work (owner request 2026-10-02:
+    paper 8's references link to other articles). Recorded as a title conflict
+    on the submitted link only when the page's own title is a real title of
+    three words or more and the field comparison finds a material conflict."""
+    page_title = max(page_titles, key=lambda value: len(str(value).split()), default='')
+    if len(_WEB_TITLE_WORD.findall(str(page_title))) < 3:
+        return
+    result = RetrievalResult(source_name='web_fetch', success=False, title=str(page_title))
+    identity, comparisons, _confirmed = _web_identity_comparison(
+        result, title=title, author=expected_author, year=expected_year, doi=expected_doi)
+    conflicts = [c.field_name for c in comparisons if c.outcome == 'material_conflict']
+    if 'title' not in conflicts:
+        return
+    identity_observed(url, hashlib.sha256(resp.content).hexdigest(), 'bibliographic_fields_conflict', conflicts,
+                      differences=_web_link_differences(comparisons, result, title=title, author=expected_author,
+                                                        year=expected_year, doi=expected_doi))
+
+
+_WEB_TITLE_WORD = re.compile(r"[^\W\d_]{2,}")
+_S2_PAPER_LINK = re.compile(r"^https?://(?:www\.)?semanticscholar\.org/paper/(?:[^/]+/)?([0-9a-f]{40})(?:[/?#]|$)", re.I)
+
+
+def _record_registry_link_identity(url, resp, title, *, expected_author=None, expected_year=None,
+                                   expected_doi=None) -> None:
+    """A submitted Semantic Scholar paper link names one registered paper by its
+    ID; its record is compared with the reference even when the page answers
+    automated requests with a challenge (paper 8 reference 2, 2026-10-02)."""
+    match = _S2_PAPER_LINK.match(str(url or ""))
+    if not match or not title:
+        return
+    try:
+        from app.services.retrieval.semantic_scholar import SemanticScholarRetriever
+        record = SemanticScholarRetriever().paper_by_id(match.group(1).lower())
+    except Exception:  # noqa: BLE001 - a missing registry record only leaves the link unassessed
+        return
+    if not record.success or not record.title:
+        return
+    identity, comparisons, confirmed = _web_identity_comparison(
+        record, title=title, author=expected_author, year=expected_year, doi=expected_doi)
+    conflicts = [c.field_name for c in comparisons if c.outcome == 'material_conflict']
+    reason = ('bibliographic_fields_conflict' if identity.has_material_conflict and 'title' in conflicts
+              else 'bibliographic_identity_confirmed' if confirmed else None)
+    if reason:
+        identity_observed(url, hashlib.sha256(resp.content).hexdigest(), reason, conflicts,
+                          differences=_web_link_differences(comparisons, record, title=title, author=expected_author,
+                                                            year=expected_year, doi=expected_doi))
+
+
+def _organisation_author_in_page(author, comparisons, page_text) -> bool:
+    """The cited author is an organisation, the page shows no byline, its name
+    appears in the opening page text, and title and year or DOI agree."""
+    author = " ".join(str(author or "").split())
+    if (len(author.split()) < 2 or re.search(r"\b[A-Z]\.|,", author)
+            or not page_text or not isinstance(page_text, str)):
+        return False
+    outcomes = {c.field_name: c.outcome for c in comparisons}
+    if (outcomes.get('author') != 'unknown' or outcomes.get('title') not in {'agreement', 'minor_difference'}
+            or any(c.outcome == 'material_conflict' for c in comparisons)
+            or not any(outcomes.get(f) == 'agreement' for f in ('year', 'doi'))):
+        return False
+    flat = lambda value: " ".join(re.sub(r"[^\w&]+", " ", value).casefold().split())
+    return f" {flat(author)} " in f" {flat(page_text[:3000])} "
+
+
 def _doi_identity_matches(expected: str | None, observed: str | None) -> bool:
     if not expected or not observed:
         return False
@@ -601,7 +681,22 @@ def _extract_text_representation(payload: bytes, kind: RepresentationKind) -> st
     if kind is RepresentationKind.XML:
         from bs4 import BeautifulSoup
 
-        text = BeautifulSoup(text, "xml").get_text(" ", strip=True)
+        soup = BeautifulSoup(text, "xml")
+        body = soup.find("body")
+        if soup.find("article") is not None and body is not None:
+            # JATS full text (Europe PMC, 2026-10-02): title, abstract and body
+            # paragraphs, one per line; the reference list is not the work's prose.
+            for drop in soup.find_all(["ref-list", "xref", "table-wrap", "fig"]):
+                drop.decompose()
+            parts = [soup.find("article-title"), *soup.find_all("abstract"),
+                     *body.find_all(["title", "p"])]
+            paragraphs = [re.sub(r"\s+", " ", part.get_text(" ", strip=True)) for part in parts if part is not None]
+            text = "\n\n".join(p for p in paragraphs if p)
+            nonprose = detect_nonprose_payload(text)
+            if nonprose:
+                raise ValueError(f"retrieved representation is {nonprose}")
+            return text
+        text = soup.get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text).strip()
     nonprose = detect_nonprose_payload(text)
     if nonprose:
@@ -1513,6 +1608,61 @@ class SourceResolver:
             }
         )
         return completed_trace.model_dump(mode="json"), accepted_record
+
+    def _try_archived_copy(self, student_url, failed, title, expected_kind, author, year, doi):
+        """The Internet Archive's capture of a submitted page that failed live
+        (`wayback-snapshot-v1`). Returns an accepted result or None."""
+        from app.services.retrieval.wayback import RETRY_REASONS, archived_snapshot
+        reason = ((failed.metadata or {}).get("web_fetch_diagnostic") or {}).get("reason")
+        if reason not in RETRY_REASONS:
+            return None
+        snapshot = archived_snapshot(student_url)
+        if snapshot is None:
+            return None
+        archived = self._retry_after_network_error(lambda: self._try_web_fetch(
+            snapshot["snapshot_url"], title, expected_source_kind=expected_kind,
+            expected_author=author, expected_year=year, expected_doi=doi,
+        ))
+        archived.metadata = {**(archived.metadata or {}), "archived_copy": {
+            **snapshot, "original_url_sha256": hashlib.sha256(student_url.encode()).hexdigest()}}
+        self._record_discovery_attempt(category="student_url", provider="wayback_snapshot",
+                                       result=archived, required=False)
+        return archived if archived.success else None
+
+    @observe_reference
+    def check_submitted_links(self, reference) -> RetrievalResult:
+        """Visit an uncited reference's own link or DOI, without any search.
+
+        Owner decision 2026-10-02: a dead or wrong link in the reference list
+        is reported whether or not a citation uses the reference. Only the
+        submitted addresses are requested; the fetched text is not admitted.
+        """
+        from app.services.submitted_links import request_url
+        title = getattr(reference, "title", None) or ""
+        author = getattr(reference, "author", None) or None
+        year = getattr(reference, "year", None) or None
+        doi = getattr(reference, "doi", None) or None
+        expected_kind = _expected_source_kind_assessment(
+            source_kind=getattr(reference, "source_kind", None),
+            source_kind_confidence=getattr(reference, "source_kind_confidence", None),
+            source_kind_evidence=getattr(reference, "source_kind_evidence", None) or [],
+            raw_ref=getattr(reference, "raw_ref", "") or "", title=title,
+            url=getattr(reference, "url", None) or None)
+        last = RetrievalResult(source_name="submitted_link", success=False, error="no submitted address")
+        for kind in ("url", "doi"):
+            value = getattr(reference, kind, None) or ""
+            if not value:
+                continue
+            try:
+                last = self._try_web_fetch(request_url(value, kind), title, expected_source_kind=expected_kind,
+                                           expected_author=author, expected_year=year, expected_doi=doi)
+            except Exception as exc:  # noqa: BLE001 - the observation records the failure
+                last = RetrievalResult(source_name="submitted_link", success=False, error=type(exc).__name__)
+        # Never admitted: an uncited reference's text is not compared.
+        last.full_text = None
+        last.representation = None
+        last.success = False
+        return last
 
     @observe_reference
     @bounded_reference
@@ -2490,6 +2640,11 @@ class SourceResolver:
                     url_failure_reason = result.error or "PDF validation failed"
                 else:
                     url_failure_reason = web_result.error or "web fetch failed"
+                    archived = self._try_archived_copy(student_url, web_result, title, expected_kind,
+                                                       author, year, doi)
+                    if archived is not None:
+                        self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
+                        return archived
 
         # 2.5. Try DOI resolver / campus proxy (institutional deployment).
         #      When DOI_RESOLVER_URL is configured, construct {url}{doi} to
@@ -3609,6 +3764,13 @@ class SourceResolver:
             if getattr(validation, 'reason_code', None) == 'identity_insufficient_observations':
                 identity_confidence = 'low'
                 metadata['identity_reason_code'] = validation.reason_code
+            if (identity_confidence == 'high' and expected_doi and self._doi_title_mismatch()
+                    and not _cited_title_on_front_pages(content, expected_title)):
+                # The reference borrows a DOI that registers another work: a
+                # file carrying that DOI is the other work, not the cited one
+                # (paper 8, Smith 2012 accepted as Kerrigan 2020; 2026-10-02).
+                identity_confidence = 'rejected'
+                metadata['identity_reason_code'] = 'doi_identifies_different_work'
             if getattr(validation, 'source_inspection', None) is not None:
                 metadata['source_inspection'] = validation.source_inspection
             identity_reason = validation.reason
@@ -4009,6 +4171,10 @@ class SourceResolver:
                     )
                     if len(text) < 500:
                         raise ValueError("representation too short to be useful full text")
+                    # A PubMed Central JATS body is the deposited article whole;
+                    # its length must still fit an article (2026-10-02).
+                    jats = (location.metadata.get("route") == "europepmc_full_text_xml"
+                            and 1_000 <= len(text.split()) <= 25_000)
                     result.set_representation(
                         SourceRepresentation(
                             kind=RepresentationKind.PLAIN_TEXT,
@@ -4017,7 +4183,9 @@ class SourceResolver:
                             source_url=str(response.url),
                             original_kind=location.representation_kind,
                             charset="utf-8",
-                            completeness="not_assessed",
+                            completeness="complete" if jats else "not_assessed",
+                            metadata=({"completeness_basis": "europepmc-jats-body-v1",
+                                       "reader_url": location.landing_page_url} if jats else {}),
                         )
                     )
                 else:
@@ -4598,6 +4766,8 @@ class SourceResolver:
                 reason=reason, observed_content_sha256=hashlib.sha256(resp.content).hexdigest(),
             ).model_dump()}
 
+        _record_registry_link_identity(url, resp, title, expected_author=expected_author,
+                                       expected_year=expected_year, expected_doi=expected_doi)
         content_type = resp.headers.get("content-type", "").lower()
         if resp.content.startswith(PDF_MAGIC) or "application/pdf" in content_type:
             return RetrievalResult(
@@ -4681,6 +4851,9 @@ class SourceResolver:
                     "Web fetch identity mismatch for %s",
                     private_value_id("url", url),
                 )
+                if not homepage:
+                    _record_link_title_conflict(url, resp, title, page_titles, expected_author=expected_author,
+                                                expected_year=expected_year, expected_doi=expected_doi)
                 return RetrievalResult(
                     source_name="web_fetch",
                     success=False,
@@ -4840,6 +5013,11 @@ class SourceResolver:
         )
         identity, comparisons, confirmed = _web_identity_comparison(result,
             title=title, author=expected_author, year=expected_year, doi=expected_doi)
+        if not confirmed and _organisation_author_in_page(expected_author, comparisons, page_text):
+            # "Presented by the UCLA Film & Television Archive": an organisation
+            # author is named in the page text, not as a byline (2026-10-01).
+            confirmed = True
+            result.metadata['work_identity_basis'] = 'web-organisation-author-in-page-v1'
         # A one-year bibliographic error must not make a clearly identified
         # journal article unreadable. Keep the year conflict in discovery/link
         # evidence; this is work-level acquisition, not reference correctness.

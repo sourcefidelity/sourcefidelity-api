@@ -81,6 +81,8 @@ class CitationMarkerCensusEntry(BaseModel):
     report_text: str | None = None
     report_passage_start: int | None = None
     report_passage_end: int | None = None
+    # citation-reference-tolerance-v1: what differs when a tolerant rule linked it.
+    link_differences: list[str] = Field(default_factory=list)
 
 
 class PaperExtractionArtifact(BaseModel):
@@ -135,6 +137,13 @@ class PaperExtractionArtifact(BaseModel):
         return value
 
 
+_DATE_QUALIFIER = r"(?:(?:c\.|ca\.|circa|after|before|since|until|from|by|early|late|mid-?)\s*)*"
+_DATE_ONLY_ASIDE = re.compile(
+    rf"\(\s*{_DATE_QUALIFIER}(?:1[5-9]|20)\d{{2}}s?"
+    rf"\s*(?:(?:[-–—/]|\bto\b|\buntil\b)\s*(?:{_DATE_QUALIFIER}(?:(?:1[5-9]|20)\d{{2}}|\d{{2}})s?|present|now|today))?\s*\)",
+    re.IGNORECASE,
+)
+
 def extract_paper_evidence(
     paper_text: str,
     *,
@@ -147,6 +156,7 @@ def extract_paper_evidence(
     use_llm_reference_fallback: bool = True,
     signals: Optional[SignalConfig] = None,
     docx_content: bytes | None = None,
+    link_targets: frozenset[str] = frozenset(),
 ) -> PaperExtractionArtifact:
     """Extract stable references and citation spans from one paper version.
 
@@ -201,7 +211,7 @@ def extract_paper_evidence(
     if reference_layout_text:
         from app.services.reference_url_repair import repair_reference_urls
 
-        references = repair_reference_urls(references, reference_layout_text)
+        references = repair_reference_urls(references, reference_layout_text, link_targets=link_targets)
 
     structural_detections = extract_citations(
         body_text,
@@ -402,7 +412,8 @@ def _build_marker_census(
             )
         )
     broad_parenthetical = re.compile(
-        r"\([^()\n]{0,250}\b(?:19|20)\d{2}[a-z]?\b[^()\n]{0,250}\)",
+        # A single line break may fall inside a parenthesis (PDF wrapping).
+        r"\((?:(?!\n\s*\n)[^()]){0,250}\b(?:19|20)\d{2}[a-z]?\b(?:(?!\n\s*\n)[^()]){0,250}\)",
         re.IGNORECASE,
     )
     for match in broad_parenthetical.finditer(body_text):
@@ -423,9 +434,20 @@ def _build_marker_census(
         if (re.fullmatch(r'\(\s*(?:18|19|20)\d{2}\s*[-–—]\s*(?:18|19|20)\d{2}\s*\)', marker)
                 and re.search(r'\b(?:period|era|years)\s*$', body_text[max(0,match.start()-100):match.start()], re.I)):
             continue
+        # A date range, open range, decade or qualified year with no author text
+        # ("(1916–1965)", "(1966–present)", "(c. 1916–1965)", "(after c. 1966)") is
+        # an aside, not a citation (paper 5, 2026-10-01), unless a reference's year
+        # is exactly that date text. A bare single year is left to other rules.
+        if _DATE_ONLY_ASIDE.fullmatch(marker) and not re.fullmatch(r'\(\s*(?:18|19|20)\d{2}[a-rt-z]?\s*\)', marker):
+            inner = marker.strip('() ')
+            if not any((getattr(r, 'year', '') or '').strip() == inner for r in references):
+                continue
         linked_ids, candidate_ids = _link_broad_parenthetical_marker(
             marker, references
         )
+        link_differences: list[str] = []
+        if not linked_ids and not candidate_ids:
+            linked_ids, link_differences = _misspelt_narrative_author(body_text, match.start(), marker, references)
         sentence_span = (
             _sentence_span_containing(
                 body_text,
@@ -466,10 +488,31 @@ def _build_marker_census(
                 report_passage_start=(sentence_span[0] if sentence_span else None),
                 report_passage_end=(sentence_span[1] if sentence_span else None),
                 report_text=(sentence_span[2] if sentence_span else None),
+                link_differences=link_differences,
             )
         )
     census.sort(key=lambda item: (item.passage_start, item.passage_end, item.marker_id))
     return census
+
+
+def _misspelt_narrative_author(body_text: str, start: int, marker: str, references) -> tuple[list[str], list[str]]:
+    """Link "lagnfor (2016)" to Langford (2010): a bare year after a word that is a
+    close misspelling of exactly one reference's lead surname (paper 5, 2026-10-01).
+    The year may differ; both differences are kept for the report."""
+    from app.services.citation_extractor import _reference_lead_surnames, close_surname
+    bare = re.fullmatch(r"\(\s*((?:19|20)\d{2})[a-z]?\s*\)", marker)
+    word = re.search(r"([^\W\d_][^\W\d_'’-]*(?:['’-][^\W\d_]+)*)\s*$", body_text[max(0, start - 60):start])
+    if not bare or not word:
+        return [], []
+    close = [ref for ref in references
+             if _reference_lead_surnames(ref) and close_surname(word.group(1), _reference_lead_surnames(ref)[0])]
+    if len(close) != 1:
+        return [], []
+    ref = close[0]
+    differences = [f"author_spelling:{_reference_lead_surnames(ref)[0]}"]
+    if (ref.year or "").strip()[:4] != bare.group(1):
+        differences.append(f"year:{ref.year or 'n.d.'}")
+    return [ref.reference_id], differences
 
 
 def _link_broad_parenthetical_marker(

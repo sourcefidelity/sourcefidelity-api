@@ -18,7 +18,7 @@ LINK_MARKER_FINDINGS = SUBMITTED_LINK_FINDINGS | {'required_doi_missing', 'asses
 # The former review flag is a legacy name for the same presentation.
 UNVERIFIED_FINDINGS = frozenset({'unverified_reference', 'potentially_fabricated_reference'})
 REFERENCE_DIFFERENCE_FINDINGS = frozenset({'bibliographic_conflict', 'bibliographic_field_conflict',
-                                           'publication_year_discrepancy'})
+                                           'publication_year_discrepancy', 'doi_registered_title_differs'})
 EVIDENCE_REFERENCE_FINDINGS = UNVERIFIED_FINDINGS | REFERENCE_DIFFERENCE_FINDINGS
 
 

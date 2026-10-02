@@ -20,7 +20,7 @@ def _normalized(text: str) -> str:
 
 
 def repair_reference_urls(
-    references: list[ParsedReference], layout_text: str,
+    references: list[ParsedReference], layout_text: str, *, link_targets: frozenset[str] = frozenset(),
 ) -> list[ParsedReference]:
     """Return copies only for unique raw-reference-bound, structured wraps.
 
@@ -29,23 +29,30 @@ def repair_reference_urls(
     plain opaque tokens stop reconstruction. Require the complete observed span
     to survive in exactly one parsed raw reference, and require that reference's
     existing locator to be the prefix extracted from the same span.
+
+    A continuation without URL structure ("P ractice_of_...") is accepted only
+    when one of the PDF's own link targets begins with the joined pieces and
+    the finished URL equals that target (Dena, Paula; 2026-10-02).
     """
     proposals: dict[int, list[tuple[str, ReferenceURLRepair]]] = {}
     for match in _START.finditer(layout_text):
         end = match.end()
         pieces = [match.group()]
+        annotated = False
         for _ in range(7):
             next_line = re.match(r"[ \t]*\r?\n[ \t]*([^\r\n]+)", layout_text[end:])
             if not next_line:
                 break
             token = next_line[1].strip()
+            proven = any(target.startswith("".join(pieces) + token.rstrip('.,;)]>')) for target in link_targets)
             if (
                 not _TOKEN.fullmatch(token)
                 or _START.search(token)
-                or not ("/" in token or re.search(r"[?&][\w.-]+=", token))
+                or not ("/" in token or re.search(r"[?&][\w.-]+=", token) or proven)
                 or len("".join(pieces)) + len(token) > 8192
             ):
                 break
+            annotated = annotated or (proven and "/" not in token and not re.search(r"[?&][\w.-]+=", token))
             pieces.append(token)
             end += next_line.end()
         if len(pieces) == 1:
@@ -66,7 +73,7 @@ def repair_reference_urls(
             _ = parsed.port
         except ValueError:
             continue
-        if url == prefix:
+        if url == prefix or (annotated and url not in link_targets):
             continue
         i = owners[0]
         record = ReferenceURLRepair(

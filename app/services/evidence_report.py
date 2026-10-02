@@ -378,6 +378,8 @@ def build_evidence_report_view(
                 "tone": tone,
                 "display_coverage": display_coverage,
                 "quotation_differences": quotation_differences,
+                "reference_mismatch_members": _reference_mismatch_members(
+                    extraction, claim.passage_start, claim.passage_end),
                 "paper_location": _paper_location(
                     paper_surface,
                     passage_start=claim.passage_start,
@@ -418,6 +420,8 @@ def build_evidence_report_view(
                 "members": marker_members,
                 "marker_only": not marker["recovered_sentence"],
                 "missing_reference_members": missing_members,
+                "reference_mismatch_members": _reference_mismatch_members(
+                    extraction, marker["passage_start"], marker["passage_end"]),
                 "boundary_reason": (
                     "No reference-list entry was found for " + "; ".join(missing_members) + "."
                     if missing_members else
@@ -524,6 +528,25 @@ def build_evidence_report_view(
             continue
         layout = reference_layout.get(reference_id)
         registered = str(mismatch.get('registered_title') or '').strip()
+        if _doi_identity_agrees(discovery):
+            # The DOI's work has this reference's author and year: the title
+            # was written wrongly, the link is right (reference 8, paper 4;
+            # owner-approved wording 2026-10-02).
+            reference_practice.append({
+                'finding_type': 'doi_registered_title_differs',
+                'reference_id': reference_id,
+                'finding': 'The DOI is registered to a work with a different title; the author and year agree.',
+                'rule_id': 'doi-title-differs-v1',
+                'rule_source': 'https://www.doi.org/the-identifier/resources/handbook/',
+                'field_difference': {'field_name': 'title', 'submitted_value': reference.title or ''},
+                'located_record': {'title': registered, 'provider': mismatch.get('provider')},
+                'source': _reference_view(reference, layout),
+                'rectangles': ([item.model_dump(mode='json') for item in layout.rectangles]
+                               if layout is not None and layout.rectangles else []),
+                'localization_status': ('exact_rectangle' if layout is not None and layout.rectangles
+                                        else 'not_assessed'),
+            })
+            continue
         # An identifier that resolves is not the same as an identifier that
         # resolves to the cited work. State the discrepancy, not a motive.
         reference_practice.append({
@@ -546,12 +569,15 @@ def build_evidence_report_view(
                                     if layout is not None and layout.rectangles
                                     else 'not_assessed'),
         })
-    from app.services.reference_formatting import contribution_editor_findings
+    from app.services.reference_formatting import (chapter_form_findings, contribution_editor_findings,
+                                                   reference_element_findings)
     container_records = {
         reference_id: (discovery or {}).get('container_identity') or {}
         for reference_id, discovery in discovery_by_reference.items()
     }
-    for finding in contribution_editor_findings(references.values(), container_records):
+    for finding in (contribution_editor_findings(references.values(), container_records)
+                    + chapter_form_findings(references.values(), extraction.citation_format)
+                    + reference_element_findings(references.values(), extraction.citation_format)):
         reference = references[finding['reference_id']]
         layout = reference_layout.get(reference.reference_id)
         finding['source'] = _reference_view(reference, layout)
@@ -629,6 +655,22 @@ def build_evidence_report_view(
                 "rectangles": [],
                 "localization_status": "not_assessed",
             })
+        if (conflict.get("record_lacks_journal") and conflict.get("field_differences")
+                and getattr(reference, "source_kind", "") == "journal_article"):
+            reference_practice.append({
+                "finding_type": "bibliographic_conflict",
+                "reference_id": reference_id,
+                "source": _reference_view(reference, layout),
+                # Owner-approved wording (2026-10-02).
+                "finding": "The located record does not name the journal in this reference.",
+                "located_record": conflict.get("located_record") or {},
+                "conflicting_fields": [],
+                "field_difference": {"field_name": "container_title",
+                                     "submitted_value": getattr(reference, "container_title", "") or "",
+                                     "located_value": "", "record_lacks_field": True},
+                "rectangles": [],
+                "localization_status": "not_assessed",
+            })
     # A same-titled work credited to someone else (owner decision 2026-09-30):
     # the existing Source Record Conflict on the author, in its existing words.
     from app.services.reference_verification import same_title_author_difference
@@ -658,6 +700,26 @@ def build_evidence_report_view(
             "rectangles": [],
             "localization_status": "not_assessed",
         })
+        record = next((c for c in (discovery_by_reference.get(reference_id) or {}).get("candidates") or []
+                       if c.get("candidate_id") == difference.get("candidate_id")), {})
+        if (getattr(reference, "source_kind", "") == "journal_article"
+                and (getattr(reference, "container_title", "") or "").strip()
+                and not str((record.get("observed") or {}).get("container_title") or "").strip()):
+            reference_practice.append({
+                "finding_type": "bibliographic_conflict",
+                "reference_id": reference_id,
+                "source": _reference_view(reference, reference_layout.get(reference_id)),
+                # Owner-approved wording (2026-10-02).
+                "finding": "The located record does not name the journal in this reference.",
+                "located_record": {"title": difference["located_title"], "authors": [difference["located_value"]]},
+                "conflicting_fields": [],
+                "field_difference": {"field_name": "container_title", "submitted_value": reference.container_title,
+                                     "located_value": "", "record_lacks_field": True, "provider": difference["provider"],
+                                     "candidate_id": difference["candidate_id"]},
+                "same_title_record": True,
+                "rectangles": [],
+                "localization_status": "not_assessed",
+            })
         publisher = difference.get("publisher_difference")
         if publisher:
             reference_practice.append({
@@ -1053,7 +1115,8 @@ def _build_report_summary(
         # A same-titled work credited to someone else (2026-09-30), counted
         # with the other source-record conflicts once it is placed.
         f.get("reference_id") for f in reference_practice or []
-        if f.get("finding_type") == "bibliographic_conflict" and f.get("same_title_record") and f.get("rectangles")
+        if (f.get("finding_type") == "bibliographic_conflict" and f.get("same_title_record")
+            or f.get("finding_type") == "doi_registered_title_differs") and f.get("rectangles")
     }
     duplicate_key_references = {
         member.get("reference_id")
@@ -1110,7 +1173,8 @@ def _build_report_summary(
         ids = {f.get('reference_id') for f in reference_practice or []
                if f.get('finding_type') == kind and f.get('rectangles')}
         if ids:
-            lead = f'{len(ids)} {one if len(ids) == 1 else many}'
+            lead = (unverified_summary_lead(len(ids), int(overview.get('reference_count') or 0))
+                    if kind == 'unverified_reference' else f'{len(ids)} {one if len(ids) == 1 else many}')
             add(category, kind, lead + '.', lead=lead, rest='.', instances=refs(ids), count=len(ids))
             conflicting_references -= ids
     confirmed_duplicates = {f.get('retained_finding_id') for f in reference_practice or []
@@ -1234,6 +1298,11 @@ def _build_report_summary(
         ('contribution_author_is_volume_editor',
          ('{count} reference cites part of a book like it was an edited collection.',
           '{count} references cite parts of books like they were edited collections.')),
+        # Owner-approved wording (2026-10-01).
+        ('chapter_editors_missing', ('{count} chapter reference names no editors.',
+                                     '{count} chapter references name no editors.')),
+        ('chapter_pages_missing', ('{count} chapter reference gives no page range.',
+                                   '{count} chapter references give no page range.')),
         ('required_quotation_locator_missing', ('', '')),
     ):
         placed = [(j, f) for j, f in enumerate(reference_practice or [], 1)
@@ -1297,6 +1366,20 @@ def _build_report_summary(
                      for name in sorted(first_index, key=lambda n: (first_index[n], n))]
         add('academic_practice', 'missing_reference_entry', f"{lead} ({'; '.join(names)}).",
             lead=lead, rest='.', instances=instances, count=len(names))
+    mismatched = [(index, citation.get("reference_mismatch_members"))
+                  for index, citation in enumerate(citations, 1) if citation.get("reference_mismatch_members")]
+    if mismatched:
+        # Owner wording 2026-10-01.
+        first_mismatch: dict[str, int] = {}
+        for index, items in mismatched:
+            for item in items:
+                first_mismatch.setdefault(item, index)
+        items = sorted(first_mismatch, key=lambda n: (first_mismatch[n], n))
+        lead = (f"{len(items)} in-text citation differs from its reference-list entry" if len(items) == 1
+                else f"{len(items)} in-text citations differ from their reference-list entries")
+        instances = [{"type": "named", "label": item, "target": f"citation-panel-{first_mismatch[item]}"} for item in items]
+        add('academic_practice', 'citation_reference_mismatch', f"{lead} ({'; '.join(items)}).",
+            lead=lead, rest='.', instances=instances, count=len(items))
     if indirect_citations:
         lead = (f"{indirect_citations} {'citation currently relies' if indirect_citations == 1 else 'citations currently rely'} "
                 "on passages where the cited source represents another work")
@@ -1618,6 +1701,12 @@ _JUDGMENT_PARTS = (
 )
 
 
+def unverified_summary_lead(count: int, total: int) -> str:
+    """Owner wording 2026-10-02: "N/X sources cannot be verified and may not
+    exist (references 1, 2, 3)."; X is the number of references."""
+    return f"{count}/{max(total, count)} sources cannot be verified and may not exist"
+
+
 def judgment_summary_sentence(states: dict, without_full_text: int, citation_total: int) -> str:
     """X for the statement parts is the number of statements the judge
     answered (each proposition and source, undecided included); the last
@@ -1633,9 +1722,65 @@ def judgment_summary_sentence(states: dict, without_full_text: int, citation_tot
     return (parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + ", and " + parts[-1]) + "."
 
 
+# Broad summary lines (owner decisions 2026-10-02). The windows keep each
+# finding's own sentence; the summary counts references once per group.
+_LINK_SUMMARY_KINDS = frozenset({'submitted_link_issue', 'submitted_link_homepage', 'doi_registers_a_different_title',
+                                 'reference_identifier_conflict', 'required_doi_missing', 'assessment_link_missing',
+                                 'reference_identifier_placeholder'})
+_INCORRECT_SUMMARY_KINDS = frozenset({'identity_conflict', 'publication_year_discrepancy', 'bibliographic_field_conflict',
+                                      'reference_author_conflict', 'reference_publisher_repeated',
+                                      'contribution_author_is_volume_editor'})
+_MISSING_SUMMARY_KINDS = frozenset({'required_author_missing', 'chapter_editors_missing', 'chapter_pages_missing',
+                                    'reference_title_missing'})
+_BROAD_SUMMARY_LINES = (
+    # (kinds, column, kind, singular, plural)
+    (_LINK_SUMMARY_KINDS, 'academic_practice', 'reference_links',
+     '1 reference has an incorrect or missing link', '{n} references have incorrect or missing links'),
+    (_INCORRECT_SUMMARY_KINDS, 'reference_formatting', 'reference_incorrect_information',
+     '1 reference contains incorrect information', '{n} references contain incorrect information'),
+    (_MISSING_SUMMARY_KINDS, 'reference_formatting', 'reference_missing_information',
+     '1 reference is missing information', '{n} references are missing information'),
+)
+
+
+def broad_reference_summary(summary: dict, findings: list[dict] | None = None,
+                            numbers: dict[str, int] | None = None) -> dict:
+    """Replace the per-finding reference lines with the broad lines; idempotent.
+
+    Placed findings with no summary line of their own (the publisher and
+    no-title findings) are counted from ``findings``."""
+    from app.services.report_references import reference_template_id
+    summary = {key: list(value or []) for key, value in (summary or {}).items()}
+    for kinds, column, kind, one, many in _BROAD_SUMMARY_LINES:
+        taken = [item for items in summary.values() for item in items
+                 if isinstance(item, dict) and (item.get('kind') in kinds or item.get('kind') == kind)]
+        extra = sorted({(numbers or {}).get(f.get('reference_id')) for f in findings or []
+                        if f.get('finding_type') in kinds and f.get('rectangles')} - {None})
+        if extra:
+            taken.append({'kind': kind, 'instances': [{'type': 'reference', 'number': n,
+                                                        'target': reference_template_id(n)} for n in extra]})
+        if not taken:
+            continue
+        for key in summary:
+            summary[key] = [item for item in summary[key] if item not in taken]
+        instances = {}
+        for item in taken:
+            for instance in item.get('instances') or []:
+                if instance.get('type') == 'reference' and isinstance(instance.get('number'), int):
+                    instances.setdefault(instance['number'], instance)
+        rows = [instances[n] for n in sorted(instances)]
+        count = len(rows) or sum(int(item.get('count') or 0) for item in taken)
+        if not count:
+            continue
+        lead = one if count == 1 else many.format(n=count)
+        summary.setdefault(column, []).append(
+            _summary_item(kind, lead + '.', lead=lead, rest='.', instances=rows, count=count))
+    return summary
+
+
 def _render_report_summary(summary: dict, *, placed_citations: frozenset = frozenset(),
                            located_references: frozenset = frozenset(), retrieval: str = "",
-                           judgments: dict | None = None) -> str:
+                           judgments: dict | None = None, reference_total: int = 0) -> str:
     """One summary for everyone (owner decision 2026-09-25): neutral wording,
     no revision coaching and no cap; style-guide links live in the windows."""
     columns = (   # owner order and names, 2026-09-28
@@ -1662,6 +1807,10 @@ def _render_report_summary(summary: dict, *, placed_citations: frozenset = froze
         # the retrieval and judgment lines (owner request 2026-09-30).
         first = [item for item in items if isinstance(item, dict) and item.get("kind") == "unverified_reference"]
         items = [item for item in items if item not in first]
+        # Stored reports carry the earlier wording; restate it in the owner's.
+        first = [dict(item, lead=unverified_summary_lead(int(item.get("count") or len(item.get("instances") or [])),
+                                                       reference_total), rest=".")
+                 for item in first]
         lead = "".join(row(item) for item in first) + lead
         if items:
             body = "<ul>" + lead + "".join(row(item) for item in items) + "</ul>"
@@ -1677,6 +1826,9 @@ HOW_TO_READ_TITLE = 'How to Read This Report'
 # selection like citations, drawn over the yellow; no outline. In the window,
 # the student's and the source's words carry no background (owner request 2026-09-29).
 PASSAGE_CSS = (
+    # The Reference heading colour, in Reference windows and after "Citation N".
+    'h2 .reference-heading-link{color:#0b7a75;font:inherit;background:none;border:0;padding:0;cursor:pointer}'
+    'h2 button.reference-heading-link:hover,h2 a.reference-heading-link:hover{text-decoration:underline}'
     '.patchwriting-overlay{cursor:pointer}.patchwriting-overlay:focus{outline:none}'
     '.patchwriting-overlay .patchwriting-hit{fill:#ffe45c;fill-opacity:.4;stroke:none}'
     '.patchwriting-overlay .patchwriting-selection{fill:transparent;stroke:none}'
@@ -2001,6 +2153,7 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     for citation in citations:
         for member in citation.get('members', []):
             member['unverified'] = member.get('reference_id') in unverified_ids
+    view = withdraw_unverified_possible_matches(view, citations, unverified_ids)
     export_mode = str(view.get("export_mode") or "interactive")
     # One layout (owner decision 2026-09-28): Judgment is part of every
     # interactive report; exports carry no Judgment.
@@ -2040,6 +2193,7 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
                 f'<button type="button" data-panel-template="citation-panel-{i}">Citation {i}</button>' for i in related)
             template = template.replace('</template>',links+'</template>')
         panel_templates += template
+    panel_templates = _citation_reference_headings(panel_templates, citations, numbers)
     paper_key = _paper_key(view.get('paper_surface') or {})
     for entry in catalog:
         panel_templates += _render_reference_window_template(
@@ -2051,11 +2205,12 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     )
     # Keep unresolved geometry in retained diagnostics, not a new report section.
     summaries = _render_report_summary(
-        report_summary(view),
+        broad_reference_summary(report_summary(view), reference_practice, numbers),
         placed_citations=frozenset(i for i, c in enumerate(citations, 1)
                                    if (c.get('paper_location') or {}).get('rectangles')),
         located_references=frozenset(entry['number'] for entry in catalog if entry.get('location')),
         retrieval=_retrieval_sentence(view.get("overview") or {}),
+        reference_total=int((view.get("overview") or {}).get("reference_count") or 0),
         judgments=({"states": (view.get('judgment_summary') or {}).get('states') or {},
                     "without_full_text": sum(1 for c in citations if not any(
                         m.get('coverage_level') == 'full_text' for m in c.get('members') or [])),
@@ -2793,6 +2948,38 @@ def attach_quotation_difference_geometry(view: dict, pdf_content: bytes) -> dict
     return result
 
 
+_MISMATCH_PHRASES = {
+    "year": "reference year {}",
+    "author_count": "reference has {}",
+    "author_spelling": "reference author {}",
+    "coauthor": "reference second author {}",
+}
+
+
+def _reference_mismatch_members(extraction, start: int, end: int) -> list[str]:
+    """In-text citations a tolerant rule linked, with how each differs from its
+    reference (citation-reference-tolerance-v1, owner decision 2026-10-01)."""
+    def phrase(items):
+        parts = []
+        for item in items:
+            kind, _, value = str(item).partition(":")
+            if kind == "coauthor" and value == "none":
+                parts.append("reference has no second author")
+            elif kind in _MISMATCH_PHRASES:
+                parts.append(_MISMATCH_PHRASES[kind].format(value))
+        return ", ".join(parts)
+    found = []
+    for citation in extraction.citations:
+        if (getattr(citation, "link_differences", None) and citation.passage_start < end
+                and start < citation.passage_end):
+            found.append(f"{str(citation.marker_member or citation.citation_marker).strip()}: "
+                         f"{phrase(citation.link_differences)}")
+    for marker in getattr(extraction, "citation_marker_census", []) or []:
+        if getattr(marker, "link_differences", None) and start <= marker.passage_start < end:
+            found.append(f"{str(marker.text or '').strip('() ')}: {phrase(marker.link_differences)}")
+    return list(dict.fromkeys(found))
+
+
 def _missing_reference_members(extraction, start: int, end: int) -> list[str]:
     """Name exact parsed author/year members, not arbitrary unresolved years."""
     from app.services.citation_extractor import APA_MEMBER_RE, APA_NARRATIVE_RE
@@ -2832,7 +3019,40 @@ def _missing_reference_members(extraction, start: int, end: int) -> list[str]:
                 and start <= marker.passage_start < marker.passage_end <= end
                 and APA_MEMBER_RE.fullmatch(member)):
             missing.append(member)
+        elif (marker.link_status == 'missing_reference'
+                and not marker.reference_ids and not marker.candidate_reference_ids
+                and start <= marker.passage_start < marker.passage_end <= end
+                and re.fullmatch(r'(?:19|20)\d{2}[a-z]?', member)):
+            # A film or Act named with its year and no reference-list entry
+            # ("Princess Iron Fan" (1941), "… Corporation Act (1970)") is a
+            # citation without an entry (owner decision 2026-10-02).
+            work = _titled_work_before(marker)
+            if work:
+                missing.append(f"{work}, {member}")
     return list(dict.fromkeys(missing))
+
+
+def _doi_identity_agrees(discovery: dict | None) -> bool:
+    """A search record with the cited DOI agrees on author and year."""
+    for candidate in (discovery or {}).get('candidates') or []:
+        outcomes = {c.get('field_name'): c.get('outcome') for c in candidate.get('comparisons') or []}
+        if (outcomes.get('doi') == 'agreement' and outcomes.get('author') in {'agreement', 'minor_difference'}
+                and outcomes.get('year') == 'agreement'):
+            return True
+    return False
+
+
+def _titled_work_before(marker) -> str:
+    """The quoted title or named Act directly before a bare-year marker."""
+    text, origin = str(getattr(marker, 'report_text', '') or ''), getattr(marker, 'report_passage_start', None)
+    if not text or not isinstance(origin, int) or not 0 <= marker.passage_start - origin <= len(text):
+        return ''
+    before = text[:marker.passage_start - origin].rstrip()
+    quoted = re.search(r'[“"‘]([^”"’“‘]{2,150})[”"’]\s*$', before)
+    if quoted:
+        return quoted[1].strip(' ,.')
+    act = re.search(r"((?:[A-Z][\w'’&-]*\s+){1,10}Act)$", before)
+    return act[1].strip() if act else ''
 
 
 def _restore_retained_continuations(passages: list[dict]) -> list[dict]:
@@ -4282,7 +4502,9 @@ def _identity_view(discovery: dict | None) -> dict:
     return {
         "status": outcome,
         "label": _reason_label(outcome),
-        "attention": outcome == "bibliographic_conflict",
+        # A conflict that rested only on a placeholder record is not one (2026-10-01).
+        "attention": outcome == "bibliographic_conflict"
+                     and bool(_reference_identity_conflict_view(discovery).get("conflicting_fields")),
         "edition_year_unresolved": not compatible_year and any(
             comparison.get("reason_code") == "book_edition_year_unresolved"
             for candidate in discovery.get("candidates") or []
@@ -4324,6 +4546,10 @@ def _reportable_bibliographic_difference(difference: dict) -> bool:
     """
     left = str(difference.get('submitted_value') or '').strip()
     right = str(difference.get('located_value') or '').strip()
+    if difference.get('record_lacks_field') and left:
+        # Stated as an absence, not a conflict: "The located record does not
+        # name the journal in this reference." (owner wording 2026-10-02).
+        return True
     if not left or not right:
         return False
     field = difference.get('field_name')
@@ -4396,7 +4622,12 @@ def _same_people_other_name_order(difference: dict) -> bool:
 
 def _reference_identity_conflict_view(discovery: dict) -> dict:
     """Expose only the located candidate fields needed to inspect a conflict."""
-    candidates = list(discovery.get("candidates") or [])
+    from app.services.web_source_metadata import _label_only_author
+    # A record whose byline is interface text ("Author Notes Loading Author
+    # Notes") is page furniture, including records stored before that check
+    # existed or reused from an earlier run (2026-10-01).
+    candidates = [item for item in discovery.get("candidates") or []
+                  if not any(_label_only_author(str(a)) for a in (item.get("observed") or {}).get("authors") or [])]
     candidate = next(
         (
             item
@@ -4420,6 +4651,7 @@ def _reference_identity_conflict_view(discovery: dict) -> dict:
             "year": str(observed.get("year") or ""),
             "doi": str(observed.get("doi") or ""),
             "container_title": str(observed.get("container_title") or ""),
+            "page_url": str(candidate.get("page_url") or ""),
         },
         "conflicting_fields": [
             str(item.get("field_name") or "")
@@ -4440,6 +4672,11 @@ def _reference_identity_conflict_view(discovery: dict) -> dict:
     result['field_differences'] = [d for d in result['field_differences']
         if _reportable_bibliographic_difference(d)]
     result['conflicting_fields'] = [d['field_name'] for d in result['field_differences']]
+    # A located record that names no journal although the reference gives one
+    # (Kozlovic: a web essay under the cited title; owner decision 2026-10-02).
+    # Absence is not a conflict, so it stays out of the conflicting fields.
+    result['record_lacks_journal'] = bool(candidate and str(expected.get('container_title') or '').strip()
+                                          and not str(observed.get('container_title') or '').strip())
     return result
 
 
@@ -4662,6 +4899,7 @@ def _render_continuous_paper(
                      'bibliographic_conflict':'Differs from the Located Record',
                      'bibliographic_field_conflict':'Differs from the Located Record',
                      'publication_year_discrepancy':'Differs from the Located Record',
+                     'doi_registered_title_differs':'Differs from the Located Record',
                      'reference_identifier_conflict':'DOI Identifies a Different Work',
                      'doi_registers_a_different_title':'DOI Identifies a Different Work',
                      'reference_identifier_placeholder':'Unfinished Identifier',
@@ -5144,6 +5382,16 @@ def _render_citation_text(citation: dict, *, bold: list | None = None) -> str:
     return escape(text)
 
 
+# Sentences the owner removed from every window (2026-10-02, paper 8 review).
+_REMOVED_WINDOW_SENTENCES = frozenset({
+    'The cited work could not be identified, so no summary is shown.',
+    'Any record the search returned may describe a different work.',
+    'No clearly relevant passage was found.',
+    'This does not establish that evidence is absent.',
+    'Search coverage is bounded, not an exhaustive catalog of published works.',
+})
+
+
 def _panel_statement(text: str) -> str:
     """Remove generated revision instructions, never source or student excerpts."""
     text = str(text or '').replace(
@@ -5157,12 +5405,16 @@ def _panel_statement(text: str) -> str:
     for part in re.split(r'(?<=[.!?])\s+', str(text or '')):
         if part == 'Source completeness is uncertain.':
             continue  # The limited-text heading already conveys this boundary.
+        if part in _REMOVED_WINDOW_SENTENCES:
+            continue
         if part.startswith(instruction_starts):
             # Preserve an explanatory limitation following a request to review.
             if '; ' in part:
                 tail = part.split('; ', 1)[1]
                 if tail.startswith(('this ', 'their ', 'the ', 'its ')):
-                    statements.append(tail[0].upper()+tail[1:])
+                    tail = tail[0].upper() + tail[1:]
+                    if tail not in _REMOVED_WINDOW_SENTENCES:
+                        statements.append(tail)
             continue
         statements.append(part)
     return ' '.join(statements)
@@ -5389,8 +5641,11 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
             '<h3 class="own-reference-heading">Submitted Reference</h3>'
             f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>'
             '<h3>Located Record</h3>'
-            f'<p class="full-reference">{escape(located_text or "No displayable located-record fields were retained.")}</p>'
-            '</template>'
+            f'<p class="full-reference">{escape(located_text or "No displayable located-record fields were retained.")}'
+            + (f' <a class="reference-url" href="{escape(located["page_url"], quote=True)}" target="_blank" '
+               f'rel="noopener noreferrer">{escape(located["page_url"])}</a>'
+               if _safe_reference_href(str(located.get("page_url") or "")) else '')
+            + '</p></template>'
         )
     related = "".join(
         f'<p class="full-reference">{_render_formatted_reference(peer, peer["raw_reference"])}</p>'
@@ -5429,6 +5684,61 @@ def _paper_key(surface: dict) -> str:
     return _fold_for_titles(' '.join(words))
 
 
+def _citation_reference_headings(templates: str, citations: list[dict], numbers: dict[str, int]) -> str:
+    """"Citation N – Reference N" (owner request 2026-10-02): each linked
+    reference opens its Reference window, in the reference-heading colour."""
+    from app.services.report_references import reference_template_id
+
+    def heading(match):
+        citation = citations[int(match.group(2)) - 1] if 0 < int(match.group(2)) <= len(citations) else {}
+        linked = sorted({numbers[m.get('reference_id')] for m in citation.get('members') or []
+                         if m.get('reference_id') in numbers})
+        if not linked:
+            return match.group(0)
+        links = ', '.join(f'<button type="button" class="reference-heading-link" '
+                          f'data-go-to="{reference_template_id(n)}">Reference {n}</button>' for n in linked)
+        return f'{match.group(1)} – {links}{match.group(3)}'
+    return re.sub(r'(<template id="citation-panel-(\d+)"><h2>.*?)(<span data-proposition-suffix>)',
+                  heading, templates)
+
+
+def _submitted_link_refused(member: dict) -> bool:
+    """No text was retrieved and the reference's own link answered with a
+    refusal (HTTP 401/403) the last time it was requested."""
+    if member.get('coverage_level') not in {'unavailable', None, ''}:
+        return False
+    for row in member.get('submitted_link_observations') or []:
+        requests = [r for r in row.get('requests') or [] if isinstance(r, dict)]
+        if row.get('state') == 'observed' and requests:
+            last = max(requests, key=lambda r: str(r.get('completed_at') or ''))
+            if last.get('outcome') in {'access_refused', 'authentication_required'}:
+                return True
+    return False
+
+
+def withdraw_unverified_possible_matches(view: dict, citations: list[dict], unverified_ids: set) -> dict:
+    """A possible-match copy of a work the searches could not locate is not its
+    text (paper 8, 2026-10-02): the member shows no text and the retrieval
+    counts move it to unretrieved. Shared by the window and the PDF export."""
+    withdrawn: dict[str, str] = {}
+    for citation in citations:
+        for member in citation.get('members', []):
+            if member.get('reference_id') in unverified_ids and member.get('identity_status') == 'possible_match':
+                withdrawn.setdefault(member.get('reference_id'), str(member.get('coverage_level') or ''))
+                member.update(coverage_level='unavailable', best_evidence=None, additional_evidence=[],
+                              evidence_sentences=[], evidence_extracts=[], availability='',
+                              status='source_unavailable', source_action={}, identity_status='withdrawn_possible_match')
+    if not withdrawn:
+        return view
+    overview = dict(view.get('overview') or {})
+    full = sum(1 for level in withdrawn.values() if level == 'full_text')
+    overview['verified_full_text_sources'] = max(0, int(overview.get('verified_full_text_sources') or 0) - full)
+    overview['abstract_or_limited_sources'] = max(0, int(overview.get('abstract_or_limited_sources') or 0)
+                                                  - (len(withdrawn) - full))
+    overview['unavailable_sources'] = int(overview.get('unavailable_sources') or 0) + len(withdrawn)
+    return {**view, 'overview': overview}
+
+
 def _render_reference_window_template(entry: dict, findings: list[dict], citations: list[dict],
                                       *, citation_format: str = '', patchwriting: list[dict] | None = None,
                                       paper_key: str = '') -> str:
@@ -5441,8 +5751,8 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
     number = int(entry['number'])
     source = entry.get('source') or {}
     raw = str(source.get('raw_reference') or source.get('title') or 'Reference')
-    heading = (f'<a href="#reference-location-{number}">Reference {number}</a>'
-               if entry.get('location') else f'Reference {number}')
+    heading = (f'<a class="reference-heading-link" href="#reference-location-{number}">Reference {number}</a>'
+               if entry.get('location') else f'<span class="reference-heading-link">Reference {number}</span>')
     parts = [f'<template id="{escape(entry["template_id"], quote=True)}"><h2>{heading}</h2>',
              f'<p class="full-reference reference-window-entry">{_render_formatted_reference(source, raw)}</p>']
     member = entry.get('member')
@@ -5451,6 +5761,10 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
         availability = ('Media Reference - Cannot Assess' if _member_is_media(member)
                         else _member_coverage_heading(member))
         parts.append(f'<h3 class="reference-availability">{availability}</h3>')
+        if _submitted_link_refused(member):
+            # Owner-approved wording (2026-10-02).
+            parts.append('<p class="reference-access-note">The submitted link refused automated access, '
+                         'so the source could not be retrieved.</p>')
         first = entry.get('first_citation')
         if first and _member_accepts_upload(member):
             parts.append(_render_upload(citations[first[0] - 1].get('upload_action') or {}))
@@ -5528,7 +5842,8 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
     if member.get("evidence_sentences"):
         evidence = ('<details class="evidence-disclosure"><summary>Evidence</summary>'
                     '<ul class="evidence-sentences" data-evidence-list>' + "".join(
-            f'<li data-evidence-key="{escape(item["key"], quote=True)}">'
+            f'<li data-evidence-key="{escape(item["key"], quote=True)}"'
+            + (f' data-reason="{escape(str(item["reason"]), quote=True)}"' if item.get("reason") else '') + '>'
             + (f'<span class="ev-page">p. {escape(str(item["page"]))}</span> ' if item.get("page") else "")
             + f'<q>{escape(item["text"])}</q></li>' for item in member["evidence_sentences"]) + '</ul></details>')
     # An abstract-only source's evidence is its abstract.
@@ -5711,8 +6026,12 @@ def render_patchwriting(items: list[dict], *, portable: bool = False) -> str:
             if student:
                 parts.append(f'<p class="patchwriting-student">{open_q}{student}{close_q}</p>')
             for excerpt in comparison.get('excerpts') or []:
+                segments = excerpt.get('segments')
+                source = (''.join(f'<strong>{escape(g["text"])}</strong>' if g.get('copied') else escape(g['text'])
+                                  for g in segments if g.get('text'))
+                          if segments else escape(str(excerpt.get("text") or "")))
                 parts.append(f'<p class="passage-source-label">{escape(passage_source_label(excerpt.get("page")))}</p>'
-                             f'<p class="patchwriting-source">{open_q}{escape(str(excerpt.get("text") or ""))}{close_q}</p>')
+                             f'<p class="patchwriting-source">{open_q}{source}{close_q}</p>')
         blocks.append(('<div>' if portable else '<div class="patchwriting-finding">') + ''.join(parts) + '</div>')
     return ''.join(blocks)
 
@@ -5860,13 +6179,45 @@ def _render_formatted_reference(source: dict, fallback: str) -> str:
         # Native Word hyperlinks may bind only the suffix of an already
         # written URL. Replacing that suffix with the whole URL duplicates it.
         preceding_url = re.search(r'https?://[^\s<>"]*$', prefix)
-        if preceding_url and text[preceding_url.start():end] == href:
+        # A fragment inside a written URL is never replaced: a wrapped link's
+        # target is the PDF's normalized form (%40 as @), so an exact comparison
+        # missed it and spliced a second URL into the first (paper 5, 2026-10-01).
+        if preceding_url:
+            continue
+        # A wrapped URL's last line linked on its own: written start, a space,
+        # then the label, together the link. Write the link once (2026-10-02).
+        wrapped = re.search(r'(https?://[^\s<>"]+)\s+$', prefix)
+        if wrapped and wrapped.group(1) + text[start:end] == href:
+            text=text[:wrapped.start(1)]+href+text[end:]
+            flags=flags[:wrapped.start(1)]+[(False,False)]*len(href)+flags[end:]
             continue
         title=_field_characters(source.get('title') or '')[0]
         if (title and title in _field_characters(prefix)[0] and str(source.get('year') or '') in prefix
                 and not text[end:].strip(' .\n\t') and text[start:end]!=href):
             text=text[:start]+href+text[end:]
             flags=flags[:start]+[(False,False)]*len(href)+flags[end:]
+    # A PDF-wrapped URL ("…Theorising_the_P ractice_of_…") whose submitted link
+    # is the written start plus the following text without its spaces is one
+    # link, written once (Dena, Paula; 2026-10-02).
+    for href in dict.fromkeys(source.get('submitted_hyperlinks') or []):
+        if not _safe_reference_href(href) or href in text:
+            continue
+        for match in re.finditer(r'https?://[^\s<>"]+', text):
+            head = match.group()
+            if not href.startswith(head) or href == head:
+                continue
+            rest, cursor = href[len(head):], match.end()
+            while rest and cursor < len(text):
+                if text[cursor].isspace():
+                    cursor += 1
+                elif text[cursor] == rest[0]:
+                    rest, cursor = rest[1:], cursor + 1
+                else:
+                    break
+            if not rest:
+                text = text[:match.start()] + href + text[cursor:]
+                flags = flags[:match.start()] + [(False, False)] * len(href) + flags[cursor:]
+                break
     # Font-run boundaries must not split one URL into separately linked pieces.
     for match in re.finditer(r'https?://[^\s<>"]+',text):
         flags[match.start():match.end()] = [(False,False)] * len(match.group())
@@ -5884,8 +6235,11 @@ def _render_formatted_reference(source: dict, fallback: str) -> str:
             value = f"<strong>{value}</strong>"
         chunks.append(value)
         cursor = end
+    from urllib.parse import unquote
+    written = {unquote(url.rstrip('.,;)')).casefold() for url in re.findall(r'https?://[^\s<>"]+', text)}
     links = [href for href in dict.fromkeys(source.get('submitted_hyperlinks') or [])
-             if _safe_reference_href(href) and href not in text]
+             if _safe_reference_href(href) and href not in text
+             and unquote(href.rstrip('.,;)')).casefold() not in written]
     return "".join(chunks) + ''.join(
         f'<br><a class="reference-url" href="{escape(href, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(href)}</a>'
         for href in links)

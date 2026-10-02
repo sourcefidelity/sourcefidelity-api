@@ -47,8 +47,9 @@ def test_historical_period_range_is_not_an_extra_source_but_real_ranges_remain()
     text='During the Classical period (1927-1954), production changed (Writer, 2020).'
     census=_build_marker_census(extract_citations(text,refs,'apa'),text,refs)
     assert [c.text for c in census]==['(Writer, 2020)']
+    # Owner decision 2026-10-01: a date range in parentheses is an aside, not a citation.
     text='An uncertain mention (1927-1954).'
-    assert _build_marker_census([],text,refs)
+    assert not _build_marker_census([],text,refs)
     ref=ParsedReference(reference_id='range',author='Period',year='1927-1954',title='A serial',raw_ref='Period (1927-1954). A serial.')
     text='Period (1927-1954) reported events.'
     assert any(c.reference_ids==['range'] for c in _build_marker_census(extract_citations(text,[ref],'apa'),text,[ref]))

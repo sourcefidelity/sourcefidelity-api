@@ -11,7 +11,7 @@ POLICY = 'reference-credibility-v4'
 SCREEN_RESOLUTION_POLICY = 'screened-metadata-work-binding-v1'
 
 
-POSITIVE_ONLY_PROVIDERS = frozenset({'openaire', 'eric', 'doaj'})
+POSITIVE_ONLY_PROVIDERS = frozenset({'openaire', 'eric', 'doaj', 'europepmc'})
 POSITIVE_ONLY_POLICY = 'positive-only-corroboration-v1'
 
 

@@ -22,7 +22,10 @@ def first_run_stages(stages: list[dict]) -> list[dict]:
 
 
 def _judge_base_url(arm_id: str, settings) -> str:
-    return {"zai_glm": settings.ZAI_BASE_URL, "deepseek": settings.LLM_BASE_URL}.get(arm_id) or ""
+    # Repeat samples are "zai_glm:s2", "zai_glm:s3": the same arm and endpoint
+    # (they were listed as a second GLM row with no endpoint; 2026-10-02).
+    base = str(arm_id or "").split(":", 1)[0]
+    return {"zai_glm": settings.ZAI_BASE_URL, "deepseek": settings.LLM_BASE_URL}.get(base) or ""
 
 
 def judgment_usage(results: list, arms: list, settings) -> list[dict]:

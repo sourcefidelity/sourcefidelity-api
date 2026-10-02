@@ -526,6 +526,23 @@ and the abstract states a different value on that dimension,
 stated_scope_conflict is present. Every case listed as absent stays absent.
 """
 
+# v7 = v5 (the default) plus one clause (owner request 2026-10-02, under
+# evaluation; not the default). The earlier
+# sentences may name the case the citation is about ("the Red Lip Revolution"
+# two sentences before "This movement shows…"). v5/v6 let context resolve only
+# who/what, then compared the abstract with the citation sentence alone and
+# called it a general claim. v7 makes a case the context names part of the
+# statement's subject for the topic tests, and nothing more.
+_ABSTRACT_SCOPE_PROMPT_V7 = _ABSTRACT_SCOPE_PROMPT_V5 + """
+One clarification about preceding context. When student_context names the
+specific case, work, person, event, movement or example that the citation unit
+goes on to discuss, that case is part of the statement's subject for
+topic_relation, broad_subject_relation and plausible_connection, even when the
+citation unit itself refers to it only by a pronoun or a general phrase. Do not
+describe the statement as general, or say it does not mention that case, when
+the context names it. Context still adds no assertions and settles no support.
+"""
+
 
 
 def _scope_character_budget(policy_version: str) -> int:
@@ -573,6 +590,8 @@ def _scope_prompt(policy_version: str) -> str:
     """
     if policy_version == "abstract-topic-v5":
         return _ABSTRACT_SCOPE_PROMPT_V5
+    if policy_version == "abstract-topic-v7":
+        return _ABSTRACT_SCOPE_PROMPT_V7
     return _ABSTRACT_SCOPE_PROMPT_V6
 
 

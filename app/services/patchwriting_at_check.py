@@ -1,4 +1,4 @@
-"""Run patchwriting-v3 during a paper check while each source's text is authorized.
+"""Run patchwriting-v4 during a paper check while each source's text is authorized.
 
 Owner decision 2026-09-29. For every retrieved full-text source the paper check
 authorizes, all body sentences of the paper are compared with that source
@@ -230,7 +230,7 @@ def _student(span: pw.StudentSpan) -> dict:
 
 
 def _source_sentence(sentence: pw.MatchedSourceSentence) -> dict:
-    return {
+    row = {
         "sentence_key": sentence.sentence_key,
         "page_index": sentence.page_index,
         "page_label": sentence.page_label,
@@ -241,6 +241,20 @@ def _source_sentence(sentence: pw.MatchedSourceSentence) -> dict:
         "text_truncated": sentence.text_truncated or len(sentence.text) > MAX_SOURCE_TEXT,
         "matched_spans": [span.model_dump() for span in sentence.matched_spans[:MAX_MATCHED_SPANS]],
     }
+    origin, stop = sentence.absolute_start, sentence.absolute_end
+    if (len(sentence.text) > MAX_SOURCE_TEXT and not sentence.text_truncated and row["matched_spans"]
+            and isinstance(origin, int) and isinstance(stop, int) and stop - origin == len(sentence.text)):
+        # A long sentence keeps the stretch around its matched words, not its
+        # first characters, so those words can be shown (2026-10-02).
+        low = min(span["absolute_start"] for span in row["matched_spans"]) - origin
+        high = max(span["absolute_end"] for span in row["matched_spans"]) - origin
+        if 0 <= low < high <= len(sentence.text) and high - low <= MAX_SOURCE_TEXT:
+            start = max(0, min(low - (MAX_SOURCE_TEXT - (high - low)) // 2, len(sentence.text) - MAX_SOURCE_TEXT))
+            end = start + MAX_SOURCE_TEXT
+            row.update(text=sentence.text[start:end], text_truncated=False,
+                       absolute_start=origin + start, absolute_end=origin + end,
+                       cut_before=start > 0, cut_after=end < len(sentence.text))
+    return row
 
 
 def bounded_result(result: pw.PatchwritingResult, *, reference_id: str, completeness=None) -> dict:

@@ -46,7 +46,7 @@ def test_unquoted_verbatim_run_is_flagged_with_exact_spans():
     text = ("Researchers observe that social media platforms have fundamentally transformed "
             "the ways in which adolescents communicate (Smith, 2020).")
     result = detect_patchwriting(_statement(text, marker="Smith, 2020"), _index())
-    assert result.policy_version == POLICY_VERSION == "patchwriting-v3"
+    assert result.policy_version == POLICY_VERSION == "patchwriting-v4"
     assert result.status == "compared"
     assert result.decision_applied is False
     kinds = [finding.kind for finding in result.findings]
@@ -399,3 +399,13 @@ def test_a_title_repeated_from_the_source_is_not_patchwriting():
             "had changed the studio (Lake, 2023).")
     result = detect_patchwriting(_statement(text, marker="Lake, 2023"), _index(source))
     assert result.findings == []
+
+
+def test_shared_runs_require_copied_wording_not_only_similar_words():
+    # Owner request 2026-10-02: one run of 4+ identical words, or two of 2+.
+    source = pw.tokenize("The rapid expansion of online networks has altered how young people form friendships")
+    isolated = pw.tokenize("Rapid growth in networks online altered the way the young now make friendships")
+    copied = pw.tokenize("A rapid expansion of online networks changed how young people form friendships")
+    assert max(pw._shared_content_runs(isolated, source), default=0) < pw.PARAPHRASE_MIN_SHORT_RUN
+    runs = pw._shared_content_runs(copied, source)
+    assert runs[0] >= pw.PARAPHRASE_MIN_LONG_RUN

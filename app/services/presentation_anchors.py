@@ -81,6 +81,7 @@ def bind_citations_to_pdf(
     *,
     citations: list[InTextCitation],
     paragraphs: list[str] | None = None,
+    body_text: str | None = None,
 ) -> PresentationAnchorArtifact:
     """Bind exact citation-unit tokens to PDF words without retaining paper prose."""
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -145,6 +146,7 @@ def bind_citations_to_pdf(
                 and 0 <= citation.paragraph_index < len(paragraphs)
                 else None
             ),
+            body_text=body_text,
         )
         for citation in unique_citations
     ]
@@ -177,6 +179,7 @@ def _bind_one(
     citation: InTextCitation,
     *,
     paragraph: str | None,
+    body_text: str | None = None,
 ) -> CitationPresentationAnchor:
     target = [_token(value) for value in re.findall(r"\S+", citation.text)]
     target = [value for value in target if value]
@@ -207,6 +210,16 @@ def _bind_one(
                 if len(bounded) == 1:
                     matches = bounded
                     mapping_method = "paragraph_context_disambiguation"
+    if len(matches) > 1 and body_text:
+        # A passage the paper repeats word for word (paper 4 pasted one
+        # paragraph twice): the k-th copy in the text is the k-th on the page,
+        # when the counts agree (2026-10-02).
+        words_pattern = r"\s+".join(re.escape(value) for value in citation.text.split())
+        copies = [m.start() for m in re.finditer(words_pattern, body_text)] if words_pattern else []
+        own = [k for k, at in enumerate(copies) if at <= citation.passage_start < at + len(citation.text) + 8]
+        if len(copies) == len(matches) and len(own) == 1:
+            matches = [sorted(matches)[own[0]]]
+            mapping_method = "body_order_disambiguation"
     if len(matches) != 1:
         paragraph_pages = (
             _page_indexes(words[paragraph_match[0] : paragraph_match[1]])

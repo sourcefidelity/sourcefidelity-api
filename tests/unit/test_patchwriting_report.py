@@ -99,7 +99,7 @@ def test_overlapping_findings_merge_into_numbered_passages_listing_each_source()
         ('ref-1', 'close_paraphrase'), ('ref-2', 'unquoted_verbatim')]
     assert first['kind'] == 'unquoted_verbatim' and passages[1]['kind'] == 'close_paraphrase'
     [comparison] = first['sources'][0]['comparisons']
-    assert comparison['excerpts'] == [
+    assert [{k: e[k] for k in ('page', 'text')} for e in comparison['excerpts']] == [
         {'page': '4', 'text': 'Remote learning reduced the engagement of first-year students in large lectures.'}]
     assert ''.join(g['text'] for g in comparison['student']) == STUDENT
     stored = str(passages)
@@ -138,9 +138,13 @@ def test_comparison_marks_copied_words_and_cuts_the_source_to_the_followed_claus
     assert shown == ('… **rebellion against rigid patriarchal structures fueled** the '
                      '**female**-dominated **Disney narrative** …')
     # The heading and the words before the first followed word are cut.
-    assert comparison['excerpts'] == [{'page': None, 'text': (
+    assert [{k: e[k] for k in ('page', 'text')} for e in comparison['excerpts']] == [{'page': None, 'text': (
         '… rebellion against rigid patriarchal structures is rich fuel that powers the engine of '
         'female-led Disney narratives')}]
+    # The source's copied words are bold too (owner request 2026-10-02).
+    source = ''.join(f"**{g['text']}**" if g['copied'] else g['text'] for g in comparison['excerpts'][0]['segments'])
+    assert source == ('… **rebellion against rigid patriarchal structures is rich fuel** that powers the engine of '
+                      '**female**-led **Disney narratives**')
 
 
 def test_a_source_sentence_that_cannot_be_bound_is_shown_whole():

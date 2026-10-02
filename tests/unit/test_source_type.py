@@ -262,7 +262,8 @@ class TestInstitutionalAndIdentifierBearingReferences:
     more specific marker than a bare URL, not a weaker one.
     """
 
-    def test_a_self_published_institutional_document_is_not_searchable(self):
+    def test_a_self_published_institutional_document_is_a_searchable_report(self):
+        """Owner decision 2026-10-02 reverses 2026-09-23: almost every report a student cites is online."""
         from app.services.source_type import (
             classify_reference_source_kind,
             is_bibliographically_searchable,
@@ -274,8 +275,10 @@ class TestInstitutionalAndIdentifierBearingReferences:
             "UNESCO Institute for Statistics (2020). Global education monitoring.",
         ):
             assessment = classify_reference_source_kind(raw)
-            assert assessment.kind == "webpage", raw
-            assert not is_bibliographically_searchable(assessment.kind), raw
+            assert assessment.kind == "report", raw
+            assert is_bibliographically_searchable(assessment.kind), raw
+        # Undated or title-first entries stay web pages.
+        assert classify_reference_source_kind("Example Council. (n.d.). A page title here. https://example.org/p").kind == "webpage"
 
     def test_an_organizational_author_does_not_override_a_real_work_type(self):
         """The rule requires the absence of every stronger marker."""
@@ -371,3 +374,19 @@ def test_a_url_still_decides_when_no_publisher_clause_supports_a_book() -> None:
 
     assert assessment.kind == "webpage"
     assert assessment.confidence == "low"
+
+
+@pytest.mark.parametrize(("raw", "archive"), [
+    # Paper 5, 2026-10-01: an organisation named "... Archive" publishing a web page.
+    ("UCLA Film & Television Archive. (2023). The Day the Earth Stood Still [Online]. "
+     "Retrieved May 20, 2025, from https://hammer.ucla.edu/programs-events/2023/day", False),
+    ("UCLA Film & Television Archive. The Day the Earth Stood Still. 2023, hammer.ucla.edu/programs-events.", False),
+    # Still a physical holding: an archive creator with no online marker, or archival
+    # wording in the item's own description.
+    ("National Archives. (1942). Memorandum on wartime production [Memo]. Washington, DC.", True),
+    ("Doe, J. (1945). Letter to A. Smith [Letter]. John Doe Papers (Box 3, Folder 2), Special Collections.", True),
+    ("Smith, J. (2020). Notes from the archive. Retrieved from https://example.org/notes", True),
+])
+def test_archive_wording_only_in_the_author_of_an_online_reference_is_a_web_page(raw, archive):
+    from app.services.source_type import is_archive_source
+    assert is_archive_source(raw) is archive
