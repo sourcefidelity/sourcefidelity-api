@@ -43,9 +43,11 @@ def marker_words(document):
 
     Native word indices used by annotations must remain unchanged.
     """
+    from app.services.presentation_anchors import reading_order
     pages = {}
     for page in document:
-        words = page.get_text('words', sort=True)
+        # Left to right within a line, as the citation binding reads (2026-10-04).
+        words = reading_order(page.get_text('words', sort=True))
         boundary = r'(?<=\S)[（(]|(?<=[）)])(?=[.!?]?[A-Z])'
         joined = any(re.search(boundary,w[4]) for w in words)
         chars = [c for b in page.get_text('rawdict', sort=True)['blocks'] for line in b.get('lines', [])
@@ -124,6 +126,13 @@ def member_targets(citation, words_by_page):
         segment_tokens=[token for piece in segment.split() for token in _pieces(piece)]
         starts=[i for i in range(len(slots)-len(segment_tokens)+1)
                 if segment_tokens and text_tokens[i:i+len(segment_tokens)] == segment_tokens]
+        if len(starts)>1 and parenthetical:
+            # "Onay (2024) argues … (Onay, 2024).": the narrative mention reads
+            # like the marker once brackets are ignored; the marker is the one
+            # that opens with its bracket (paper 6, 2026-10-04).
+            bracketed=[i for i in starts if str(words[slots[i][1]][1][4]).lstrip().startswith(('(', '（'))]
+            if len(bracketed)==1:
+                starts=bracketed
         if len(starts)==1:
             positions=set(range(starts[0],starts[0]+len(segment_tokens)))
             marker_positions.update(positions)

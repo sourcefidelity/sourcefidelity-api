@@ -244,7 +244,7 @@ def _bind_one(
             page_indexes=paragraph_pages,
         )
     selected = words[matches[0][0] : matches[0][1]]
-    if mapping_method == "normalized_tokens_with_margin_skip":
+    if mapping_method in {"normalized_tokens_with_margin_skip", "compact_alphanumeric_with_margin_skip"}:
         # The skipped running header/footer words occupy the same contiguous
         # surface slice as the page-spanning body text. They must not become
         # citation rectangles merely because they were bypassed for matching.
@@ -353,33 +353,55 @@ def _token_matches(surface_tokens, words, target) -> tuple[list[tuple[int, int]]
     # tokens) even when the rendered characters are identical. Permit a second
     # exact mapping only when the complete normalized alphanumeric sequence
     # begins and ends on extracted-word boundaries.
-    compact_surface = "".join(surface_tokens)
     compact_target = "".join(target)
     if len(compact_target) < 20:
         return [], None
-    starts: dict[int, int] = {}
-    ends: dict[int, int] = {}
-    offset = 0
-    for index, token in enumerate(surface_tokens):
-        starts[offset] = index
-        offset += len(token)
-        ends[offset] = index + 1
-    compact_matches = []
-    cursor = 0
-    while True:
-        found = compact_surface.find(compact_target, cursor)
-        if found < 0:
-            break
-        finish = found + len(compact_target)
-        if found in starts and finish in ends:
-            compact_matches.append((starts[found], ends[finish]))
-        cursor = found + 1
-    return compact_matches, ("compact_alphanumeric" if compact_matches else None)
+
+    def compact(indexes):
+        surface = "".join(surface_tokens[i] for i in indexes)
+        starts: dict[int, int] = {}
+        ends: dict[int, int] = {}
+        offset = 0
+        for index in indexes:
+            starts[offset] = index
+            offset += len(surface_tokens[index])
+            ends[offset] = index + 1
+        found_matches = []
+        cursor = 0
+        while True:
+            found = surface.find(compact_target, cursor)
+            if found < 0:
+                break
+            finish = found + len(compact_target)
+            if found in starts and finish in ends:
+                found_matches.append((starts[found], ends[finish]))
+            cursor = found + 1
+        return found_matches
+
+    compact_matches = compact(range(len(surface_tokens)))
+    if compact_matches:
+        return compact_matches, "compact_alphanumeric"
+    # A paragraph crossing a page break carries the running header and page
+    # number between its halves; the compact reading skips them as the
+    # token reading does (paper 7, 2026-10-04).
+    body_indexes = [i for i in range(len(surface_tokens)) if not words[i][6]]
+    compact_matches = compact(body_indexes)
+    return compact_matches, ("compact_alphanumeric_with_margin_skip" if compact_matches else None)
 
 
 def _token(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold().replace("\u00ad", "")
     return "".join(character for character in normalized if character.isalnum())
+
+
+def reading_order(words):
+    """Words of one PDF line left to right. The y-then-x sort puts a word set a
+    point higher ("2020)." in paper 9) at the start of its line; PyMuPDF's own
+    block and line numbers keep it in its line (2026-10-04)."""
+    first: dict = {}
+    for index, word in enumerate(words):
+        first.setdefault((word[5], word[6]), index)
+    return sorted(words, key=lambda word: (first[(word[5], word[6])], word[0]))
 
 
 def _sentence_boundary_words(page):
@@ -389,7 +411,7 @@ def _sentence_boundary_words(page):
     Unrecoverable character geometry leaves the original conservative word.
     """
     chars = None
-    for word in page.get_text('words', sort=True):
+    for word in reading_order(page.get_text('words', sort=True)):
         boundaries = [m.end() for m in re.finditer(r'[.!?](?=[A-Z])', word[4])]
         if not boundaries:
             yield word

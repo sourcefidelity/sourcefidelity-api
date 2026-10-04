@@ -244,6 +244,9 @@ def extract_paper_evidence(
         marker_census,
         body_text,
     )
+    extracted = source_headed_sections(extracted, marker_census, body_text, references)
+    extracted = join_adjacent_continuations(extracted, body_text, references)
+    extracted = join_author_naming_sentences(extracted, marker_census, body_text, references)
     accepted = [citation for citation in extracted if citation.drop_reason is None]
     rejected = [citation for citation in extracted if citation.drop_reason is not None]
     accepted, ungrouped_multi_marker = _group_multi_marker_units(accepted)
@@ -496,7 +499,7 @@ def _build_marker_census(
 
 
 def _misspelt_narrative_author(body_text: str, start: int, marker: str, references) -> tuple[list[str], list[str]]:
-    """Link "lagnfor (2016)" to Langford (2010): a bare year after a word that is a
+    """Link "Hartmn (2016)" to Langford (2010): a bare year after a word that is a
     close misspelling of exactly one reference's lead surname (paper 5, 2026-10-01).
     The year may differ; both differences are kept for the report."""
     from app.services.citation_extractor import _reference_lead_surnames, close_surname
@@ -896,6 +899,266 @@ def _merge_additive_llm_recovery(
         accepted_explicit.append(recovered)
         structural_marker_ids.update(marker.marker_id for marker in sentence_markers)
     return merged
+
+
+SOURCE_SECTION_VERSION = "source-headed-section-v1"
+SOURCE_HEADING_MARKER_TYPE = "source_heading"
+
+
+def source_heading_statement_start(text: str, marker: str) -> int:
+    """Where a source-heading citation's statement begins: after the heading line."""
+    at = text.find(marker) if marker else -1
+    line_end = text.find("\n", max(at, 0))
+    if line_end < 0:
+        return 0
+    return len(text) - len(text[line_end:].lstrip())
+
+
+def _fold_words(text: str) -> str:
+    return " ".join(re.findall(r"\w+", str(text).casefold()))
+_HEADING_MAX_WORDS = 30
+_SECTION_MIN_WORDS = 8
+
+
+def source_headed_sections(
+    citations: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+    references,
+) -> list[InTextCitation]:
+    """Paragraphs under a heading that cites one source are about that source.
+
+    A source-by-source review ("Article 2: Johnson, L. (2021)." followed by
+    paragraphs discussing it; owner decision 2026-10-04) attributes each
+    following paragraph with no citation of its own to the heading's source,
+    up to the next such heading or another short heading ("Conclusion: …").
+    It applies only when the paper has at least two such headings, so an
+    ordinary one-line cited paragraph never claims the paragraphs after it.
+    A film or other media heading is not a source of statements here.
+
+    The heading's own citation is extended over the section's paragraphs, so
+    the statement carries the exact marker its Evidence Package needs; no
+    marker is made up. The heading-only citation and any model continuation
+    inside the section are kept for audit with a drop reason. Returns the
+    citations with these changes.
+    """
+    from app.services.citation_extractor import _original_paragraphs_with_offsets
+    kinds = {reference.reference_id: reference.source_kind for reference in references}
+    titles = {reference.reference_id: _fold_words(getattr(reference, "title", "") or "") for reference in references}
+    linked = [c for c in citations if c.drop_reason is None and c.link_status == "linked"]
+
+    def markers_in(start, end):
+        return [m for m in census if start <= m.passage_start < end]
+
+    def heading_source(start, end):
+        text = body_text[start:end]
+        markers = markers_in(start, end)
+        words = re.findall(r"\w+", text)
+        if not words or len(words) > _HEADING_MAX_WORDS or len(markers) != 1:
+            return None
+        marker = markers[0]
+        if marker.link_status != "linked" or len(marker.reference_ids) != 1:
+            return None
+        reference_id = marker.reference_ids[0]
+        if kinds.get(reference_id) in {"traditional_media", "video", "podcast_episode"}:
+            return None
+        before = body_text[start:marker.passage_start].strip()
+        # A label ("Article 2:") or nothing may precede the citation; the
+        # citation, not a sentence, carries the line.
+        if before and not re.fullmatch(r"[^.!?]{0,60}:", before):
+            return None
+        # After the citation, nothing, a title-cased line or the work's own
+        # title: never the rest of a sentence ("Jones (2020) argues …").
+        after = body_text[marker.passage_end:end].strip(" .:;,-–—\n\t")
+        if after:
+            folded = _fold_words(after)
+            long_words = [w for w in re.findall(r"[A-Za-z][\w'’-]*", after) if len(w) >= 4]
+            title_cased = long_words and sum(w[0].isupper() for w in long_words) >= 0.75 * len(long_words)
+            own_title = titles.get(reference_id) and folded.startswith(titles[reference_id][:40])
+            if not (title_cased or own_title):
+                return None
+        return reference_id
+
+    # Units: blank-line paragraphs, split at any line that is a source heading
+    # (paper 7 runs a heading, its discussion and the next heading together).
+    units = []   # (start, end, heading reference id or None, whole paragraph)
+    for text, offset in _original_paragraphs_with_offsets(body_text):
+        lines = [(offset + m.start(), offset + m.end()) for m in re.finditer(r"[^\n]+", text) if m.group().strip()]
+        run = None
+        pieces = []
+        for line_start, line_end in lines:
+            rid = heading_source(line_start, line_end)
+            if rid:
+                if run:
+                    pieces.append((run[0], run[1], None))
+                    run = None
+                pieces.append((line_start, line_end, rid))
+            else:
+                run = (run[0], line_end) if run else (line_start, line_end)
+        if run:
+            pieces.append((run[0], run[1], None))
+        units.extend((a, b, rid, len(pieces) == 1) for a, b, rid in pieces)
+
+    def section_break(start, end, whole):
+        text = body_text[start:end].strip()
+        words = re.findall(r"\w+", text)
+        return whole and len(words) <= 15 and (
+            not re.search(r"[.!?][\"”’')]*$", text) or bool(re.match(r"[^.!?]{1,40}:", text)))
+
+    if sum(1 for unit in units if unit[2]) < 2:
+        return citations
+    # Each heading's run of attributable paragraphs, up to the first that
+    # cites something itself, another heading or a section break.
+    sections: list[tuple[int, int, str, int]] = []   # heading start/end, reference, section end
+    current = None
+    for start, end, rid, whole in units:
+        if rid:
+            current = [start, end, rid, None]
+            sections.append(current)
+            continue
+        if current is None:
+            continue
+        text = body_text[start:end]
+        if section_break(start, end, whole) or markers_in(start, end):
+            current = None
+            continue
+        if len(re.findall(r"\w+", text)) < _SECTION_MIN_WORDS:
+            continue
+        current[3] = end
+    result = list(citations)
+    for heading_start, heading_end, rid, section_end in sections:
+        if section_end is None:
+            continue
+        heading = next((i for i, c in enumerate(result) if c.drop_reason is None and c.link_status == "linked"
+                        and c.citation_marker != "implicit_continuation" and rid in c.reference_ids
+                        and heading_start <= c.passage_start < heading_end), None)
+        if heading is None:
+            continue
+        base = result[heading]
+        result[heading] = base.model_copy(update={"drop_reason": "base_of_source_headed_section_v1"})
+        for i, other in enumerate(result):
+            if (other.drop_reason is None and other.citation_marker == "implicit_continuation"
+                    and other.passage_start < section_end and base.passage_start < other.passage_end):
+                result[i] = other.model_copy(update={"drop_reason": "within_source_headed_section_v1"})
+        result.append(base.model_copy(update={
+            "text": body_text[base.passage_start:section_end],
+            "passage_end": section_end,
+            "confidence": "medium",
+            # The heading only names the source: the paragraphs are the
+            # statement shown and judged (owner decision 2026-10-04).
+            "marker_type": SOURCE_HEADING_MARKER_TYPE,
+        }))
+    return result
+
+
+JOINED_CONTINUATION_VERSION = "joined-continuation-v1"
+
+
+def join_adjacent_continuations(citations: list[InTextCitation], body_text: str,
+                                references=()) -> list[InTextCitation]:
+    """A follow-on sentence with no citation of its own joins the citation right
+    before it (owner decision 2026-10-04, option A: paper 9's "…as Smith (2019)
+    outlines. Mara's capacity…"), so the statement carries the exact marker
+    its Evidence Package needs and is assessed with it.
+
+    Joined only when the citation before it cites exactly the same sources and
+    only spaces lie between them, or sentences that each name the cited
+    author with no citation of their own ("Smith contends that …"); never a
+    paragraph break. The original citation and the continuation are kept for
+    audit with drop reasons.
+    """
+    from app.services.relevance import extract_surnames
+    surnames = {reference.reference_id: {name.casefold() for name in extract_surnames(reference.author or "")}
+                for reference in references}
+
+    def attributing_gap(gap: str, reference_ids) -> bool:
+        if re.search(r"\n\s*\n", gap) or re.search(r"\((?:[^()]*\d{4}|n\.d\.)[^()]*\)", gap):
+            return False
+        if not gap.strip():
+            return True
+        names = set().union(*(surnames.get(rid, set()) for rid in reference_ids)) if reference_ids else set()
+        sentences = [part for part in re.split(r"(?<=[.!?])\s+", gap.strip()) if part]
+        return bool(names) and all(any(re.search(rf"\b{re.escape(name)}\b", part, re.IGNORECASE) for name in names)
+                                   for part in sentences)
+    active = sorted((c for c in citations if c.drop_reason is None and c.link_status == "linked"),
+                    key=lambda c: (c.passage_start, c.passage_end))
+    result = list(citations)
+    current = None   # (index in result of the growing citation, its citation)
+    for citation in active:
+        if citation.citation_marker != "implicit_continuation":
+            current = (result.index(citation), citation)
+            continue
+        if citation.citation_markers or current is None:
+            continue
+        index, base = current
+        gap = body_text[base.passage_end:citation.passage_start]
+        if (set(citation.reference_ids) != set(base.reference_ids) or base.passage_end > citation.passage_start
+                or not attributing_gap(gap, base.reference_ids)):
+            continue
+        extended = base.model_copy(update={
+            "text": body_text[base.passage_start:citation.passage_end],
+            "passage_end": citation.passage_end,
+            "confidence": "medium",
+        })
+        if base.drop_reason is None and result[index] is base:
+            result[index] = base.model_copy(update={"drop_reason": "base_of_joined_continuation_v1"})
+            result.append(extended)
+            index = len(result) - 1
+        else:
+            result[index] = extended
+        result[result.index(citation)] = citation.model_copy(update={"drop_reason": "joined_to_preceding_citation_v1"})
+        current = (index, extended)
+    return result
+
+
+def join_author_naming_sentences(
+    citations: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+    references,
+) -> list[InTextCitation]:
+    """Sentences right after a one-source citation that name its author with no
+    citation of their own ("Smith contends that …") join it (owner decision
+    2026-10-04, paper 9), whether or not the model proposed them.
+
+    Only within the paragraph, only spaces between sentences, and never into
+    a sentence that is already part of a citation or holds a marker.
+    """
+    from app.services.relevance import extract_surnames
+    surnames = {reference.reference_id: [name for name in extract_surnames(reference.author or "") if len(name) >= 3]
+                for reference in references}
+    result = list(citations)
+    for index in range(len(result)):
+        base = result[index]
+        if (base.drop_reason is not None or base.link_status != "linked" or len(base.reference_ids) != 1
+                or base.citation_marker == "implicit_continuation"):
+            continue
+        names = surnames.get(base.reference_ids[0]) or []
+        if not names:
+            continue
+        end = base.passage_end
+        while True:
+            gap = re.match(r"[ \t]*\n?[ \t]*", body_text[end:])
+            start = end + gap.end()
+            if start >= len(body_text) or "\n" in gap.group() and re.match(r"\s*\n", body_text[start:]):
+                break
+            sentence = re.match(r"[^.!?]*[.!?]+[\"”’')]*", body_text[start:])
+            if sentence is None:
+                break
+            stop = start + sentence.end()
+            if (not any(re.search(rf"\b{re.escape(name)}\b", sentence.group(), re.IGNORECASE) for name in names)
+                    or any(start <= m.passage_start < stop for m in census)
+                    or any(c is not base and c.drop_reason is None and c.passage_start < stop and start < c.passage_end
+                           for c in result)
+                    or re.search(r"\n\s*\n", body_text[start:stop])):
+                break
+            end = stop
+        if end == base.passage_end:
+            continue
+        result[index] = base.model_copy(update={"drop_reason": "base_of_author_naming_extension_v1"})
+        result.append(base.model_copy(update={
+            "text": body_text[base.passage_start:end], "passage_end": end, "confidence": "medium"}))
+    return result
 
 
 def _valid_implicit_continuation(

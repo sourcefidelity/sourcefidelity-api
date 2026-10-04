@@ -183,7 +183,8 @@ def test_citation_window_shows_patchwriting_under_academic_practice_with_the_app
         first, second = win.select('[data-source-member]')
         assert 'Academic Practice' not in first.get_text()
         finding_html = second.select_one('.patchwriting-finding')
-        heading = finding_html.find_previous_sibling('p')
+        # One bullet per issue under the heading (owner request 2026-10-03).
+        heading = finding_html.find_parent('ul').find_previous_sibling('p')
         assert heading.select_one('.issue-heading.academic').get_text() == 'Academic Practice'
         assert [p.get_text() for p in finding_html.select('p')] == [
             line, STUDENT, 'Source (p. iv):',
@@ -201,8 +202,13 @@ def test_words_no_citation_covers_are_shown_in_the_reference_window():
     section = win.select_one('.reference-finding[data-category="academic"]')
     assert section.select_one('.issue-heading.academic').get_text() == 'Academic Practice'
     assert CLOSE in section.select_one('.patchwriting-finding').get_text()
+    # The highlight opens its own Academic Practice window (owner request 2026-10-03).
     overlay = soup.select_one('a.patchwriting-overlay')
-    assert overlay['data-panel-template'] == 'reference-entry-panel-1' and not overlay.get('data-member-index')
+    assert overlay['data-panel-template'] == 'passage-panel-1' and not overlay.get('data-member-index')
+    own = window(soup, 'passage-panel-1')
+    assert own.select_one('h2 .issue-heading.academic').get_text() == 'Academic Practice'
+    assert own.select_one('h2 .reference-heading-link')['data-go-to'] == 'reference-entry-panel-1'
+    assert CLOSE in own.select_one('.patchwriting-finding').get_text()
 
 
 def test_summary_lines_singular_and_plural_link_to_the_windows_and_highlights():
@@ -432,3 +438,41 @@ def test_projection_refresh_picks_passages_up_from_the_job_summary():
 
 
 from test_report_export import export_store  # noqa: E402,F401  (fixture)
+
+
+def test_selected_flags_take_the_citation_outline_and_the_arrows_reach_passages():
+    # Owner requests 2026-10-03: paper 2's arrows skipped both passages, and a
+    # selected flag outside a citation (or an unverified citation) had no outline.
+    from pathlib import Path
+    from app.services.evidence_report import PASSAGE_CSS
+    for selector in ('.patchwriting-overlay.selected:not([data-panel-template^="citation-panel-"]) .patchwriting-selection',
+                     '.reference-practice-overlay.selected rect.reference-formatting-hit',
+                     '.citation-overlay.member-target.selected .source-highlight.unverified-highlight'):
+        assert selector in PASSAGE_CSS
+    script = Path('app/services/report_interactions.js').read_text()
+    assert "!document.getElementById(el.dataset.panelTemplate)" in script
+    assert ".patchwriting-overlay,.reference-practice-overlay,.paper-badge" in script
+
+
+def test_a_passage_window_shows_the_matched_works_reference():
+    # Owner request 2026-10-04: the separate window shows which text the wording follows.
+    from app.services.evidence_report import render_patchwriting
+    item = {'wording': 'close_paraphrase', 'comparisons': [],
+            'source': {'raw_reference': 'Langford, B. (2010). Post-Classical Hollywood. Edinburgh University Press.',
+                       'title': 'Post-Classical Hollywood', 'text_style_spans': []}}
+    html = render_patchwriting([item], as_items=True, show_reference=True)
+    assert html.index('class="full-reference"') < html.index('closely follows')
+    assert 'Langford, B. (2010).' in html
+    assert 'full-reference' not in render_patchwriting([item], as_items=True)
+
+
+def test_a_stored_close_paraphrase_of_field_terminology_is_not_shown():
+    # Owner decision 2026-10-04: applied to findings stored under patchwriting-v4.
+    from app.services.patchwriting_report import _only_conventional
+    text = "Fox's vertical integration (control over production, distribution, and exhibition) ensured release."
+    words = ("vertical integration", "production", "distribution", "and exhibition")
+    spans = [(100 + text.index(w), 100 + text.index(w) + len(w)) for w in words]
+    assert _only_conventional({"text": text}, 100, spans)
+    other = "These films produce feelings of satisfaction, fear, and pity rather than action or revolt."
+    other_spans = [(other.index(w), other.index(w) + len(w)) for w in ("films produce", "satisfaction", "pity", "revolt")]
+    assert not _only_conventional({"text": other}, 0, other_spans)

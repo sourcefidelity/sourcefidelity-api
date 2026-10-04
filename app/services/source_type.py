@@ -246,7 +246,9 @@ _BOOK_PUBLISHER_RE = re.compile(
     r"university\s*press|universitet|"
     # Institutional imprints. A body that publishes its own work is a publisher
     # even when its name says nothing about publishing.
-    r"british\s+council|british\s+film\s+institute|kamera\s+books)\b",
+    r"british\s+council|british\s+film\s+institute|kamera\s+books|"
+    # Major academic imprints missing above (paper 7's Taylor & Francis, 2026-10-04).
+    r"taylor\s*(?:&|and)\s*francis|peter\s+lang)\b",
     re.IGNORECASE,
 )
 _BOOK_EDITION_RE = re.compile(r"\(\s*\d+(?:st|nd|rd|th)\s+ed\.?(?:ition)?\s*\)", re.I)

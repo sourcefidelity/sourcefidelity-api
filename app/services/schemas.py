@@ -186,6 +186,13 @@ class ParsedReference(BoundedFieldsMixin):
         default_factory=list,
         description="Bounded inspectable signals supporting source_kind",
     )
+    split_parts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "The two entries of the submitted list this reference was joined from, "
+            "in list order, when one reference was split in two (split-entry-v1)"
+        ),
+    )
     needs_review: bool = Field(
         default=False,
         description=(

@@ -419,7 +419,7 @@ def _record_link_title_conflict(url, resp, title, page_titles, *, expected_autho
     on the submitted link only when the page's own title is a real title of
     three words or more and the field comparison finds a material conflict."""
     page_title = max(page_titles, key=lambda value: len(str(value).split()), default='')
-    if len(_WEB_TITLE_WORD.findall(str(page_title))) < 3:
+    if len(_WEB_TITLE_WORD.findall(str(page_title))) < 3 or interstitial_page_title(str(page_title)):
         return
     result = RetrievalResult(source_name='web_fetch', success=False, title=str(page_title))
     identity, comparisons, _confirmed = _web_identity_comparison(
@@ -433,6 +433,18 @@ def _record_link_title_conflict(url, resp, title, page_titles, *, expected_autho
 
 
 _WEB_TITLE_WORD = re.compile(r"[^\W\d_]{2,}")
+# A page served instead of the content (bot check, script shell, access or
+# cookie wall) names no work; its title is never a conflict (IMDb's
+# "JavaScript is disabled", paper 5, 2026-10-02).
+_INTERSTITIAL_TITLE = re.compile(
+    r"(?i)\b(?:javascript\s+(?:is\s+)?(?:disabled|required)|enable\s+javascript|just\s+a\s+moment"
+    r"|access\s+denied|attention\s+required|are\s+you\s+a\s+(?:robot|human)|verify(?:ing)?\s+you\s+are"
+    r"|captcha|security\s+check|checking\s+your\s+browser|please\s+wait|request\s+blocked|forbidden"
+    r"|too\s+many\s+requests|cookie\s+(?:consent|settings|policy)|sign\s+in|log\s+in|loading)\b")
+
+
+def interstitial_page_title(title: str) -> bool:
+    return bool(_INTERSTITIAL_TITLE.search(title or ""))
 _S2_PAPER_LINK = re.compile(r"^https?://(?:www\.)?semanticscholar\.org/paper/(?:[^/]+/)?([0-9a-f]{40})(?:[/?#]|$)", re.I)
 
 
@@ -3866,6 +3878,13 @@ class SourceResolver:
                     },
                 }
         else:
+            from app.services.source_validator import detect_nonprose_payload
+            nonprose = detect_nonprose_payload(content.decode("utf-8", errors="replace"))
+            if nonprose:
+                # Whatever route delivered it, a catalogue export, feed or
+                # script is not the work's text (2026-10-03).
+                metadata["nonprose_reason"] = nonprose
+                return False, "type_rejected", f"retrieved representation is {nonprose}"[:160]
             provider_identity = self._verify_source_identity(
                 result,
                 expected_doi or result.doi,
@@ -5018,6 +5037,17 @@ class SourceResolver:
             # author is named in the page text, not as a byline (2026-10-01).
             confirmed = True
             result.metadata['work_identity_basis'] = 'web-organisation-author-in-page-v1'
+        if confirmed and web_coverage.get('verdict') != 'complete' and not identity.has_material_conflict:
+            # A confirmed cited web page is the work itself, not a host of it
+            # (paper 5 reference 13 read as limited text, 2026-10-03).
+            from app.services.web_completeness import confirmed_page_completeness
+            page_coverage = confirmed_page_completeness(page_text, expected_source_kind.kind)
+            if page_coverage['verdict'] == 'complete':
+                web_coverage = {**page_coverage, 'article_coverage': web_coverage}
+                result.representation.completeness = 'complete'
+                result.representation.metadata = {**(result.representation.metadata or {}),
+                                                  'web_completeness': web_coverage}
+                result.metadata['web_completeness'] = web_coverage
         # A one-year bibliographic error must not make a clearly identified
         # journal article unreadable. Keep the year conflict in discovery/link
         # evidence; this is work-level acquisition, not reference correctness.

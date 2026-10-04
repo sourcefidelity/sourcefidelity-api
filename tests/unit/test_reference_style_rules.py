@@ -48,13 +48,15 @@ def test_literal_marked_periodical_requires_actual_italics():
     'Smith, J. (2020). Images of the “Other” in cinema. University Press.',
     'Smith, J. (2020). A complete book title. ExampleUniversityPress.',
     'Smith, J. (Director). (2020). Example film [Film]. Example Studios.',
+    # APA 6's film label (paper 2's Kubrick, 2026-10-03).
+    'Smith, J. (Director). (2020). Example film [Motion Picture]. Example Studios.',
 ])
 def test_plain_book_quoted_phrase_and_explicit_film_titles(raw):
     refs, layout = build([raw])
     result = assess_reference_formatting(layout, references=refs).title_results[0]
     assert result.status == 'difference'
     assert result.rule_id == 'apa7_reference_title_italics_v2'
-    assert '[Film]' not in raw[result.title_start:result.title_end]
+    assert '[' not in raw[result.title_start:result.title_end]
 
 
 def test_blog_post_does_not_inherit_book_or_film_title_rule():
@@ -205,3 +207,59 @@ def test_a_plain_part_title_before_an_italic_larger_work_is_not_flagged():
     layout = extract_reference_layout_from_bytes(buf.getvalue(), 'case.docx', references=[ref], citation_format='apa')
     results = assess_reference_formatting(layout, references=[ref]).title_results
     assert all(r.status != 'difference' for r in results)
+
+
+def test_a_plain_journal_and_volume_run_together_with_commas_are_checked():
+    # Paper 2's Hess, 2026-10-03: "Jump Cut,1,1,16-18" was never checked.
+    raw = 'Adams, A. (1974). A complete article title. Jump Cut,1,1,16-18'
+    refs, layout = build([raw])
+    result = next(r for r in assess_reference_formatting(layout, references=refs).title_results
+                  if r.rule_id == 'apa7_marked_periodical_italics_v1')
+    assert result.status == 'difference' and raw[result.title_start:result.title_end] == 'Jump Cut,1'
+
+
+
+def test_an_edited_book_title_is_checked_for_italics():
+    # Paper 7, 2026-10-04: "Schmidt, H.C. (Ed.). (2023). Issues … Taylor & Francis" went unchecked.
+    raw = 'Schmidt, H. C. (Ed.). (2023). Issues in contemporary American journalism. Taylor & Francis.'
+    refs, layout = build([raw])
+    if refs[0].source_kind != 'edited_collection':
+        pytest.skip('parser did not classify the edited book')
+    result = assess_reference_formatting(layout, references=refs).title_results[0]
+    assert result.status == 'difference' and result.expected_italic is True
+
+
+def test_title_case_and_missing_publication_details():
+    # Owner wording 2026-10-04 (paper 7).
+    from app.services.reference_formatting import (PUBLICATION_MISSING_TEXT, TITLE_CASE_TEXT,
+                                                   reference_entry_findings, title_case_title)
+    assert title_case_title('The Yellow Press Era: Ethical Challenges and Reforms in 19th Century American Journalism')
+    assert title_case_title('Freedom of the Press Under Andres Manuel López Obrador')
+    assert not title_case_title('The Washington Post and the New York Times coverage of Iraq')
+    assert not title_case_title('Power without responsibility: Press, broadcasting and the internet in Britain')
+    assert not title_case_title('A short Title')
+    refs = {}
+    for i, raw in enumerate(['Johnson, L. (2021). The Yellow Press Era: Ethical Challenges and Reforms.',
+                             'Adams, A. (2021). A complete article title. Journal Name, 4(2), 11-19.',
+                             'Smith, J. (2020). A complete book title. University Press.']):
+        ref = extract_fields_apa(raw); ref.reference_id = str(i); refs[str(i)] = ref
+    found = {(f['reference_id'], f['finding']) for f in reference_entry_findings(refs)}
+    assert found == {('0', TITLE_CASE_TEXT), ('0', PUBLICATION_MISSING_TEXT)}
+
+
+def test_title_case_and_publication_checks_are_apa_only():
+    # Owner request 2026-10-04: other styles capitalise titles differently.
+    from app.services.reference_formatting import reference_style_findings
+    ref = extract_fields_apa('Johnson, L. (2021). The Yellow Press Era: Ethical Challenges and Reforms.')
+    ref.reference_id = 'r'
+    base = {'assessment_version': 'reference-formatting-v2', 'title_results': [], 'order_result': None}
+    assert reference_style_findings({**base, 'citation_format': 'apa'}, {'r': ref})
+    assert reference_style_findings({**base, 'citation_format': 'mla'}, {'r': ref}) == []
+
+
+def test_a_joined_reference_is_flagged_as_split():
+    from app.services.reference_formatting import SPLIT_ENTRY_TEXT, reference_entry_findings
+    ref = extract_fields_apa('Santillana, M. (2023). Freedom of the press under pressure. In Media (pp. 1-2). Springer.')
+    ref.reference_id = 's'
+    ref.split_parts = ['Santillana, M. (2023). Freedom of the press', 'under pressure. In Media (pp. 1-2). Springer.']
+    assert ('s', SPLIT_ENTRY_TEXT) in {(f['reference_id'], f['finding']) for f in reference_entry_findings({'s': ref})}

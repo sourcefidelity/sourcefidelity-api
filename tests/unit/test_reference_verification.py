@@ -359,6 +359,13 @@ def test_a_same_titled_work_by_someone_else_is_an_author_difference():
     page = same_title_author_difference(ref, _record(
         ('web_search', 'A Study of Rivers in the Northern Plains | Film Site - Reviews', ['Mary River'])))
     assert page['located_value'] == 'Mary River'
+    # A page splitting the name into two items names the same author, and the
+    # catalogue record is the one shown (paper 2's Falsetto, 2026-10-03).
+    split = same_title_author_difference(ref, _record(
+        ('web_search', 'A Study of Rivers in the Northern Plains - Softcover', ['River', 'Mary']),
+        ('web_search', 'A Study of Rivers in the Northern Plains', ['Mary River']),
+        ('google_books', 'A Study of Rivers in the Northern Plains', ['Mary River'])))
+    assert split['provider'] == 'google_books' and split['located_value'] == 'Mary River'
 
 
 def test_a_same_titled_record_with_another_publisher_names_the_publisher_too():

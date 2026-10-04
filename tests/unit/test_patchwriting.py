@@ -46,7 +46,7 @@ def test_unquoted_verbatim_run_is_flagged_with_exact_spans():
     text = ("Researchers observe that social media platforms have fundamentally transformed "
             "the ways in which adolescents communicate (Smith, 2020).")
     result = detect_patchwriting(_statement(text, marker="Smith, 2020"), _index())
-    assert result.policy_version == POLICY_VERSION == "patchwriting-v4"
+    assert result.policy_version == POLICY_VERSION == "patchwriting-v5"
     assert result.status == "compared"
     assert result.decision_applied is False
     kinds = [finding.kind for finding in result.findings]
@@ -409,3 +409,12 @@ def test_shared_runs_require_copied_wording_not_only_similar_words():
     assert max(pw._shared_content_runs(isolated, source), default=0) < pw.PARAPHRASE_MIN_SHORT_RUN
     runs = pw._shared_content_runs(copied, source)
     assert runs[0] >= pw.PARAPHRASE_MIN_LONG_RUN
+
+
+def test_field_terminology_does_not_count_toward_a_close_paraphrase():
+    # Owner decision 2026-10-04: film studies' standard definition of vertical integration.
+    from app.services.patchwriting import matched_content_counts
+    text = "Fox's vertical integration (control over production, distribution, and exhibition) ensured release."
+    words = ("vertical integration", "production", "distribution", "and exhibition")
+    spans = [(text.index(w), text.index(w) + len(w)) for w in words]
+    assert matched_content_counts(text, 0, spans) == (5, 0)

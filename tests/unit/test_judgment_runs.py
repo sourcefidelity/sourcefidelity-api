@@ -282,3 +282,31 @@ def test_an_uncertain_reading_gets_an_undecided_note_and_the_result_is_unchanged
     assert systems and all("could not decide" in s for s in systems)
     arm = judged[0].panel["arms"][0]
     assert arm["context_resolution"] == "not_required"
+
+
+def test_answers_with_no_shared_result_get_a_note_about_the_statement_and_source(store, monkeypatch):
+    """Owner decision 2026-10-03: a split is explained by the statement and the source, not the answers."""
+    import itertools
+    import threading
+
+    from test_judgment_panel import _response
+    session, report, _ = store
+    monkeypatch.setattr("app.services.judgment_panel.settings.JUDGMENT_SAMPLES", 3)
+    labels, lock, systems = itertools.cycle(["supports", "none", "contradicts"]), threading.Lock(), []
+
+    def call(system_prompt, user_prompt, *, route, receipt, **kwargs):
+        if '"coaching_request"' in user_prompt:
+            systems.append(system_prompt)
+            return {"note": "The source never discusses this part of the statement.", "facet_ids": [],
+                    "sentence_ids": []}
+        with lock:
+            label = next(labels)
+        return _response(user_prompt, label)
+    run = runs.create_run(session, report.id, PRINCIPAL)
+    session.commit()
+    run = runs.execute_run(session, run.id, routes_factory=lambda: (ROUTES[:1], {"arms": "one"}), call=call)
+    split = [r for r in _rows(session, run) if r.reason_code == "samples_split"]
+    assert split and all(r.display_state == "not_judged" for r in split)
+    assert all(r.coaching["status"] == "model" and r.coaching["version"] == "judgment-split-note-v1"
+               for r in split)
+    assert systems and all("never say how many there were" in s for s in systems)

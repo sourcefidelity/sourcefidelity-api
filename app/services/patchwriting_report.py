@@ -40,6 +40,17 @@ def stored_block(job, aggregate: dict | None = None) -> dict | None:
     return None
 
 
+def _only_conventional(region: dict, start: int, spans: list[tuple[int, int]]) -> bool:
+    """A stored close paraphrase that rests on terminology the current list
+    treats as conventional no longer reaches the matched-word minimum (2026-10-04)."""
+    from app.services import patchwriting as pw
+    text = str(region.get("text") or "")
+    if not text or region.get("text_truncated") or not spans:
+        return False
+    raw, counted = pw.matched_content_counts(text, start, spans)
+    return counted < raw and counted < pw.PARAPHRASE_MIN_MATCHED
+
+
 def _finding_rows(block: dict, known: Callable[[str], bool]) -> list[dict]:
     rows = []
     for reference_id, entry in (block.get("sources") or {}).items():
@@ -60,6 +71,12 @@ def _finding_rows(block: dict, known: Callable[[str], bool]) -> list[dict]:
                 share = float((finding.get("measures") or {}).get("source_quoted_share") or 0.0)
             except (TypeError, ValueError):
                 share = 0.0
+            spans = [(span["paper_start"], span["paper_end"])
+                     for span in finding.get("student_matched_spans") or []
+                     if isinstance(span, dict) and isinstance(span.get("paper_start"), int)
+                     and isinstance(span.get("paper_end"), int)]
+            if finding["kind"] == "close_paraphrase" and _only_conventional(region, start, spans):
+                continue
             sentence = finding.get("student_sentence") or {}
             rows.append({
                 "reference_id": reference_id, "kind": finding["kind"],

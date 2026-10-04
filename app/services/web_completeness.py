@@ -172,6 +172,15 @@ def stated_page_completeness(html: str, text: str, kind: str | None) -> dict:
 WEB_PAGE_KINDS = frozenset({"webpage", "news_article", "blog_post"})
 
 
+def confirmed_page_completeness(text: str, kind: str | None) -> dict:
+    """A cited web page whose own title (or organisation author) confirmed it
+    is itself the work: complete under the uploaded-page rule, with no sign of
+    being cut off and a length fitting a web page (owner request 2026-10-03)."""
+    result = uploaded_page_completeness(text, kind)
+    return {**result, "version": "confirmed-web-page-coverage-v1",
+            **({"reason": "confirmed_web_page_whole"} if result["verdict"] == "complete" else {})}
+
+
 def uploaded_page_completeness(text: str, kind: str | None) -> dict:
     """Completeness of an owner-uploaded PDF of a web page (owner decision 2026-10-01).
 

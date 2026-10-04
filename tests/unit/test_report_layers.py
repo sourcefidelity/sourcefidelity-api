@@ -78,7 +78,9 @@ def test_quotation_and_locator_issues_are_not_relevance_or_judgment():
     member = {'coverage_level': 'full_text', 'show_quotation_check': True,
               'quotation_check': {'attention': True, 'status': 'complete'}, 'show_locator_check': True,
               'locator_check': {'attention': True, 'status': 'complete'}}
-    assert member_layers(member, {}) == {'practice', 'reference'}
+    # A locator issue is Academic Practice, yellow on the citation (2026-10-03).
+    from app.services.report_layers import locator_attention
+    assert member_layers(member, {}) == {'practice'} and locator_attention(member)
     member['coverage_level'] = 'unavailable'
     assert member_layers(member, {}) == set()
 

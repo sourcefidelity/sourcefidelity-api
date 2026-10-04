@@ -206,3 +206,29 @@ def test_report_location_contract_distinguishes_exact_page_and_structural_levels
     assert structural["reason_code"] == (
         "paragraph_known_presentation_location_unresolved"
     )
+
+
+def test_page_spanning_paragraph_with_split_words_skips_the_running_header():
+    # Paper 7, 2026-10-04: "U.S." is one word in the text and two in the PDF,
+    # and the paragraph crosses a page with a running header between.
+    sentence = "Journalism ethics in the U.S. developed early and continued with newspapers (Smith, 2020)."
+    document = fitz.open()
+    first = document.new_page()
+    first.insert_text((72, 700), "Journalism ethics in the U. S. developed early and")
+    second = document.new_page()
+    second.insert_text((72, 50), "[2] Author Name")
+    second.insert_text((72, 110), "continued with newspapers (Smith, 2020).")
+    pdf = document.tobytes()
+    document.close()
+    anchor = bind_citations_to_pdf(pdf, citations=[_citation(sentence)]).anchors[0]
+    assert anchor.mapping_status == "matched"
+    assert anchor.mapping_method == "compact_alphanumeric_with_margin_skip"
+    assert anchor.page_indexes == [0, 1] and len(anchor.rectangles) == 2
+
+
+def test_a_word_set_slightly_higher_keeps_its_place_in_the_line():
+    # Paper 9, 2026-10-04: "2020)." sat a point above its line and was read first.
+    from app.services.presentation_anchors import reading_order
+    words = [(257, 400, 287, 411, "2020).", 5, 1, 0), (70, 401, 97, 412, "roots,", 5, 1, 1),
+             (218, 400, 252, 412, "(Jones,", 5, 1, 2), (336, 386, 354, 396, "one", 5, 0, 0)]
+    assert [w[4] for w in reading_order(words)] == ["roots,", "(Jones,", "2020).", "one"]

@@ -39,7 +39,7 @@ from typing import Any, Iterable, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
-POLICY_VERSION = "patchwriting-v4"
+POLICY_VERSION = "patchwriting-v5"   # v5: field terminology is conventional (2026-10-04)
 
 # --- Provisional thresholds (for owner calibration) ------------------------
 # unquoted_verbatim: a contiguous shared word run (exact word forms).
@@ -137,6 +137,10 @@ CONVENTIONAL_PHRASES = tuple(tuple(phrase.split()) for phrase in (
     "the authors", "the author", "the researchers", "take into account", "play a role",
     "plays a role", "an important role", "a significant role", "in particular",
     "on the basis of", "per cent", "percent of", "high school", "long term", "short term",
+    # A field's standard terminology, not its author's wording (owner decision
+    # 2026-10-04: paper 5's "vertical integration of production, distribution
+    # and exhibition" is film studies' standard definition).
+    "vertical integration", "production distribution and exhibition",
 ))
 _CONVENTIONAL_BY_FIRST: dict[str, list[tuple[str, ...]]] = {}
 for _phrase in sorted(CONVENTIONAL_PHRASES, key=len, reverse=True):
@@ -323,7 +327,8 @@ class PatchwritingCoverage(BaseModel):
 
 
 class PatchwritingResult(BaseModel):
-    policy_version: Literal["patchwriting-v1", "patchwriting-v2", "patchwriting-v3", "patchwriting-v4"] = POLICY_VERSION
+    policy_version: Literal["patchwriting-v1", "patchwriting-v2", "patchwriting-v3", "patchwriting-v4",
+                            "patchwriting-v5"] = POLICY_VERSION
     status: Literal["compared", "not_assessed"]
     reason: str | None = None
     claim_id: str | None = None
@@ -1420,3 +1425,12 @@ def detect_in_body(body_text: str, sources: Sequence[SourceIndex], *,
     except Exception as exc:
         return _not_assessed("internal_error", [f"internal_error:{type(exc).__name__}"],
                              [s for s in sources if isinstance(s, SourceIndex)])
+
+
+def matched_content_counts(region_text: str, region_start: int, spans: list[tuple[int, int]]) -> tuple[int, int]:
+    """Content words inside a stored finding's matched spans, without and with
+    the conventional-phrase discount, so older findings meet the current list."""
+    tokens = tokenize(region_text, region_start)
+    inside = [t for t in tokens if any(a <= t.start and t.end <= b for a, b in spans)]
+    return sum(1 for t in inside if _is_content(t.norm)), sum(1 for t in inside if t.content)
+

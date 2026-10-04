@@ -113,3 +113,10 @@ def test_pdf_member_links_and_translucent_marks():
             assert f'source {target["member_index"]+1}' in heading
         marks=[drawing for drawing in output[0].get_drawings() if drawing.get('fill')]
         assert len(marks)==2 and all(abs(m['fill_opacity']-.23)<.01 for m in marks)
+
+
+def test_a_narrative_mention_does_not_hide_the_bracketed_marker():
+    # Paper 6, 2026-10-04: "Onay (2024) argues … (Onay, 2024)." placed no target.
+    citation,words=fixture('Onay (2024) argues a claim (Onay, 2024).','(Onay, 2024)',[('Onay','2024','unavailable')])
+    result=member_targets(citation,words)
+    assert len(result)==1 and result[0]['x0']==5*40 and result[0]['x1']==6*40+38

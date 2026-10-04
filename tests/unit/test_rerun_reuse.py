@@ -39,6 +39,10 @@ def test_an_optional_route_failure_does_not_force_a_search_when_required_searche
     monkeypatch.setattr(reuse, "_required_searches_completed", lambda item, reference: reference is not None)
     assert _reusable(item, REF)
     assert not _reusable(item)
+    # A provider's retry no longer forces a search when every required search
+    # finished (2026-10-04, paper 10); unfinished required searches still do.
+    assert _reusable(dict(item, retryable_provider_dependencies=["crossref"]), REF)
+    monkeypatch.setattr(reuse, "_required_searches_completed", lambda item, reference: False)
     assert not _reusable(dict(item, retryable_provider_dependencies=["crossref"]), REF)
 
 

@@ -136,7 +136,7 @@ def extract_from_pdf_pdfplumber(file_path: str) -> str:
     try:
         with pdfplumber.open(file_path) as pdf:
             pages = [page.extract_text() for page in pdf.pages if page.extract_text()]
-        return "\n\n".join(_strip_repeated_page_marginals(pages))
+        return join_pdf_pages(_strip_repeated_page_marginals(pages))
     except Exception as e:
         raise TextExtractionError(f"pdfplumber failed: {e}")
 
@@ -147,7 +147,7 @@ def extract_from_pdf_pymupdf(file_path: str) -> str:
         doc = fitz.open(file_path)
         pages = _strip_repeated_page_marginals([page.get_text() for page in doc])
         doc.close()
-        return "\n\n".join(pages)
+        return join_pdf_pages(pages)
     except Exception as e:
         raise TextExtractionError(f"PyMuPDF failed: {e}")
 
@@ -347,17 +347,69 @@ def extract_text_from_bytes(
 def _extract_pdfplumber_bytes(content: bytes) -> str:
     with pdfplumber.open(io.BytesIO(content)) as pdf:
         pages = [page.extract_text() for page in pdf.pages if page.extract_text()]
-    return "\n\n".join(_strip_repeated_page_marginals(pages))
+    return join_pdf_pages(_strip_repeated_page_marginals(pages))
 
 
 def _extract_pymupdf_bytes(content: bytes) -> str:
     document = fitz.open(stream=content, filetype="pdf")
     try:
-        return "\n\n".join(
+        return join_pdf_pages(
             _strip_repeated_page_marginals([page.get_text() for page in document])
         )
     finally:
         document.close()
+
+
+def join_pdf_pages(pages: list[str]) -> str:
+    """Pages as paragraphs, except a sentence the page break cuts: a page ending
+    without sentence punctuation before one that opens in lower case
+    ("This part" / "of her experience", paper 9, 2026-10-04) joins with a space."""
+    text = ""
+    for page in pages:
+        if not text:
+            text = page
+            continue
+        if re.search(r"[A-Za-z,;]\s*$", text) and re.match(r"\s*[a-z]", page):
+            # Move the cut sentence's start to the next page, so each page keeps
+            # its size (a page is one paragraph to the citation reader).
+            boundary = max((m.end() for m in re.finditer(r"[.!?][\"”’')]*\s+", text)), default=-1)
+            if boundary > 0:
+                text = text[:boundary].rstrip() + "\n\n" + " ".join(text[boundary:].split()) + " " + page.lstrip()
+            else:
+                text = text.rstrip() + " " + page.lstrip()
+        else:
+            text = text + "\n\n" + page
+    return isolate_pdf_headings(text)
+
+
+_REFERENCE_LIST_HEADING = re.compile(r"(?im)^\s*(?:references|reference list|bibliography|works cited)\s*$")
+
+
+def isolate_pdf_headings(text: str) -> str:
+    """A heading line the PDF prints without a blank line after it is not the
+    start of the next sentence ("Conceptualisation of Identity and
+    Representation" / "Identity is …", paper 9, 2026-10-04): a short,
+    title-cased line with no closing punctuation, after a finished sentence
+    and before a capitalised line, becomes its own paragraph. The reference
+    list is left as it is."""
+    end = len(text)
+    heading = None
+    for heading in _REFERENCE_LIST_HEADING.finditer(text):
+        pass
+    if heading is not None:
+        end = heading.start()
+    lines = text[:end].split("\n")
+    out = list(lines)
+    for i in range(1, len(lines) - 1):
+        line, before, after = lines[i].strip(), lines[i - 1].strip(), lines[i + 1].strip()
+        words = re.findall(r"[A-Za-z][\w'’-]*", line)
+        long_words = [w for w in words if len(w) >= 4]
+        if (not 2 <= len(words) <= 12 or len(long_words) < 2 or re.search(r"[.!?:;,]$", line)
+                or not re.search(r"[.!?][\"”’')]*$", before) or not after[:1].isupper()
+                or sum(w[0].isupper() for w in long_words) < 0.75 * len(long_words)):
+            continue
+        out[i] = "\n" + lines[i] + "\n"
+    return "\n".join(out) + text[end:]
 
 
 def _strip_repeated_page_marginals(pages: list[str]) -> list[str]:

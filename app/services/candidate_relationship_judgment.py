@@ -289,6 +289,12 @@ def attach_verification_candidates(
 
     marker_span = _marker_span(claim.text, claim.citation_marker)
     content_spans = _content_spans(claim.text, marker_span)
+    if claim.citation_marker_type == "source_heading":
+        # The heading only names the source (owner decision 2026-10-04).
+        from app.services.paper_extraction import source_heading_statement_start
+        start = source_heading_statement_start(claim.text, claim.citation_marker)
+        trimmed = _trim_optional(claim.text, start, len(claim.text)) if 0 < start < len(claim.text) else None
+        content_spans = [trimmed] if trimmed else content_spans
     guard_segments = [
         _segment(artifact, start, end, "whole_unit_guard")
         for start, end in content_spans

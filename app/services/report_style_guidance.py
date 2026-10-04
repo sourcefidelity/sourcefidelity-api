@@ -14,6 +14,9 @@ GUIDANCE = {
     'quotation': ('Quoting and indicating changes', APA + 'citations/quotations', MLA + 'avoid-bracketed-changes/'),
     'indirect': ('Citing an indirect source', APA + 'citations/secondary-sources', MLA + 'paraphrasing-indirect-sources/'),
     'citation': ('Connecting citations to references', APA + 'citations/basic-principles', MLA + 'in-text-citations-overview/'),
+    # Titles of standalone works (films, books) are italicized in the text
+    # (2026-10-03). No MLA page was verified, so MLA papers get no link.
+    'italics': ('Italics', APA + 'italics-quotations/italics', None),
 }
 
 
@@ -58,6 +61,7 @@ FINDING_GUIDANCE = {
     'reference_title_missing': 'reference',
     'chapter_pages_missing': 'reference',
     'required_quotation_locator_missing': 'quotation',
+    'body_title_style': 'italics',
     'quotation_difference': 'quotation',
     'indirect_source': 'indirect',
     'missing_reference_entry': 'citation',
@@ -72,6 +76,8 @@ def guidance_link(kind: str | None, citation_format: str) -> str:
         return ''
     label, apa, mla = GUIDANCE[kind]
     name, url = ('APA', apa) if style.startswith('APA') else ('MLA', mla)
+    if not url:
+        return ''
     return (f'<a class="style-guidance" href="{escape(url, quote=True)}" target="_blank" '
             f'rel="noopener noreferrer">{name}: {escape(label)}</a>')
 

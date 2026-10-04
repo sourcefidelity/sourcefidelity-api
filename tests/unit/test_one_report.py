@@ -49,7 +49,9 @@ def test_style_links_sit_at_the_bottom_of_the_window_category_not_in_the_summary
     formatting = sections['formatting']
     assert formatting.find_all(recursive=False)[-1]['class'] == ['style-guidance-links']
     assert 'apastyle.apa.org' in formatting.select_one('a.style-guidance')['href']
-    assert not sections['evidence'].select('a.style-guidance')   # evidence is not a style question
+    # A located-record difference is Academic Practice in the window (owner 2026-10-03), not a style question.
+    assert not sections['academic'].select('a.style-guidance')
+    assert 'The information in this reference differs from the located record.' in sections['academic'].get_text()
     citation = window(soup, 'citation-panel-1')
     links = citation.select('.style-guidance-links a')
     assert [a.get_text() for a in links] == ['APA: Connecting citations to references']

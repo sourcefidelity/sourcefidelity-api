@@ -590,7 +590,62 @@ def retrieve_paper_sources(
         except Exception as exc:  # noqa: BLE001 - a failed visit is recorded, never fatal
             record["submitted_link_observations"] = getattr(exc, "submitted_link_observations", None)
         checkpoint(record)
-    job.source_results = results
+    # A reference looked up by its details only (uncited, identity-only) never
+    # had its own DOI or link visited, so a dead DOI went unreported (paper
+    # 10, 2026-10-04): visit it now; the visit is free and changes no search.
+    if check_links is not None:
+        references_by_id = {reference.reference_id: reference for reference in artifact.references}
+        for record in results:
+            reference = references_by_id.get(record.get("reference_id"))
+            observations = record.get("submitted_link_observations") or []
+            if (reference is None or not (getattr(reference, "url", None) or getattr(reference, "doi", None))
+                    or any(item.get("state") != "not_checked" for item in observations)):
+                continue
+            try:
+                checked = check_links(reference)
+                visited = (checked.metadata or {}).get("submitted_link_observations")
+            except Exception as exc:  # noqa: BLE001 - a failed visit is recorded, never fatal
+                visited = getattr(exc, "submitted_link_observations", None)
+            if visited:
+                record["submitted_link_observations"] = visited
+    # A cited web page is judged by its link, an archived copy and web search
+    # (`webpage-verification-v1`, owner decision 2026-10-03). An uncited page
+    # whose link fails tellingly is searched too, but its text is never used.
+    from app.services.web_page_verification import web_page_check
+    by_reference = {reference.reference_id: reference for reference in artifact.references}
+    for record in results:
+        reference = by_reference.get(record.get("reference_id"))
+        if reference is None or record.get("web_page_check"):
+            continue
+        try:
+            check = web_page_check(reference, record.get("submitted_link_observations"))
+        except Exception:  # noqa: BLE001 - the evidence is optional; the page stays unassessed
+            check = None
+        if check is None:
+            continue
+        record["web_page_check"] = check
+        if (check["link"] == "telling" and check["archive"] != "matched"
+                and not record.get("reference_discovery") and check_links is not None):
+            earlier = reused_result(rerun_index, reference, identity_only=False)
+            if earlier and earlier.get("reference_discovery") and earlier.get("status") == "link_check_only":
+                record["reference_discovery"] = earlier["reference_discovery"]
+                record["search_reuse"] = earlier.get("search_reuse")
+                continue
+            try:
+                with search_memo_scope(memo_context):
+                    found = active_resolver.resolve_reference(reference)
+                record["reference_discovery"] = (found.metadata or {}).get("reference_discovery")
+            except SourceResolutionError as exc:
+                record["reference_discovery"] = exc.reference_discovery
+            except Exception:  # noqa: BLE001 - an incomplete search leaves the page unassessed
+                pass
+    # The records above were changed in place, so the JSON column's old value
+    # compares equal to the new one; mark it changed or nothing is written
+    # (the web-page evidence was lost twice, 2026-10-03).
+    from sqlalchemy.orm.attributes import flag_modified
+    job.source_results = [dict(record) for record in results]
+    if hasattr(job, "_sa_instance_state"):
+        flag_modified(job, "source_results")
     job.stage = JobStage.RETRIEVED
     job.updated_at = datetime.now(timezone.utc)
     session.commit()

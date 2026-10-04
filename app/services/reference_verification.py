@@ -43,6 +43,7 @@ FINDING_TEXT = 'Cannot be verified. Searches for this source could not locate th
 
 ARTICLE_KINDS = frozenset({'journal_article', 'conference_paper', 'book_review'})
 BOOK_KINDS = frozenset({'monograph', 'edited_collection'})
+WEB_PAGE_KINDS = frozenset({'webpage', 'blog_post', 'news_article'})
 
 # The metadata routes that must complete, by kind. Each is an index that
 # holds that kind of work; an index that cannot hold it is neither called nor
@@ -215,16 +216,38 @@ def _title_led(query: dict) -> bool:
     return titled and not scoped
 
 
-def assess_reference_verification(reference, discovery: dict | None) -> dict:
-    """Return the verification status and, when flagged, one finding."""
+def assess_reference_verification(reference, discovery: dict | None, web_page_check: dict | None = None) -> dict:
+    """Return the verification status and, when flagged, one finding.
+
+    A web page is assessed under `webpage-verification-v1` from
+    ``web_page_check`` (its link, an archived capture) plus the web searches;
+    see app/services/web_page_verification.py."""
     result = dict(policy_version=POLICY, reference_id=getattr(reference, 'reference_id', None),
                   status='not_assessed', reason_code='discovery_unavailable', findings=[])
+    web_rule = False
+    kind = normalize_source_kind(getattr(reference, 'source_kind', None))
+    if web_page_check and kind in WEB_PAGE_KINDS:
+        result.update(source_kind=kind, web_page_check=dict(web_page_check))
+        if web_page_check.get('link') == 'confirmed':
+            result.update(status='verified', reason_code='submitted_page_confirmed')
+            return result
+        if web_page_check.get('archive') == 'matched':
+            result.update(status='verified', reason_code='archived_page_confirmed')
+            return result
+        if web_page_check.get('link') == 'near':
+            # The linked page carries nearly the cited title: shown, never flagged.
+            result.update(status='possible_match', reason_code='submitted_page_near_title')
+            return result
+        if web_page_check.get('link') != 'telling':
+            result['reason_code'] = 'web_page_link_not_telling'
+            return result
+        web_rule = True
     if not isinstance(discovery, dict) or not discovery.get('attempts') and not discovery.get('outcome'):
         return result
     expected = discovery.get('expected') or {}
     kind = normalize_source_kind(expected.get('source_kind') or getattr(reference, 'source_kind', None))
     result['source_kind'] = kind
-    if not is_bibliographically_searchable(kind):
+    if not web_rule and not is_bibliographically_searchable(kind):
         result['reason_code'] = 'not_held_by_academic_indexes'
         return result
     outcome = discovery.get('outcome')
@@ -285,7 +308,8 @@ def assess_reference_verification(reference, discovery: dict | None) -> dict:
                     failed.add(engine)
                     if q.get('execution_outcome') in SELF_SKIPPED_QUERY:
                         self_skipped.add(engine)
-    required = required_adapters(kind)
+    # A web page is held by web search, not by the scholarly indexes.
+    required = () if web_rule else required_adapters(kind)
     missing = [p for p in required if p not in completed]
     result.update(required_routes=list(required), completed_routes=sorted(completed & set(required)),
                   web_routes=sorted(web))
@@ -307,6 +331,7 @@ def assess_reference_verification(reference, discovery: dict | None) -> dict:
         finding=FINDING_TEXT,
         evidence_explanation='Searched by title and author: ' + ', '.join(searched) + '.',
         searched_routes=searched, source_kind=kind, discovery_outcome=outcome,
+        **({'web_page_check': dict(web_page_check)} if web_rule else {}),
         limitations=['Search coverage is bounded, not an exhaustive catalog of published works.'],
         field_difference=dict(field_name='entry', submitted_value=getattr(reference, 'raw_ref', '')),
         rectangles=[], localization_status='not_assessed', discovery_sha256=_digest(discovery))
@@ -336,7 +361,7 @@ def same_title_author_difference(reference, discovery: dict | None) -> dict | No
     cited_surnames = {s.casefold() for s in extract_surnames(cited_author)}
     if len(cited_title) < 12 or not cited_surnames:
         return None
-    located: dict[frozenset, dict] = {}
+    located: list[tuple[frozenset, dict]] = []
     for candidate in discovery.get('candidates') or []:
         observed = candidate.get('observed') or {}
         if _title_forms(observed.get('title'))[1] != cited_title and not (
@@ -351,15 +376,19 @@ def same_title_author_difference(reference, discovery: dict | None) -> dict | No
         if surnames & cited_surnames:
             return None
         publisher = str(observed.get('publisher') or (candidate.get('edition_metadata') or {}).get('publisher') or '')
-        located.setdefault(surnames, dict(field_name='author', submitted_value=cited_author,
-                                          located_value=', '.join(authors),
-                                          provider=candidate.get('provider'),
-                                          candidate_id=candidate.get('candidate_id'),
-                                          located_title=str(observed.get('title') or ''),
-                                          located_publisher=publisher.strip()))
-    if len(located) != 1:
+        located.append((surnames, dict(field_name='author', submitted_value=cited_author,
+                                       located_value=', '.join(authors),
+                                       provider=candidate.get('provider'),
+                                       candidate_id=candidate.get('candidate_id'),
+                                       located_title=str(observed.get('title') or ''),
+                                       located_publisher=publisher.strip())))
+    # Records sharing a surname name the same author, however a page splits the
+    # name ("Falsetto", "Mario" against "Mario Falsetto", 2026-10-03).
+    if not located or any(not a & b for a, _ in located for b, _ in located):
         return None
-    found = next(iter(located.values()))
+    # A catalogue record naming its publisher is shown before a web page's.
+    found = min((record for _, record in located),
+                key=lambda r: (r['provider'] == 'web_search', not r['located_publisher']))
     # The same record's publisher, when it shares no name with the reference's
     # (Singer: Palgrave Macmillan against Falsetto's Greenwood, 2026-09-30).
     cited_publisher = str(getattr(reference, 'publisher', '') or '')

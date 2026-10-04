@@ -41,3 +41,16 @@ def test_jats_text_keeps_paragraphs_and_drops_the_reference_list():
     text = _extract_text_representation(xml, RepresentationKind.XML)
     assert text.startswith("A study\n\nThe abstract says") and "Paragraph 11" in text
     assert "Cited Work" not in text
+
+
+def test_a_catalogue_export_is_not_the_works_text():
+    from app.services.source_validator import detect_nonprose_payload
+    rdf = "\n".join(f"<https://repo.example.test/id/eprint/9394> <http://purl.org/dc/terms/p{n}> <http://example.test/o{n}> ."
+                    for n in range(20))
+    assert detect_nonprose_payload(rdf) == "a linked-data catalogue record"
+    bibtex = "@book{cornea2007,\n  title={Science Fiction Cinema},\n  author={Cornea, Christine},\n" + "  note={x},\n" * 20 + "}"
+    assert detect_nonprose_payload(bibtex) == "a citation metadata export"
+    ris = "TY  - BOOK\nTI  - Science Fiction Cinema\nAU  - Cornea, Christine\n" + "KW  - film\n" * 30 + "ER  -\n"
+    assert detect_nonprose_payload(ris) == "a citation metadata export"
+    prose = "Science fiction cinema has long negotiated the boundary between fantasy and reality. " * 10
+    assert detect_nonprose_payload(prose) is None

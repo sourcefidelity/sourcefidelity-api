@@ -130,6 +130,9 @@ class ReferenceOrderResult(BaseModel):
         return self
 
 
+_FILM_LABEL = r'\[(?:Film|Motion picture)\]'
+
+
 def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[ParsedReference]):
     """Bounded APA book/article/explicit-film rule with observed typography."""
     entries = {entry.reference_id: entry for entry in layout.entries}
@@ -142,15 +145,16 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
         entry = entries.get(ref.reference_id)
         supported = (layout.citation_format == 'apa' and not ref.needs_review
                      and ref.source_kind_confidence == 'high'
-                     and ref.source_kind in {'monograph', 'journal_article', 'traditional_media'})
+                     and ref.source_kind in {'monograph', 'edited_collection', 'journal_article', 'traditional_media'})
         if supported:
             reason = 'title_span_not_uniquely_observed'
             title = ref.title
+            # "[Motion picture]" is the APA 6 label for a film (paper 2, 2026-10-03).
             film = (ref.source_kind == 'traditional_media'
-                    and bool(re.search(r'\[Film\]', ref.raw_ref, re.I))
+                    and bool(re.search(_FILM_LABEL, ref.raw_ref, re.I))
                     and bool(re.search(r'\(Director\)', ref.raw_ref, re.I)))
             if film:
-                title = re.sub(r'\s*\[Film\]\s*$', '', title, flags=re.I).rstrip()
+                title = re.sub(r'\s*' + _FILM_LABEL + r'\s*$', '', title, flags=re.I).rstrip()
             if (entry and entry.reference_text_sha256 == digest and len(title) >= 8
                     and len(title.split()) >= (2 if film else 3) and ref.raw_ref.count(title) == 1):
                 start = ref.raw_ref.index(title); end = start + len(title)
@@ -160,11 +164,12 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
                 # publisher must not establish an independent book title.
                 independent_kind = (
                     bool(_BOOK_PUBLISHER_RE.search(tail)) and not re.match(r'In\b', tail, re.I)
-                    if ref.source_kind == 'monograph' else
+                    # An edited book is a book: its title is italic too (paper 7, 2026-10-04).
+                    if ref.source_kind in {'monograph', 'edited_collection'} else
                     bool(_JOURNAL_STRUCTURE_RE.search(tail.replace('*', '')) or re.search(
                         r',\s*\d{1,4}\s*,\s*\d+\s*[-–—]\s*\d+', tail.replace('*','')))
                     if ref.source_kind == 'journal_article' else
-                    film and bool(re.match(r'\[Film\]', tail, re.I))
+                    film and bool(re.match(_FILM_LABEL, tail, re.I))
                 )
                 if not independent_kind:
                     results.append(ReferenceTitleStyleResult(**data, reason_code='independent_container_or_publisher_not_established'))
@@ -176,7 +181,7 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
                     # Mixed styling can be correct for embedded titles or terms.
                     # An entirely plain book title is missing italics even if
                     # it contains a quoted phrase. Mixed styling still abstains.
-                    expected = ref.source_kind in {'monograph', 'traditional_media'}
+                    expected = ref.source_kind in {'monograph', 'edited_collection', 'traditional_media'}
                     # A plain title followed by an italic larger work is a
                     # part of that work, correctly styled (Curle, 2026-09-30).
                     later_italic = any(sp.italic and sp.start >= end and any(ch.isalpha() for ch in ref.raw_ref[sp.start:sp.end])
@@ -207,6 +212,11 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
                 if journal and volume and '*' not in ref.raw_ref[offset:]:
                     match = re.match(r'\s*[.?!]\s*(?P<field>' + re.escape(journal)
                                      + r'\s*,\s*' + re.escape(volume) + r')\b', ref.raw_ref[offset:])
+                elif '*' not in ref.raw_ref[offset:]:
+                    # Journal, volume, issue and pages run together with commas
+                    # ("Jump Cut,1,1,16-18", paper 2, 2026-10-03).
+                    match = re.match(r'\s*[.?!]\s*(?P<field>[A-Z][^\d,.()]{1,80}?\s*,\s*\d{1,4})\s*,\s*\d{1,4}\s*,'
+                                     r'\s*\d+\s*[-–—]\s*\d+\.?\s*$', ref.raw_ref[offset:])
             if match:
                 start, end = offset + match.start('field'), offset + match.end('field')
                 if reference_span_style_observed(entry, ref.raw_ref, start, end):
@@ -415,6 +425,74 @@ def reference_style_findings(assessment: dict, references: dict[str, ParsedRefer
                     expected_reference_order=result.expected_order,
                     observed_reference_order=result.observed_order,
                     rectangles=[], localization_status='not_assessed'))
+    if assessment.get('citation_format') == 'apa':
+        findings.extend(reference_entry_findings(references))
+    return findings
+
+
+# Owner wording 2026-10-04.
+TITLE_CASE_TEXT = 'This title uses title case; APA uses sentence case for article and book titles in the reference list.'
+PUBLICATION_MISSING_TEXT = 'This reference does not name a journal or publisher.'
+SPLIT_ENTRY_TEXT = 'This reference is split into two entries in the reference list.'
+_MEDIA_KINDS = frozenset({'traditional_media', 'video', 'podcast_episode'})
+# Short function words APA title case leaves in lower case; any other lower-case
+# word of four or more letters marks a sentence-case title.
+_LOWER_IN_TITLE_CASE = frozenset({'with', 'from', 'into', 'onto', 'upon', 'over', 'than', 'that', 'this', 'also'})
+
+
+def title_case_title(title: str) -> bool:
+    """A title written in title case: no ordinary lower-case word of four or
+    more letters, and at least three capitalised ones besides the words that
+    sentence case also capitalises (the first, and the first after a colon).
+    Proper nouns cannot be told apart, so a title of names alone may match."""
+    capitalised = 0
+    for index, match in enumerate(re.finditer(r"[^\s]+", title)):
+        token = match.group()
+        word = re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', token)
+        if not word or any(ch.isdigit() for ch in word):
+            continue
+        after_colon = title[:match.start()].rstrip().endswith((':', '?', '!', '—', '–'))
+        if index == 0 or after_colon:
+            continue
+        head = word.split('-')[0]
+        if len(head) < 4 or not head[0].isalpha():
+            continue
+        if head[0].islower():
+            if head.casefold() not in _LOWER_IN_TITLE_CASE:
+                return False
+        else:
+            capitalised += 1
+    return capitalised >= 3
+
+
+def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dict]:
+    """Title capitalisation and missing publication details (owner decision 2026-10-04)."""
+    findings = []
+    for reference_id, ref in references.items():
+        if len(getattr(ref, 'split_parts', None) or []) == 2:
+            findings.append(dict(finding_type='reference_split_entry', reference_id=reference_id,
+                finding=SPLIT_ENTRY_TEXT, rule_id='apa7_single_entry_v1', rule_source=APA_TITLE_RULE_SOURCE,
+                field_difference={'field_name': 'entry', 'submitted_value': ref.raw_ref},
+                rectangles=[], localization_status='not_assessed'))
+        title = str(ref.title or '').strip().rstrip('.')
+        if (ref.needs_review or ref.source_kind in _MEDIA_KINDS or len(title.split()) < 3
+                or ref.raw_ref.count(title) != 1):
+            continue
+        if title_case_title(title):
+            findings.append(dict(finding_type='reference_title_style', reference_id=reference_id,
+                finding=TITLE_CASE_TEXT, rule_id='apa7_title_sentence_case_v1', rule_source=APA_TITLE_RULE_SOURCE,
+                field_difference={'field_name': 'title', 'submitted_value': title},
+                rectangles=[], localization_status='not_assessed'))
+        tail = ref.raw_ref[ref.raw_ref.index(title) + len(title):]
+        # Nothing follows the title. A parsed publisher or journal can be a
+        # piece of the title itself (paper 7's Johnson), so the entry's own
+        # words after the title decide, not the parsed fields.
+        if not re.search(r'\w', tail) and not (ref.url or ref.doi) and ref.raw_ref.index(title) > 0:
+            findings.append(dict(finding_type='reference_publication_missing', reference_id=reference_id,
+                finding=PUBLICATION_MISSING_TEXT, rule_id='apa7_publication_details_present_v1',
+                rule_source=APA_TITLE_RULE_SOURCE,
+                field_difference={'field_name': 'entry', 'submitted_value': ref.raw_ref},
+                rectangles=[], localization_status='not_assessed'))
     return findings
 
 
@@ -638,7 +716,11 @@ def chapter_form_findings(references, citation_format: str) -> list[dict]:
     findings = []
     for reference in references:
         raw = getattr(reference, 'raw_ref', '') or ''
-        if (getattr(reference, 'source_kind', '') != 'book_section' or getattr(reference, 'needs_review', False)
+        # The checks read the entry itself, so a reference held for review
+        # whose chapter form is clear is still checked (paper 7, 2026-10-04).
+        if (getattr(reference, 'source_kind', '') != 'book_section'
+                or (getattr(reference, 'needs_review', False)
+                    and getattr(reference, 'source_kind_confidence', '') != 'high')
                 or not _CHAPTER_IN_RE.search(raw)):
             continue
         for finding_type, text, present in (

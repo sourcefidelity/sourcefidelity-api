@@ -307,7 +307,11 @@ def execute_run(
                 # A judge left part of the statement uncertain: the note says why
                 # (owner decision 2026-09-30). An unresolved statement keeps its fixed note.
                 note_state = "undecided"
-            if note_state in COACHED_STATES or note_state == "undecided":
+            elif result.display_state == "not_judged" and result.reason_code.removeprefix("wider_search_") == "samples_split":
+                # Answers with no shared result: the note explains the statement and
+                # the source, never the answers (owner decision 2026-10-03).
+                note_state = "split"
+            if note_state in COACHED_STATES or note_state in {"undecided", "split"}:
                 wider_record = wider or {}
                 sentences = {sid: sentence.text for sid, sentence in prepared.sentences.items()}
                 sentences.update((wider_record.get("sentences") or {}))

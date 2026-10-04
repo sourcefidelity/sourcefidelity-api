@@ -6,6 +6,7 @@ appropriate format-specific parser.
 
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from typing import List, Optional
@@ -107,6 +108,47 @@ def _apply_identifier_normalization(references):
     return [apply_preprint_identity(reference) for reference in references]
 
 
+# An APA entry opens with its author or title and carries "(Year)" or "(n.d.)" early.
+_APA_DATE_EARLY = re.compile(r"\((?:\d{4}[a-z]?|n\.\s?d\.)[^)]{0,30}\)")
+_MID_PHRASE = re.compile(
+    r"(?:\b(?:the|a|an|of|and|or|in|on|for|to|with|between|from|by|at|as|into|its|their)"
+    r"|\w{3,}(?:ic|al|ive|ous|ful|ary|ian|ist|ing))$", re.IGNORECASE)
+_AUTHOR_START = re.compile(r"^[^\W\d_][\w'’\-]+(?:\s[^\W\d_][\w'’\-]+)*,\s*(?:[A-Z]\.|[A-Z][a-z])")
+
+
+def merge_split_entries(raw_refs: list[str], fmt: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Join one reference the submitted list splits in two (split-entry-v1, owner
+    decision 2026-10-04: paper 7's Santillana & Davis stops mid-title and its
+    remainder heads the list).
+
+    APA only. Exactly one entry must stop mid-sentence (it ends on a letter,
+    not on punctuation, a URL or a DOI) and exactly one other must have neither
+    an author nor a date; anything else is left alone. Returns the entries with
+    the joined one in the first part's place, and the parts of each join.
+    """
+    if fmt != "apa" or len(raw_refs) < 3:
+        return raw_refs, {}
+    def unfinished(entry):
+        text = entry.strip()
+        return bool(text) and text[-1].isalpha() and not re.search(r"(?:https?://|doi\.org/|www\.)\S*$", text)
+    def headless(entry):
+        text = entry.strip()
+        return (not _APA_DATE_EARLY.search(text[:160]) and not _AUTHOR_START.match(text)
+                and len(text.split()) >= 4)
+    tails = [i for i, entry in enumerate(raw_refs) if unfinished(entry) and _APA_DATE_EARLY.search(entry[:160])]
+    if len(tails) > 1:
+        # Several entries only lack a final full stop; the cut one stops
+        # mid-phrase, on a function word or an adjective ("…Between Journalistic").
+        tails = [i for i in tails if _MID_PHRASE.search(raw_refs[i].strip())]
+    heads = [i for i, entry in enumerate(raw_refs) if headless(entry)]
+    if len(tails) != 1 or len(heads) != 1 or tails[0] == heads[0]:
+        return raw_refs, {}
+    first, rest = raw_refs[tails[0]].strip(), raw_refs[heads[0]].strip()
+    joined = f"{first} {rest}"
+    merged = [joined if i == tails[0] else entry for i, entry in enumerate(raw_refs) if i != heads[0]]
+    return merged, {" ".join(joined.split()): [first, rest]}
+
+
 def extract_and_parse_references(
     raw_text: str,
     format_hint: Optional[str] = None,
@@ -179,16 +221,18 @@ def extract_and_parse_references(
                 raw_refs = split_references(raw_text, format_hint)
         else:
             raw_refs = split_references(raw_text, format_hint)
+        raw_refs, splits = merge_split_entries(raw_refs, fmt)
 
         from app.services.reference_identity import assign_reference_ids
+        parsed = _extract_fields_regex_first(
+            raw_refs,
+            format_hint,
+            use_llm_fallback=use_llm_fallback,
+        )
+        parsed = [ref.model_copy(update={"split_parts": splits[" ".join(ref.raw_ref.split())]})
+                  if " ".join(ref.raw_ref.split()) in splits else ref for ref in parsed]
         return assign_reference_ids(
-            _apply_identifier_normalization(
-                _extract_fields_regex_first(
-                    raw_refs,
-                    format_hint,
-                    use_llm_fallback=use_llm_fallback,
-                )
-            ),
+            _apply_identifier_normalization(parsed),
             paper_version_id=paper_version_id,
         )
 

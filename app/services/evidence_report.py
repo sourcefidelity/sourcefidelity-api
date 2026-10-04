@@ -148,6 +148,32 @@ def get_authorized_evidence_report_view(
     return view
 
 
+def _statement_text(claim) -> str:
+    """The wording a window shows: a source heading's paragraphs without the heading."""
+    if getattr(claim, "citation_marker_type", "") != "source_heading":
+        return claim.text
+    from app.services.paper_extraction import source_heading_statement_start
+    return claim.text[source_heading_statement_start(claim.text, claim.citation_marker):] or claim.text
+
+
+def heading_citation(citation: dict) -> bool:
+    """A heading naming a work with its citation ("Classical Hollywood: The Day
+    the Earth Stood Still (Wise, 1951)"): short, title-cased, holding the
+    citation and with no sentence punctuation at its end."""
+    text = " ".join(str(citation.get("student_text") or "").split())
+    marker = " ".join(str(citation.get("citation_marker") or "").split())
+    # The citation may also open the heading: "Killer's Kiss (1955): Classical
+    # Hollywood Film Analysis" (paper 6, 2026-10-04).
+    if not marker or marker not in text or re.search(r"[.!?;][\"”’')]*$", text):
+        return False
+    lead = text.replace(marker, " ", 1).strip(" :–-")
+    words = re.findall(r"[A-Za-z][\w'’\-]*", lead)
+    if not 1 <= len(words) <= 15 or re.search(r"[.!?;][\"”’')]*$", lead):
+        return False
+    long_words = [word for word in words if len(word) >= 4]
+    return bool(long_words) and sum(word[0].isupper() for word in long_words) >= 0.75 * len(long_words)
+
+
 def build_evidence_report_view(
     *,
     report: Report,
@@ -371,7 +397,7 @@ def build_evidence_report_view(
                 "paper_character_start": claim.passage_start,
                 "paper_character_end": claim.passage_end,
                 "student_text": claim.text,
-                "display_student_text": _normalize_display_text(claim.text),
+                "display_student_text": _normalize_display_text(_statement_text(claim)),
                 "citation_marker": claim.citation_marker,
                 "claim_type": claim.claim_type,
                 "page_locator": claim.page_locator,
@@ -379,6 +405,8 @@ def build_evidence_report_view(
                 "display_coverage": display_coverage,
                 "quotation_differences": quotation_differences,
                 "reference_mismatch_members": _reference_mismatch_members(
+                    extraction, claim.passage_start, claim.passage_end),
+                "reference_mismatch_details": _reference_mismatch_details(
                     extraction, claim.passage_start, claim.passage_end),
                 "paper_location": _paper_location(
                     paper_surface,
@@ -422,6 +450,8 @@ def build_evidence_report_view(
                 "missing_reference_members": missing_members,
                 "reference_mismatch_members": _reference_mismatch_members(
                     extraction, marker["passage_start"], marker["passage_end"]),
+                "reference_mismatch_details": _reference_mismatch_details(
+                    extraction, marker["passage_start"], marker["passage_end"]),
                 "boundary_reason": (
                     "No reference-list entry was found for " + "; ".join(missing_members) + "."
                     if missing_members else
@@ -439,6 +469,13 @@ def build_evidence_report_view(
             item["claim_id"],
         )
     )
+    # A heading that names a work with its citation states nothing to check
+    # (owner request 2026-10-03): it is not a citation, but its reference
+    # still counts as cited.
+    heading_reference_ids = sorted({member.get("reference_id") for citation in citations
+                                    if heading_citation(citation)
+                                    for member in citation.get("members") or [] if member.get("reference_id")})
+    citations[:] = [citation for citation in citations if not heading_citation(citation)]
     for citation_number, citation in enumerate(citations, 1):
         citation["citation_number"] = citation_number
 
@@ -475,7 +512,8 @@ def build_evidence_report_view(
         assessment = assess_reference_credibility(reference, observation.get('reference_discovery'),
                                                    observation.get('reference_discovery_trace'))
         credibility[reference_id] = assessment
-        checked = assess_reference_verification(reference, observation.get('reference_discovery'))
+        checked = assess_reference_verification(reference, observation.get('reference_discovery'),
+                                                observation.get('web_page_check'))
         verification[reference_id] = {k: v for k, v in checked.items() if k != 'findings'}
         # "Cannot be verified" replaces the former fabrication review flag;
         # that assessment stays in the audit record but is not reported.
@@ -586,6 +624,10 @@ def build_evidence_report_view(
             # findings; a panel nobody opens is not a report.
             finding['rectangles'] = [item.model_dump(mode='json') for item in layout.rectangles]
             finding['localization_status'] = 'exact_rectangle'
+        else:
+            # No layout boxes (paper 7): the whole entry is found in the
+            # paper instead, both parts of a split one (2026-10-04).
+            finding['locate_value'] = reference.raw_ref
         reference_practice.append(finding)
     from app.services.required_reference_locator import required_doi_omissions
     from app.services.required_reference_author import required_author_omissions
@@ -685,14 +727,15 @@ def build_evidence_report_view(
         difference = same_title_author_difference(reference, discovery_by_reference.get(reference_id))
         if difference is None:
             continue
+        same_title_record = _candidate_record(discovery_by_reference.get(reference_id), difference.get("candidate_id"))
         reference_practice.append({
             "finding_type": "bibliographic_conflict",
             "reference_id": reference_id,
             "source": _reference_view(reference, reference_layout.get(reference_id)),
             "finding": ("The author in this reference differs from the located record. "
                         "Compare the work and edition actually used before changing the reference."),
-            "located_record": {"title": difference["located_title"],
-                               "authors": [difference["located_value"]]},
+            "located_record": same_title_record or {"title": difference["located_title"],
+                                                    "authors": [difference["located_value"]]},
             "conflicting_fields": ["author"],
             "field_difference": {k: difference[k] for k in
                                  ("field_name", "submitted_value", "located_value", "provider", "candidate_id")},
@@ -711,7 +754,7 @@ def build_evidence_report_view(
                 "source": _reference_view(reference, reference_layout.get(reference_id)),
                 # Owner-approved wording (2026-10-02).
                 "finding": "The located record does not name the journal in this reference.",
-                "located_record": {"title": difference["located_title"], "authors": [difference["located_value"]]},
+                "located_record": same_title_record or {"title": difference["located_title"], "authors": [difference["located_value"]]},
                 "conflicting_fields": [],
                 "field_difference": {"field_name": "container_title", "submitted_value": reference.container_title,
                                      "located_value": "", "record_lacks_field": True, "provider": difference["provider"],
@@ -728,7 +771,7 @@ def build_evidence_report_view(
                 "source": _reference_view(reference, reference_layout.get(reference_id)),
                 "finding": ("The publisher in this reference differs from the located record. "
                             "Compare the work and edition actually used before changing the reference."),
-                "located_record": {"title": difference["located_title"], "authors": [difference["located_value"]]},
+                "located_record": same_title_record or {"title": difference["located_title"], "authors": [difference["located_value"]]},
                 "conflicting_fields": ["publisher"],
                 "field_difference": {**publisher, "provider": difference["provider"],
                                      "candidate_id": difference["candidate_id"]},
@@ -838,6 +881,7 @@ def build_evidence_report_view(
             "references": extraction.reference_word_count,
         },
         "paper_surface": paper_surface,
+        "heading_reference_ids": heading_reference_ids,
         "overview": overview,
         "summary": summary,
         "gauges": gauges,
@@ -1291,6 +1335,11 @@ def _build_report_summary(
                                           '{count} references give details that differ from the records for the sources.')),
         ('reference_title_style', ('{count} reference title uses incorrect title formatting.',
                                    '{count} reference titles use incorrect title formatting.')),
+        # From the owner's window wording (2026-10-04).
+        ('reference_split_entry', ('{count} reference is split into two entries in the reference list.',
+                                   '{count} references are split into two entries in the reference list.')),
+        ('reference_publication_missing', ('{count} reference does not name a journal or publisher.',
+                                           '{count} references do not name a journal or publisher.')),
         ('body_title_style', ('{count} film or book title lacks required italics in the paper.',
                               '{count} film or book titles lack required italics in the paper.')),
         ('reference_order', ('{count} reference is not in alphabetical order.',
@@ -1369,17 +1418,14 @@ def _build_report_summary(
     mismatched = [(index, citation.get("reference_mismatch_members"))
                   for index, citation in enumerate(citations, 1) if citation.get("reference_mismatch_members")]
     if mismatched:
-        # Owner wording 2026-10-01.
-        first_mismatch: dict[str, int] = {}
-        for index, items in mismatched:
-            for item in items:
-                first_mismatch.setdefault(item, index)
-        items = sorted(first_mismatch, key=lambda n: (first_mismatch[n], n))
-        lead = (f"{len(items)} in-text citation differs from its reference-list entry" if len(items) == 1
-                else f"{len(items)} in-text citations differ from their reference-list entries")
-        instances = [{"type": "named", "label": item, "target": f"citation-panel-{first_mismatch[item]}"} for item in items]
-        add('academic_practice', 'citation_reference_mismatch', f"{lead} ({'; '.join(items)}).",
-            lead=lead, rest='.', instances=instances, count=len(items))
+        # Owner wording 2026-10-01; citation numbers only, the differences
+        # are in each citation's window (owner request 2026-10-03).
+        instances = cite(index for index, _ in mismatched)
+        n = len(instances)
+        lead = (f"{n} in-text citation differs from its reference-list entry" if n == 1
+                else f"{n} in-text citations differ from their reference-list entries")
+        add('academic_practice', 'citation_reference_mismatch', f"{lead} ({_instance_list(instances)}).",
+            lead=lead, rest='.', instances=instances, count=n)
     if indirect_citations:
         lead = (f"{indirect_citations} {'citation currently relies' if indirect_citations == 1 else 'citations currently rely'} "
                 "on passages where the cited source represents another work")
@@ -1823,7 +1869,7 @@ def _render_report_summary(summary: dict, *, placed_citations: frozenset = froze
 
 HOW_TO_READ_TITLE = 'How to Read This Report'
 # Patchwriting passages: the Academic Practice yellow; light-blue hover and
-# selection like citations, drawn over the yellow; no outline. In the window,
+# selection like citations, drawn over the yellow; outside a citation, a blue outline when selected (2026-10-03). In the window,
 # the student's and the source's words carry no background (owner request 2026-09-29).
 PASSAGE_CSS = (
     # The Reference heading colour, in Reference windows and after "Citation N".
@@ -1836,7 +1882,17 @@ PASSAGE_CSS = (
     '.patchwriting-overlay:focus .patchwriting-selection{fill:#b9dcff;fill-opacity:.22}'
     'body.hide-reference-practice .patchwriting-overlay,body.layout-judgment .patchwriting-overlay{display:none}'
     '.patchwriting-finding+.patchwriting-finding{margin-top:.75rem}'
-    '.patchwriting-student,.patchwriting-source{margin:.3rem 0}.passage-source-label{margin:.5rem 0 0}'
+    'mark.record-difference{background:#dbeafe;outline:1px solid var(--blue);border-radius:2px;padding:0 1px}'
+    '.patchwriting-student,.patchwriting-source{margin:.3rem 0 .3rem 1.2rem}.passage-source-label{margin:.5rem 0 0}'
+    # A selected window's flagged text outside a citation, and its formatting
+    # flags, take the selected citation's blue outline (owner request 2026-10-03),
+    # as does a selected citation to a reference that cannot be verified.
+    '.patchwriting-overlay.selected:not([data-panel-template^="citation-panel-"]) .patchwriting-selection,'
+    '.reference-practice-overlay.selected rect.reference-formatting-hit:not(.unverified-highlight):not(.reference-difference-highlight),'
+    '.citation-overlay.citation-format-target.selected .citation-format-mark,'
+    '.citation-overlay.member-target.selected .source-highlight.unverified-highlight,'
+    '.citation-overlay.member-target.selected .source-highlight.academic-highlight'
+    '{stroke:var(--blue);stroke-width:1;stroke-dasharray:none;vector-effect:non-scaling-stroke}'
 )
 HOW_TO_READ_CSS = (
     '.how-to-read-dialog{max-width:44rem;width:calc(100% - 2rem);border:1px solid var(--line);border-radius:8px;'
@@ -2194,6 +2250,7 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
             template = template.replace('</template>',links+'</template>')
         panel_templates += template
     panel_templates = _citation_reference_headings(panel_templates, citations, numbers)
+    panel_templates += _passage_window_templates(passages, citations, numbers)
     paper_key = _paper_key(view.get('paper_surface') or {})
     for entry in catalog:
         panel_templates += _render_reference_window_template(
@@ -2323,9 +2380,9 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
     rendered = rendered.replace('</style>', '.issue-heading{font-weight:700;text-decoration:none;padding:.1em .2em;box-decoration-break:clone;color:inherit}.issue-heading.formatting{text-decoration-color:#d95f02;background:rgba(255,154,56,.3)}.issue-heading.academic{text-decoration-color:#b99b00;background:rgba(255,228,92,.4)}.submitted-link-marker{fill:#7651a8;stroke:white;stroke-width:1;pointer-events:all}.submitted-link-key{width:.7rem;height:.7rem;transform:rotate(45deg);background:#7651a8}.paper-reference-link rect{fill:transparent;pointer-events:all}</style>', 1)
     rendered = rendered.replace('<h2>Submitted Paper</h2>', '')
     rendered = rendered.replace('<span>Light-grey underline:', '<span data-key="reference"><i class="submitted-link-key"></i>purple diamond: link issue</span><span>Light-grey underline:')
-    rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.unverified-highlight,.reference-practice-overlay .reference-formatting-hit.unverified-highlight{fill:#f28b82;fill-opacity:.42;stroke:none}.reference-practice-overlay .reference-formatting-hit.reference-difference-highlight{fill:transparent;stroke:#0a7cff;stroke-width:1.8;stroke-dasharray:none;pointer-events:all}.issue-heading.unverified{text-decoration-color:#c5221f;background:rgba(242,139,130,.42)}.issue-heading.evidence{text-decoration-color:#2f62a8}.unverified-key,.difference-key{display:inline-block;width:1.3rem;height:.75rem}.unverified-key{background:#f28b826b}.difference-key{border:2px solid #0a7cff}.reference-finding .finding-item+.finding-item{margin-top:.6rem;padding-top:.6rem;border-top:1px solid #e4e7ec}</style>', 1)
+    rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.unverified-highlight,.reference-practice-overlay .reference-formatting-hit.unverified-highlight{fill:#f28b82;fill-opacity:.42;stroke:none}.reference-practice-overlay .reference-formatting-hit.reference-difference-highlight{fill:transparent;stroke:#0a7cff;stroke-width:1.8;stroke-dasharray:none;pointer-events:all}.issue-heading.unverified{text-decoration-color:#c5221f;background:rgba(242,139,130,.42)}.issue-heading.evidence{text-decoration-color:#2f62a8}.unverified-key,.difference-key{display:inline-block;width:1.3rem;height:.75rem}.unverified-key{background:#f28b826b}.difference-key{border:2px solid #0a7cff}.reference-finding .finding-item+.finding-item{margin-top:.6rem}</style>', 1)
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}.submitted-link-hit{fill:transparent;pointer-events:all}.submitted-link-key{width:.85rem;height:.85rem;transform:rotate(45deg);background:#7651a8}.focus-relevance .topical-reference-hit{display:block}</style>', 1)
-    rendered = rendered.replace('</style>', '/* One connected workspace: a single control bar over the paper and the evidence window. */.workspace-bar{grid-column:1/-1;grid-row:1;display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.3rem .6rem;background:#fff;border-bottom:1px solid var(--line);min-width:0}.workspace-bar .toolbar{position:static;margin:0;padding:0;background:transparent;border:0;box-shadow:none;height:auto;flex-wrap:nowrap;overflow-x:auto;gap:.25rem;min-width:0}.evidence-controls{margin-left:auto}.evidence-controls>*{flex:none;white-space:nowrap}.evidence-controls .group{display:inline-flex;gap:.3rem}.toolbar button,.toolbar label{padding:.35rem .45rem}.toolbar button:disabled{opacity:.45;cursor:default}.layout>.paper{grid-row:2;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0;border:0;border-radius:0;background:transparent}.layout .paper-viewport{flex:1;min-height:0;overflow:auto;padding:.75rem}/* Skipped content-visibility pages report their last-rendered width; a flexible track stops it holding the column open. */.paper-pages{grid-template-columns:minmax(0,1fr)}.paper>.report-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}.side-pane{grid-row:2;min-height:0;min-width:0;display:grid;grid-template-columns:.75rem minmax(0,1fr);background:#fff;border-left:1px solid var(--line);transition:transform .22s ease}.side-pane .splitter{height:auto;position:static;background:var(--page)}.side-pane .evidence-column{min-height:0;min-width:0;display:flex;flex-direction:column}.side-pane .panel{flex:1;min-height:0;max-height:none;position:static;margin:0;border:0;border-radius:0}.layout.panel-sliding .side-pane{transform:translateX(100%)}.layout.panel-collapsed{grid-template-columns:minmax(0,1fr)}.layout.panel-collapsed .side-pane{display:none}@media(prefers-reduced-motion:reduce){.side-pane{transition:none}}.page-container{content-visibility:auto}.text-selection-off .page-container,.text-selection-off .page-container *{user-select:none!important;-webkit-user-select:none!important}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:auto auto auto;height:auto;overflow:visible}.workspace-bar{flex-wrap:wrap}.layout>.paper{grid-row:auto}.layout .paper-viewport{max-height:calc(100dvh - 3rem)}.side-pane{grid-row:auto;grid-template-columns:1fr;border-left:0;border-top:1px solid var(--line)}.side-pane .splitter{display:none}.side-pane .panel{max-height:none}}@media print{.workspace-bar,.side-pane{display:none}.layout{display:block;height:auto;overflow:visible;border:0;margin:0}.layout .paper-viewport{max-height:none;overflow:visible;padding:0}.page-container{content-visibility:visible}}/* Margin numbers and whole-entry reference targets. */.paper-badge{cursor:pointer}.paper-badge .badge-bg{fill:#fff;stroke:#7b8794;stroke-width:.6;vector-effect:non-scaling-stroke}.paper-badge .badge-number{font:600 7px system-ui,-apple-system,sans-serif;fill:#34404c;pointer-events:none}.paper-badge:hover .badge-bg,.paper-badge.selected .badge-bg{fill:#dcecff;stroke:var(--blue)}body.layout-paper .paper-badge{display:none}.style-guidance-links{margin-top:.8rem;padding-top:.5rem;border-top:1px solid #e4e7ec;font-size:.85rem;color:var(--muted)}body.layout-judgment .citation-overlay,body.layout-judgment .reference-practice-overlay,body.layout-judgment .reference-entry-overlay,body.layout-judgment .paper-badge{display:none}@media print{.paper-badge{display:none}}.reference-entry-overlay{cursor:pointer}.reference-entry-hit{fill:transparent;stroke:none;pointer-events:all}.reference-entry-overlay:hover .reference-entry-hit{fill:#b9dcff;fill-opacity:.12}.reference-entry-overlay.selected .reference-entry-hit{fill:#b9dcff;fill-opacity:.22}.reference-entry-overlay:focus{outline:none}.reference-entry-overlay:focus .reference-entry-hit{stroke:var(--blue);stroke-width:1;vector-effect:non-scaling-stroke}.badge-key{display:inline-flex;align-items:center;justify-content:center;min-width:1.05rem;height:.85rem;padding:0 .2rem;border:1px solid #7b8794;background:#fff;font-size:.62rem;font-style:normal;font-weight:600;color:#34404c}.citation-badge-key{border-radius:.45rem}.reference-badge-key{border-radius:2px}/* Linked summary instances and the Reference window. */.summary-instance{color:var(--blue)}.reference-availability{font-size:.95rem;margin:.6rem 0 .3rem}.reference-citations button{border:1px solid var(--line);background:#fff;border-radius:4px;padding:.1rem .45rem;margin:.1rem .15rem;font:inherit;font-size:.86rem;cursor:pointer}.reference-finding{border-top:1px solid var(--line);margin-top:.75rem;padding-top:.25rem}' + '</style>', 1)
+    rendered = rendered.replace('</style>', '/* One connected workspace: a single control bar over the paper and the evidence window. */.workspace-bar{grid-column:1/-1;grid-row:1;display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.3rem .6rem;background:#fff;border-bottom:1px solid var(--line);min-width:0}.workspace-bar .toolbar{position:static;margin:0;padding:0;background:transparent;border:0;box-shadow:none;height:auto;flex-wrap:nowrap;overflow-x:auto;gap:.25rem;min-width:0}.evidence-controls{margin-left:auto}.evidence-controls>*{flex:none;white-space:nowrap}.evidence-controls .group{display:inline-flex;gap:.3rem}.toolbar button,.toolbar label{padding:.35rem .45rem}.toolbar button:disabled{opacity:.45;cursor:default}.layout>.paper{grid-row:2;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0;border:0;border-radius:0;background:transparent}.layout .paper-viewport{flex:1;min-height:0;overflow:auto;padding:.75rem}/* Skipped content-visibility pages report their last-rendered width; a flexible track stops it holding the column open. */.paper-pages{grid-template-columns:minmax(0,1fr)}.paper>.report-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}.side-pane{grid-row:2;min-height:0;min-width:0;display:grid;grid-template-columns:.75rem minmax(0,1fr);background:#fff;border-left:1px solid var(--line);transition:transform .22s ease}.side-pane .splitter{height:auto;position:static;background:var(--page)}.side-pane .evidence-column{min-height:0;min-width:0;display:flex;flex-direction:column}.side-pane .panel{flex:1;min-height:0;max-height:none;position:static;margin:0;border:0;border-radius:0}.layout.panel-sliding .side-pane{transform:translateX(100%)}.layout.panel-collapsed{grid-template-columns:minmax(0,1fr)}.layout.panel-collapsed .side-pane{display:none}@media(prefers-reduced-motion:reduce){.side-pane{transition:none}}.page-container{content-visibility:auto}.text-selection-off .page-container,.text-selection-off .page-container *{user-select:none!important;-webkit-user-select:none!important}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:auto auto auto;height:auto;overflow:visible}.workspace-bar{flex-wrap:wrap}.layout>.paper{grid-row:auto}.layout .paper-viewport{max-height:calc(100dvh - 3rem)}.side-pane{grid-row:auto;grid-template-columns:1fr;border-left:0;border-top:1px solid var(--line)}.side-pane .splitter{display:none}.side-pane .panel{max-height:none}}@media print{.workspace-bar,.side-pane{display:none}.layout{display:block;height:auto;overflow:visible;border:0;margin:0}.layout .paper-viewport{max-height:none;overflow:visible;padding:0}.page-container{content-visibility:visible}}/* Margin numbers and whole-entry reference targets. */.paper-badge{cursor:pointer}.paper-badge .badge-bg{fill:#fff;stroke:#7b8794;stroke-width:.6;vector-effect:non-scaling-stroke}.paper-badge .badge-number{font:600 7px system-ui,-apple-system,sans-serif;fill:#34404c;pointer-events:none}.paper-badge:hover .badge-bg,.paper-badge.selected .badge-bg{fill:#dcecff;stroke:var(--blue)}body.layout-paper .paper-badge{display:none}.style-guidance-links{margin-top:.8rem;font-size:.85rem;color:var(--muted)}.finding-list{margin:.3rem 0 0;padding-left:1.2rem}.finding-list>li{margin:.25rem 0}.finding-list>li>p{margin:0}body.layout-judgment .citation-overlay,body.layout-judgment .reference-practice-overlay,body.layout-judgment .reference-entry-overlay,body.layout-judgment .paper-badge{display:none}@media print{.paper-badge{display:none}}.reference-entry-overlay{cursor:pointer}.reference-entry-hit{fill:transparent;stroke:none;pointer-events:all}.reference-entry-overlay:hover .reference-entry-hit{fill:#b9dcff;fill-opacity:.12}.reference-entry-overlay.selected .reference-entry-hit{fill:#b9dcff;fill-opacity:.22}.reference-entry-overlay:focus{outline:none}.reference-entry-overlay:focus .reference-entry-hit{stroke:var(--blue);stroke-width:1;vector-effect:non-scaling-stroke}.badge-key{display:inline-flex;align-items:center;justify-content:center;min-width:1.05rem;height:.85rem;padding:0 .2rem;border:1px solid #7b8794;background:#fff;font-size:.62rem;font-style:normal;font-weight:600;color:#34404c}.citation-badge-key{border-radius:.45rem}.reference-badge-key{border-radius:2px}/* Linked summary instances and the Reference window. */.summary-instance{color:var(--blue)}.reference-availability{font-size:.95rem;margin:.6rem 0 .3rem}.reference-citations button{border:1px solid var(--line);background:#fff;border-radius:4px;padding:.1rem .45rem;margin:.1rem .15rem;font:inherit;font-size:.86rem;cursor:pointer}.reference-finding{border-top:1px solid var(--line);margin-top:.75rem;padding-top:.25rem}' + '</style>', 1)
     return _bind_inline_styles(rendered, nonce)
 
 
@@ -2500,6 +2557,9 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
                             characters.append(folded)
                             geometry.append((page.number, block_index, line_index, char["bbox"]))
     surface = "".join(characters)
+    # The last reference-list heading in the paper ("References", "Bibliography",
+    # "Works Cited"), or -1.
+    reference_list_start = max(surface.rfind(word) for word in ("references", "referencelist", "bibliography", "workscited"))
     for finding in findings:
         finding["rectangles"] = []
         finding["localization_status"] = "exact_field_not_located"
@@ -2507,7 +2567,7 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
                else str((finding.get("source") or {}).get("raw_reference") or ""))
         entry, _ = _field_characters(raw)
         difference = finding["field_difference"]
-        field, _ = _field_characters(difference.get("submitted_value") or "")
+        field, _ = _field_characters(finding.get("locate_value") or difference.get("submitted_value") or "")
         if finding.get('finding_type') == 'required_quotation_locator_missing':
             # Mark the retained citation marker, never the borrowed passage.
             marker = str(finding.get('citation_marker') or '')
@@ -2544,11 +2604,33 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
             peer_ids = [p.get('reference_id') for p in peers]
             if len(entry_matches) == len(peer_ids) == len(set(peer_ids)) and finding.get('reference_id') in peer_ids:
                 entry_matches = [entry_matches[peer_ids.index(finding['reference_id'])]]
-        if len(entry_matches) != 1 or len(field_matches) != 1:
+        if len(entry_matches) > 1 and finding.get('finding_type') not in {'required_quotation_locator_missing', 'body_title_style'}:
+            # A paper that heads each discussion with its reference repeats the
+            # entry in the body (paper 7, 2026-10-04): the reference list's own
+            # copy, after its heading, is the entry.
+            listed = [m for m in entry_matches if m >= reference_list_start]
+            if reference_list_start >= 0 and len(listed) == 1:
+                entry_matches = listed
+        span_geometry = None
+        parts = (finding.get("source") or {}).get("split_parts") or []
+        if len(entry_matches) != 1 and len(parts) == 2 and len(field_matches) == 1:
+            # A reference the list splits in two: its two entries, each found
+            # once, read in order as the one entry (split-entry-v1, 2026-10-04).
+            located = []
+            for part in parts:
+                folded, _ = _field_characters(part)
+                hits = [m.start() for m in re.finditer(f"(?={re.escape(folded)})", surface)] if len(folded) >= 12 else []
+                located.append((hits, len(folded)))
+            if all(len(hits) == 1 for hits, _ in located):
+                joined = [g for hits, size in located for g in geometry[hits[0]:hits[0] + size]]
+                if len(joined) == len(entry):
+                    span_geometry = joined[field_matches[0]:field_matches[0] + len(field)]
+        if span_geometry is None and (len(entry_matches) != 1 or len(field_matches) != 1):
             continue
-        start = entry_matches[0] + field_matches[0]
+        start = entry_matches[0] + field_matches[0] if span_geometry is None else 0
         boxes = {}
-        for page_index, block_index, line_index, bbox in geometry[start:start + len(field)]:
+        for page_index, block_index, line_index, bbox in (span_geometry if span_geometry is not None
+                                                         else geometry[start:start + len(field)]):
             key = (page_index, block_index, line_index)
             box = fitz.Rect(bbox)
             boxes[key] = boxes[key] | box if key in boxes else box
@@ -2630,6 +2712,14 @@ def normalize_reference_findings(findings: list[dict]) -> list[dict]:
     wrong_doi = identifier | {f.get('reference_id') for f in rows
                               if f.get('finding_type') == 'doi_registers_a_different_title'}
     unverified = {f.get('reference_id') for f in rows if f.get('finding_type') in UNVERIFIED_FINDINGS}
+    from app.services.source_resolver import interstitial_page_title
+    # A "conflict" with a bot-check or script-shell page title is no conflict
+    # (stored reports included; 2026-10-02).
+    rows = [f for f in rows if not (
+        f.get('finding_type') == 'submitted_link_issue' and f.get('link_outcome') == 'destination_conflict'
+        and any(interstitial_page_title(str(d.get('destination') or ''))
+                for o in f.get('submitted_link_observations') or [] for q in o.get('requests') or []
+                for d in q.get('identity_differences') or []))]
     return [f for f in rows
             if not (f.get('finding_type') == 'doi_registers_a_different_title' and f.get('reference_id') in identifier)
             and not (f.get('finding_type') in REFERENCE_DIFFERENCE_FINDINGS and f.get('reference_id') in unverified)
@@ -2815,9 +2905,11 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     words = (result.get('paper_surface') or {}).get('selectable_words')
     paper_key = (_paper_key(result['paper_surface']) if words
                  else _fold_for_titles(' '.join(page.get_text() for page in document)))
+    headed = set(result.get('heading_reference_ids') or [])
     result['uncited_reference_ids'] = [
         entry['reference_id'] for entry in reference_catalog(result, result['reference_numbers'])
-        if not entry.get('citation_numbers') and not _media_named_in_paper(entry.get('source') or {}, paper_key)]
+        if not entry.get('citation_numbers') and entry['reference_id'] not in headed
+        and not _media_named_in_paper(entry.get('source') or {}, paper_key)]
     result.pop('role_summaries', None)   # the former per-audience summaries
     summary = result['summary'] = _build_report_summary(
         citations=result.get('citations') or [], overview=result.get('overview') or {},
@@ -2959,6 +3051,24 @@ _MISMATCH_PHRASES = {
 def _reference_mismatch_members(extraction, start: int, end: int) -> list[str]:
     """In-text citations a tolerant rule linked, with how each differs from its
     reference (citation-reference-tolerance-v1, owner decision 2026-10-01)."""
+    return [f"{row['label']}: {row['difference']}" for row in _reference_mismatch_details(extraction, start, end)]
+
+
+def _narrative_label(marker) -> str:
+    """"Smith (2016)" for a narrative marker: the name words before its year."""
+    text = str(getattr(marker, 'text', '') or '').strip()
+    context = str(getattr(marker, 'report_text', '') or '')
+    at = context.find(text) if text else -1
+    if at > 0 and text.startswith('('):
+        name = re.search(r"((?:[\w’'-]+\s+(?:and|&)\s+)?[\w’'-]+(?:\s+et\s+al\.?)?)\s*$", context[:at])
+        if name:
+            return f"{name.group(1)} {text}"
+    return text.strip('() ')
+
+
+def _reference_mismatch_details(extraction, start: int, end: int) -> list[dict]:
+    """Each differing in-text citation: its wording, how its reference differs,
+    and the references it was linked to (window lines, 2026-10-03)."""
     def phrase(items):
         parts = []
         for item in items:
@@ -2968,16 +3078,26 @@ def _reference_mismatch_members(extraction, start: int, end: int) -> list[str]:
             elif kind in _MISMATCH_PHRASES:
                 parts.append(_MISMATCH_PHRASES[kind].format(value))
         return ", ".join(parts)
-    found = []
+    found: dict[tuple, dict] = {}
     for citation in extraction.citations:
         if (getattr(citation, "link_differences", None) and citation.passage_start < end
                 and start < citation.passage_end):
-            found.append(f"{str(citation.marker_member or citation.citation_marker).strip()}: "
-                         f"{phrase(citation.link_differences)}")
+            row = {"label": str(citation.marker_member or citation.citation_marker).strip(),
+                   "difference": phrase(citation.link_differences),
+                   "differences": list(citation.link_differences),
+                   "reference_ids": list(citation.candidate_reference_ids or [])}
+            found.setdefault((row["label"], row["difference"]), row)
     for marker in getattr(extraction, "citation_marker_census", []) or []:
         if getattr(marker, "link_differences", None) and start <= marker.passage_start < end:
-            found.append(f"{str(marker.text or '').strip('() ')}: {phrase(marker.link_differences)}")
-    return list(dict.fromkeys(found))
+            # A year-only marker ("(2016)") follows the author's name in the sentence.
+            year_only = re.match(r'\(\s*(?:\d{4}|n\.d\.)', str(marker.text or '').strip())
+            row = {"label": _narrative_label(marker) if marker.marker_type == "narrative" or year_only
+                   else str(marker.text or '').strip('() '),
+                   "difference": phrase(marker.link_differences),
+                   "differences": list(marker.link_differences),
+                   "reference_ids": list(marker.reference_ids or marker.candidate_reference_ids or [])}
+            found.setdefault((row["label"], row["difference"]), row)
+    return list(found.values())
 
 
 def _missing_reference_members(extraction, start: int, end: int) -> list[str]:
@@ -3616,6 +3736,7 @@ def _reference_view(reference, reference_layout=None) -> dict:
         "url": getattr(reference, "url", ""),
         "source_kind": getattr(reference, "source_kind", "unknown"),
         "raw_reference": reference.raw_ref,
+        "split_parts": list(getattr(reference, "split_parts", None) or []),
         "text_style_spans": (
             [item.model_dump(mode="json") for item in reference_layout.text_style_spans]
             if reference_layout is not None
@@ -4651,6 +4772,10 @@ def _reference_identity_conflict_view(discovery: dict) -> dict:
             "year": str(observed.get("year") or ""),
             "doi": str(observed.get("doi") or ""),
             "container_title": str(observed.get("container_title") or ""),
+            "publisher": str(observed.get("publisher") or ""),
+            "volume": str(observed.get("volume") or ""),
+            "issue": str(observed.get("issue") or ""),
+            "pages": str(observed.get("pages") or ""),
             "page_url": str(candidate.get("page_url") or ""),
         },
         "conflicting_fields": [
@@ -4860,17 +4985,18 @@ def _render_continuous_paper(
             member_index = target['member_index']
             member = citation['members'][member_index]
             label = str((member.get('source') or {}).get('raw_reference') or 'Source')
-            from app.services.report_layers import member_marks
+            from app.services.report_layers import locator_attention, member_marks
             issue = member_marks(member, citation, target, (surface.get('selectable_words') or {}).get(target['page_index'], []))
+            academic = bool(member.get('secondary_citation')) or locator_attention(member)
             overlays_by_page.setdefault(target['page_index'], []).append(
                 f'<a href="#evidence-panel" class="citation-overlay member-target {target["tone"]}" '
                 f'role="button" tabindex="0" aria-pressed="false" '
                 f'aria-label="Citation {index}, source {member_index+1}: {escape(label, quote=True)}; {_tone_label(target["tone"])}" '
                 f'data-member-index="{member_index}" data-anchor-id="{escape(anchor_id, quote=True)}" '
                 f'data-panel-template="citation-panel-{index}">'
-                f'<rect class="source-highlight{" unverified-highlight" if member.get("unverified") else " academic-highlight" if member.get("secondary_citation") else ""}" '
+                f'<rect class="source-highlight{" unverified-highlight" if member.get("unverified") else " academic-highlight" if academic else ""}" '
                 + ('style="fill:#f28b82;fill-opacity:.42;stroke:none" ' if member.get('unverified') else
-                   'style="fill:#ffe45c;fill-opacity:.4;stroke:none" ' if member.get('secondary_citation') else '') +
+                   'style="fill:#ffe45c;fill-opacity:.4;stroke:none" ' if academic else '') +
                 f'x="{target["x0"]:.3f}" y="{target["y0"]:.3f}" '
                 f'width="{target["x1"]-target["x0"]:.3f}" height="{target["y1"]-target["y0"]:.3f}" rx="1" />{issue}</a>'
             )
@@ -4968,7 +5094,9 @@ def _render_continuous_paper(
             target = (f'data-panel-template="citation-panel-{window["citation"]}" '
                       f'data-member-index="{window["member_index"]}"')
         elif (numbers or {}).get(window['reference_id']):
-            target = f'data-panel-template="{reference_template_id(numbers[window["reference_id"]])}"'
+            # Words no citation covers open their own Academic Practice
+            # window, like a formatting highlight (owner request 2026-10-03).
+            target = f'data-panel-template="passage-panel-{number}"'
         else:
             continue
         by_page: dict[int, list[tuple[float, float, float, float]]] = {}
@@ -5272,7 +5400,8 @@ def _render_panel_template(citation: dict, index: int, *, patchwriting: dict | N
         f'data-source-member="{member_index}"'+ (' hidden' if member_index else '') + '>'
         f'<h3 class="member-label">{_member_label(item, citation)}</h3>'
         + _render_member({**item, 'upload_action':upload if _member_accepts_upload(item) else {},
-                          '_citation_text': str(citation.get('display_student_text') or citation.get('student_text') or '')},
+                          '_citation_text': str(citation.get('display_student_text') or citation.get('student_text') or ''),
+                          '_reference_mismatch': _mismatch_lines(citation, member_index)},
                          grouped=True,
                          patchwriting=(patchwriting or {}).get(('citation', index, member_index)))
         + '</section>' for member_index,item in enumerate(citation.get('members', [])))
@@ -5288,10 +5417,13 @@ def _render_panel_template(citation: dict, index: int, *, patchwriting: dict | N
     # The citation's own description already states why no source is shown
     # (owner decision 2026-09-30).
     practice = (
-        _category_heading('academic', 'p') +
-        f'<p class="practice-notice">{escape(_panel_statement(citation.get("boundary_reason") or ""))}</p>'
+        _category_heading('academic', 'p') + _academic_list(
+            [f'<li class="finding-item"><p class="practice-notice">{escape(_panel_statement(citation.get("boundary_reason") or ""))}</p></li>'])
         if citation.get("missing_reference_members") else ""
     )
+    if not citation.get('members') and _mismatch_lines(citation, 0):
+        practice += _category_heading('academic', 'p') + _academic_list(
+            [f'<li class="finding-item"><p class="check-line">{escape(line)}</p></li>' for line in _mismatch_lines(citation, 0)])
     heading = (f'<a href="#citation-location-{index}">Citation {index}</a>'
                if (citation.get('paper_location') or {}).get('rectangles') else f'Citation {index}')
     return (
@@ -5456,7 +5588,7 @@ def _source_version_label(value: str) -> str:
 
 _CATEGORY_LABELS = {'evidence': 'Evidence', 'formatting': 'Citation and Reference Formatting',
                     'academic': 'Academic Practice'}
-_CATEGORY_ORDER = ('evidence', 'formatting', 'academic')
+_CATEGORY_ORDER = ('evidence', 'academic', 'formatting')  # owner order 2026-10-03
 
 
 def _category_heading(category: str, tag: str = 'h2') -> str:
@@ -5488,6 +5620,68 @@ def _finding_body(finding: dict, index: int, *, combined: bool = False) -> str:
     return inner.replace('<h2', '<h3').replace('</h2>', '</h3>')
 
 
+RECORD_DIFFERENCE_TEXT = 'The information in this reference differs from the located record.'   # owner wording 2026-10-03
+
+
+def _located_record_text(record: dict) -> str:
+    """Author, year, title, journal or publisher, volume (issue), pages and DOI."""
+    authors = record.get('authors') or []
+    volume = str(record.get('volume') or '')
+    if volume and record.get('issue'):
+        volume += f"({record['issue']})"
+    venue = ', '.join(v for v in (str(record.get('container_title') or ''), volume, str(record.get('pages') or '')) if v)
+    parts = [', '.join(str(a) for a in authors) if isinstance(authors, list) else str(authors),
+             f"({record['year']})" if record.get('year') else '', str(record.get('title') or ''),
+             venue, str(record.get('publisher') or '') if record.get('publisher') != record.get('container_title') else '',
+             f"https://doi.org/{record['doi']}" if record.get('doi') else '']
+    return '. '.join(p.strip().rstrip('.') for p in parts if p and p.strip())
+
+
+def _candidate_record(discovery: dict | None, candidate_id) -> dict:
+    """Every observed field of one search record, for the Located Record."""
+    candidate = next((c for c in (discovery or {}).get("candidates") or []
+                      if candidate_id and c.get("candidate_id") == candidate_id), None)
+    if candidate is None:
+        return {}
+    # A book record can keep its publisher with the edition details (Google Books).
+    observed = {"publisher": (candidate.get("edition_metadata") or {}).get("publisher")} | {
+        k: v for k, v in (candidate.get("observed") or {}).items() if v}
+    return {key: (list(observed.get(key) or []) if key == "authors" else str(observed.get(key) or ""))
+            for key in ("title", "authors", "year", "container_title", "publisher", "volume", "issue", "pages", "doi")} | {
+            "page_url": str(candidate.get("page_url") or "")}
+
+
+def _record_difference_block(group: list[tuple[dict, int]]) -> str:
+    source = next((f.get('source') for f, _ in group if f.get('source')), {}) or {}
+    raw = str(source.get('raw_reference') or '')
+    reference_html = _render_formatted_reference(source, raw) if raw else ''
+    for finding, _ in group:
+        value = str((finding.get('field_difference') or {}).get('submitted_value') or '').strip()
+        if len(value) >= 2:
+            escaped = escape(value)
+            if escaped in reference_html and f'<mark class="record-difference">{escaped}' not in reference_html:
+                reference_html = reference_html.replace(escaped, f'<mark class="record-difference">{escaped}</mark>', 1)
+    located: dict = {}
+    for finding, _ in group:
+        for key, value in (finding.get('located_record') or {}).items():
+            if value and not located.get(key):
+                located[key] = value
+    located_text = _located_record_text(located)
+    page_url = str(located.get('page_url') or '')
+    indexes = ' '.join(str(i) for _, i in group)
+    return (f'<div class="finding-item record-difference-block" data-finding-index="{indexes.split()[0]}">'
+            f'<p>{escape(RECORD_DIFFERENCE_TEXT)}</p>'
+            + (f'<p class="full-reference own-reference">{reference_html}</p>' if reference_html else '')
+            + '<h3>Located Record</h3>'
+            f'<p class="full-reference">{escape(located_text or "No displayable located-record fields were retained.")}'
+            + (f' <a class="reference-url" href="{escape(page_url, quote=True)}" target="_blank" '
+               f'rel="noopener noreferrer">{escape(page_url)}</a>' if _safe_reference_href(page_url) else '')
+            + '</p></div>')
+
+
+_LISTED_CATEGORIES = ('formatting', 'academic')
+
+
 def _grouped_findings(items: list[tuple[dict, int]], *, combined: bool = False, tag: str = 'h3',
                       citation_format: str = '', guidance: bool = True, extra: dict | None = None) -> str:
     """Findings under one heading per category: Evidence, formatting, Academic Practice.
@@ -5497,18 +5691,38 @@ def _grouped_findings(items: list[tuple[dict, int]], *, combined: bool = False, 
     from app.services.report_style_guidance import guidance_links
     by_category: dict[str, list[str]] = {}
     kinds: dict[str, list[str]] = {}
+    # Located-record differences for one reference are one block under
+    # Academic Practice (owner request 2026-10-03): the owner's sentence, the
+    # reference with the differing details marked, then the located record.
+    differences: dict[str, list[tuple[dict, int]]] = {}
+    for finding, index in items:
+        if finding.get('finding_type') in REFERENCE_DIFFERENCE_FINDINGS:
+            differences.setdefault(str(finding.get('reference_id')), []).append((finding, index))
+    for group in differences.values():
+        by_category.setdefault('academic', []).append(
+            f'<li class="finding-item">{_record_difference_block(group)}</li>')
+        kinds.setdefault('academic', [])
+    items = [(f, i) for f, i in items if f.get('finding_type') not in REFERENCE_DIFFERENCE_FINDINGS]
     for finding, index in items:
         body = _finding_body(finding, index, combined=combined)
         category = finding_category(finding.get('finding_type'))
+        # Formatting and Academic Practice issues are bulleted lists (owner requests 2026-10-03).
+        tag_name = 'li' if category in _LISTED_CATEGORIES else 'div'
         by_category.setdefault(category, []).append(
-            f'<div class="finding-item" data-finding-index="{index}">{body}</div>')
+            f'<{tag_name} class="finding-item" data-finding-index="{index}">{body}</{tag_name}>')
         kinds.setdefault(category, []).append(finding.get('finding_type'))
     for category, html in (extra or {}).items():
-        by_category.setdefault(category, []).append(html)
+        # Academic Practice extras arrive as list items already.
+        by_category.setdefault(category, []).append(
+            f'<li class="finding-item">{html}</li>' if category == 'formatting' else html)
         kinds.setdefault(category, [])
+
+    def body(category):
+        parts = ''.join(by_category[category])
+        return f'<ul class="finding-list">{parts}</ul>' if category in _LISTED_CATEGORIES else parts
     return ''.join(
         f'<section class="reference-finding" data-category="{category}">'
-        + _category_heading(category, tag) + ''.join(by_category[category])
+        + _category_heading(category, tag) + body(category)
         + (guidance_links(kinds[category], citation_format) if guidance else '') + '</section>'
         for category in _CATEGORY_ORDER if category in by_category)
 
@@ -5684,6 +5898,30 @@ def _paper_key(surface: dict) -> str:
     return _fold_for_titles(' '.join(words))
 
 
+def _passage_window_templates(passages: list[dict], citations: list[dict], numbers: dict[str, int]) -> str:
+    """An Academic Practice window for each patchwriting passage that no
+    citation covers: the heading, its Reference link and the comparison."""
+    from app.services.patchwriting_report import passage_windows
+    from app.services.report_references import reference_template_id
+    templates = []
+    for passage in passages or []:
+        windows = passage_windows(passage, citations)
+        first = next(iter(windows), None)
+        if first is None or first['citation']:
+            continue
+        rows = [w for w in windows if not w['citation'] and (numbers or {}).get(w['reference_id'])]
+        if not rows:
+            continue
+        links = ', '.join(f'<button type="button" class="reference-heading-link" '
+                          f'data-go-to="{reference_template_id(numbers[w["reference_id"]])}">'
+                          f'Reference {numbers[w["reference_id"]]}</button>'
+                          for w in sorted(rows, key=lambda w: numbers[w['reference_id']]))
+        templates.append(f'<template id="passage-panel-{int(passage["number"])}"><h2>'
+                         '<strong class="issue-heading academic">Academic Practice</strong>'
+                         f' – {links}</h2><ul class="finding-list">{render_patchwriting([w["item"] for w in rows], as_items=True, show_reference=True)}</ul></template>')
+    return ''.join(templates)
+
+
 def _citation_reference_headings(templates: str, citations: list[dict], numbers: dict[str, int]) -> str:
     """"Citation N – Reference N" (owner request 2026-10-02): each linked
     reference opens its Reference window, in the reference-heading colour."""
@@ -5761,6 +5999,9 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
         availability = ('Media Reference - Cannot Assess' if _member_is_media(member)
                         else _member_coverage_heading(member))
         parts.append(f'<h3 class="reference-availability">{availability}</h3>')
+        # The retrieved text's button and a collapsed abstract, as in the
+        # citation windows (owner request 2026-10-03).
+        parts.append(_member_action_html(member) + _abstract_disclosure(member))
         if _submitted_link_refused(member):
             # Owner-approved wording (2026-10-02).
             parts.append('<p class="reference-access-note">The submitted link refused automated access, '
@@ -5778,7 +6019,7 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
         parts.append('<p class="muted">No in-text citation in this report is linked to this reference.</p>')
     grouped = _grouped_findings([(findings[j - 1], j) for j in entry.get('finding_indexes') or []],
                                 citation_format=citation_format,
-                                extra={'academic': render_patchwriting(patchwriting)} if patchwriting else None)
+                                extra={'academic': render_patchwriting(patchwriting, as_items=True)} if patchwriting else None)
     if member and 'issue-heading unverified' in _member_coverage_heading(member):
         # The heading already says "Cannot be verified"; the finding keeps
         # only its explanation (owner decision 2026-09-30).
@@ -5846,12 +6087,7 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
             + (f' data-reason="{escape(str(item["reason"]), quote=True)}"' if item.get("reason") else '') + '>'
             + (f'<span class="ev-page">p. {escape(str(item["page"]))}</span> ' if item.get("page") else "")
             + f'<q>{escape(item["text"])}</q></li>' for item in member["evidence_sentences"]) + '</ul></details>')
-    # An abstract-only source's evidence is its abstract.
-    abstract = next((item for item in _member_evidence_extracts(member)
-                     if item.get("evidence_kind") in {"abstract", None} and item.get("text")), None)
-    if abstract is not None and member.get("coverage_level") == "abstract_only":
-        evidence += ('<details class="abstract-disclosure"><summary>Abstract</summary>'
-                     f'<blockquote>{escape(str(abstract["text"]))}</blockquote></details>')
+    evidence += _abstract_disclosure(member)
     additional = ""
     more_context = ""  # Candidate reserves stay in the package, not the reader's window.
     check_items = []
@@ -5859,26 +6095,29 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
         check_items.append(("Quotation", member.get("quotation_check") or {}, False))
     if member.get("show_locator_check"):
         check_items.append(("Locator", member.get("locator_check") or {}, False))
-    checks = ""
-    if check_items:
-        rows = "".join(
-            f'<p class="check-line">{escape(_panel_statement(_check_sentence(label, check)))}</p>'
-            + (render_quotation_comparisons(check, str(member.get("_citation_text") or ""))
-               if label == "Quotation" else "")
-            for label, check, _identity_item in check_items
-        )
-        heading = _category_heading('academic','p') if any(check.get('attention') for _, check, _ in check_items) else ''
-        checks = heading + rows
+    # Checks that found nothing stay plain; each Academic Practice issue is a
+    # bullet under its heading (owner request 2026-10-03).
+    plain_rows, academic_items = "", []
+    for label, check, _identity_item in check_items:
+        row = (f'<p class="check-line">{escape(_panel_statement(_check_sentence(label, check)))}</p>'
+               + (render_quotation_comparisons(check, str(member.get("_citation_text") or ""))
+                  if label == "Quotation" else ""))
+        if check.get('attention'):
+            academic_items.append(f'<li class="finding-item">{row}</li>')
+        else:
+            plain_rows += row
+    academic_items += [f'<li class="finding-item"><p class="check-line">{escape(line)}</p></li>'
+                       for line in member.get("_reference_mismatch") or []]
     secondary = secondary_citation_line(member.get("secondary_citation"))
     if secondary:
-        checks += ('' if 'issue-heading academic' in checks else _category_heading('academic', 'p')) \
-            + f'<p class="check-line">{escape(secondary)}</p>'
+        academic_items.append(f'<li class="finding-item"><p class="check-line">{escape(secondary)}</p></li>')
     if patchwriting:
         # Patchwriting sits with the window's other Academic Practice issues.
-        checks += ('' if 'issue-heading academic' in checks else _category_heading('academic', 'p')) \
-            + render_patchwriting(patchwriting)
+        academic_items.append(render_patchwriting(patchwriting, as_items=True))
+    checks = plain_rows + (_category_heading('academic', 'p') + _academic_list(academic_items) if academic_items else '')
     if any(f.get("finding_type") == "duplicate_citation_key" for f in member.get("reference_findings") or []):
-        checks += _category_heading('formatting','p') + '<p class="check-line">Two or more references share this author and year.</p>'
+        checks += (_category_heading('formatting','p') + '<ul class="finding-list"><li class="finding-item">'
+                   '<p class="check-line">Two or more references share this author and year.</p></li></ul>')
     # Year findings belong to the bound reference-field layer. An unresolved
     # comparison against an arbitrary search candidate is not a reader finding.
     reference_html = _member_reference_html(source, source_label)
@@ -5929,13 +6168,29 @@ def _member_reference_html(source: dict, label: str) -> str:
     return reference_html
 
 
-def _member_action_html(member: dict, reference_html: str) -> str:
-    """The member's source button. A DOI or cited link is already in the
-    reference; only a route to retrieved text gets a button."""
+def _abstract_disclosure(member: dict) -> str:
+    """An abstract-only source's evidence is its abstract, collapsed under "Abstract"."""
+    abstract = next((item for item in _member_evidence_extracts(member)
+                     if item.get("evidence_kind") in {"abstract", None} and item.get("text")), None)
+    if abstract is None or member.get("coverage_level") != "abstract_only":
+        return ""
+    return ('<details class="abstract-disclosure"><summary>Abstract</summary>'
+            f'<blockquote>{escape(str(abstract["text"]))}</blockquote></details>')
+
+
+_RETRIEVED_TEXT_ACTIONS = frozenset({'verified_public_source_available', 'authenticated_source_view_available',
+                                     'public_candidate_available'})
+
+
+def _member_action_html(member: dict, reference_html: str = '') -> str:
+    """The member's source button, for retrieved text only: a DOI or cited link
+    that only lands on a record gets none. Retrieved text read from the cited
+    link itself gets its button too (owner request 2026-10-03)."""
     action = member.get("source_action") or {}
+    retrieved = action.get("status") in _RETRIEVED_TEXT_ACTIONS
     if (member.get("coverage_level") != "abstract_only" and action.get("enabled")
             and action.get("status") not in {"canonical_landing_available", "cited_https_route_available"}
-            and action.get("href") and escape(action["href"], quote=True) not in reference_html):
+            and action.get("href") and (retrieved or escape(action["href"], quote=True) not in reference_html)):
         return (
             f'<p class="actions"><a class="compact-action" href="{escape(action["href"], quote=True)}" '
             f'target="_blank" rel="noopener">{escape(action.get("label", "Open source"))}</a></p>'
@@ -6009,7 +6264,8 @@ def render_quotation_comparisons(check: dict, citation_text: str, *, portable: b
     return ''.join(parts)
 
 
-def render_patchwriting(items: list[dict], *, portable: bool = False) -> str:
+def render_patchwriting(items: list[dict], *, portable: bool = False, as_items: bool = False,
+                        show_reference: bool = False) -> str:
     """Per matched source: its approved line, then for each finding the student's
     words with the copied words in bold above the source clause they follow."""
     # The PDF engine does not draw <q> quotation marks.
@@ -6020,6 +6276,11 @@ def render_patchwriting(items: list[dict], *, portable: bool = False) -> str:
         if not line:
             continue
         parts = [f'<p class="check-line">{escape(line)}</p>']
+        source = item.get('source') or {}
+        if show_reference and source.get('raw_reference'):
+            # The matched work's entry, so a passage outside its citations is
+            # seen to come from another text (owner request 2026-10-04).
+            parts.insert(0, f'<p class="full-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>')
         for comparison in item.get('comparisons') or []:
             student = ''.join(f'<strong>{escape(g["text"])}</strong>' if g.get('copied') else escape(g['text'])
                               for g in comparison.get('student') or [] if g.get('text'))
@@ -6032,8 +6293,75 @@ def render_patchwriting(items: list[dict], *, portable: bool = False) -> str:
                           if segments else escape(str(excerpt.get("text") or "")))
                 parts.append(f'<p class="passage-source-label">{escape(passage_source_label(excerpt.get("page")))}</p>'
                              f'<p class="patchwriting-source">{open_q}{source}{close_q}</p>')
-        blocks.append(('<div>' if portable else '<div class="patchwriting-finding">') + ''.join(parts) + '</div>')
+        if as_items:
+            # One bullet per Academic Practice issue (owner request 2026-10-03).
+            blocks.append('<li class="finding-item patchwriting-finding">' + ''.join(parts) + '</li>')
+        else:
+            blocks.append(('<div>' if portable else '<div class="patchwriting-finding">') + ''.join(parts) + '</div>')
     return ''.join(blocks)
+
+
+def _academic_list(items: list[str]) -> str:
+    """Academic Practice issues as a bulleted list (owner request 2026-10-03)."""
+    return f'<ul class="finding-list">{"".join(items)}</ul>' if items else ''
+
+
+MISMATCH_LINE = 'Citation differs from its reference: {label} vs. {difference}'   # owner wording 2026-10-03
+
+# Stored phrases ("reference year n.d.") before the raw differences were kept.
+_PHRASE_KINDS = (('reference second author ', 'coauthor'), ('reference author ', 'author_spelling'),
+                 ('reference year ', 'year'), ('reference has no second author', 'coauthor'),
+                 ('reference has ', 'author_count'))
+
+
+def _reference_authors(member: dict) -> str:
+    """The reference's author surnames as a citation writes them."""
+    author = str((member.get('source') or {}).get('author') or '').strip()
+    # Name parts between commas, without the initials ("Bordwell, D" too).
+    names = [part.strip() for part in re.split(r',\s*', author.replace('&', ','))
+             if part.strip() and not re.fullmatch(r"(?:[A-Z]\.?\s*-?\s*)+", part.strip())]
+    if not names:
+        return author.rstrip('.')
+    return names[0] if len(names) == 1 else ' & '.join(names) if len(names) == 2 else f'{names[0]} et al.'
+
+
+def _reference_side(row: dict, member: dict) -> str:
+    """Only the reference's differing text: "n.d.", "Hartman, 2010" (owner request 2026-10-03)."""
+    differences = row.get('differences')
+    if differences is None:
+        differences = []
+        for part in str(row.get('difference') or '').split(', '):
+            for prefix, kind in _PHRASE_KINDS:
+                if part.startswith(prefix.rstrip()):
+                    value = part[len(prefix):] if prefix.endswith(' ') else 'none'
+                    differences.append(f'{kind}:{value}')
+                    break
+    author, year = '', ''
+    for item in differences:
+        kind, _, value = str(item).partition(':')
+        if kind == 'year':
+            year = value
+        elif kind == 'author_spelling' or (kind == 'coauthor' and value != 'none'):
+            author = author or value
+        elif kind in {'author_count', 'coauthor'}:
+            author = author or _reference_authors(member)
+    return ', '.join(part for part in (author, year) if part)
+
+
+def _mismatch_lines(citation: dict, member_index: int) -> list[str]:
+    """The window lines for one source of a citation whose wording differs from
+    its reference; a difference bound to no shown source goes to the first."""
+    members = citation.get('members') or []
+    details = citation.get('reference_mismatch_details')
+    if details is None:   # reports built before 2026-10-03
+        details = [dict(zip(('label', 'difference'), item.split(': ', 1)), reference_ids=[])
+                   for item in citation.get('reference_mismatch_members') or [] if ': ' in item]
+    shown = {m.get('reference_id') for m in members}
+    member = members[member_index] if member_index < len(members) else {}
+    member_id = member.get('reference_id')
+    return [MISMATCH_LINE.format(label=row['label'], difference=_reference_side(row, member)) for row in details
+            if member_id in (row.get('reference_ids') or [])
+            or (member_index == 0 and not shown & set(row.get('reference_ids') or []))]
 
 
 def _judgment_slot(member: dict) -> str:

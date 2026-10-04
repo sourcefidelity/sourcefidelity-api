@@ -65,10 +65,10 @@ def test_reference_window_shows_entry_links_citations_and_grouped_findings():
     assert [b['data-go-to'] for b in win.select('.reference-citations button')] == ['citation-panel-1']
     sections = win.select('section.reference-finding')
     assert len(sections) == 2                          # the body-title finding keeps its own window
-    # One heading per category; a submitted-link issue is Academic Practice.
+    # One heading per category, Academic Practice before formatting (owner order 2026-10-03).
     assert [s.select_one('.issue-heading').get_text() for s in sections] == [
-        'Citation and Reference Formatting', 'Academic Practice']
-    assert 'The submitted link returned a missing page.' in sections[1].get_text()
+        'Academic Practice', 'Citation and Reference Formatting']
+    assert 'The submitted link returned a missing page.' in sections[0].get_text()
     # The complete reference appears once; each finding drops its own copy.
     assert len(win.select('.full-reference')) == 1
     # Merged reference-list findings no longer have standalone windows.
@@ -139,3 +139,14 @@ def test_badge_placement_falls_back_to_right_margin_then_chip():
     assert chip['placement'] == 'chip' and chip['box'][3] <= 112
     assert badge_width(12) > badge_width(3)
     assert text_block_edges([], [(40, 0, 90, 10)]) == (40, 90) and text_block_edges([], []) is None
+
+
+def test_a_located_book_record_takes_its_publisher_from_the_edition_details():
+    from app.services.evidence_report import _candidate_record
+    discovery = {"candidates": [{"candidate_id": "c1", "edition_metadata": {"publisher": "Greenwood"},
+                                 "observed": {"title": "A Study", "authors": ["Mary River"], "year": "1994",
+                                              "publisher": ""}}]}
+    record = _candidate_record(discovery, "c1")
+    assert record["publisher"] == "Greenwood" and record["year"] == "1994" and record["authors"] == ["Mary River"]
+    discovery["candidates"][0]["observed"]["publisher"] = "Plains Press"
+    assert _candidate_record(discovery, "c1")["publisher"] == "Plains Press"

@@ -45,3 +45,13 @@ def test_a_semantic_scholar_link_is_read_from_its_registered_record(monkeypatch)
     calls.clear()
     resolver._record_registry_link_identity("https://www.example.test/paper/x", SimpleNamespace(content=b""), "A title")
     assert calls == []
+
+
+def test_a_bot_check_or_script_shell_page_title_is_never_a_conflict(monkeypatch):
+    calls = capture(monkeypatch)
+    resp = SimpleNamespace(content=b"<html></html>")
+    for shell in ("JavaScript is disabled", "Just a moment...", "Access Denied | Example Site Security Check"):
+        resolver._record_link_title_conflict("https://www.example.test/t", resp, "The Day the Earth Stood Still (1951)", [shell])
+    assert calls == []
+    assert resolver.interstitial_page_title("JavaScript is disabled")
+    assert not resolver.interstitial_page_title("Film, Television and Digital Games, Australia")

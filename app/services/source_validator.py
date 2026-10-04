@@ -634,6 +634,15 @@ def detect_nonprose_payload(text: str) -> str | None:
         return None
     if _FEED_OR_OBJECT_OPENING.match(sample):
         return "a feed or structured data payload"
+    # A repository's catalogue export is about the work, not the work: linked
+    # data (RDF N-Triples, Turtle), BibTeX or RIS (Cornea's "limited text" was
+    # an eprints RDF export; 2026-10-03).
+    if re.match(r"\s*@[A-Za-z]+\s*\{", sample) or (
+            re.search(r"(?m)^TY  - ", sample) and re.search(r"(?m)^ER  -", sample)):
+        return "a citation metadata export"
+    iris = len(re.findall(r"<https?://[^>\s]+>", sample))
+    if iris >= 10 and iris * (1000 / len(sample)) >= 2:
+        return "a linked-data catalogue record"
     per_1k = 1000 / len(sample)
     scripts = len(_SCRIPT_MARKER.findall(sample))
     if scripts >= _MIN_SCRIPT_MARKERS and scripts * per_1k >= _SCRIPT_MARKERS_PER_1K:

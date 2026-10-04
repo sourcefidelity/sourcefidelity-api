@@ -49,7 +49,8 @@
   function markSelected(id) {
     // A citation's light blue is cut around its patchwriting highlights, which
     // are selected with it.
-    document.querySelectorAll('.citation-overlay:not(.member-target),.reference-entry-overlay,.patchwriting-overlay,.paper-badge').forEach(el => {
+    // A window's formatting flags are selected with it (2026-10-03).
+    document.querySelectorAll('.citation-overlay:not(.member-target),.reference-entry-overlay,.patchwriting-overlay,.reference-practice-overlay,.paper-badge').forEach(el => {
       if (el.dataset.panelTemplate === id) { el.classList.add('selected'); el.setAttribute('aria-pressed','true'); }
     });
   }
@@ -429,10 +430,16 @@
     return [...document.querySelectorAll('.page-container .citation-overlay[data-panel-template],.page-container .reference-practice-overlay[data-panel-template],.page-container .reference-entry-overlay[data-panel-template],.page-container .patchwriting-overlay[data-panel-template]:not([data-panel-template^="citation-panel-"])')]
       .sort((a, b) => {
         const page = Number(a.closest('.page-container').dataset.pageIndex) - Number(b.closest('.page-container').dataset.pageIndex);
-        return page || a.getBoundingClientRect().top - b.getBoundingClientRect().top || a.getBoundingClientRect().left - b.getBoundingClientRect().left;
+        // A highlight with no drawn area sorts last on its page, so the same
+        // window's drawn highlight decides its place; by its zero box it had
+        // jumped ahead of the references above it (2026-10-03).
+        const top = el => { const box = el.getBoundingClientRect(); return box.height > 0 ? box.top : Infinity; };
+        return page || top(a) - top(b) || a.getBoundingClientRect().left - b.getBoundingClientRect().left;
       }).filter(el => {
+        // A passage's highlight opens its own window (2026-10-03: the passage
+        // key named no window, so the arrows skipped every passage).
         const key = el.dataset.passage ? 'passage-' + el.dataset.passage : el.dataset.panelTemplate;
-        if (seen.has(key) || !document.getElementById(key)) return false;
+        if (seen.has(key) || !document.getElementById(el.dataset.panelTemplate)) return false;
         seen.add(key); return true;
       });
   }

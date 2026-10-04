@@ -376,3 +376,19 @@ def test_a_single_judge_answers_three_times_and_reuses_its_first_cached_answer(m
     assert [a.arm_id for a in result.arms] == ["deepseek", "deepseek:s2", "deepseek:s3"]
     assert [a.in_majority for a in result.arms] == [True, False, True]
     assert len({a.cache_key for a in result.arms}) == 3 and len(stored) == 2
+
+
+def test_a_stored_bare_this_claim_is_judged_against_the_previous_sentence():
+    # Owner decision 2026-10-03: stored reports re-judge without a new paper run.
+    from app.services.judgment_input import judgment_context_from_payload
+    artifact = _artifact()
+    payload = _payload(artifact)
+    previous = "Researchers surveyed attitudes towards disability."
+    text = "This shows people with disabilities were viewed as intelligent (Wood, 2012)."
+    payload["claim"].update(text=text, passage_start=len(previous) + 1, passage_end=len(previous) + 1 + len(text),
+                            antecedent_context=[{"context_index": 0, "distance_before": 1, "text": previous,
+                                                 "paper_start": 0, "paper_end": len(previous)}],
+                            antecedent_dependencies=[], context_dependency_status="not_required")
+    claim = judgment_context_from_payload(payload).claim
+    assert claim.context_dependency_status == "resolved"
+    assert claim.antecedent_dependencies[0].antecedent_text == previous

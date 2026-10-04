@@ -71,7 +71,7 @@ def test_result_is_persisted_with_bounded_fields_and_labels(checker):
     check = checker()
     check.run(_source(), "ref-1")
     block = check.summary_block()
-    assert block["policy_version"] == "patchwriting-v4" and block["decision_applied"] is False
+    assert block["policy_version"] == "patchwriting-v5" and block["decision_applied"] is False
     assert block["body"]["status"] == "ready"
     entry = block["sources"]["ref-1"]
     assert entry["status"] == "compared"

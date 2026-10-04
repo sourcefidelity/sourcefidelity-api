@@ -96,6 +96,12 @@ _COMPATIBLE_GROUP_PHRASE = re.compile(
     re.IGNORECASE,
 )
 _PARAGRAPH = re.compile(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", re.DOTALL)
+# "As Belton (2013) notes, this model …": the attribution opens the sentence
+# and the dependent mention follows it (paper 5, 2026-10-03).
+_ATTRIBUTION_LEAD = re.compile(r"^\s*(?:as|according\s+to)\s+[^,.;]{1,120}?,\s*", re.IGNORECASE)
+PREVIOUS_SENTENCE_VERSION = "previous-sentence-antecedent-v1"
+_MARKER = re.compile(r"\(([^()]*?(?:1[6-9]|20)\d{2}[a-z]?[^()]*)\)")
+_NOT_NAMES = {"p", "pp", "para", "et", "al", "and", "n", "d", "ed", "eds", "cited", "as", "in", "see", "e", "g"}
 
 
 def resolve_claim_antecedents(
@@ -126,6 +132,10 @@ def resolve_claim_antecedents(
         if not candidates:
             continue
         status, selected = _resolve_candidates(candidates, plural=plural)
+        if status != "resolved":
+            fallback = previous_sentence_antecedent(claim)
+            if fallback is not claim:
+                return fallback
         dependency = _dependency(
             claim,
             local_start,
@@ -143,6 +153,9 @@ def resolve_claim_antecedents(
             }
         )
 
+    fallback = previous_sentence_antecedent(claim)
+    if fallback is not claim:
+        return fallback
     dependency = _dependency(
         claim,
         local_start,
@@ -165,9 +178,16 @@ def _dependency_mention(claim):
     marker_start = claim.text.find(claim.citation_marker) if claim.citation_marker else -1
     searchable = claim.text if marker_start < 0 else claim.text[:marker_start]
     match = _LEADING_DEPENDENCY.match(searchable)
+    offset = 0
+    lead = None if match else _ATTRIBUTION_LEAD.match(claim.text)
+    if lead:
+        # The marker may sit inside the opening attribution; the mention follows it.
+        after = claim.text if marker_start < lead.end() else claim.text[:marker_start]
+        offset = lead.end()
+        match = _LEADING_DEPENDENCY.match(after[offset:])
     if not match:
         return None
-    start, end = match.span("mention")
+    start, end = match.start("mention") + offset, match.end("mention") + offset
     typed = match.group("typed")
     demonstrative = match.group("demonstrative")
     if typed:
@@ -181,12 +201,13 @@ def _dependency_mention(claim):
             if value in _MENTION_BOUNDARY_WORDS:
                 break
             # After a singular demonstrative and its noun, a word in -s is the
-            # verb: "This portrayal reflects" ends at "portrayal" (v3).
-            if singular and kept and re.fullmatch(r"[a-z]+[^su]s", value):
+            # verb: "This portrayal reflects" ends at "portrayal" (v3); so is
+            # one in -ed ("this model enabled", 2026-10-03).
+            if singular and kept and re.fullmatch(r"[a-z]+(?:[^su]s|ed)", value):
                 break
             kept.append(word)
         if kept:
-            end = match.start("demonstrative") + kept[-1].end()
+            end = offset + match.start("demonstrative") + kept[-1].end()
             head = kept[-1].group().casefold()
         else:
             head = ""
@@ -529,3 +550,56 @@ def _normalized(text):
 
 def _stable_id(*parts):
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _marker_names(text: str) -> set[str]:
+    """Author names in the parenthetical citations of a text; a year-only
+    marker takes the capitalised word before it ("Langford (2010)")."""
+    names = set()
+    for match in _MARKER.finditer(text or ""):
+        inside = {w.casefold() for w in re.findall(r"[A-Za-z][\w'’\-]*", match.group(1))} - _NOT_NAMES
+        if not inside:
+            before = re.search(r"([A-Z][\w'’\-]*)\s*$", text[:match.start()])
+            inside = {before.group(1).casefold()} if before else set()
+        names |= inside
+    return names
+
+
+def previous_sentence_antecedent(claim: ClaimEvidence) -> ClaimEvidence:
+    """A statement opening with "This"/"That" (with or without a noun) whose
+    referent no exact phrase settled refers to the discussion of the previous
+    sentence (owner decision 2026-10-03), unless that sentence cites another
+    source or is a heading. Returns the claim unchanged when it does not apply."""
+    if claim.context_dependency_status == "resolved":
+        return claim
+    mention = _dependency_mention(claim)
+    if mention is None or mention[2].split()[0].casefold() not in {"this", "that"}:
+        return claim
+    previous = next((c for c in claim.antecedent_context if c.distance_before == 1), None)
+    if previous is None or not re.search(r"[.!?][\"”’')\]]*\s*$", previous.text):
+        return claim
+    cited = _marker_names(previous.text)
+    claim_names = _marker_names(claim.text) | _marker_names(claim.citation_marker or "")
+    if cited and not cited & claim_names:
+        return claim
+    local_start, local_end, mention_text = mention[0], mention[1], mention[2]
+    dependency = ClaimAntecedentDependency(
+        mention_text=mention_text,
+        mention_local_start=local_start,
+        mention_local_end=local_end,
+        mention_paper_start=claim.passage_start + local_start,
+        mention_paper_end=claim.passage_start + local_end,
+        resolution_status="resolved",
+        confidence="medium",
+        antecedent_context_index=previous.context_index,
+        antecedent_text=previous.text,
+        antecedent_paper_start=previous.paper_start,
+        antecedent_paper_end=previous.paper_end,
+        search_tier="immediate_context",
+        candidates=[],
+        selected_candidate_ids=[],
+        method=f"{PREVIOUS_SENTENCE_VERSION}:immediate_context",
+    )
+    return claim.model_copy(update={"antecedent_dependencies": [dependency],
+                                    "context_dependency_status": "resolved"})
+

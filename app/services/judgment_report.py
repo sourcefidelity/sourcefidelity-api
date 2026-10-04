@@ -17,6 +17,7 @@ from html import escape
 
 from app.services.judgment_coaching import (
     COACHING_PROMPT_VERSION,
+    SPLIT_NOTE_VERSION,
     TEMPLATE_NOTES,
     UNDECIDED_NOTE_VERSION,
     without_advice,
@@ -232,8 +233,15 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
                 + (f'<span class="ev-page">p. {escape(str(key["page"]))}</span> ' if key.get("page") else "")
                 + f'<q>{escape(key["text"])}</q></li></ul>')
     elif state == "undecided":
-        # Answers with no shared result keep the fixed note; otherwise the statement was unresolved.
-        note = UNDECIDED_NOTE if str(reason or "").removeprefix("wider_search_") == "samples_split" else UNDECIDED_WORDING_NOTE
+        # Answers with no shared result show their note about the statement and the
+        # source (2026-10-03), else the fixed note; otherwise the statement was unresolved.
+        coaching = row.get("coaching") or {}
+        if str(reason or "").removeprefix("wider_search_") != "samples_split":
+            note = UNDECIDED_WORDING_NOTE
+        elif coaching.get("status") == "model" and coaching.get("version") == SPLIT_NOTE_VERSION and coaching.get("note"):
+            note = coaching["note"]
+        else:
+            note = UNDECIDED_NOTE
         parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
     if reason in _RETRY_REASONS:
         parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')

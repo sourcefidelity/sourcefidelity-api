@@ -25,6 +25,9 @@ COACHING_PROMPT_VERSION = "judgment-coaching-v4"
 # An undecided judge whose readings name the undecided part gets its own note
 # (owner decision 2026-09-30); an unresolved statement keeps a fixed note.
 UNDECIDED_NOTE_VERSION = "judgment-undecided-note-v2"
+# Answers with no shared result get a note about the statement and the source,
+# never about the answers differing (owner decision 2026-10-03).
+SPLIT_NOTE_VERSION = "judgment-split-note-v1"
 COACHED_STATES = frozenset({"qualified", "contradicts", "insufficient"})
 MAX_NOTE_CHARS = 600
 
@@ -81,6 +84,18 @@ most a few words, and only words that appear in the statement or evidence.
 Return one JSON object: {"note": string <= 600 characters, "facet_ids": [ids
 from the input], "sentence_ids": [ids from the input]}. No text outside JSON."""
 
+_SPLIT_SYSTEM_PROMPT = _UNDECIDED_SYSTEM_PROMPT.replace(
+    "using only\nthe judge's reasons and the evidence sentences from the source.",
+    "using only\nthe reasons and the evidence sentences from the source.") + """
+
+The reasons come from separate readings that reached different results. Never
+mention this: never say or imply that readings, answers, models or judges
+disagreed, differed, were split or voted, and never say how many there were.
+Explain only what in the statement and the source leaves support uncertain, for
+example a part of the statement the source never discusses, a source passage
+that bears on the statement only partly or in another context, or wording in the
+statement that goes further than the source's own wording."""
+
 STATE_MEANING = {
     "undecided": "The model could not decide whether the source supports the statement.",
     "qualified": "The source supports only part of the statement, supports it only under a condition the "
@@ -106,6 +121,20 @@ _DECIDES = re.compile(
     r"contradicted|disproves?|refutes?|refuted)\b", re.IGNORECASE)
 _UNDECIDING = re.compile(r"\b(?:not|no|never|whether|if|cannot|can't|neither|nor|unclear|without)\b"
                          r"[^.!?]{0,40}$", re.IGNORECASE)
+
+
+# A split note talks about the statement and the source, not the answers (2026-10-03).
+_DISAGREEMENT = re.compile(
+    r"\b(?:disagree\w*|agree(?:d|ment|s)?|split|vot(?:e|es|ed|ing)|majority|samples?|answers?|readings|"
+    r"runs|attempts|models|judgments|differing|inconsistent(?:ly)?)\b"
+    r"|\b(?:one|two|three|some|other|each|both)\s+(?:of\s+the\s+)?(?:models?|answers?|readings?|passes)\b",
+    re.IGNORECASE)
+# Judge-prompt sentence aliases ("s9", "(s9, s10)", "s36-s43") mean nothing in the note prompt.
+_JUDGE_ALIAS = re.compile(r"\s*\(\s*s\d+(?:\s*[-–,]\s*s?\d+)*\s*\)|\bs\d+(?:\s*[-–]\s*s?\d+)?\b")
+
+
+def _without_judge_aliases(text: str) -> str:
+    return _JUDGE_ALIAS.sub(lambda m: "" if m.group(0).lstrip().startswith("(") else "a source sentence", text)
 
 
 # The judge's working vocabulary, which an undecided note must translate (v2).
@@ -172,7 +201,8 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
     judge when there are fewer (one judge since 2026-09-27); facets are those a
     majority of valid judges did not find supported.
     """
-    arms = [a for a in panel.get("arms") or [] if a.get("status") == "valid" and a.get("in_majority", True)]
+    arms = [a for a in panel.get("arms") or []
+            if a.get("status") == "valid" and (state == "split" or a.get("in_majority", True))]
     counts: dict[str, int] = {}
     facet_votes: dict[str, list[str]] = {}
     for arm in arms:
@@ -192,6 +222,14 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
             sid for arm in arms for m in arm.get("mappings") or [] if m.get("direction") == "uncertain"
             for sid in m.get("evidence_sentence_ids") or [])
         bound_sentences = [sid for sid in undecided_cited if sid in sentences] or bound_sentences
+    elif state == "split":
+        # No shared result: every part not read as supported by all, with what those readings cite.
+        weak_facets = [fid for fid, votes in facet_votes.items()
+                       if fid in facets and any(v != "supports" for v in votes)]
+        split_cited = dict.fromkeys(
+            sid for arm in arms for m in arm.get("mappings") or [] if m.get("direction") != "supports"
+            for sid in m.get("evidence_sentence_ids") or [])
+        bound_sentences = [sid for sid in split_cited if sid in sentences][:8] or bound_sentences
     else:
         weak_facets = [fid for fid, votes in facet_votes.items()
                        if fid in facets and facets[fid].get("kind") != "candidate_as_written"
@@ -200,19 +238,23 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
     f_alias = {fid: f"f{i}" for i, fid in enumerate(weak_facets, 1)}
     s_alias = {sid: f"s{i}" for i, sid in enumerate(bound_sentences, 1)}
     rationales = []
-    if state == "undecided":
+    if state == "split":
+        rationales = [_without_judge_aliases(m["rationale"])[:240] for arm in arms for m in arm.get("mappings") or []
+                      if m.get("rationale")]
+    elif state == "undecided":
         rationales = [m["rationale"][:240] for arm in arms for m in arm.get("mappings") or []
                       if m.get("direction") == "uncertain" and m.get("rationale")]
-    for arm in arms:
+    for arm in arms if state != "split" else ():
         for mapping in arm.get("mappings") or []:
             if (facets.get(mapping.get("facet_id")) or {}).get("kind") == "candidate_as_written" and mapping.get("rationale"):
                 rationales.append(mapping["rationale"][:240])
+    shown = "undecided" if state == "split" else state
     payload = {
-        "coaching_request": True, "result": state, "result_meaning": STATE_MEANING[state],
+        "coaching_request": True, "result": shown, "result_meaning": STATE_MEANING[shown],
         "statement": claim, "cited_as": citation_marker,
         "unsupported_facets": [{"facet_id": f_alias[fid], "text": facets[fid].get("text") or facets[fid].get("kind")}
                                for fid in weak_facets],
-        "judge_rationales": rationales[:3],
+        "judge_rationales": rationales[:6] if state == "split" else rationales[:3],
         "evidence_sentences": [{"sentence_id": s_alias[sid], "text": sentences[sid]} for sid in bound_sentences],
     }
     bound = {"facets": f_alias, "sentences": s_alias, "claim": claim, "citation_marker": citation_marker,
@@ -248,10 +290,15 @@ def check_note(raw, bound: dict) -> tuple[dict | None, list[str]]:
         violations.append("evidence_attributed_to_student")
     if _ADVICE.search(note):
         violations.append("advice")
-    if bound.get("state") == "undecided" and _decides(note):
+    if bound.get("state") in {"undecided", "split"} and _decides(note):
         violations.append("decides_result")
-    if bound.get("state") == "undecided" and _JARGON.search(note):
+    if bound.get("state") in {"undecided", "split"} and _JARGON.search(note):
         violations.append("internal_terms")
+    if bound.get("state") == "split":
+        # Words the statement or the source itself uses ("practical models") are its own.
+        own = set(_plain(" ".join([bound["claim"], *bound["evidence_text"]])).split())
+        if any(not set(_plain(m.group(0)).split()) <= own for m in _DISAGREEMENT.finditer(note)):
+            violations.append("mentions_answers")
     cited = _plain(bound["citation_marker"])
     for surname in _AUTHOR_YEAR.findall(note):
         if _plain(surname) not in cited:
@@ -284,18 +331,19 @@ def coaching_cache_key(route, system_prompt: str, user_prompt: str, version: str
 def coach(state: str, claim: str, citation_marker: str, facets: dict, panel: dict, sentences: dict, *,
           route, call=chat_completion_json, cache_lookup=None, cache_store=None) -> dict:
     """A checked model note, or the fixed note for the state; never raises."""
-    if state not in COACHED_STATES and state != "undecided":
+    if state not in COACHED_STATES and state not in {"undecided", "split"}:
         return {"status": "not_applicable"}
-    version = UNDECIDED_NOTE_VERSION if state == "undecided" else COACHING_PROMPT_VERSION
-    system_prompt = _UNDECIDED_SYSTEM_PROMPT if state == "undecided" else _SYSTEM_PROMPT
+    version = {"undecided": UNDECIDED_NOTE_VERSION, "split": SPLIT_NOTE_VERSION}.get(state, COACHING_PROMPT_VERSION)
+    system_prompt = {"undecided": _UNDECIDED_SYSTEM_PROMPT, "split": _SPLIT_SYSTEM_PROMPT}.get(state, _SYSTEM_PROMPT)
+    fixed_note = TEMPLATE_NOTES["undecided" if state == "split" else state]
     if route is None:
-        return {"version": version, "status": "template", "note": TEMPLATE_NOTES[state],
+        return {"version": version, "status": "template", "note": fixed_note,
                 "facet_ids": [], "sentence_ids": [], "violations": ["no_note_model"], "attempts": 0,
                 "cost_usd": 0.0, "cost_basis": "unpriced"}
     try:
         payload, bound = coaching_input(state, claim, citation_marker, facets, panel, sentences)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        return {"version": version, "status": "template", "note": TEMPLATE_NOTES[state],
+        return {"version": version, "status": "template", "note": fixed_note,
                 "facet_ids": [], "sentence_ids": [], "violations": [f"input_{type(exc).__name__}"],
                 "attempts": 0, "cost_usd": 0.0, "cost_basis": "unpriced"}
     user_prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -332,7 +380,7 @@ def coach(state: str, claim: str, citation_marker: str, facets: dict, panel: dic
         prompt = user_prompt + ("\n\nYour previous note was rejected (" + ", ".join(violations) +
                                 "). Follow every rule exactly.")
     else:
-        result.update(status="template", note=TEMPLATE_NOTES[state], facet_ids=[], sentence_ids=[])
+        result.update(status="template", note=fixed_note, facet_ids=[], sentence_ids=[])
     if cache_store:
         # The note's own cost is kept, so a reused note can still be costed as one run.
         cache_store(key, {**{k: v for k, v in result.items() if k not in {"cost_usd", "cache_key"}},

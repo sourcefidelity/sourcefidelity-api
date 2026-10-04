@@ -1899,6 +1899,15 @@ def _validate_claim_antecedents(claim):
             != claim.passage_start + dependency.mention_local_end
         ):
             raise ReportAuthorizationError("Antecedent mention does not match the citation unit")
+        if dependency.method.startswith("previous-sentence-antecedent-v1"):
+            # The referent is the exact previous sentence (owner decision 2026-10-03).
+            context = contexts.get(dependency.antecedent_context_index)
+            if (context is None or context.distance_before != 1
+                    or dependency.antecedent_text != context.text
+                    or dependency.antecedent_paper_start != context.paper_start
+                    or dependency.antecedent_paper_end != context.paper_end):
+                raise ReportAuthorizationError("Previous-sentence antecedent does not match its context")
+            continue
         if not dependency.method.startswith(
             ("local-document-antecedent-rescue-v1", "local-document-antecedent-rescue-v2",
              "local-document-antecedent-rescue-v3")

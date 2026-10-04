@@ -61,16 +61,30 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if item.get("status") == "durable_authorized":
         # The text itself is stored; how the search ended does not matter.
         return bool(item.get("representation_id"))
+    discovery = item.get("reference_discovery") or {}
+    if item.get("status") == "link_check_only":
+        # An uncited web page's own search (webpage-verification-v1): reused
+        # once its web providers answered (paper 10's Statista, 2026-10-04).
+        return bool(item.get("web_page_check")) and _web_search_answered(discovery)
     if item.get("status") not in _REUSABLE_STATUSES or item.get("reason_code") in _INCOMPLETE_REASONS:
         return False
-    if item.get("retryable_provider_dependencies") or item.get("full_text_search_incomplete_providers"):
+    if item.get("full_text_search_incomplete_providers"):
         return False
-    discovery = item.get("reference_discovery") or {}
+    if item.get("retryable_provider_dependencies"):
+        # An optional provider left a retry, but every search the reference's
+        # kind requires finished (paper 10: OpenAlex re-searched each run, 2026-10-04).
+        return _required_searches_completed(item, reference)
     if _network_failed(discovery):
         return False
     if discovery.get("outcome") == "search_incomplete":
         return _required_searches_completed(item, reference)
     return bool(discovery)
+
+
+def _web_search_answered(discovery: dict) -> bool:
+    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
+    web = [a for a in attempts if a.get("route_category") == "bounded_web"]
+    return bool(web) and all(a.get("outcome") in {"candidate_found", "no_match"} for a in web)
 
 
 def _network_failed(discovery: dict) -> bool:

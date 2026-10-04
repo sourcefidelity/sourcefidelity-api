@@ -81,8 +81,11 @@ def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
     claim = {k: v for k, v in (payload.get("claim") or {}).items() if k not in _CLAIM_STORAGE_FIELDS}
     binding = payload.get("source_binding")
     try:
+        # A bare "This …" stored as unresolved reads as the previous sentence
+        # (owner decision 2026-10-03), for the prompt and its interpretation alike.
+        from app.services.antecedent_resolver import previous_sentence_antecedent
         return SimpleNamespace(
-            claim=ClaimEvidence.model_validate(claim),
+            claim=previous_sentence_antecedent(ClaimEvidence.model_validate(claim)),
             source_binding=CitationSourceBinding.model_validate(binding) if binding else None,
             source_identity=SimpleNamespace(status=(payload.get("source_identity") or {}).get("status")),
             verification_candidates=VerificationCandidateSet.model_validate(

@@ -205,6 +205,15 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
         and str(scope.get('rationale') or '').strip())
 
 
+def locator_attention(member: dict) -> bool:
+    """A quotation located outside the supplied locator: an Academic Practice
+    issue, marked yellow on the citation (owner request 2026-10-03), not orange."""
+    locator = member.get('locator_check') or {}
+    return bool(member.get('coverage_level') in {'full_text', 'abstract_only', 'partial_text'}
+                and member.get('show_locator_check') and locator.get('attention')
+                and locator.get('status') in {'complete', 'incomplete'})
+
+
 def member_layers(member: dict, citation: dict) -> set[str]:
     layers = set()
     if topical_mismatch(member, citation):
@@ -213,9 +222,6 @@ def member_layers(member: dict, citation: dict) -> set[str]:
         check = member.get('quotation_check') or {}
         if member.get('show_quotation_check') and check.get('attention') and check.get('status') in {'complete', 'incomplete'}:
             layers.add('practice')
-        locator = member.get('locator_check') or {}
-        if member.get('show_locator_check') and locator.get('attention') and locator.get('status') in {'complete', 'incomplete'}:
-            layers.add('reference')
     if any(f.get('finding_type') == 'duplicate_citation_key' for f in member.get('reference_findings') or []):
         layers.add('reference')
     return layers

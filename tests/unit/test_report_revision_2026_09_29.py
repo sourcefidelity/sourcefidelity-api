@@ -275,7 +275,7 @@ def test_secondary_citation_window_line_names_the_attributed_authors():
     soup = BeautifulSoup(_render_member(member), "html.parser")
     heading = soup.select_one(".issue-heading.academic")
     assert heading.get_text() == "Academic Practice"
-    assert heading.find_parent("p").find_next_sibling("p").get_text() == line
+    assert heading.find_parent("p").find_next_sibling("ul").select_one("li").get_text() == line
 
 
 def test_unverified_references_head_the_sources_column():
