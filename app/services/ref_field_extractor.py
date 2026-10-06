@@ -287,9 +287,19 @@ def extract_authorless_apa_fields(ref: str) -> Optional[ParsedReference]:
 # usually gets right. Discarding it left discovery searching only for the
 # chapter title, which in Belton's case named no work that exists, so the
 # merge attached whichever record shared those two words.
+# A full stop after "(Ed.)" and an edition between the book title and the
+# pages are common too (Gershon, Elsaesser; 2026-10-04).
 _CONTAINER_IN_RE = re.compile(
-    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*,\s*(?P<container>[^()]{3,300}?)\s*'
+    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*(?P<container>[^()]{3,300}?)\s*'
+    r'(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?'
     r'(?:\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)|[.,])',
+    re.IGNORECASE)
+
+
+_CONTAINER_IN_PAGES_RE = re.compile(
+    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*(?P<container>[^()]{3,300}?)\s*'
+    r'(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?'
+    r'\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)',
     re.IGNORECASE)
 
 
@@ -397,8 +407,10 @@ def _container_and_pages(ref: str) -> tuple[str, str]:
     edited collection carries its own page range, and its container is named
     after an explicit "In ... (Ed.),". An article names its journal instead.
     """
-    match = (_CONTAINER_IN_RE.search(ref or '') or _CONTAINER_IN_NO_EDITOR_RE.search(ref or '')
-             or _CONTAINER_IN_EDITORS_AFTER_RE.search(ref or ''))
+    # A book title with commas before its page range ("Global entertainment
+    # media: Content, audiences, issues (pp. 17-35)") is read to the pages first.
+    match = (_CONTAINER_IN_PAGES_RE.search(ref or '') or _CONTAINER_IN_RE.search(ref or '')
+             or _CONTAINER_IN_NO_EDITOR_RE.search(ref or '') or _CONTAINER_IN_EDITORS_AFTER_RE.search(ref or ''))
     if not match:
         return _journal_and_pages(ref)
     container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')

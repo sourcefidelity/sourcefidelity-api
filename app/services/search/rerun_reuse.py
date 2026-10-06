@@ -62,6 +62,13 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
         # The text itself is stored; how the search ended does not matter.
         return bool(item.get("representation_id"))
     discovery = item.get("reference_discovery") or {}
+    if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
+            and (reference.get("container_title") or "").strip()
+            and discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
+            and not discovery.get("container_identity")):
+        # An unconfirmed chapter whose book was never identified is searched
+        # again, so a corrected book lookup reaches it (Gershon, 2026-10-04).
+        return False
     if item.get("status") == "link_check_only":
         # An uncited web page's own search (webpage-verification-v1): reused
         # once its web providers answered (paper 10's Statista, 2026-10-04).

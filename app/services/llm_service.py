@@ -378,7 +378,8 @@ def chat_completion_json(
                 response_format=response_format,
                 disable_thinking=disable_thinking,
                 reasoning_effort=reasoning_effort,
-                **({"route": route, "receipt": receipt} if route is not None else {}),
+                **({"route": route} if route is not None else {}),
+                **({"receipt": receipt} if receipt is not None else {}),
             )
             if receipt is not None:
                 receipt["attempts"] = attempt + 1

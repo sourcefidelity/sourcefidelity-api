@@ -407,3 +407,49 @@ def test_a_provider_failure_or_a_completed_retry_still_counts_as_before():
     # A skipped query does not matter when the same provider completed another title search.
     retried = assess_reference_verification(ref(), _with_web_query(discovery(web=('brave', 'exa')), 'exa', 'budget_skipped'))
     assert retried['status'] == 'cannot_be_verified'
+
+
+def test_chapter_containers_with_common_student_variants():
+    # P5 run 2026-10-04: "(Eds)" without a full stop, a full stop after "(Ed.)",
+    # an edition before the pages, and commas inside the book title.
+    from app.services.ref_field_extractor import extract_fields_apa
+    cases = {
+        'Stone, T. (1993). The new cinema. In J. Reed, & A. Lowe (Eds), Theory goes to the movies (pp. 8-36). Routledge.':
+            ('Theory goes to the movies', '8-36'),
+        'Gray, R. (2005). The transnationals. In Cooper-Lane, A. (Ed.). Global media: Content, audiences, issues (pp. 17-35). Erlbaum.':
+            ('Global media: Content, audiences, issues', '17-35'),
+        'Elm, T. (1998). Specularity and engulfment. In S. Neale, & M. Smith (Ed.), Contemporary cinema (1st ed.) (pp.191-206). Routledge.':
+            ('Contemporary cinema', '191-206'),
+    }
+    for raw, (container, pages) in cases.items():
+        ref = extract_fields_apa(raw)
+        assert (ref.source_kind, ref.container_title, ref.pages) == ('book_section', container, pages), raw
+
+
+def test_the_same_authors_book_under_another_subtitle_is_a_possible_match():
+    from app.services.reference_verification import _possible_match
+    candidate = {'provider': 'google_books', 'observed': {'title': 'The Curse of Bigness: How Giants Came to Rule'},
+                 'comparisons': [{'field_name': 'title', 'outcome': 'material_conflict'},
+                                 {'field_name': 'author', 'outcome': 'agreement'}]}
+    cited = {'title': 'The curse of bigness: Antitrust in the new gilded age (Vol. 15)'}
+    assert _possible_match(candidate, cited)
+    other_author = {**candidate, 'comparisons': [{'field_name': 'title', 'outcome': 'material_conflict'},
+                                                 {'field_name': 'author', 'outcome': 'material_conflict'}]}
+    assert not _possible_match(other_author, cited)
+
+
+def test_an_undated_entry_after_a_doi_is_its_own_reference():
+    # Regulation 2, 2026-10-04: a regulation's title after a DOI-ended entry.
+    from app.services.parsers.apa_parser import ApaParser
+    section = ("Humphreys, P. (2006). Policy transfer. Journal of Policy, 29(4), 305–334. https://doi.org/10.1080/0190069\n\n"
+               "Measures for the Administration of Receiving Facilities 1990.\n\nhttp://www.example.test/art/1.html\n\n"
+               "Parc, J. (2022). Protectionism. Journal of Media Economics, 34(2), 117–133.")
+    refs = ApaParser.split_references(section)
+    assert len(refs) == 3 and refs[1].startswith("Measures for") and refs[1].endswith("art/1.html")
+
+
+def test_a_chapters_book_is_looked_up_under_its_editors():
+    from app.services.source_resolver import chapter_editors
+    assert chapter_editors("Gray, R. (2005). Chapter. In Cooper-Lane, A. (Ed.). Global media (pp. 17-35). Erlbaum.") == "Cooper-Lane, A"
+    assert chapter_editors("Elm, T. (1998). Chapter. In S. Neale, & M. Smith (Ed.), Cinema (pp.191-206).") == "S. Neale, & M. Smith"
+    assert chapter_editors("Stone, T. (2010). A whole book. Routledge.") == ""

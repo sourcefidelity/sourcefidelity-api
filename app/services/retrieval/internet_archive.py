@@ -68,3 +68,72 @@ def locations_from_metadata(data, url: str, *, max_bytes: int) -> list[Acquisiti
         metadata={'discovery_signal': VERSION, 'archive_item_id': identifier,
                   'listed_size': size})
         for _, name, size in sorted(set(candidates))[:2]]
+
+
+TEXT_IDENTITY_VERSION = 'archive-item-text-v1'
+_TEXT_MAX_BYTES = 3 * 1024 * 1024
+
+
+def _words(value) -> str:
+    return ' '.join(re.findall(r'[0-9a-z]+', str(value or '').casefold()))
+
+
+def item_text_identity(meta: dict, text: str, *, title: str, author: str) -> dict | None:
+    """The cited work as an archived item's own text and record name it.
+
+    Owner decision 2026-10-06 (Wagner): a link to one page of a whole archived
+    magazine issue names the article only inside the issue, so the item's
+    title never matches the cited one. When the cited title appears in the
+    item's text, the item's publication date, title and volume are compared
+    with the reference like any other record. Identity only: the text is not
+    admitted as source evidence.
+    """
+    cited = _words(title)
+    if len(cited) < 12 or cited not in _words(text):
+        return None
+    from app.services.relevance import extract_surnames
+    body = set(_words(text).split())
+    surnames = [s for s in extract_surnames(author or '') if s.casefold() in body]
+    item_title = str(meta.get('title') or '')
+    creator = meta.get('creator')
+    creator = creator[0] if isinstance(creator, list) and creator else creator
+    issue = meta.get('issue') or (re.search(r'\bNo\.?\s*(\d+)\b', item_title) or [None, None])[1]
+    date = str(meta.get('date') or '')
+    return {
+        'title': title, 'authors': [author] if surnames else [],
+        'year': date[:4] if re.match(r'(?:1[5-9]|20)\d{2}', date) else None, 'doi': None,
+        'date_method': 'catalog_publication_date',
+        'container_title': str(creator or '') if creator and _words(item_title).startswith(_words(creator)) else '',
+        'volume': str(meta.get('volume') or ''), 'issue': str(issue or ''),
+        'item_title': item_title, 'work_identity_basis': TEXT_IDENTITY_VERSION,
+    }
+
+
+def item_text_observation(url: str, *, title: str, author: str, timeout: float) -> dict | None:
+    """Read a public item's record and OCR text and apply item_text_identity."""
+    identifier = item_identifier(url)
+    if not identifier:
+        return None
+    endpoint = f'https://archive.org/metadata/{identifier}'
+    require_source_candidate(endpoint)
+    data = json.loads(safe_fetch_bytes(endpoint, usage_label="adapter:internet_archive", max_bytes=2*1024*1024,
+                                       accept_content_types=('application/json',), timeout=timeout))
+    meta = data.get('metadata') if isinstance(data, dict) else None
+    if (not isinstance(meta, dict) or meta.get('identifier') != identifier or data.get('is_dark')
+            or any(str(meta.get(k, '')).lower() not in {'', 'false', '0', 'none'}
+                   for k in ('access-restricted-item', 'is_dark', 'noindex'))):
+        return None
+    names = [f.get('name') for f in data.get('files') or [] if isinstance(f, dict)
+             and f.get('format') == 'DjVuTXT' and not f.get('private') and isinstance(f.get('name'), str)
+             and '/' not in f['name'] and 0 < int(f.get('size') or 0) <= _TEXT_MAX_BYTES]
+    if not names:
+        return None
+    target = f'https://archive.org/download/{identifier}/{quote(names[0], safe="")}'
+    require_source_candidate(target)
+    raw = safe_fetch_bytes(target, usage_label="adapter:internet_archive", max_bytes=_TEXT_MAX_BYTES,
+                           accept_content_types=('text/plain',), timeout=timeout)
+    observed = item_text_identity(meta, raw.decode('utf-8', 'replace'), title=title, author=author)
+    if observed:
+        import hashlib
+        observed['item_text_sha256'] = hashlib.sha256(raw).hexdigest()
+    return observed

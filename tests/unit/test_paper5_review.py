@@ -121,3 +121,21 @@ def test_an_entry_repeated_as_a_body_heading_is_located_in_the_reference_list():
     probe2 = {'source': {'raw_reference': entry}, 'field_difference': {'submitted_value': entry}}
     _attach_reference_field_geometry({'reference_practice': [probe2]}, doc2, hashlib.sha256(doc2.tobytes()).hexdigest())
     assert probe2['rectangles'] == []
+
+
+def test_a_topical_mismatch_on_a_retrieved_document_does_not_break_the_report(monkeypatch):
+    # Regulation 4, 2026-10-06: the report failed (HTTP 500) because the
+    # mismatch finding read best_evidence, which a retrieved document lacks.
+    import fitz
+    from app.services import evidence_report, report_layers
+    monkeypatch.setattr(report_layers, "topical_mismatch", lambda member, citation: True)
+    member = {"reference_id": "r1", "coverage_level": "full_text", "best_evidence": None,
+              "scope_source": {"text": "The leading excerpt the topic was judged against."},
+              "abstract_relevance": {"scope_assessment": {"rationale": "Different topic."}},
+              "source": {"raw_reference": "Org. (2014). A page title here. http://example.test"}}
+    view = {"citations": [{"student_text": "A claim (Org, 2014).", "members": [member]}],
+            "reference_practice": [], "paper_surface": {}}
+    document = fitz.open(); document.new_page()
+    result = evidence_report.project_reference_flags(view, document, "x" * 64)
+    [finding] = [f for f in result["reference_practice"] if f["finding_type"] == "source_topical_mismatch"]
+    assert finding["abstract_text"] == "The leading excerpt the topic was judged against."

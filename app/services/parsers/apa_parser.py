@@ -219,7 +219,16 @@ class ApaParser(BaseParser):
                 and len(re.split(r'https?://', ref, maxsplit=1)[0].split()) >= 6
                 and re.search(r'[.!?]\s', re.split(r'https?://', ref, maxsplit=1)[0])
             )
-            if cleaned and not independently_linked_block and (
+            # A DOI or URL ends an APA entry: a full line after it opens the
+            # next one even with no "(Year)", as an undated regulation's title
+            # does (Regulation 2, 2026-10-04: two entries joined to the one before).
+            after_terminator = bool(
+                cleaned
+                and re.search(r'(?:https?://|doi\.org/)\S+[.)]?$', cleaned[-1])
+                and len(ref.split()) >= 4 and ref[:1].isupper()
+                and not re.match(r'(?i)^(?:https?://|www\.|doi\b|retrieved\b|available\b|accessed\b)', ref)
+            )
+            if cleaned and not independently_linked_block and not after_terminator and (
                 not _APA_DATE.search(ref)
                 or not cls._starts_new_reference(ref, [])
             ):

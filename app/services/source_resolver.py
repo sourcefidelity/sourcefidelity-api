@@ -1975,9 +1975,13 @@ class SourceResolver:
             return None
         if getattr(reference, "source_kind", "") not in {"book_section", "edited_collection"}:
             return None
+        # The book's credited names are its editors, not the chapter's author
+        # (Gershon's chapter in Cooper-Chen's book, 2026-10-04).
+        editors = chapter_editors(getattr(reference, "raw_ref", "") or "")
         try:
             probe = reference.model_copy(update={
                 "title": container,
+                "author": editors or reference.author,
                 "container_title": "",
                 "source_kind": "monograph",
                 "source_kind_confidence": "medium",
@@ -4747,6 +4751,18 @@ class SourceResolver:
             )
             if not result.success:
                 result.error = 'archive_source_not_acquired'
+                from app.services.retrieval.internet_archive import item_text_observation
+                try:
+                    observed = item_text_observation(url, title=title or '', author=expected_author or '',
+                                                     timeout=settings.STUDENT_URL_TIMEOUT_SECONDS)
+                except Exception as exc:
+                    logger.info("Archive item text unavailable: %s", type(exc).__name__)
+                    observed = None
+                if observed:
+                    result.title, result.authors, result.year = observed['title'], observed['authors'], observed['year']
+                    result.metadata.update(
+                        web_identity=observed, work_identity_basis=observed['work_identity_basis'],
+                        **{k: observed[k] for k in ('container_title', 'volume', 'issue') if observed[k]})
             return result
         try:
             require_source_candidate(url)
@@ -4870,6 +4886,25 @@ class SourceResolver:
                     "Web fetch identity mismatch for %s",
                     private_value_id("url", url),
                 )
+                cross_script = all(cross_script_comparison_unresolved(title, value) for value in page_titles)
+                if cross_script and not homepage:
+                    # Owner decision 2026-10-06 (Xu & Luo): the configured model
+                    # compares titles across writing systems.
+                    import trafilatura
+                    from app.services.cross_script_identity import judge_cross_script_identity
+                    judged = judge_cross_script_identity(
+                        {'title': title, 'author': expected_author, 'year': expected_year},
+                        {'titles': page_titles, 'date': observed.get('year'),
+                         'text': trafilatura.extract(resp.text, include_comments=False, include_links=False,
+                                                     include_tables=False) or ''})
+                    page = RetrievalResult(
+                        source_name="web_fetch", success=False, title=observed.get('title') or page_titles[0],
+                        authors=judged['page_authors'] or observed.get('authors') or [],
+                        year=observed.get('year'), doi=observed.get('doi'),
+                        error="Page title is in another writing system; its text is not admitted",
+                        metadata={'web_identity': observed, 'cross_script_judgment': judged,
+                                  **diagnostic('cross_script_title_unresolved')})
+                    return page
                 if not homepage:
                     _record_link_title_conflict(url, resp, title, page_titles, expected_author=expected_author,
                                                 expected_year=expected_year, expected_doi=expected_doi)
@@ -4972,6 +5007,19 @@ class SourceResolver:
                 and kind_compatibility.verdict != "compatible"
             )
         ):
+            # The page's own citation details can still name the cited work: a
+            # repository page for a book labelled "article" (Wu, 2026-10-06).
+            # Its title, author and year identify the work; its text is not
+            # accepted, and the conflicting type label is not passed on.
+            named = RetrievalResult(source_name="web_fetch", success=False, title=observed["title"],
+                                    authors=observed["authors"], year=observed["year"], doi=observed["doi"])
+            _identity, _comparisons, names_work = _web_identity_comparison(
+                named, title=title, author=expected_author, year=expected_year, doi=expected_doi)
+            if names_work:
+                named.error = "Page names the cited work; its text is not the cited work's text"
+                named.metadata = {"web_identity": observed, "work_identity_basis": "page-citation-metadata-v1",
+                                  **diagnostic('source_kind_unconfirmed')}
+                return named
             return RetrievalResult(
                 source_name="web_fetch",
                 success=False,
@@ -6785,3 +6833,21 @@ def _check_is_oa(result: RetrievalResult) -> bool:
             return True
 
     return False
+
+
+_CHAPTER_EDITORS_RE = re.compile(r"\bIn\s+(?P<editors>[^()]{2,120}?)\s*\(\s*Eds?\.?\s*\)", re.IGNORECASE)
+
+
+def chapter_editors(raw: str) -> str:
+    """The editors an APA chapter reference names: "In A. Cooper-Chen (Ed.)" or
+    "In Cooper-Chen, A. (Ed.)" gives the names before "(Ed.)"; else ''."""
+    match = _CHAPTER_EDITORS_RE.search(raw or "")
+    if not match:
+        return ""
+    editors = " ".join(match.group("editors").split()).strip(" ,.")
+    # Initial and surname reversed, "B, Poore" (Pheasant-Kelly, 2026-10-06).
+    reversed_name = re.fullmatch(r"([A-Z])\.?\s*,\s*([A-Z][\w'’-]{2,})", editors)
+    if reversed_name:
+        return f"{reversed_name.group(2)}, {reversed_name.group(1)}."
+    return editors
+

@@ -82,11 +82,53 @@ def _digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
+_REDIRECT = {301, 302, 303, 307, 308}
+
+
+def registered_unread_doi(reference, discovery: dict | None, link_observations) -> str | None:
+    """How a cited DOI that doi.org registers, but no index could read, agrees.
+
+    Owner decision 2026-10-06 (Yang): doi.org redirecting the DOI shows it is
+    registered, here by an agency whose metadata the indexes do not carry, so
+    the reference is never "Cannot be verified". 'agrees' when the DOI's own
+    suffix carries the cited year (and issue, where both give one), else
+    'registered'; None when the DOI was not registered or an index read it.
+    """
+    doi = str(getattr(reference, 'doi', '') or '').strip().casefold()
+    if not doi:
+        return None
+    for candidate in (discovery or {}).get('candidates') or []:
+        if str((candidate.get('observed') or {}).get('doi') or '').strip().casefold() == doi:
+            return None
+    registered = False
+    for observation in link_observations or []:
+        if observation.get('kind') != 'doi':
+            continue
+        for request in observation.get('requests') or []:
+            hops = request.get('hops') or []
+            if (hops and str(hops[0].get('destination_origin') or '').split('://')[-1] == 'doi.org'
+                    and hops[0].get('http_status') in _REDIRECT and hops[0].get('location_sha256')):
+                registered = True
+    if not registered:
+        return None
+    suffix = doi.split('/', 1)[-1]
+    year = str(getattr(reference, 'year', '') or '')[:4]
+    found = re.search(rf'(?<!\d){year}(?!\d)(?:\.(\d{{1,2}})(?!\d))?', suffix) if year.isdigit() else None
+    if not found:
+        return 'registered'
+    issue = str(getattr(reference, 'issue', '') or '').strip()
+    if found.group(1) and issue.isdigit() and int(found.group(1)) != int(issue):
+        return 'registered'
+    return 'agrees'
+
+
 def _outcomes(candidate: dict) -> dict:
     return {c.get('field_name'): c.get('outcome') for c in candidate.get('comparisons') or []}
 
 
-_EDITION = re.compile(r'\(\s*(?:\d+(?:st|nd|rd|th)|rev(?:ised)?\.?|new|updated)\s*ed(?:ition|\.)?\s*\)',
+_EDITION = re.compile(r'\(\s*(?:(?:\d+(?:st|nd|rd|th)|rev(?:ised)?\.?|new|updated)\s*ed(?:ition|\.)?'
+                      # A series volume carried in the title, "(Vol. 15)" (Wu, 2026-10-04).
+                      r'|vol(?:ume|\.)?\s*\d+)\s*\)',
                       re.IGNORECASE)
 
 
@@ -119,6 +161,13 @@ def _book_title_matches(expected: dict, observed_title) -> bool:
         if len(words.split()) >= 4 and (seen + ' ').startswith(words + ' '):
             return True
     return False
+
+
+def _same_main_title(cited, observed) -> bool:
+    """The titles before their subtitles agree, three words or more."""
+    cited_main, _ = _title_forms(str(cited or '').split(':', 1)[0])
+    seen_main, _ = _title_forms(str(observed or '').split(':', 1)[0])
+    return bool(cited_main) and len(cited_main.split()) >= 3 and cited_main == seen_main
 
 
 def _page_title_matches(expected: dict, observed_title) -> bool:
@@ -159,6 +208,13 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
     if not expected:
         return False
     observed = (candidate.get('observed') or {}).get('title')
+    if (outcomes.get('author') in {'agreement', 'minor_difference'}
+            and candidate.get('provider') in BOOK_CATALOGUES | {'crossref', 'openalex'}
+            and _same_main_title(expected.get('title'), observed)):
+        # The same author's book under the same main title with another
+        # subtitle, as editions retitle (Wu's "The Curse of Bigness",
+        # 2026-10-04): a record that the work exists, never a flag.
+        return True
     if candidate.get('provider') in BOOK_CATALOGUES:
         return _book_title_matches(expected, observed)
     return candidate.get('provider') == 'web_search' and _page_title_matches(expected, observed)
@@ -216,7 +272,8 @@ def _title_led(query: dict) -> bool:
     return titled and not scoped
 
 
-def assess_reference_verification(reference, discovery: dict | None, web_page_check: dict | None = None) -> dict:
+def assess_reference_verification(reference, discovery: dict | None, web_page_check: dict | None = None,
+                                  link_observations: list | None = None) -> dict:
     """Return the verification status and, when flagged, one finding.
 
     A web page is assessed under `webpage-verification-v1` from
@@ -282,6 +339,13 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
                                         for c in matches[:3]])
         return result
 
+    if any(c.get('reason_code') == 'cross_script_model_unsure'
+           for candidate in candidates for c in candidate.get('comparisons') or []):
+        # The student's link names a work in another writing system that the
+        # model could not tell apart from the cited one (2026-10-06).
+        result['reason_code'] = 'cross_script_page_unresolved'
+        return result
+
     queries = {q.get('query_id'): q for q in discovery.get('queries') or []}
     title = text_key(expected.get('title') or getattr(reference, 'title', '') or '')
     completed, failed, web, self_skipped = set(), set(), set(), set()
@@ -324,6 +388,13 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         result.update(status='search_incomplete', reason_code='web_search_skipped_by_budget',
                       incomplete_routes=[PROVIDER_NAMES[p] for p in budget_skipped],
                       failed_routes=sorted(failed))
+        return result
+    doi_state = registered_unread_doi(reference, discovery, link_observations)
+    if doi_state == 'agrees':
+        result.update(status='possible_match', reason_code='registered_doi_agrees')
+        return result
+    if doi_state:
+        result['reason_code'] = 'registered_doi_unread'
         return result
     searched = [PROVIDER_NAMES.get(p, p) for p in required] + [PROVIDER_NAMES[p] for p in sorted(web)]
     finding = dict(

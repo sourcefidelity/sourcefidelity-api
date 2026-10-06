@@ -21,3 +21,12 @@ def test_an_uncited_web_pages_answered_search_is_reused():
     failed = {"attempts": [{"route_category": "bounded_web", "outcome": "operational_failure"}]}
     assert not rerun_reuse._reusable({**item, "reference_discovery": failed}, {})
     assert not rerun_reuse._reusable({**item, "web_page_check": None}, {})
+
+
+def test_an_unconfirmed_chapter_without_its_book_lookup_is_searched_again():
+    chapter = {"source_kind": "book_section", "container_title": "Global media"}
+    item = {"status": "unavailable", "reason_code": "source_not_found",
+            "reference_discovery": {"outcome": "unlocated_after_search"}}
+    assert not rerun_reuse._reusable(item, chapter)
+    found = {**item, "reference_discovery": {"outcome": "unlocated_after_search", "container_identity": {"status": "identified"}}}
+    assert rerun_reuse._reusable(found, chapter)

@@ -513,7 +513,8 @@ def build_evidence_report_view(
                                                    observation.get('reference_discovery_trace'))
         credibility[reference_id] = assessment
         checked = assess_reference_verification(reference, observation.get('reference_discovery'),
-                                                observation.get('web_page_check'))
+                                                observation.get('web_page_check'),
+                                                observation.get('submitted_link_observations'))
         verification[reference_id] = {k: v for k, v in checked.items() if k != 'findings'}
         # "Cannot be verified" replaces the former fabrication review flag;
         # that assessment stays in the audit record but is not reported.
@@ -2848,7 +2849,7 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
         for observation in row.get('observations') or []:
             sources.setdefault(observation.get('reference_id'),row.get('reference') or {})
     findings = result.setdefault('reference_practice', [])
-    from app.services.report_layers import topical_mismatch
+    from app.services.report_layers import _scope_source_text, topical_mismatch
     findings[:] = [f for f in findings if f.get('finding_type') != 'source_topical_mismatch']
     for citation in result.get('citations', []):
         for member in citation.get('members', []):
@@ -2861,7 +2862,9 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
                 'reference_id': member.get('reference_id'), 'source': deepcopy(source),
                 'finding': 'The abstract appears unrelated to the topic attributed to this source. ' + scope['rationale'],
                 'citation_text': citation['student_text'],
-                'abstract_text': member['best_evidence']['text'],
+                # The text the topic was judged against: a retrieved document's
+                # leading excerpt has no best evidence (Regulation 4, 2026-10-06).
+                'abstract_text': _scope_source_text(member)[0],
                 'scope_rationale': scope['rationale'],
                 'field_difference': {'submitted_value': source['raw_reference']},
                 'rectangles': [],

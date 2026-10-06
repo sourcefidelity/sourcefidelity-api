@@ -817,14 +817,26 @@ def build_reference_discovery_candidate(
         )
 
     title_relevant = False
+    cross_script_judgment = (result.metadata or {}).get("cross_script_judgment") or {}
     if expected.title or result.title:
         if expected.title and result.title:
             if cross_script_comparison_unresolved(expected.title, result.title):
-                title_outcome = "unknown"
-                title_reason = "cross_script_title_unresolved"
+                # The configured model's comparison across writing systems
+                # (cross-script-identity-v1, owner decision 2026-10-06).
+                same_work = cross_script_judgment.get("same_work")
+                title_outcome = {"yes": "agreement", "no": "material_conflict"}.get(same_work, "unknown")
+                title_reason = {"yes": "cross_script_model_same_work", "no": "cross_script_model_different_work",
+                                "unsure": "cross_script_model_unsure"}.get(same_work, "cross_script_title_unresolved")
+                title_relevant = same_work == "yes"
             elif _normalize_text(expected.title) == _normalize_text(result.title):
                 title_outcome: FieldComparisonOutcome = "agreement"
                 title_reason = "normalized_title_match"
+                title_relevant = True
+            elif _normalize_text(_without_volume_note(expected.title)) == _normalize_text(_without_volume_note(result.title)):
+                # A series volume or edition note after the title, "(Vol. 15)",
+                # is not title wording (Wu's repository page, 2026-10-06).
+                title_outcome = "agreement"
+                title_reason = "title_match_without_volume_note"
                 title_relevant = True
             elif _web_title_furniture_only(expected.title, result.title, author_match=bool(
                     expected.authors and result.authors
@@ -873,7 +885,11 @@ def build_reference_discovery_candidate(
         )
 
     if expected.authors or result.authors:
-        if expected.authors and result.authors:
+        judged_author = cross_script_judgment.get("author")
+        if expected.authors and result.authors and judged_author in {"agrees", "differs"}:
+            author_outcome = "agreement" if judged_author == "agrees" else "material_conflict"
+            author_reason = "cross_script_model_author_" + judged_author
+        elif expected.authors and result.authors:
             passes, _score, _detail = verify_authors(expected_author_names, observed_author_names)
             expected_surnames = {
                 surname
@@ -1203,6 +1219,14 @@ def _web_title_furniture_only(expected: str, observed: str, *, author_match: boo
     if match and len(match.group(0).split()) <= 6 and (author_match or match.group(0).strip().startswith("|")):
         forms.add(_normalize_text(page[:match.start()]))
     return cited in forms
+
+
+_VOLUME_NOTE = re.compile(r"\(\s*(?:(?:\d+(?:st|nd|rd|th)|rev(?:ised)?\.?|new|updated)\s*ed(?:ition|\.)?"
+                          r"|vol(?:ume|\.)?\s*\d+)\s*\)\s*$", re.IGNORECASE)
+
+
+def _without_volume_note(value: str) -> str:
+    return _VOLUME_NOTE.sub("", str(value or "")).strip()
 
 
 def _normalize_text(value: str) -> str:

@@ -253,7 +253,7 @@ _BOOK_PUBLISHER_RE = re.compile(
 )
 _BOOK_EDITION_RE = re.compile(r"\(\s*\d+(?:st|nd|rd|th)\s+ed\.?(?:ition)?\s*\)", re.I)
 _BOOK_SECTION_RE = re.compile(
-    r"\bIn\s+.{1,160}\((?:Ed|Eds)\.\)"
+    r"\bIn\s+.{1,160}\((?:Ed|Eds)\.?\)"
     # Editors omitted: "Chapter. In Book title (pp. 75-116)." (2026-09-29).
     r"|\.\s+In\s+[^()]{3,300}?\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)"
     # Editors after the book title: "Chapter. In Book title (A. Name & B. Name,
