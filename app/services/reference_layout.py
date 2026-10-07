@@ -176,10 +176,16 @@ def _extract_pdf(
     citation_format: str,
 ) -> ReferenceLayoutArtifact:
     lines: list[_LayoutLine] = []
+    slanted_pages = _slanted_characters(content)
     document = fitz.open(stream=content, filetype="pdf")
     try:
         for page_index, page in enumerate(document):
-            payload = page.get_text("dict", sort=True)
+            slanted = slanted_pages.get(page_index) or []
+            italic_of = lambda span: _pdf_span_italic(span) or bool(span.get("slanted"))
+            payload = page.get_text("rawdict", sort=True)
+            for block in payload.get("blocks", []):
+                for line in block.get("lines", []):
+                    line["spans"] = [part for span in line.get("spans", []) for part in _split_by_slant(span, slanted)]
             for block in payload.get("blocks", []):
                 if block.get("type") != 0:
                     continue
@@ -188,7 +194,7 @@ def _extract_pdf(
                     text, style_spans = _styled_text(
                         (
                             span.get("text", ""),
-                            _pdf_span_italic(span),
+                            italic_of(span),
                             _pdf_span_bold(span),
                         )
                         for span in spans
@@ -205,7 +211,7 @@ def _extract_pdf(
                     italic = sum(
                         len(span.get("text", ""))
                         for span in spans
-                        if _pdf_span_italic(span)
+                        if italic_of(span)
                     )
                     bold = sum(
                         len(span.get("text", ""))
@@ -662,6 +668,68 @@ def reference_span_style_observed(entry: ReferenceEntryLayout, raw_reference: st
         return False
     return all(any(r.start <= i < r.end for r in entry.style_observation_ranges)
         for i in range(start,end) if not raw_reference[i].isspace())
+
+
+def _slanted_characters(content: bytes) -> dict[int, list[tuple[float, float, float, float, bool]]]:
+    """Per page, each character's box and whether it is drawn slanted.
+
+    Some PDFs set italics by slanting a regular font, so the font name and
+    flags say regular (Franchise 2's journal names, 2026-10-07); the text
+    matrix's skew shows it. Unreadable files give no evidence, never italics.
+    """
+    try:
+        import pdfplumber
+        pages = {}
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for index, page in enumerate(pdf.pages):
+                rows = []
+                for char in page.chars:
+                    a, b, c, d = (char.get("matrix") or (1, 0, 0, 1))[:4]
+                    slant = abs(c / d) if d else 0.0
+                    rows.append((char["x0"], char["top"], char["x1"], char["bottom"], 0.15 <= slant <= 0.6 and not b))
+                pages[index] = rows
+        return pages
+    except Exception:  # noqa: BLE001 - style evidence is optional
+        return {}
+
+
+def _split_by_slant(span: dict, characters) -> list[dict]:
+    """A rawdict span as dict-style spans, split where the drawn slant changes."""
+    chars = span.get("chars") or []
+    if not chars:
+        return [{**span, "text": span.get("text", "")}]
+    def is_slanted(char):
+        # The nearest drawn character, by centre: a slanted glyph's box
+        # overlaps its neighbours, so containment would mix them.
+        x0, y0, x1, y1 = char["bbox"]
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        near = [(abs((a + c) / 2 - cx) + abs((b + d) / 2 - cy), s) for a, b, c, d, s in characters
+                if abs((b + d) / 2 - cy) <= 4 and abs((a + c) / 2 - cx) <= 4]
+        return bool(near) and min(near)[1]
+    parts, current, flag = [], [], None
+    for char in chars:
+        value = is_slanted(char) if char["c"].strip() else flag
+        if current and value != flag:
+            parts.append((current, flag))
+            current = []
+        current.append(char)
+        flag = value
+    parts.append((current, flag))
+    result = []
+    for group, slanted in parts:
+        bbox = (min(c["bbox"][0] for c in group), min(c["bbox"][1] for c in group),
+                max(c["bbox"][2] for c in group), max(c["bbox"][3] for c in group))
+        result.append({**{k: v for k, v in span.items() if k != "chars"}, "text": "".join(c["c"] for c in group),
+                       "bbox": bbox, "slanted": bool(slanted)})
+    return result
+
+
+def _span_slanted(span: dict, characters) -> bool:
+    """Most characters inside the span's box are drawn slanted."""
+    x0, y0, x1, y1 = span.get("bbox") or (0, 0, 0, 0)
+    inside = [s for cx0, top, cx1, bottom, s in characters
+              if x0 - 1 <= (cx0 + cx1) / 2 <= x1 + 1 and y0 - 1 <= (top + bottom) / 2 <= y1 + 1]
+    return bool(inside) and sum(inside) > len(inside) / 2
 
 
 def _pdf_span_italic(span: dict) -> bool:

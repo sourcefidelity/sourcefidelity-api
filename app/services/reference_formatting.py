@@ -85,7 +85,8 @@ def assess_contribution_reference(*, citation_format: str, body: str,
 
 
 class ReferenceTitleStyleResult(BaseModel):
-    rule_id: Literal['apa7_reference_title_italics_v1', 'apa7_reference_title_italics_v2', 'apa7_marked_periodical_italics_v1', 'literal_title_emphasis_v1'] = 'apa7_reference_title_italics_v2'
+    rule_id: Literal['apa7_reference_title_italics_v1', 'apa7_reference_title_italics_v2', 'apa7_marked_periodical_italics_v1',
+                     'apa7_periodical_volume_italics_v1', 'literal_title_emphasis_v1'] = 'apa7_reference_title_italics_v2'
     reference_id: str
     reference_text_sha256: str
     source_kind: str
@@ -231,6 +232,22 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
                             reason_code='periodical_italic_style_matches' if observed else 'periodical_italic_style_differs',
                             title_start=start, title_end=end, title_sha256=hashlib.sha256(ref.raw_ref[start:end].encode()).hexdigest(),
                             expected_italic=True, observed_italic=observed))
+                    else:
+                        # The journal title italic and only the volume number in
+                        # regular type (owner wording 2026-10-07, Franchise 2).
+                        volume = re.search(r'\d{1,4}\s*$', ref.raw_ref[start:end].replace('*', ''))
+                        volume_start = start + ref.raw_ref[start:end].rfind(volume.group().strip()) if volume else -1
+                        italic_at = lambda i: any(s.italic and s.start <= i < s.end for s in entry.text_style_spans)
+                        journal_chars = [i for i in range(start, volume_start) if ref.raw_ref[i].isalnum()]
+                        volume_end = volume_start + len(volume.group().strip()) if volume else -1
+                        if (volume and journal_chars and all(italic_at(i) for i in journal_chars)
+                                and not any(italic_at(i) for i in range(volume_start, volume_end))):
+                            results.append(ReferenceTitleStyleResult(
+                                rule_id='apa7_periodical_volume_italics_v1', reference_id=ref.reference_id,
+                                reference_text_sha256=digest, source_kind=ref.source_kind, status='difference',
+                                reason_code='periodical_volume_not_italic', title_start=volume_start, title_end=volume_end,
+                                title_sha256=hashlib.sha256(ref.raw_ref[volume_start:volume_end].encode()).hexdigest(),
+                                expected_italic=True, observed_italic=False))
     for ref in references:
         entry=entries.get(ref.reference_id)
         title=ref.title.strip('*').rstrip('.')
@@ -402,10 +419,15 @@ def reference_style_findings(assessment: dict, references: dict[str, ParsedRefer
                      if result.rule_id == 'literal_title_emphasis_v1' else
                      'The journal title and volume number are not italicized in this APA reference.'
                      if result.rule_id == 'apa7_marked_periodical_italics_v1' else
+                     # Owner-approved wording (2026-10-07).
+                     'The volume number is not italicized in this APA reference.'
+                     if result.rule_id == 'apa7_periodical_volume_italics_v1' else
                      'The title is not italicized in this APA reference.' if result.expected_italic else
                      'Use regular type, rather than italics, for the article title in this APA reference.'),
             rule_id=result.rule_id, rule_source=APA_TITLE_RULE_SOURCE,
-            field_difference={'field_name':'title','submitted_value':title},
+            # Where in the entry the field starts: a volume number such as "6"
+            # recurs in pages and years, so its own place is kept (2026-10-07).
+            field_difference={'field_name':'title','submitted_value':title,'raw_offset':result.title_start},
             rectangles=[], localization_status='not_assessed'))
     payload = assessment.get('order_result')
     if payload:

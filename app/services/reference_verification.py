@@ -441,8 +441,14 @@ def same_title_author_difference(reference, discovery: dict | None) -> dict | No
     if len(cited_title) < 12 or not cited_surnames:
         return None
     located: list[tuple[frozenset, dict]] = []
+    cited_container = _title_forms(getattr(reference, 'container_title', '') or '')[1]
     for candidate in discovery.get('candidates') or []:
         observed = candidate.get('observed') or {}
+        # An article in a named journal or newspaper is not the same work as a
+        # same-titled record outside it (Nuhn's newspaper article against an
+        # Amazon book listing by another author, 2026-10-07).
+        if cited_container and _title_forms(observed.get('container_title') or '')[1] != cited_container:
+            continue
         if _title_forms(observed.get('title'))[1] != cited_title and not (
                 candidate.get('provider') == 'web_search'
                 and _page_title_matches({'title': getattr(reference, 'title', '')}, observed.get('title'))):

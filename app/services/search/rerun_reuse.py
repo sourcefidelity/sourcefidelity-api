@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 
-POLICY = "paper-search-reuse-v2"
+POLICY = "paper-search-reuse-v3"
 _REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
 _INCOMPLETE_REASONS = frozenset({"full_text_search_incomplete", "transient_verification_run_unavailable",
                                  "transient_source_admission_failed", "durable_representation_not_authorized"})
@@ -84,8 +84,24 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if _network_failed(discovery):
         return False
     if discovery.get("outcome") == "search_incomplete":
-        return _required_searches_completed(item, reference)
+        return _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
     return bool(discovery)
+
+
+def _no_provider_at_fault(discovery: dict) -> bool:
+    """Incomplete only for reasons a repeat would meet again: every required
+    provider answered, and the gaps are filtered index records, unresolved
+    web-search leads or pages that did not confirm the work (owner decision
+    2026-10-07; Franchise 2's 8 such references were searched again each run).
+    A provider whose failure holds the search incomplete still forces a new
+    search; so does a reference whose parse was incomplete."""
+    from app.services.paper_workflow import _blocking_providers_from_record
+    if (discovery.get("expected") or {}).get("reference_parse_review"):
+        return False
+    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
+    if not any(a.get("route_category") == "bounded_web" for a in attempts):
+        return False
+    return not _blocking_providers_from_record(discovery)
 
 
 def _web_search_answered(discovery: dict) -> bool:

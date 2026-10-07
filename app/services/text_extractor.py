@@ -347,20 +347,41 @@ def extract_text_from_bytes(
 def _extract_pdfplumber_bytes(content: bytes) -> str:
     with pdfplumber.open(io.BytesIO(content)) as pdf:
         pages = [page.extract_text() for page in pdf.pages if page.extract_text()]
-    return join_pdf_pages(_strip_repeated_page_marginals(pages))
+    return join_pdf_pages(_strip_repeated_page_marginals(pages), bold_lines=_bold_pdf_lines(content))
 
 
 def _extract_pymupdf_bytes(content: bytes) -> str:
     document = fitz.open(stream=content, filetype="pdf")
     try:
         return join_pdf_pages(
-            _strip_repeated_page_marginals([page.get_text() for page in document])
+            _strip_repeated_page_marginals([page.get_text() for page in document]),
+            bold_lines=_bold_pdf_lines(content),
         )
     finally:
         document.close()
 
 
-def join_pdf_pages(pages: list[str]) -> str:
+def _bold_pdf_lines(content: bytes) -> frozenset[str]:
+    """Printed lines set wholly in a bold font, whitespace-normalised."""
+    try:
+        document = fitz.open(stream=content, filetype="pdf")
+    except Exception:  # noqa: BLE001 - layout evidence is optional
+        return frozenset()
+    lines = set()
+    try:
+        for page in document:
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+                    if spans and all(int(s.get("flags", 0)) & 16 or re.search(r"bold|black", s.get("font", ""), re.I)
+                                     for s in spans):
+                        lines.add(" ".join("".join(s["text"] for s in spans).split()))
+    finally:
+        document.close()
+    return frozenset(lines)
+
+
+def join_pdf_pages(pages: list[str], *, bold_lines: frozenset[str] = frozenset()) -> str:
     """Pages as paragraphs, except a sentence the page break cuts: a page ending
     without sentence punctuation before one that opens in lower case
     ("This part" / "of her experience", paper 9, 2026-10-04) joins with a space."""
@@ -379,13 +400,13 @@ def join_pdf_pages(pages: list[str]) -> str:
                 text = text.rstrip() + " " + page.lstrip()
         else:
             text = text + "\n\n" + page
-    return isolate_pdf_headings(text)
+    return isolate_pdf_headings(text, bold_lines=bold_lines)
 
 
 _REFERENCE_LIST_HEADING = re.compile(r"(?im)^\s*(?:references|reference list|bibliography|works cited)\s*$")
 
 
-def isolate_pdf_headings(text: str) -> str:
+def isolate_pdf_headings(text: str, *, bold_lines: frozenset[str] = frozenset()) -> str:
     """A heading line the PDF prints without a blank line after it is not the
     start of the next sentence ("Conceptualisation of Identity and
     Representation" / "Identity is …", paper 9, 2026-10-04): a short,
@@ -404,9 +425,12 @@ def isolate_pdf_headings(text: str) -> str:
         line, before, after = lines[i].strip(), lines[i - 1].strip(), lines[i + 1].strip()
         words = re.findall(r"[A-Za-z][\w'’-]*", line)
         long_words = [w for w in words if len(w) >= 4]
-        if (not 2 <= len(words) <= 12 or len(long_words) < 2 or re.search(r"[.!?:;,]$", line)
+        # A line set wholly in bold is a heading in any case ("Performance and
+        # influencing factors", Franchise 2, 2026-10-07); otherwise title case.
+        bold = " ".join(line.split()) in bold_lines
+        if (not 2 <= len(words) <= (15 if bold else 12) or len(long_words) < 2 or re.search(r"[.!?:;,]$", line)
                 or not re.search(r"[.!?][\"”’')]*$", before) or not after[:1].isupper()
-                or sum(w[0].isupper() for w in long_words) < 0.75 * len(long_words)):
+                or (not bold and sum(w[0].isupper() for w in long_words) < 0.75 * len(long_words))):
             continue
         out[i] = "\n" + lines[i] + "\n"
     return "\n".join(out) + text[end:]

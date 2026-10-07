@@ -80,7 +80,8 @@ class LinkRequest(BaseModel):
     identity_fields: list[Literal['title', 'author', 'year', 'doi']] = Field(default_factory=list)
     identity_differences: list[LinkIdentityDifference] = Field(default_factory=list, max_length=4)
     page_observation: Literal['not_assessed', 'pdf_route_required', 'cross_script_title_unresolved',
-        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'source_kind_unconfirmed', 'site_homepage'] = 'not_assessed'
+        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'source_kind_unconfirmed', 'site_homepage',
+        'access_wall'] = 'not_assessed'
     page_evidence_sha256: Hash | None = None
     representation_sha256: Hash | None = None
     representation_id: str | None = None
@@ -281,7 +282,8 @@ def identity_observed(url, content_sha256, reason, fields=(), *, differences=())
 
 def page_observed(url, content_sha256, reason):
     if reason not in {'pdf_route_required', 'cross_script_title_unresolved',
-        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'source_kind_unconfirmed', 'site_homepage'}:
+        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'source_kind_unconfirmed', 'site_homepage',
+        'access_wall'}:
         return
     for row in ACTIVE_LINKS.get() or []:
         if row.request_sha256 != binding(str(url)):

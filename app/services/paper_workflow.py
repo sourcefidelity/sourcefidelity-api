@@ -1084,6 +1084,9 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     session.commit()
     from app.services.judgment_runs import schedule_run_at_check
     schedule_run_at_check(session, report, job)
+    # Checks every finished report (owner decision 2026-10-07); never fails the run.
+    from app.services.report_check import record_report_check
+    record_report_check(session, backend, report, job)
     cleaned = cleanup_paper_job_input(session, backend, job.id)
     return {"job_id": str(job.id), "report_id": str(report.id), "input_cleaned": cleaned}
 

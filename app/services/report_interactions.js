@@ -187,6 +187,26 @@
     const trigger = event.target.closest('[data-panel-template]');
     if (trigger && ['Enter', ' '].includes(event.key)) { event.preventDefault(); openFromPaper(trigger); }
   });
+  // Tab moves between the paper's windows in reading order, one stop each,
+  // the order of the Previous/Next arrows. Marks are drawn in layers (the
+  // judgment highlights after the citations, entries bottom up), so the
+  // browser's own order jumped back and forth (2026-10-07).
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Tab' || event.altKey || event.ctrlKey || event.metaKey) return;
+    const mark = event.target.closest?.('.page-container [role="button"]');
+    if (!mark) return;
+    const template = mark.dataset.panelTemplate
+      || ((mark.getAttribute('aria-label') || '').match(/^Citation (\d+)/) || [])[1] && 'citation-panel-' + mark.getAttribute('aria-label').match(/^Citation (\d+)/)[1];
+    const targets = orderedTargets();
+    const index = targets.findIndex(el => el === mark) >= 0 ? targets.findIndex(el => el === mark)
+      : targets.findIndex(el => el.dataset.panelTemplate === template);
+    if (index < 0) return;
+    const next = targets[index + (event.shiftKey ? -1 : 1)];
+    if (!next) return;  // past either end, Tab leaves the paper as usual
+    event.preventDefault();
+    next.focus();
+    scrollPaperTo(next);
+  });
   function captureTextSelection() {
     if (mode !== 'text') return;
     const selection = document.getSelection();

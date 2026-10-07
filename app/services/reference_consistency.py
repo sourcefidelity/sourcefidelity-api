@@ -618,6 +618,11 @@ def apa_in_text_form(reference) -> str:
     "Yang & Wang, 2019") already differ (Academic Article, 2026-09-30).
     """
     author = str(getattr(reference, "author", "") or "")
+    if not author.strip() and str(getattr(reference, "title", "") or "").strip():
+        # A title-first entry is cited by its title (Franchise 2's "Sherlock
+        # season 1" and "Sherlock season 4", both n.d., 2026-10-07).
+        title = " ".join(str(reference.title).casefold().split())
+        return f"“{title}” {str(getattr(reference, 'year', '') or '').casefold()}"
     names = re.findall(r"([^\W\d_][\w'’\-]*(?:\s+[^\W\d_][\w'’\-]*)?)\s*,\s*(?:[A-Z](?:\.|\b)[\s\-]*)+", author)
     surnames = [n.strip().casefold() for n in names] or [author.split(",")[0].strip().casefold()]
     year = str(getattr(reference, "year", "") or "").casefold()

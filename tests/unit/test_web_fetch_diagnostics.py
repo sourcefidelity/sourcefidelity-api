@@ -24,7 +24,6 @@ def fetch(monkeypatch, body, *, title='History of cinema', author=None, content_
 
 @pytest.mark.parametrize('body,reason', [
     ('<title>Unrelated chemistry methods</title>', 'page_title_mismatch_unconfirmed'),
-    ('<title>Sign in</title>', 'page_title_mismatch_unconfirmed'),
     ('<title>电影史</title>', 'cross_script_title_unresolved'),
 ])
 def test_wrong_page_is_not_automatically_wrong_work(monkeypatch, body, reason):
@@ -32,6 +31,14 @@ def test_wrong_page_is_not_automatically_wrong_work(monkeypatch, body, reason):
     assert not result.success
     assert diagnostic.reason == reason
     assert diagnostic.outcome == 'identity_unconfirmed'
+
+
+@pytest.mark.parametrize('body', ['<title>Sign in</title>', '<title>Example Visitor System</title>'])
+def test_a_log_in_or_visitor_wall_is_refused_access(monkeypatch, body):
+    # 2026-10-07: a wall standing in for the page refuses automated access.
+    result, diagnostic = fetch(monkeypatch, body)
+    assert not result.success
+    assert (diagnostic.reason, diagnostic.outcome) == ('access_wall', 'access_restricted')
 
 
 def test_pdf_requires_separate_route(monkeypatch):

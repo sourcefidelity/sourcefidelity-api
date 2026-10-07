@@ -45,10 +45,19 @@ def repair_reference_urls(
                 break
             token = next_line[1].strip()
             proven = any(target.startswith("".join(pieces) + token.rstrip('.,;)]>')) for target in link_targets)
+            # Also structured (Franchise 2, 2026-10-07): a parameter split in a
+            # query the URL already has ("...&utm_sour" / "ce=app_share"),
+            # and a whole line that is one long slug of at least four separators
+            # ("herlock_holmes_the_awakened_sales_within_10_days"); a short
+            # fragment ("ractice_of_Media") still needs a link target's proof.
+            query_split = "?" in "".join(pieces) and re.match(r"[\w.-]*=", token)
+            slug = len(re.findall(r"[-_]", token)) >= 4 and re.fullmatch(r"[\w-]+/?", token)
+            # A line opening with a URL separator cannot start new prose ("_10_days").
+            slug = slug or re.match(r"[_\-./?=&%#]\w", token)
             if (
                 not _TOKEN.fullmatch(token)
                 or _START.search(token)
-                or not ("/" in token or re.search(r"[?&][\w.-]+=", token) or proven)
+                or not ("/" in token or re.search(r"[?&][\w.-]+=", token) or query_split or slug or proven)
                 or len("".join(pieces)) + len(token) > 8192
             ):
                 break

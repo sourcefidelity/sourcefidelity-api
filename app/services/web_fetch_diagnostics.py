@@ -12,6 +12,8 @@ _OUTCOMES = {
     'cross_script_title_unresolved': 'identity_unconfirmed',
     'page_title_mismatch_unconfirmed': 'identity_unconfirmed',
     'site_homepage': 'identity_unconfirmed',
+    # A log-in, visitor or bot-check page stands in for the work (2026-10-07).
+    'access_wall': 'access_restricted',
     'readable_text_unavailable': 'identity_unconfirmed',
     'source_kind_unconfirmed': 'type_unconfirmed',
     'bibliographic_fields_conflict': 'identity_rejected',
@@ -28,7 +30,7 @@ class WebFetchDiagnostic(BaseModel):
         'candidate_budget_exhausted',
         'access_restricted', 'transport_failure', 'fetch_unavailable',
         'pdf_route_required', 'cross_script_title_unresolved',
-        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'site_homepage',
+        'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'site_homepage', 'access_wall',
         'source_kind_unconfirmed', 'bibliographic_fields_conflict',
         'bibliographic_identity_confirmed', 'bibliographic_identity_unconfirmed',
         'diagnostic_unavailable',

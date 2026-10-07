@@ -200,10 +200,11 @@ def test_reference_findings_are_counted_in_three_broad_lines():
         _summary_item('chapter_pages_missing', 'x', instances=[ref(6)], count=1)]}
     findings = [{'finding_type': 'reference_title_missing', 'reference_id': 'r7', 'rectangles': [{}]}]
     grouped = broad_reference_summary(summary, findings, {'r7': 7})
+    # Incorrect information is Academic Practice (owner decision 2026-10-07).
     assert [(i['kind'], i['lead'], [x['number'] for x in i['instances']]) for i in grouped['academic_practice']] == [
-        ('reference_links', '2 references have incorrect or missing links', [3, 5])]
+        ('reference_links', '2 references have incorrect or missing links', [3, 5]),
+        ('reference_incorrect_information', '1 reference contains incorrect information', [2])]
     assert [(i['kind'], i['lead']) for i in grouped['reference_formatting']] == [
-        ('reference_incorrect_information', '1 reference contains incorrect information'),
         ('reference_missing_information', '2 references are missing information')]
     assert broad_reference_summary(grouped, findings, {'r7': 7}) == grouped
 

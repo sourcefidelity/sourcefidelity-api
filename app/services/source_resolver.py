@@ -178,6 +178,46 @@ def _search_execution_outcome(result: RetrievalResult) -> str:
 _HTTP_STATUS_IN_ERROR = re.compile(r"\bhttp[_\s]?(\d{3})\b", re.IGNORECASE)
 
 
+# A student link or DOI page that answered but did not identify the cited work
+# is a completed check, not a provider failure (P3, 2026-10-07: 100 stored
+# student-link attempts and the DOI route's title and identity rejections were
+# recorded as operational failures, which read as provider outages).
+_ANSWERED_LINK_REASONS = {
+    'page_title_mismatch_unconfirmed': 'link_page_title_differs',
+    'cross_script_title_unresolved': 'link_title_other_script',
+    'site_homepage': 'link_site_home_page',
+    'readable_text_unavailable': 'link_text_unreadable',
+    'source_kind_unconfirmed': 'link_source_type_unconfirmed',
+    'bibliographic_fields_conflict': 'link_details_conflict',
+    'bibliographic_identity_unconfirmed': 'link_identity_unconfirmed',
+}
+_ANSWERED_DOI_ERRORS = {
+    'DOI resolver HTML title does not match cited source': 'doi_page_title_differs',
+    'Public DOI landing identity remains unconfirmed': 'doi_page_identity_unconfirmed',
+    'DOI resolver HTML work type conflicts with citation': 'doi_page_source_type_differs',
+    'DOI resolver returned content that failed representation or identity validation': 'doi_content_rejected',
+}
+
+
+def _student_link_disposition(result) -> tuple[str, str] | None:
+    """(outcome, reason) for a student link or DOI that was checked and did not
+    identify the work, or a DOI that could not be requested; None otherwise."""
+    if result.success:
+        return None
+    error = result.error or ''
+    if error == 'Malformed DOI':
+        return 'unavailable', 'doi_malformed'
+    if error in _ANSWERED_DOI_ERRORS:
+        return 'no_match', _ANSWERED_DOI_ERRORS[error]
+    from app.services.web_fetch_diagnostics import read_web_fetch_diagnostic
+    reason = read_web_fetch_diagnostic(result).reason
+    if reason == 'access_wall':
+        return 'access_restricted', 'link_access_wall'
+    if reason in _ANSWERED_LINK_REASONS:
+        return 'no_match', _ANSWERED_LINK_REASONS[reason]
+    return None
+
+
 def _route_error_code(result) -> str | None:
     """Classify a failed route against a fixed vocabulary.
 
@@ -440,7 +480,10 @@ _INTERSTITIAL_TITLE = re.compile(
     r"(?i)\b(?:javascript\s+(?:is\s+)?(?:disabled|required)|enable\s+javascript|just\s+a\s+moment"
     r"|access\s+denied|attention\s+required|are\s+you\s+a\s+(?:robot|human)|verify(?:ing)?\s+you\s+are"
     r"|captcha|security\s+check|checking\s+your\s+browser|please\s+wait|request\s+blocked|forbidden"
-    r"|too\s+many\s+requests|cookie\s+(?:consent|settings|policy)|sign\s+in|log\s+in|loading)\b")
+    r"|too\s+many\s+requests|cookie\s+(?:consent|settings|policy)|sign\s+in|log\s+in|loading"
+    # A visitor wall ("... Visitor System") and a bot check ("Making sure
+    # you're not a bot"), Franchise 2, 2026-10-07.
+    r"|visitor\s+system|not\s+a\s+(?:bot|robot))\b")
 
 
 def interstitial_page_title(title: str) -> bool:
@@ -1213,9 +1256,13 @@ class SourceResolver:
         observed_web_candidate = bool(
             category == "student_url" and (result.metadata or {}).get("web_identity")
         )
+        link_disposition = (_student_link_disposition(result)
+                            if category == "student_url" and not observed_web_candidate else None)
         if not applicable:
             outcome = "unavailable"
             reason_code = "route_not_applicable"
+        elif link_disposition is not None:
+            outcome, reason_code = link_disposition
         elif category == "bounded_web" and transient_audits and not bounded_candidate_returned:
             outcome = "candidates_processed"
             reason_code = "transient_candidate_accounting"
@@ -1264,7 +1311,7 @@ class SourceResolver:
             # as `operational_failure` made a skipped CORE lookup read as a
             # CORE fault in every audit (289 such records by 2026-09-24).
             execution = "budget_skipped" if budget_exhausted else "declined" \
-                if reason_code == "route_not_applicable" else {
+                if reason_code in {"route_not_applicable", "doi_malformed"} else {
                 "candidate_found": "results", "no_match": "no_results",
                 "access_restricted": "access_restricted",
             }.get(outcome, "operational_failure")
@@ -1294,7 +1341,7 @@ class SourceResolver:
             query_ids=[query.query_id for query in queries],
             outcome=outcome,
             reason_code=reason_code,
-            error_code=_route_error_code(result) if outcome in {
+            error_code=_route_error_code(result) if reason_code != "doi_malformed" and outcome in {
                 "operational_failure", "timeout", "rate_limited", "unavailable",
                 "access_restricted",
             } else None,
@@ -4881,6 +4928,12 @@ class SourceResolver:
             )
             if page_titles and not _html_title_matches(title, page_titles):
                 from app.services.submitted_links import is_site_homepage
+                if all(interstitial_page_title(str(value)) for value in page_titles):
+                    # A log-in or visitor wall answered in the work's place: a
+                    # refusal of automated access, not a page with another title.
+                    return RetrievalResult(source_name="web_fetch", success=False,
+                                           error="Access wall answered in place of the page",
+                                           metadata=diagnostic('access_wall'))
                 homepage = is_site_homepage(resp.text, final_url)
                 logger.info(
                     "Web fetch identity mismatch for %s",
@@ -6766,6 +6819,17 @@ def _expected_page_range(result: RetrievalResult) -> tuple[int, int] | None:
         match = range_re.search(raw)
         if not match:
             continue
+        start, end = int(match.group(1)), int(match.group(2))
+        if start <= end and 1 < end - start + 1 <= 500:
+            return start, end
+    # A copy found without a provider record (web search) is checked against
+    # the range the reference states: Smith (2016), pp. 537-554, was an
+    # 18-page journal PDF judged "uncertain" and shown as limited text
+    # (Franchise 2, 2026-10-07).
+    trace = _ACTIVE_DISCOVERY_TRACE.get()
+    expected = trace.get("expected") if trace else None
+    match = range_re.search(str(getattr(expected, "pages", "") or ""))
+    if match:
         start, end = int(match.group(1)), int(match.group(2))
         if start <= end and 1 < end - start + 1 <= 500:
             return start, end

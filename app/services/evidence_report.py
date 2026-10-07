@@ -1783,7 +1783,8 @@ _BROAD_SUMMARY_LINES = (
     # (kinds, column, kind, singular, plural)
     (_LINK_SUMMARY_KINDS, 'academic_practice', 'reference_links',
      '1 reference has an incorrect or missing link', '{n} references have incorrect or missing links'),
-    (_INCORRECT_SUMMARY_KINDS, 'reference_formatting', 'reference_incorrect_information',
+    # Academic Practice, as its windows are (owner decision 2026-10-07).
+    (_INCORRECT_SUMMARY_KINDS, 'academic_practice', 'reference_incorrect_information',
      '1 reference contains incorrect information', '{n} references contain incorrect information'),
     (_MISSING_SUMMARY_KINDS, 'reference_formatting', 'reference_missing_information',
      '1 reference is missing information', '{n} references are missing information'),
@@ -2561,6 +2562,7 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
     # The last reference-list heading in the paper ("References", "Bibliography",
     # "Works Cited"), or -1.
     reference_list_start = max(surface.rfind(word) for word in ("references", "referencelist", "bibliography", "workscited"))
+    mention_order: dict[tuple[str, str], int] = {}
     for finding in findings:
         finding["rectangles"] = []
         finding["localization_status"] = "exact_field_not_located"
@@ -2585,6 +2587,12 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
         entry_matches = [m.start() for m in re.finditer(f"(?={re.escape(entry)})", surface)]
         field_matches = [m.start() for m in re.finditer(f"(?={re.escape(field)})", entry)]
         literal_field = str(difference.get('submitted_value') or '')
+        offset = difference.get('raw_offset')
+        if (len(field_matches) > 1 and isinstance(offset, int) and 0 <= offset <= len(raw)
+                and raw[offset:offset + len(literal_field)] == literal_field):
+            at = len(_field_characters(raw[:offset])[0])
+            if at in field_matches:
+                field_matches = [at]
         if len(field_matches) > 1 and literal_field and raw.count(literal_field) == 1:
             # A URL slug can repeat a title/year after normalization. The
             # exact literal submitted field disambiguates its original offset.
@@ -2612,6 +2620,32 @@ def _attach_reference_field_geometry(view: dict, document, paper_hash: str) -> N
             listed = [m for m in entry_matches if m >= reference_list_start]
             if reference_list_start >= 0 and len(listed) == 1:
                 entry_matches = listed
+        cited_entry = entry
+        if finding.get('finding_type') == 'body_title_style' and not entry_matches and len(entry) >= 120:
+            # A long passage the page interrupts (a running header or page
+            # number at a page break): bounded by its unique opening and
+            # closing, the title is found in that stretch (paper 1, 5 of 11
+            # italics findings hidden, 2026-10-07).
+            head, tail = entry[:40], entry[-40:]
+            starts = [m.start() for m in re.finditer(f"(?={re.escape(head)})", surface)]
+            ends = [m.start() for m in re.finditer(f"(?={re.escape(tail)})", surface)]
+            if len(starts) == 1 and len(ends) == 1 and 0 < ends[0] - starts[0] <= len(entry) + 400:
+                stretch = surface[starts[0]:ends[0] + len(tail)]
+                inside = [m.start() for m in re.finditer(f"(?={re.escape(field)})", stretch)]
+                if len(inside) == len(field_matches):
+                    entry, entry_matches, field_matches = stretch, [starts[0]], inside
+        if (finding.get('finding_type') == 'body_title_style' and len(entry_matches) == 1 and len(field_matches) > 1):
+            # One sentence naming the same title more than once: each mention is
+            # its own finding, so the mentions are placed in order (paper 2, 7
+            # of 13 italics findings were hidden, 2026-10-07).
+            key = (cited_entry, field)
+            peers = sum(1 for f in findings if f.get('finding_type') == 'body_title_style'
+                        and _field_characters(str(f.get('citation_text') or ''))[0] == cited_entry
+                        and _field_characters(str((f.get('field_difference') or {}).get('submitted_value') or ''))[0] == field)
+            index = mention_order.get(key, 0)
+            mention_order[key] = index + 1
+            if peers == len(field_matches) and index < len(field_matches):
+                field_matches = [field_matches[index]]
         span_geometry = None
         parts = (finding.get("source") or {}).get("split_parts") or []
         if len(entry_matches) != 1 and len(parts) == 2 and len(field_matches) == 1:
@@ -2900,6 +2934,18 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     findings[:], pervasive_order = reference_order_projection(findings, reference_ordinal)
     result['pervasive_reference_order'] = bool(result.get('pervasive_reference_order')) or pervasive_order
     _attach_reference_field_geometry(result, document, paper_hash)
+    # A finding about the whole entry, or about an element the entry lacks
+    # (Croteau & Hoynes's missing editors, Franchise 2, 2026-10-07), that the
+    # field matcher could not place takes the entry's own location, which the
+    # report already uses to open its Reference window.
+    for finding in result.get('reference_practice') or []:
+        located = (result.get('paper_surface') or {}).get('reference_locations', {}).get(finding.get('reference_id'))
+        nothing_to_place = not str((finding.get('field_difference') or {}).get('submitted_value') or '').strip()
+        if (finding.get('locate_value') or nothing_to_place) and not finding.get('rectangles') and located \
+                and finding.get('finding_type') not in {'required_quotation_locator_missing', 'body_title_style'}:
+            finding['rectangles'] = list(located['rectangles'])
+            finding['localization_status'] = 'exact_rectangle'
+            finding['geometry_provenance'] = located.get('geometry_provenance')
     result.pop('reference_numbers', None)
     result['reference_numbers'] = reference_numbers(result)
     # References no citation links to, except a film or programme the paper
@@ -3737,6 +3783,7 @@ def _reference_view(reference, reference_layout=None) -> dict:
         "title": reference.title,
         "doi": getattr(reference, "doi", ""),
         "url": getattr(reference, "url", ""),
+        "url_repair": bool(getattr(reference, "url_repair", None)),
         "source_kind": getattr(reference, "source_kind", "unknown"),
         "raw_reference": reference.raw_ref,
         "split_parts": list(getattr(reference, "split_parts", None) or []),
@@ -5945,7 +5992,8 @@ def _citation_reference_headings(templates: str, citations: list[dict], numbers:
 
 def _submitted_link_refused(member: dict) -> bool:
     """No text was retrieved and the reference's own link answered with a
-    refusal (HTTP 401/403) the last time it was requested."""
+    refusal (HTTP 401/403), or with a log-in or visitor wall, the last time it
+    was requested."""
     if member.get('coverage_level') not in {'unavailable', None, ''}:
         return False
     for row in member.get('submitted_link_observations') or []:
@@ -5954,7 +6002,45 @@ def _submitted_link_refused(member: dict) -> bool:
             last = max(requests, key=lambda r: str(r.get('completed_at') or ''))
             if last.get('outcome') in {'access_refused', 'authentication_required'}:
                 return True
+            # A log-in or visitor wall answering in the work's place (2026-10-07).
+            if last.get('outcome') == 'response' and last.get('page_observation') == 'access_wall':
+                return True
     return False
+
+
+# Owner-approved wording (2026-10-07) for why a cited link gave no text.
+_LINK_REASON_TITLE = 'The submitted link opened a page with a different title, so the source could not be retrieved.'
+_LINK_REASON_UNREADABLE = 'The submitted link opened the page, but its text could not be read.'
+_LINK_REASON_UNREACHED = 'The submitted link could not be reached when checked.'
+_UNREACHED_OUTCOMES = frozenset({'timeout', 'dns_failure', 'tls_failure', 'connection_failure', 'server_failure',
+                                 'operational_failure'})
+
+
+def _submitted_link_unretrieved_reason(member: dict, findings: list[dict] | None = None) -> str | None:
+    """Why the reference's own link gave no text, from its last request.
+
+    A missing page, a home page and a page titled with another work already
+    have their own findings, so they add no sentence here."""
+    if member.get('coverage_level') not in {'unavailable', None, ''}:
+        return None
+    reference_id = member.get('reference_id')
+    if any(f.get('reference_id') == reference_id and f.get('finding_type') in {'submitted_link_issue', 'submitted_link_homepage'}
+           for f in findings or []):
+        return None
+    for row in member.get('submitted_link_observations') or []:
+        requests = [r for r in row.get('requests') or [] if isinstance(r, dict)]
+        if row.get('state') != 'observed' or not requests:
+            continue
+        last = max(requests, key=lambda r: str(r.get('completed_at') or ''))
+        if last.get('outcome') in _UNREACHED_OUTCOMES:
+            return _LINK_REASON_UNREACHED
+        if last.get('outcome') == 'response':
+            observation = last.get('page_observation')
+            if observation == 'page_title_mismatch_unconfirmed':
+                return _LINK_REASON_TITLE
+            if observation == 'readable_text_unavailable':
+                return _LINK_REASON_UNREADABLE
+    return None
 
 
 def withdraw_unverified_possible_matches(view: dict, citations: list[dict], unverified_ids: set) -> dict:
@@ -6009,6 +6095,10 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
             # Owner-approved wording (2026-10-02).
             parts.append('<p class="reference-access-note">The submitted link refused automated access, '
                          'so the source could not be retrieved.</p>')
+        else:
+            reason = _submitted_link_unretrieved_reason(member, findings)
+            if reason:
+                parts.append(f'<p class="reference-access-note">{escape(reason)}</p>')
         first = entry.get('first_citation')
         if first and _member_accepts_upload(member):
             parts.append(_render_upload(citations[first[0] - 1].get('upload_action') or {}))
@@ -6530,7 +6620,11 @@ def _render_formatted_reference(source: dict, fallback: str) -> str:
     # A PDF-wrapped URL ("…Theorising_the_P ractice_of_…") whose submitted link
     # is the written start plus the following text without its spaces is one
     # link, written once (Dena, Paula; 2026-10-02).
-    for href in dict.fromkeys(source.get('submitted_hyperlinks') or []):
+    # The reference's repaired address (a structured line wrap,
+    # reference_url_repair) joins the same way when the file has no link
+    # target (Franchise 2 references 9, 11 and 13, 2026-10-07).
+    repaired = [source.get('url')] if source.get('url_repair') and source.get('url') else []
+    for href in dict.fromkeys([*(source.get('submitted_hyperlinks') or []), *repaired]):
         if not _safe_reference_href(href) or href in text:
             continue
         for match in re.finditer(r'https?://[^\s<>"]+', text):
