@@ -105,7 +105,7 @@ def _extract_identifiers(text: str) -> tuple[str, str]:
 _APA_YEAR = re.compile(
     r'\((?:19|20)\d{2}[a-z]?(?:\s*[-–—]\s*(?:19|20)\d{2})?(?:,\s*[^)]{1,60}|'
     r'\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)'
-    r'(?:\s+(?:[1-9]|[12]\d|3[01]))?)?\)|\(n\.d\.\)',
+    r'(?:\s+(?:[1-9]|[12]\d|3[01]))?)?\)|\(n\.d\.?\)',
     re.IGNORECASE,
 )
 
@@ -191,6 +191,10 @@ def _apa_title(after_year: str) -> str:
             # (e.g. "Pearl S. Buck" or "David O. Selznick").
             if (re.search(r'\b[A-Z][a-z]{1,30}\s+(?:[A-Z]\.\s*)*[A-Z]$', text[:index])
                     and re.match(r'\s+[A-Z][a-z]{1,30}\b', text[index+1:])):
+                continue
+            # "Party Dominance vs. Cultural Imperialism" (Hao, 2026-10-06): an
+            # abbreviation inside a title is not a source boundary either.
+            if re.search(r'(?:^|\s)(?:[Vv]s|v|Mr|Mrs|Ms|Dr|e\.g|i\.e)$', text[:index]):
                 continue
             extended = _review_header_end(text, index)
             end = index if extended is None else extended
@@ -515,6 +519,17 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
         # Preserve a cited component locator in raw_ref, but keep it out of
         # canonical title identity and retrieval queries.
         title = _TRAILING_PAGE_RANGE.sub("", title).strip()
+
+    # A title-first web entry, "Sherlock season 1. (n.d.) Retrieved from: URL":
+    # APA moves the title into the author position when there is no author, so
+    # what precedes the date is the title and nothing but the link follows it
+    # (Franchise 2, 2026-10-06; its title had been read as "Retrieved from:").
+    after_date = ref[year_match.end():] if year_match else ''
+    if (author and year_match and url and not doi
+            and re.fullmatch(r'[\s.,;:]*(?:(?:retrieved?|available|accessed)\b[^:/]{0,40}:?\s*)?\S*https?://.+',
+                             after_date, re.IGNORECASE | re.DOTALL)):
+        return ParsedReference(author='', year=year or 'n.d.', title=author, url=url, raw_ref=ref,
+                               citation_key=_make_citation_key(author, year), extraction_method='regex')
 
     # Success check — need both author and title
     if not author or not title:

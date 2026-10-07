@@ -208,6 +208,14 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
     if not expected:
         return False
     observed = (candidate.get('observed') or {}).get('title')
+    cited_words = re.findall(r'\w+', _title_forms(expected.get('title'))[0])
+    observed_words = re.findall(r'\w+', _title_forms(observed)[0])
+    if (outcomes.get('doi') == 'agreement' and outcomes.get('year') == 'agreement'
+            and len(cited_words) >= 2 and observed_words[:len(cited_words)] == cited_words):
+        # The same DOI and year, the cited title the start of the record's: a
+        # title cut short by parsing ("Party Dominance vs", Hao, 2026-10-06),
+        # whatever the author's name order.
+        return True
     if (outcomes.get('author') in {'agreement', 'minor_difference'}
             and candidate.get('provider') in BOOK_CATALOGUES | {'crossref', 'openalex'}
             and _same_main_title(expected.get('title'), observed)):

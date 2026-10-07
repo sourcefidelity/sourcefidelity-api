@@ -247,6 +247,7 @@ def extract_paper_evidence(
     extracted = source_headed_sections(extracted, marker_census, body_text, references)
     extracted = join_adjacent_continuations(extracted, body_text, references)
     extracted = join_author_naming_sentences(extracted, marker_census, body_text, references)
+    extracted = yearless_author_mentions(extracted, marker_census, body_text, references)
     accepted = [citation for citation in extracted if citation.drop_reason is None]
     rejected = [citation for citation in extracted if citation.drop_reason is not None]
     accepted, ungrouped_multi_marker = _group_multi_marker_units(accepted)
@@ -1158,6 +1159,86 @@ def join_author_naming_sentences(
         result[index] = base.model_copy(update={"drop_reason": "base_of_author_naming_extension_v1"})
         result.append(base.model_copy(update={
             "text": body_text[base.passage_start:end], "passage_end": end, "confidence": "medium"}))
+    return result
+
+
+_REPORTING_VERBS = (r"(?:also\s+|further\s+)?(?:argues|argued|states|stated|notes|noted|claims|claimed|writes|wrote|"
+                    r"documents|documented|suggests|suggested|explains|explained|observes|observed|mentions|"
+                    r"mentioned|points out|pointed out|describes|described|contends|contended|asserts|asserted|"
+                    r"maintains|maintained|uncovers|uncovered|identifies|identified|shows|showed|emphasi[sz]es|"
+                    r"emphasi[sz]ed|highlights|highlighted|recovers|recovered|reports|reported)")
+_WORK_NOUNS = r"(?:argument|study|biography|view|analysis|work|book|article|research|account|findings|theory|concept)"
+_FIRST_NAMES = r"(?:[A-Z][\w'’.-]*\s+){0,3}"
+
+
+def yearless_author_mentions(
+    citations: list[InTextCitation],
+    census: list[CitationMarkerCensusEntry],
+    body_text: str,
+    references,
+) -> list[InTextCitation]:
+    """A sentence that names a cited author with no year ("Hodges documents …",
+    "according to Helsby", "Richard Dyer's argument") is a citation of that
+    author's one reference (owner decision 2026-10-06, from the owner's
+    highlights). Only for an author whose reference the paper cites elsewhere
+    with a marker, whose surname leads exactly one reference, and only for a
+    sentence outside every citation and holding no marker; no difference is
+    recorded, because APA lets a later narrative mention omit the year.
+    """
+    from app.services.citation_extractor import _reference_lead_surnames
+    active = [c for c in citations if c.drop_reason is None]
+    cited = {rid for c in active if c.link_status == "linked" and c.citation_marker != "implicit_continuation"
+             for rid in c.reference_ids}
+    by_surname: dict[str, list] = {}
+    for reference in references:
+        lead = _reference_lead_surnames(reference)[:1]
+        if lead and len(lead[0]) >= 3 and "," in (reference.author or ""):
+            by_surname.setdefault(lead[0], []).append(reference)
+    # The surname the paper itself cites a reference by, for an author the
+    # list writes first name first ("(Helsby, 2005)" for "Wendy Helsby …").
+    for marker in census:
+        if marker.link_status == "linked" and len(marker.reference_ids) == 1:
+            word = re.match(r"\(?\s*([A-Z][\w'’-]{2,})", marker.text)
+            reference = next((r for r in references if r.reference_id == marker.reference_ids[0]), None)
+            if word and reference is not None and "," not in (reference.author or "") \
+                    and re.search(rf"\b{re.escape(word[1])}\b", reference.author or ""):
+                by_surname.setdefault(word[1], [])
+                if reference not in by_surname[word[1]]:
+                    by_surname[word[1]].append(reference)
+    names = {name: refs[0] for name, refs in by_surname.items() if len(refs) == 1 and refs[0].reference_id in cited}
+    if not names:
+        return citations
+    result = list(citations)
+    for paragraph in re.finditer(r"[^\n]+(?:\n(?!\s*\n)[^\n]+)*", body_text):
+        offset = paragraph.start()
+        cursor = 0
+        for sentence in split_sentences(paragraph.group()):
+            local = paragraph.group().find(sentence, cursor)
+            if local < 0:
+                continue
+            cursor = local + len(sentence)
+            start, stop = offset + local, offset + local + len(sentence)
+            if (any(start <= m.passage_start < stop for m in census)
+                    or any(c.drop_reason is None and c.passage_start < stop and start < c.passage_end for c in result)
+                    # The student describing their own essay is not the source's claim.
+                    or re.search(r"\b(?:this|my|our|the present)\s+(?:essay|paper|article|study|analysis|research)\b"
+                                 r"|\b(?:I|we)\b", sentence)):
+                continue
+            for name, reference in names.items():
+                n = re.escape(name)
+                found = (re.search(rf"\b[Aa]ccording to {_FIRST_NAMES}{n}\b(?!\s*\()", sentence)
+                         or re.search(rf"\b{n}(?:['’]s?)?\s+{_REPORTING_VERBS}\b", sentence)
+                         or re.search(rf"\b{_FIRST_NAMES}{n}['’]s?\s+(?:\w+\s+){{0,2}}?{_WORK_NOUNS}\b", sentence)
+                         or re.search(rf"\b(?:introduced|proposed|argued|developed|coined|defined)\s+by\s+{_FIRST_NAMES}{n}\b",
+                                      sentence))
+                if not found or re.match(r"\s*\(", sentence[found.end():]):
+                    continue
+                result.append(InTextCitation(
+                    reference_ids=[reference.reference_id], link_status="linked", text=sentence,
+                    citation_key=reference.citation_key, citation_marker=found.group(0).strip(),
+                    marker_member=found.group(0).strip(), marker_type="narrative",
+                    passage_start=start, passage_end=stop, confidence="medium"))
+                break
     return result
 
 

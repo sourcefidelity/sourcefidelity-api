@@ -269,6 +269,7 @@ def extract_citations(
             ref_by_surname,
             format_hint,
             paragraph_body_start=paragraph_body_start,
+            all_references=references,
         )
         citations.extend(para_citations)
 
@@ -364,7 +365,12 @@ def _build_surname_index(references: list[ParsedReference]) -> dict[str, list[Pa
     Yang as its sixth author.
     """
     index: dict[str, list[ParsedReference]] = {}
-    for ref in references:
+    for original in references:
+        ref = original
+        if not (ref.author or "").strip() and ref.title and (ref.raw_ref or "").startswith(ref.title):
+            # A title-first entry ("Photoplay. (1945). URL") is cited by its title,
+            # which APA puts in the author position (2026-10-06).
+            ref = ref.model_copy(update={"author": ref.title})
         names = _reference_lead_surnames(ref)[:1]
         if ',' not in ref.author and len(ref.author.split())>1:
             names.append(ref.author.strip())
@@ -379,7 +385,7 @@ def _build_surname_index(references: list[ParsedReference]) -> dict[str, list[Pa
             key = _surname_key(surname)
             if not key:
                 continue
-            index.setdefault(key, []).append(ref)
+            index.setdefault(key, []).append(original)
     return index
 
 
@@ -483,8 +489,12 @@ def _find_citations_in_paragraph(
     ref_index: dict[str, list[ParsedReference]],
     format_hint: str,
     paragraph_body_start: int = 0,
+    all_references: list[ParsedReference] | None = None,
 ) -> list[InTextCitation]:
-    """Find all citation markers in a paragraph and extract attributed text."""
+    """Find all citation markers in a paragraph and extract attributed text.
+
+    ``all_references`` also reaches entries with no author, which the surname
+    index cannot hold ("Sherlock Holmes box office. (n.d)", 2026-10-06)."""
     citations: list[InTextCitation] = []
 
     def append_linked(
@@ -501,6 +511,7 @@ def _find_citations_in_paragraph(
         original_author: str = "",
         exact_candidates: list[ParsedReference] | None = None,
         unresolved_candidates: list[ParsedReference] | None = None,
+        differences: list[str] | None = None,
     ) -> None:
         surname = re.sub(r"['’]s$", "", author.split()[0], flags=re.IGNORECASE)
         et_al_lead = re.fullmatch(r'(.+?)\s+et\.?\s+al\.?', author.strip(), re.IGNORECASE)
@@ -525,6 +536,14 @@ def _find_citations_in_paragraph(
             candidates = list({ref.reference_id: ref for refs in ref_index.values()
                 for ref in refs if any(_surname_key(name.split()[-1]) == _surname_key(surname)
                     for name in _reference_lead_surnames(ref)[:1] if len(name.split()) > 1)}.values())
+        if not candidates and marker_type == "parenthetical" and year and len(_surname_key(surname)) >= 3:
+            # A reference author written first name first, "Wendy Helsby Film &
+            # Media Tutor", holds the cited surname as a word (2026-10-06).
+            # Parenthetical markers only: a narrative "Victory (1939)" is the end
+            # of a film title, which a later step recovers whole.
+            candidates = list({ref.reference_id: ref for refs in ref_index.values() for ref in refs
+                if ',' not in ref.author and len(ref.author.split()) > 1 and not re.search(r"[\[\]]", ref.author)
+                and re.search(rf"(?<!\w){re.escape(surname)}(?!\w)", ref.author, re.IGNORECASE)}.values())
         if year:
             candidates = [
                 ref for ref in candidates if _year_key(ref.year) == _year_key(year)
@@ -607,6 +626,7 @@ def _find_citations_in_paragraph(
                         link_differences.append(f"author_spelling:{organisation.author.strip().rstrip('.')}")
         if exact_candidates is not None:
             candidates = exact_candidates
+            link_differences.extend(differences or [])
         # A printed-page citation can distinguish an article from a same-year
         # film by the same creator, but must not break ties between text works.
         if len(candidates) > 1 and page and any(ref.source_kind == "traditional_media" for ref in candidates):
@@ -708,7 +728,8 @@ def _find_citations_in_paragraph(
             )
 
     else:  # APA
-        references = list({ref.reference_id: ref for refs in ref_index.values() for ref in refs}.values())
+        references = list({ref.reference_id: ref for ref in [*(all_references or []),
+                                                              *(r for refs in ref_index.values() for r in refs)]}.values())
         secondary_spans = {(match.start(), match.end()) for match in SECONDARY_RE.finditer(para_text)}
         for block in PAREN_BLOCK_RE.finditer(para_text):
             if (block.start(), block.end()) in secondary_spans:
@@ -716,7 +737,18 @@ def _find_citations_in_paragraph(
             raw_marker = block.group(0)
             members = list(apa_parenthetical_members(block.group(1)))
             if not any(parsed for parsed, _member in members):
-                titled = _title_author_reference(block.group(1), references)
+                named = _author_only_reference(block.group(1), references)
+                if named is not None:
+                    # "(American Academy of Pediatrics)": the author with no year
+                    # (Regulation 4, 2026-10-06); the missing year is a difference.
+                    append_linked(author=" ".join(block.group(1).split()), raw_marker=raw_marker,
+                                  marker_member=" ".join(block.group(1).split()),
+                                  marker_start=block.start(), marker_end=block.end(),
+                                  marker_type="parenthetical", exact_candidates=[named],
+                                  differences=[f"year:{named.year or 'n.d.'}"])
+                    continue
+                titled = (_title_author_reference(block.group(1), references)
+                          or _title_year_reference(block.group(1), references))
                 if titled is not None:
                     reference, author, year = titled
                     append_linked(author=author, year=year, raw_marker=raw_marker,
@@ -898,20 +930,69 @@ def _organisation_match(before: str, author: str, year: str, ref_index: dict) ->
 def _title_author_reference(content: str, references: list[ParsedReference]):
     """A title used as the author, "(Long Title of a Page_Site.com, 2023)", names
     the one same-year reference whose author (or opening words) it ends with
-    (paper 4, 2026-10-02). None unless exactly one reference qualifies."""
-    match = re.fullmatch(r"(.{8,250}),\s*((?:19|20)\d{2}[a-z]?)", " ".join(content.split()))
+    (paper 4, 2026-10-02). An undated title, "(“Sherlock season 1”, n.d.)", names
+    the one undated reference opening with it (Franchise 2, 2026-10-06). None
+    unless exactly one reference qualifies."""
+    match = re.fullmatch(r"(.{8,250}),\s*((?:19|20)\d{2}[a-z]?|n\.\s?d\.?)", " ".join(content.split()))
     if not match:
         return None
     key = lambda value: re.sub(r"[\W_]+", "", str(value or "")).casefold()
+    undated = lambda value: re.sub(r"[^a-z]", "", _year_key(value)) == "nd"
     cited = key(match[1])
     found = []
     for reference in references:
-        if _year_key(reference.year) != _year_key(match[2]):
+        if not (_year_key(reference.year) == _year_key(match[2]) or undated(match[2]) and undated(reference.year)):
             continue
-        opening = key(re.split(r"\(\s*(?:19|20)\d{2}", reference.raw_ref or "", maxsplit=1)[0])
+        opening = key(re.split(r"\(\s*(?:(?:19|20)\d{2}|n\.\s?d)", reference.raw_ref or "", maxsplit=1)[0])
         author = key(reference.author)
         if (len(author) >= 6 and cited.endswith(author)) or (len(opening) >= 12 and cited == opening):
             found.append(reference)
+    return (found[0], match[1], match[2]) if len(found) == 1 else None
+
+
+def _author_only_reference(content: str, references: list[ParsedReference]):
+    """The one reference whose whole author is the bracket's content, with no
+    year: "(American Academy of Pediatrics)". None for anything else."""
+    if re.search(r"\d", content):
+        return None
+    key = lambda value: re.sub(r"[\W_]+", "", str(value or "")).casefold()
+    cited = key(content)
+    if len(cited) < 6:
+        return None
+    found = [reference for reference in references if key(reference.author) == cited]
+    if len(found) != 1:
+        return None
+    # The author slot must hold an author, not the work's own title: a separate
+    # title follows the date ("(Sherlock Holmes The Awakened)" names a game).
+    after = re.split(r"\(\s*(?:(?:19|20)\d{2}|n\.\s?d)[^)]*\)\.?", found[0].raw_ref or "", maxsplit=1)
+    rest = re.sub(r"https?://\S+|\b(?:retrieved|available)\b[^:]*:?", " ", after[1] if len(after) > 1 else "", flags=re.I)
+    return found[0] if len(re.findall(r"[^\W\d_]{2,}", rest)) >= 3 else None
+
+
+def _raw_title_year(reference: ParsedReference) -> tuple[str, str] | None:
+    """The title and year an authorless entry opens with, "Measures for the
+    Administration of … Programs 1990. http://…" (legislation, 2026-10-06)."""
+    if (reference.author or "").strip():
+        return None
+    match = re.match(r"\s*(.{12,250}?)[\s,.]*\(?((?:19|20)\d{2})\)?(?=[.,;\s]|$)", reference.raw_ref or "")
+    if not match or re.search(r"\b(?:https?|www)\b", match[1]):
+        return None
+    return " ".join(match[1].split()).strip('"“”'), match[2]
+
+
+def _title_year_reference(content: str, references: list[ParsedReference]):
+    """A work named by its title and year, as legislation is cited: "(Measures
+    for … Programs 1990, reg 4)". None unless exactly one authorless entry opens
+    with that title and year (Regulation 2, 2026-10-06)."""
+    match = re.fullmatch(
+        r"[\"“]?(.{12,250}?)[\"”]?,?\s+((?:19|20)\d{2})"
+        r"(?:\s*,\s*(?:regs?|ss?|sections?|arts?|articles?|ch(?:apter)?s?|cl(?:ause)?s?|paras?)\.?\s*[\w.]+(?:\s*[-–]\s*[\w.]+)?)?",
+        " ".join(content.split()), re.IGNORECASE)
+    if not match:
+        return None
+    key = lambda value: re.sub(r"[\W_]+", "", str(value or "")).casefold()
+    found = [reference for reference in references
+             if (named := _raw_title_year(reference)) and named[1] == match[2] and key(named[0]) == key(match[1])]
     return (found[0], match[1], match[2]) if len(found) == 1 else None
 
 
@@ -2348,6 +2429,7 @@ def _cite_extract_batch(
             ref_by_surname,
             format_hint,
             paragraph_body_start=paragraph_start,
+            all_references=references,
         )
     except Exception as e:
         logger.warning(

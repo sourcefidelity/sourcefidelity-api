@@ -103,3 +103,19 @@ def test_a_series_volume_note_is_not_title_wording():
     built = build_reference_discovery_candidate(attempt_id='a', provider='student_url_html', expected=expected, result=result)
     assert {c.field_name: c.reason_code for c in built.comparisons}['title'] == 'title_match_without_volume_note'
     assert built.is_credible
+
+
+def test_a_title_cut_at_vs_is_parsed_whole_and_its_doi_record_is_a_possible_match():
+    from app.services.reference_parser import extract_and_parse_references
+    from app.services.reference_verification import _possible_match
+    [ref] = extract_and_parse_references(
+        'References\nLin, Q. (2000). Harbour Rights vs. Inland Claims: Two Coastal Strategies. Journal of Ports, 5(2), '
+        '155–182. https://doi.org/10.9999/jp0502_1\n', format_hint='apa', use_regex_first=True,
+        use_llm_fallback=False, paper_version_id='x')
+    assert ref.title == 'Harbour Rights vs. Inland Claims: Two Coastal Strategies'
+    record = {'observed': {'title': 'Harbour Rights vs. Inland Claims: Two Coastal Strategies'},
+              'comparisons': [{'field_name': 'doi', 'outcome': 'agreement'}, {'field_name': 'year', 'outcome': 'agreement'},
+                              {'field_name': 'title', 'outcome': 'material_conflict'},
+                              {'field_name': 'author', 'outcome': 'material_conflict'}]}
+    assert _possible_match(record, {'title': 'Harbour Rights vs'})
+    assert not _possible_match(record, {'title': 'Different Words Entirely'})
