@@ -295,6 +295,9 @@ def attach_verification_candidates(
         start = source_heading_statement_start(claim.text, claim.citation_marker)
         trimmed = _trim_optional(claim.text, start, len(claim.text)) if 0 < start < len(claim.text) else None
         content_spans = [trimmed] if trimmed else content_spans
+    member_spans = _member_clause_spans(claim, getattr(getattr(artifact, "source_binding", None), "reference_id", None))
+    if member_spans:
+        content_spans = member_spans
     guard_segments = [
         _segment(artifact, start, end, "whole_unit_guard")
         for start, end in content_spans
@@ -363,7 +366,10 @@ def attach_verification_candidates(
         kind="whole_unit",
         spans=tuple(content_spans),
         role="whole_unit_guard" if has_decomposition else "relationship_candidate",
-        method="complete_citation_unit_guard",
+        # A source scoped to its own clause keeps its provenance on the
+        # candidate; the generator version (and so every unaffected
+        # candidate's ID and cached Judgment) is unchanged (2026-10-07).
+        method="member_clause_scope_v1" if member_spans else "complete_citation_unit_guard",
         eligible=not has_decomposition,
         requires_context=_requires_parent_context(claim.text, content_spans),
     )
@@ -1370,6 +1376,41 @@ def _passage_matches_authorization(artifact, passage):
         and passage.authorization_scope_id == source.authorization_scope_id
         and passage.verification_run_id == source.verification_run_id
     )
+
+
+def _member_clause_spans(claim, reference_id):
+    """The wording one source's own parenthetical marker covers (owner decision
+    2026-10-07): from the previous parenthetical marker in the citation, or its
+    start, up to this marker. Wording after the marker in the same sentence
+    belongs to no source ("…(McDonald et al., 2025), so the revision was …");
+    later sentences joined to the citation stay with it. None when nothing
+    would be set aside, or the source has no single parenthetical marker."""
+    if not reference_id:
+        return None
+    text = claim.text
+    # A narrative citation's bracketed year ("Hartmn (2016) highlights …") is
+    # not a parenthetical marker: only markers recorded as parenthetical count.
+    markers = sorted((m for m in claim.citation_markers or []
+                      if getattr(m, "marker_type", "parenthetical") == "parenthetical"
+                      and m.text.lstrip().startswith("(")
+                      # A year alone ("(2016)") follows a name in the text: narrative.
+                      and re.search(r"\b[A-Z][\w'’-]+", m.text)),
+                     key=lambda m: m.local_start)
+    mine = [m for m in markers if reference_id in (m.reference_ids or [])]
+    if len(mine) != 1 or not 0 <= mine[0].local_start < mine[0].local_end <= len(text):
+        return None
+    marker = mine[0]
+    earlier = [m for m in markers if m.local_end <= marker.local_start]
+    start = earlier[-1].local_end if earlier else 0
+    sentence_end = re.search(r"[.!?][\"”’')]*(?:\s+|$)", text[marker.local_end:])
+    later_start = marker.local_end + sentence_end.end() if sentence_end else len(text)
+    set_aside = text[marker.local_end:later_start]
+    if not earlier and len(re.findall(r"[A-Za-z]{2,}", set_aside)) < 3:
+        return None
+    spans = [span for span in (_trim_optional(text, start, marker.local_start),
+                               _trim_optional(text, later_start, len(text)) if later_start < len(text) else None)
+             if span]
+    return spans or None
 
 
 def _content_spans(text, marker_span):

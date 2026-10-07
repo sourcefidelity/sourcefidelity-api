@@ -38,6 +38,7 @@ LABELS = {
 UNDECIDED_NOTE = TEMPLATE_NOTES["undecided"]
 # Owner wording 2026-09-30, for a judge that could not resolve what the statement refers to.
 UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported. It could not tell what the statement refers to."
+REFERRAL_NOTE = "Not judged: a \u201csee\u201d citation points to further reading rather than supporting a statement."
 
 
 def display_state(state: str | None, reason: str | None) -> str:
@@ -243,6 +244,9 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         else:
             note = UNDECIDED_NOTE
         parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
+    if state == "not_judged" and reason == "referral_citation":
+        # Owner-approved wording (2026-10-07).
+        parts.append(f'<p class="jw-coaching">{escape(REFERRAL_NOTE)}</p>')
     if reason in _RETRY_REASONS:
         parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')
     parts.append("</section>")

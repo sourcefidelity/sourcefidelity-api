@@ -174,6 +174,19 @@ def heading_citation(citation: dict) -> bool:
     return bool(long_words) and sum(word[0].isupper() for word in long_words) >= 0.75 * len(long_words)
 
 
+def _hanging_indent_narrow(differences: list[dict]) -> bool:
+    """An indent that is present but narrower than 0.5 inch is not a missing one
+    (owner decision 2026-10-07: the article's 15-point indent). The typical
+    entry decides, so one entry whose wrapped line sits elsewhere does not
+    make the list's indent wider."""
+    from app.services.reference_formatting import HANGING_INDENT_POINTS, HANGING_INDENT_TOLERANCE_POINTS
+    observed = sorted(v for v in (r.get("observed_points") for r in differences) if isinstance(v, (int, float)))
+    if not observed:
+        return False
+    typical = observed[len(observed) // 2]
+    return 6.0 <= typical < HANGING_INDENT_POINTS - HANGING_INDENT_TOLERANCE_POINTS
+
+
 def build_evidence_report_view(
     *,
     report: Report,
@@ -501,6 +514,7 @@ def build_evidence_report_view(
     pervasive_hanging_indent = len(hanging_indent_differences) >= max(
         3, len(reference_layout) // 2
     )
+    hanging_indent_narrow = pervasive_hanging_indent and _hanging_indent_narrow(hanging_indent_differences)
     reference_practice = []
     from app.services.reference_credibility import assess_reference_credibility
     source_observations = {item.get('reference_id'): item for item in (job.source_results or [])}
@@ -817,6 +831,7 @@ def build_evidence_report_view(
     reference_practice_summary = []
     if pervasive_hanging_indent:
         reference_practice_summary.append(
+            HANGING_INDENT_NARROW_TEXT if hanging_indent_narrow else
             "The reference list consistently lacks the expected hanging indent. This is reported once rather than highlighting every reference."
         )
     unplaced_count = sum(
@@ -857,6 +872,7 @@ def build_evidence_report_view(
         citations=citations,
         overview=overview,
         pervasive_hanging_indent=pervasive_hanging_indent,
+        hanging_indent_narrow=hanging_indent_narrow,
         reference_practice=reference_practice,
         require_paper_flags=True,
         pervasive_reference_order=pervasive_reference_order,
@@ -902,6 +918,7 @@ def build_evidence_report_view(
         "assessment_configuration": extraction.assessment_configuration.model_dump(mode='json'),
         "submitted_locator_inventory": _locator_inventory_view(extraction, paper_surface),
         "reference_practice_summary": reference_practice_summary,
+        "hanging_indent_narrow": hanging_indent_narrow,
         "pervasive_reference_order": pervasive_reference_order,
         # Every reference in bibliography order, so an uncited reference with
         # no findings still receives a Reference N window.
@@ -1087,6 +1104,10 @@ def _instance_list(instances: list[dict]) -> str:
     return "; ".join(f"{row['type']} {row['number']}" for row in instances)
 
 
+# Owner-approved wording (2026-10-07).
+HANGING_INDENT_NARROW_TEXT = "The reference list's hanging indent is narrower than APA's 0.5 inch."
+
+
 def _build_report_summary(
     *,
     citations: list[dict],
@@ -1094,6 +1115,7 @@ def _build_report_summary(
     pervasive_hanging_indent: bool,
     reference_practice: list[dict] | None = None,
     require_paper_flags: bool = False,
+    hanging_indent_narrow: bool = False,
     pervasive_reference_order: bool = False,
     reference_numbers: dict[str, int] | None = None,
     patchwriting_passages: list[dict] | None = None,
@@ -1294,7 +1316,8 @@ def _build_report_summary(
                 lead=lead, rest='.', count=n, instances=instances)
     if pervasive_hanging_indent:
         add('reference_formatting', 'hanging_indent_pervasive',
-            "The reference list repeatedly lacks the expected hanging indent. ", pervasive=True)
+            HANGING_INDENT_NARROW_TEXT if hanging_indent_narrow
+            else "The reference list repeatedly lacks the expected hanging indent. ", pervasive=True)
     else:
         indent_ids = {f.get('reference_id') for f in reference_practice or []
                       if f.get('finding_type') == 'formatting' and f.get('rectangles')} - {None}
@@ -2963,6 +2986,7 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     summary = result['summary'] = _build_report_summary(
         citations=result.get('citations') or [], overview=result.get('overview') or {},
         pervasive_hanging_indent=bool(result.get('reference_practice_summary')),
+        hanging_indent_narrow=bool(result.get('hanging_indent_narrow')),
         reference_practice=findings, require_paper_flags=True,
         pervasive_reference_order=result['pervasive_reference_order'],
         reference_numbers=result['reference_numbers'],
@@ -3080,6 +3104,7 @@ def attach_quotation_difference_geometry(view: dict, pdf_content: bytes) -> dict
     result['summary'] = _build_report_summary(
         citations=result.get('citations') or [], overview=result.get('overview') or {},
         pervasive_hanging_indent=bool(result.get('reference_practice_summary')),
+        hanging_indent_narrow=bool(result.get('hanging_indent_narrow')),
         reference_practice=result.get('reference_practice') or [],
         require_paper_flags=True,
         pervasive_reference_order=bool(result.get('pervasive_reference_order')),

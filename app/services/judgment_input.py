@@ -10,6 +10,7 @@ same prompt the paper run would have produced, and refuses when it cannot.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -52,6 +53,9 @@ def judgment_eligibility(payload: dict) -> Eligibility:
 
     Every refusal carries a reason the window can explain; none is a result.
     """
+    # A "see" citation is never judged, whatever text was retrieved (2026-10-07).
+    if referral_citation(payload):
+        return Eligibility(False, "referral_citation")
     coverage = (payload.get("coverage") or {}).get("level")
     if coverage != "full_text":
         return Eligibility(False, "not_complete_full_text")
@@ -71,6 +75,19 @@ def judgment_eligibility(payload: dict) -> Eligibility:
     if (payload.get("claim") or {}).get("text_truncated"):
         return Eligibility(False, "claim_text_truncated")
     return Eligibility(True, "eligible")
+
+
+_REFERRAL_SIGNAL = re.compile(r"^\(\s*(?:see(?:\s+also)?|cf\.?)\s", re.IGNORECASE)
+
+
+def referral_citation(payload: dict) -> bool:
+    """Every marker naming this source is a "see"/"see also"/"cf." signal,
+    which points to further reading rather than supporting the statement
+    (owner decision 2026-10-07)."""
+    reference_id = (payload.get("source_binding") or {}).get("reference_id")
+    markers = [m for m in (payload.get("claim") or {}).get("citation_markers") or []
+               if isinstance(m, dict) and (not reference_id or reference_id in (m.get("reference_ids") or []))]
+    return bool(markers) and all(_REFERRAL_SIGNAL.match(str(m.get("text") or "")) for m in markers)
 
 
 def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
