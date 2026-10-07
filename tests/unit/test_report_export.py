@@ -81,7 +81,7 @@ def test_pdf_is_the_one_report_without_audience(export_store, monkeypatch):
     with fitz.open(stream=exported.content, filetype='pdf') as document:
         import unicodedata
         text = ' '.join(unicodedata.normalize('NFKC', ' '.join(page.get_text() for page in document)).split())
-    assert 'Finding third.' in text and 'Patterns and Issues' in text
+    assert 'Finding third.' in text and 'Patterns and Issues' not in text   # removed (owner, 2026-10-07)
     assert 'Student report' not in text and 'Instructor report' not in text
 
 

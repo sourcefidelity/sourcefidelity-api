@@ -6643,6 +6643,12 @@ def _render_formatted_reference(source: dict, fallback: str) -> str:
                 text = text[:match.start()] + href + text[cursor:]
                 flags = flags[:match.start()] + [(False, False)] * len(href) + flags[cursor:]
                 break
+    # A typeset DOI address the PDF breaks after "doi." ("https://doi. org/10…",
+    # 2026-10-07) is one address.
+    for match in reversed(list(re.finditer(r'(https?://(?:dx\.)?doi\.)\s+(org/10\.)', text, re.IGNORECASE))):
+        gap_start, gap_end = match.end(1), match.start(2)
+        text = text[:gap_start] + text[gap_end:]
+        flags = flags[:gap_start] + flags[gap_end:]
     # Font-run boundaries must not split one URL into separately linked pieces.
     for match in re.finditer(r'https?://[^\s<>"]+',text):
         flags[match.start():match.end()] = [(False,False)] * len(match.group())

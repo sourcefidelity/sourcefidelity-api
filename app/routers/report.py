@@ -212,6 +212,16 @@ def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id
     return layer
 
 
+def _export_judgment_summary(session: Session, report_id: str, principal) -> dict | None:
+    """The page's Judgment tally for the PDF's Sources to Upload, or None."""
+    try:
+        details = _run_details(session, report_id, principal)
+    except Exception:  # noqa: BLE001 - the PDF is still built without the count
+        return None
+    summary = details.get("judgment_summary") if isinstance(details, dict) else None
+    return summary if isinstance(summary, dict) else None
+
+
 def _run_details(session: Session, report_id: str, principal) -> dict:
     """Judged citations and single-run technical details (owner requests 2026-09-28)."""
     from sqlalchemy import select
@@ -285,6 +295,7 @@ def get_released_report_pdf(
             report_id=report_id,
             scope_type=principal.scope_type,
             scope_id=principal.scope_id,
+            judgment_summary=_export_judgment_summary(session, report_id, principal),
         )
     except EvidenceReportAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Report not found") from exc
@@ -322,6 +333,7 @@ def get_released_report_manifest(
             report_id=report_id,
             scope_type=principal.scope_type,
             scope_id=principal.scope_id,
+            judgment_summary=_export_judgment_summary(session, report_id, principal),
         )
     except EvidenceReportAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Report not found") from exc

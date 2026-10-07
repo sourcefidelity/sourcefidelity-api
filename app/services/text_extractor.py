@@ -400,7 +400,38 @@ def join_pdf_pages(pages: list[str], *, bold_lines: frozenset[str] = frozenset()
                 text = text.rstrip() + " " + page.lstrip()
         else:
             text = text + "\n\n" + page
-    return isolate_pdf_headings(text, bold_lines=bold_lines)
+    return isolate_pdf_tables(isolate_pdf_headings(text, bold_lines=bold_lines))
+
+
+_FUNCTION_WORDS = frozenset({"the", "of", "to", "and", "a", "an", "is", "are", "was", "were", "for", "that", "it",
+                             "in", "on", "with", "because", "they", "this", "be", "by", "as", "not", "their", "do"})
+
+
+def isolate_pdf_tables(text: str) -> str:
+    """A table with no ruling lines reads as one run of short fragments after its
+    "Table N" caption, straight into the next prose (the owner's article: a
+    marking rubric captured as part of a citation, 2026-10-07). In a paragraph
+    opening with such a caption, the first line that reads as prose (a capital
+    start, eight or more words, four or more function words, a sentence break
+    within three lines) begins a new paragraph."""
+    paragraphs = text.split("\n\n")
+    caption = re.compile(r"\s*Table\s+\d+\b")
+    for index, paragraph in enumerate(paragraphs):
+        # The caption may already stand alone (a heading line), the rows after it.
+        after_caption = index > 0 and caption.match(paragraphs[index - 1]) and "\n" not in paragraphs[index - 1].strip()
+        if not (caption.match(paragraph) or after_caption):
+            continue
+        lines = paragraph.split("\n")
+        for at in range(0 if after_caption else 1, len(lines)):
+            line = lines[at].strip()
+            words = re.findall(r"[A-Za-z’'-]+", line)
+            function = sum(w.casefold() in _FUNCTION_WORDS for w in words)
+            ahead = " ".join(lines[at:at + 3])
+            if (line[:1].isupper() and len(words) >= 8 and function >= 4
+                    and re.search(r"[a-z)][.!?][\"”’)]*(?:\s+[A-Z]|\s*$)", ahead)):
+                paragraphs[index] = "\n".join(lines[:at]) + "\n\n" + "\n".join(lines[at:])
+                break
+    return "\n\n".join(paragraphs)
 
 
 _REFERENCE_LIST_HEADING = re.compile(r"(?im)^\s*(?:references|reference list|bibliography|works cited)\s*$")

@@ -148,6 +148,68 @@ def test_a_passage_a_page_break_interrupts_is_found_between_its_ends():
     assert probe["rectangles"][0]["page_index"] == 0 and twin["rectangles"][0]["page_index"] == 1
 
 
+def test_a_line_break_hyphen_inside_a_word_does_not_change_the_title():
+    from app.services.reference_discovery import build_reference_discovery_candidate
+    from app.services.retrieval.base import RetrievalResult
+    expected = ExpectedBibliographicFields(title="Revolution-izing harbour teaching with chatbots", authors=["Lin, Q."], year="2023")
+    result = RetrievalResult(source_name="semantic_scholar", success=True,
+                             title="Revolutionizing Harbour Teaching with Chatbots", authors=["Q. Lin"], year="2023")
+    built = build_reference_discovery_candidate(attempt_id="a", provider="semantic_scholar", expected=expected, result=result)
+    assert {c.field_name: c.outcome for c in built.comparisons}["title"] == "agreement"
+    # A real compound keeps its hyphen's meaning against a different word.
+    other = RetrievalResult(source_name="semantic_scholar", success=True,
+                            title="Revolution in harbour teaching with chatbots", authors=["Q. Lin"], year="2023")
+    built = build_reference_discovery_candidate(attempt_id="b", provider="semantic_scholar", expected=expected, result=other)
+    assert {c.field_name: c.outcome for c in built.comparisons}["title"] != "agreement"
+
+
+def test_a_url_cut_after_a_slash_continues_on_the_next_line():
+    from app.services.reference_parser import extract_and_parse_references
+    from app.services.reference_url_repair import repair_reference_urls
+    layout = "References\nAmes, A. (2022). Harbour usage notes. Open Archive. https://archive.example.test/\nhal-03913837\n"
+    refs = extract_and_parse_references(layout, format_hint="apa", use_regex_first=True, use_llm_fallback=False,
+                                        paper_version_id="x")
+    assert repair_reference_urls(refs, layout)[0].url == "https://archive.example.test/hal-03913837"
+
+
+def test_a_doi_address_broken_after_doi_dot_is_one_link():
+    from app.services.evidence_report import _render_formatted_reference
+    raw = "Ames, A. (2025). Title of a study. Journal of Ports, 3, 100121. https://doi. org/10.1016/j.ports.2025.100121"
+    html = _render_formatted_reference({"raw_reference": raw}, raw)
+    assert 'href="https://doi.org/10.1016/j.ports.2025.100121"' in html
+
+
+def test_a_table_without_rules_is_kept_apart_from_the_prose_after_it():
+    from app.services.text_extractor import isolate_pdf_tables
+    text = ("Earlier prose ends here (Ames, 2001).\n\nTable 1 Harbour essay marking rubric\n0–39 40–49 50–59\n"
+            "Partially Primarily Correct,\nCompletely Repeatedly Occasionally\n– 15% writing conciseness writing\n"
+            "It is difficult for the models to produce analyses because they are dependent on the data\n"
+            "and do not truly understand context (Lin, 2023). Unless the analyses are common, it fails.")
+    out = isolate_pdf_tables(text)
+    assert "\n\nIt is difficult for the models" in out
+    assert out.split("\n\n")[1].startswith("Table 1")
+    # A paragraph without a table caption is untouched.
+    plain = "Some prose.\n\nIt is difficult for the models to produce analyses because they are dependent. Yes."
+    assert isolate_pdf_tables(plain) == plain
+
+
+def test_a_long_reference_list_starting_before_the_last_pages_counts_as_back_matter():
+    from app.services.completeness_checker import check_completeness
+    doc = fitz.open()
+    for page in range(12):
+        p = doc.new_page()
+        if page < 7:
+            p.insert_text((72, 100), f"Body text of the article on page {page + 1}, discussing harbour teaching.")
+        else:
+            if page == 7:
+                p.insert_text((72, 80), "REFERENCES")
+            for row in range(6):
+                p.insert_text((72, 120 + row * 40), f"Ames, A. ({2000 + row}). Harbour study {row}. "
+                                                    f"https://doi.org/10.1000/h{page}{row}")
+    signals = check_completeness(doc.tobytes(), is_article=True, title="Harbour", author="Ames, A").signals
+    assert any("found heading 'REFERENCES'" in s for s in signals)
+
+
 def test_title_first_entries_are_told_apart_by_their_titles():
     from app.services.reference_consistency import apa_in_text_form
     one = SimpleNamespace(author="", title="Harbour season 1", year="n.d.")

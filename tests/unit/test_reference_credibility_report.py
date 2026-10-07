@@ -37,7 +37,7 @@ def test_legacy_strong_flag_is_soft_red_evidence_with_one_summary_and_audit_only
         export_binding='synthetic-test', view=None)
     with fitz.open(stream=rendered, filetype='pdf') as exported:
         text = '\n'.join(page.get_text() for page in exported)
-        assert 'Evidence 1' in text and 'Cannot be veri' in text     # the PDF font sets 'fi' as a ligature
+        assert 'Sources 1' in text and 'Cannot be veri' in text      # the PDF font sets 'fi' as a ligature
         assert 'Potentially fabricated' not in text
         assert not any('10.1234/coastal' in str(link) for page in exported for link in page.get_links())
     # An unplaced report issue is not advertised in the summary.

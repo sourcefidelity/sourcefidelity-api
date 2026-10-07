@@ -27,10 +27,13 @@ def split_links(soup: BeautifulSoup) -> list[dict]:
     text: text glued to the link's end, or a single address-like piece left
     after it at the end of the entry."""
     out = []
-    for window, inner in _windows(soup):
+    places = list(_windows(soup)) + [("sources-to-upload", soup.select_one("section.upload-priorities") or BeautifulSoup("", "html.parser"))]
+    for window, inner in places:
         # The student's own entry; a located record's page address is shown
         # as text on purpose when provider terms bar linking it.
-        for entry in [e for e in inner.select(".full-reference") if not e.find_parent(class_="record-difference-block")]:
+        selector = "li" if window == "sources-to-upload" else ".full-reference"
+        entries = [e for e in inner.select(selector) if not e.find_parent(class_="record-difference-block")]
+        for entry in entries:
             for anchor in entry.find_all("a", href=re.compile(r"^https?://")):
                 after = anchor.next_sibling
                 text = str(after) if isinstance(after, NavigableString) else ""

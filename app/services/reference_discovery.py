@@ -832,6 +832,14 @@ def build_reference_discovery_candidate(
                 title_outcome: FieldComparisonOutcome = "agreement"
                 title_reason = "normalized_title_match"
                 title_relevant = True
+            elif (re.search(r"[a-z]-[a-z]", expected.title + result.title)
+                    and _normalize_text(re.sub(r"(?<=[a-z])-(?=[a-z])", "", expected.title, flags=re.I))
+                    == _normalize_text(re.sub(r"(?<=[a-z])-(?=[a-z])", "", result.title, flags=re.I))):
+                # A line-break hyphen kept inside a word ("Revolution-izing"
+                # against "Revolutionizing", 2026-10-07).
+                title_outcome = "agreement"
+                title_reason = "title_match_without_word_hyphen"
+                title_relevant = True
             elif _normalize_text(_without_volume_note(expected.title)) == _normalize_text(_without_volume_note(result.title)):
                 # A series volume or edition note after the title, "(Vol. 15)",
                 # is not title wording (Wu's repository page, 2026-10-06).

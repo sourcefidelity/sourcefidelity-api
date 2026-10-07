@@ -62,8 +62,12 @@ def build_released_report_export(
     report_id: str | uuid.UUID,
     scope_type: str,
     scope_id: str,
+    judgment_summary: dict | None = None,
 ) -> ReleasedReportExport:
-    """Build the one report's PDF derivative without persisting a partial object."""
+    """Build the one report's PDF derivative without persisting a partial object.
+
+    ``judgment_summary`` is the page's own Judgment tally, so Sources to Upload
+    states the same judgment counts as the live report (2026-10-07)."""
     view, artifact, paper_content = load_authorized_evidence_report_bundle(
         session,
         backend,
@@ -92,6 +96,8 @@ def build_released_report_export(
     unverified = {f.get('reference_id') for f in normalize_reference_findings(view.get('reference_practice') or [])
                   if f.get('finding_type') in UNVERIFIED_FINDINGS}
     view = withdraw_unverified_possible_matches(view, view.get('citations') or [], unverified)
+    if judgment_summary is not None:
+        view['judgment_summary'] = judgment_summary
     manifest = _base_manifest(
         report=report,
         view=view,
@@ -307,7 +313,8 @@ def _append_evidence(document, citations, findings, view) -> dict:
     """Append inspectable evidence with two-way links."""
     paper_pages = document.page_count
     blocks = [
-        '<h1 id="evidence-start">Evidence</h1>',
+        # The report's own names (owner request 2026-10-07): Sources, not Evidence.
+        '<h1 id="evidence-start">Sources</h1>',
         '<p>Click a marked passage in the paper to open its evidence here. Each entry links back to the paper. '
         'Evidence availability does not establish citation correctness. Missing text or a retrieval miss does not establish source absence.</p>',
         '<p>Translucent highlights identify individual sources: blue for full text, teal for abstracts, blue-mauve for limited text, '
@@ -318,7 +325,6 @@ def _append_evidence(document, citations, findings, view) -> dict:
         'Orange highlights identify formatting issues, purple diamonds identify link issues, '
         'and yellow highlights indicate Academic Practice issues.</p>',
     ]
-    blocks.append('<h2>Patterns and Issues</h2>')
     from app.services.report_style_guidance import guidance_links
     from app.services.evidence_report import _citation_guidance_kinds
     citation_format = str(view.get('citation_format') or '')
@@ -326,13 +332,16 @@ def _append_evidence(document, citations, findings, view) -> dict:
     from app.services.report_references import reference_numbers
     for category, priorities in broad_reference_summary(report_summary(view), findings, reference_numbers(view)).items():
         if priorities:
-            label = 'Citation and Reference Formatting' if category == 'reference_formatting' else category.replace('_',' ').capitalize()
+            label = {'evidence': 'Sources', 'academic_practice': 'Academic Practice',
+                     'reference_formatting': 'Citation and Reference Formatting'}.get(category, category.replace('_', ' ').capitalize())
             # The PDF keeps the complete count-only sentence: it has no side
             # window for instance links to open (ARCHITECTURE §8).
             blocks.append('<h3>'+escape(label)+'</h3><ul>'+''.join('<li>'+escape(summary_text(item))+'</li>' for item in priorities)+'</ul>')
     from app.services.evidence_report import _render_upload_priorities
     from app.services.highlight_priority import UNVERIFIED_FINDINGS as _UNVERIFIED
+    states = (view.get('judgment_summary') or {}).get('states')
     blocks.append(_render_upload_priorities([{**c,'upload_action':{}} for c in citations],
+        judgments=(sum(int(v or 0) for v in states.values()) if isinstance(states, dict) else None),
         unverified=frozenset(f.get('reference_id') for f in findings if f.get('finding_type') in _UNVERIFIED)))
     targets = []
     words_by_page = marker_words(document)
@@ -381,7 +390,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
     for index, finding in enumerate(findings, 1):
         key = f"reference-{index}"
         from app.services.highlight_priority import finding_category
-        heading = {'evidence': 'Evidence', 'academic': 'Academic Practice'}.get(
+        heading = {'evidence': 'Sources', 'academic': 'Academic Practice'}.get(
             finding_category(finding.get('finding_type')), 'Citation and Reference Formatting') + f' {index}'
         if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
             heading = f'Submitted-Link Issue {index}'
@@ -480,7 +489,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
     finally:
         appendix.close()
     links = 0
-    toc = [[1, "Submitted Paper", 1], [1, "Evidence", paper_pages + 1]]
+    toc = [[1, "Submitted Paper", 1], [1, "Sources", paper_pages + 1]]
     # Position callbacks can report an element that the layout engine never
     # paints. Bind destinations to actual rendered headings, not callbacks.
     rendered_headings = {}
@@ -510,7 +519,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
     # The PDF carries no processing or cost details; those are an
     # instructor-only section of the HTML report (ARCHITECTURE §8).
     for index in range(paper_pages, document.page_count):
-        document[index].insert_text((42,775),f"Evidence appendix {index-paper_pages+1} / {document.page_count-paper_pages}",fontsize=8,color=(.36,.4,.45))
+        document[index].insert_text((42,775),f"Sources appendix {index-paper_pages+1} / {document.page_count-paper_pages}",fontsize=8,color=(.36,.4,.45))
     return {"paper_pages":paper_pages,"evidence_appendix_pages":document.page_count-paper_pages,"internal_evidence_links":links}
 
 

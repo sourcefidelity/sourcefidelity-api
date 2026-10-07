@@ -52,8 +52,10 @@ def repair_reference_urls(
             # fragment ("ractice_of_Media") still needs a link target's proof.
             query_split = "?" in "".join(pieces) and re.match(r"[\w.-]*=", token)
             slug = len(re.findall(r"[-_]", token)) >= 4 and re.fullmatch(r"[\w-]+/?", token)
-            # A line opening with a URL separator cannot start new prose ("_10_days").
-            slug = slug or re.match(r"[_\-./?=&%#]\w", token)
+            # A line opening with a URL separator cannot start new prose ("_10_days"),
+            # nor can one token after a URL ending in a slash ("hal.science/" / "hal-0391").
+            slug = slug or re.match(r"[_\-./?=&%#]\w", token) or (
+                pieces[-1].endswith("/") and re.fullmatch(r"[\w.~%-]+/?", token) and re.search(r"[\d_-]", token))
             if (
                 not _TOKEN.fullmatch(token)
                 or _START.search(token)

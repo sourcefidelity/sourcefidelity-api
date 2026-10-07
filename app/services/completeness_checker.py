@@ -389,6 +389,13 @@ def _signal_back_matter(
             tail_text = ""
             for page in doc[start:]:
                 tail_text += page.get_text()
+            # A long reference list can start before that window: an article's
+            # heading in its second half counts when every page from it to the
+            # end is reference entries (13-page article, references from page
+            # 8, judged "uncertain", 2026-10-07).
+            earlier = []
+            if document_kind == "article" and n >= 4:
+                earlier = [page.get_text() for page in doc[max(0, n // 2):start]]
         finally:
             doc.close()
     except Exception as e:
@@ -408,6 +415,16 @@ def _signal_back_matter(
                 if len(entries) >= 3 and len(years) >= 3:
                     found = [line]
                     break
+    if not found and earlier:
+        for offset, page_text in enumerate(earlier):
+            page_lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+            if not any(_TERMINAL_HEADING_RE.fullmatch(line) for line in page_lines):
+                continue
+            later = earlier[offset + 1:] + [tail_text]
+            entry = re.compile(r"\((?:18|19|20)\d{2}[a-z]?[,)]|doi\.org/10\.|\b(?:18|19|20)\d{2}[a-z]?\)\.")
+            if all(len(entry.findall(text)) >= 3 for text in later[:-1]) and len(entry.findall(tail_text)) >= 3 * window:
+                found = [next(line for line in page_lines if _TERMINAL_HEADING_RE.fullmatch(line))]
+                break
     if found:
         return {
             "vote": COMPLETE,
