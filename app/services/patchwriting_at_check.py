@@ -1,4 +1,4 @@
-"""Run patchwriting-v4 during a paper check while each source's text is authorized.
+"""Run patchwriting-v5 during a paper check while each source's text is authorized.
 
 Owner decision 2026-09-29. For every retrieved full-text source the paper check
 authorizes, all body sentences of the paper are compared with that source

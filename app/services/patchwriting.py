@@ -1,4 +1,4 @@
-"""Deterministic unquoted-wording and close-paraphrase comparison (patchwriting-v4).
+"""Deterministic unquoted-wording and close-paraphrase comparison (patchwriting-v5).
 
 Compares student wording with the sentences of authorized source texts and
 reports exact matched wording on both sides, the measures that produced each

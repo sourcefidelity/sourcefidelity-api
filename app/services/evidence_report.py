@@ -2166,7 +2166,7 @@ def _upload_priorities(citations: list[dict], unverified: frozenset = frozenset(
 KEY_HTML = (
     '<div class="legend" id="active-key">'
     '<div class="key-line" data-key="judgment"><span class="key-title">Judgment:</span>'
-    '<span class="jk state-supported">Supported</span>'
+    '<span class="jk state-supported">Supports</span>'
     '<span class="jk state-qualified">Qualified or Mixed</span>'
     '<span class="jk state-contradicts">Contradicts</span>'
     '<span class="jk state-insufficient">Not Supported</span>'
@@ -2176,6 +2176,8 @@ KEY_HTML = (
     '<span class="key-mark key-practice">Academic-Practice</span>'
     '<span class="key-mark key-reference">Citation/Reference Issue</span>'
     '<span class="key-mark key-unverified">Unverifiable Reference</span>'
+    # Owner request 2026-10-08: the topical-mismatch highlight has a key entry.
+    '<span class="key-mark key-topical">Topical Mismatch</span>'
     '<span class="key-mark key-record">Source Record Conflict</span>'
     '<span class="key-link"><i class="submitted-link-key"></i>Link</span></div></div>'
 )
@@ -2186,6 +2188,7 @@ KEY_CSS = (
     '.legend .key-mark{padding:0 .2em;border-radius:2px}'
     '.legend .key-practice{background:#ffe45c66}.legend .key-reference{background:#ff9a384d}'
     '.legend .key-unverified{background:#f28b826b}'
+    '.legend .key-topical{background:rgba(239,130,186,.38)}'
     '.legend .key-record{border:2px solid #0a7cff}'
     '.legend .key-link{display:inline-flex;align-items:center;gap:.45rem}'
     '.legend .submitted-link-key{display:inline-block;width:.7rem;height:.7rem;transform:rotate(45deg);background:#7651a8}'

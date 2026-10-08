@@ -459,14 +459,14 @@ class Settings(BaseSettings):
     # same search again (`search-reuse-memo-v1`). Free academic adapters still
     # run; an incomplete search never creates a memo; a source upload or
     # `force_search` bypasses it. 0 disables reuse.
-    # Patchwriting detector (patchwriting-v4) run during each paper check while
+    # Patchwriting detector (patchwriting-v5) run during each paper check while
     # every retrieved source's text is authorized (owner decision 2026-09-29).
     # Results are stored under the verification summary and shown in the report
     # (yellow Academic Practice marks and window lines).
     PATCHWRITING_AT_CHECK_ENABLED: bool = True
     SEARCH_REUSE_PAUSE_DAYS: int = Field(default=30, ge=0)
     # A re-run of a paper reuses an earlier run's completed result for each
-    # unchanged reference within this many days (paper-search-reuse-v1,
+    # unchanged reference within this many days (paper-search-reuse-v4,
     # owner decision 2026-10-01). 0 disables reuse.
     SEARCH_RERUN_REUSE_DAYS: int = Field(default=30, ge=0)
     # Comma-separated paid/bounded fallbacks, tried only when the primary

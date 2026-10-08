@@ -47,8 +47,11 @@ def test_key_is_two_lines_with_each_mark_on_its_own_label():
     html=render_evidence_report_html(dict(title='Example',citation_format='APA',citations=[],paper_surface={}),csp_nonce='feedback-test-nonce')
     key=BeautifulSoup(html,'html.parser').select_one('#active-key')
     lines=[' '.join(line.get_text(' ').split()) for line in key.select('.key-line')]
-    assert lines==['Judgment: Supported Qualified or Mixed Contradicts Not Supported LLM Undecided Not Judged',
-                   'Issues: Academic-Practice Citation/Reference Issue Unverifiable Reference Source Record Conflict Link']
+    # "Supports" as the result label reads, and the topical-mismatch key (owner requests 2026-10-08).
+    assert lines==['Judgment: Supports Qualified or Mixed Contradicts Not Supported LLM Undecided Not Judged',
+                   'Issues: Academic-Practice Citation/Reference Issue Unverifiable Reference Topical Mismatch '
+                   'Source Record Conflict Link']
+    assert key.select_one('.key-topical').get_text()=='Topical Mismatch'
     assert key.select_one('.key-practice').get_text()=='Academic-Practice'
     assert key.select_one('.key-reference').get_text()=='Citation/Reference Issue'
     assert key.select_one('.key-unverified').get_text()=='Unverifiable Reference'

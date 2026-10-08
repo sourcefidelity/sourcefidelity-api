@@ -99,7 +99,9 @@ _PARAGRAPH = re.compile(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", re.DOTALL)
 # "As Belton (2013) notes, this model …": the attribution opens the sentence
 # and the dependent mention follows it (paper 5, 2026-10-03).
 _ATTRIBUTION_LEAD = re.compile(r"^\s*(?:as|according\s+to)\s+[^,.;]{1,120}?,\s*", re.IGNORECASE)
-PREVIOUS_SENTENCE_VERSION = "previous-sentence-antecedent-v1"
+# v2 (owner decisions 2026-10-08): a previous sentence citing other sources
+# qualifies, and a dummy "It" opening needs no referent. v1 records stay valid.
+PREVIOUS_SENTENCE_VERSION = "previous-sentence-antecedent-v2"
 _MARKER = re.compile(r"\(([^()]*?(?:1[6-9]|20)\d{2}[a-z]?[^()]*)\)")
 _NOT_NAMES = {"p", "pp", "para", "et", "al", "and", "n", "d", "ed", "eds", "cited", "as", "in", "see", "e", "g"}
 

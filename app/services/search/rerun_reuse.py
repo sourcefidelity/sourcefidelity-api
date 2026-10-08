@@ -1,4 +1,4 @@
-"""Reuse a paper's earlier search results when it is checked again (`paper-search-reuse-v1`).
+"""Reuse a paper's earlier search results when it is checked again (`paper-search-reuse-v1`, now v4).
 
 Owner decision 2026-10-01: re-running a paper must not pay again for references
 already searched. When a later run of a paper in the same scope reaches a

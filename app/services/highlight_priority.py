@@ -9,8 +9,8 @@ SUBMITTED_LINK_FINDINGS = frozenset({'submitted_link_issue', 'reference_identifi
                                      'doi_registers_a_different_title'})
 # Every link issue is drawn as the purple diamond (owner decisions 2026-09-30),
 # including a DOI or link the reference should include but does not, and an
-# unfinished identifier; those stay Citation and reference formatting findings
-# in windows and summaries.
+# unfinished identifier; those are Citation and Reference Formatting findings
+# in windows and are counted in the Academic Practice links summary line.
 LINK_MARKER_FINDINGS = SUBMITTED_LINK_FINDINGS | {'required_doi_missing', 'assessment_link_missing',
                                                   'reference_identifier_placeholder'}
 # Reference findings about the evidence for the cited work: whether it could be
@@ -25,12 +25,13 @@ EVIDENCE_REFERENCE_FINDINGS = UNVERIFIED_FINDINGS | REFERENCE_DIFFERENCE_FINDING
 def finding_category(kind: str | None) -> str:
     """The report category a reference finding belongs to.
 
-    ``evidence``, ``formatting`` or ``academic``; submitted-link issues are
-    Academic Practice and topical mismatch is Evidence.
+    ``evidence``, ``formatting`` or ``academic``; submitted-link issues and
+    differences from the located record are Academic Practice (owner decision
+    2026-10-07); an unverifiable reference and topical mismatch are Sources.
     """
-    if kind in EVIDENCE_REFERENCE_FINDINGS or kind == 'source_topical_mismatch':
+    if kind in UNVERIFIED_FINDINGS or kind == 'source_topical_mismatch':
         return 'evidence'
-    if kind in ACADEMIC_FINDINGS | SUBMITTED_LINK_FINDINGS | {
+    if kind in ACADEMIC_FINDINGS | SUBMITTED_LINK_FINDINGS | REFERENCE_DIFFERENCE_FINDINGS | {
             'missing_reference', 'missing_reference_entry', 'quotation_difference'}:
         return 'academic'
     return 'formatting'
