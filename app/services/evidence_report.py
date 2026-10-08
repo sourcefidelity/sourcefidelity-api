@@ -187,6 +187,44 @@ def _hanging_indent_narrow(differences: list[dict]) -> bool:
     return 6.0 <= typical < HANGING_INDENT_POINTS - HANGING_INDENT_TOLERANCE_POINTS
 
 
+def _citation_entry(extraction, paper_surface, claim, members, has_attention, start, end, text, display) -> dict:
+    """One citation of the report: the wording from start to end and its sources."""
+    display_coverage = _citation_display_coverage(members)
+    connected = any(item.get("relevance_status") == "connected" for item in members)
+    tone = (
+        "attention"
+        if has_attention
+        else "evidence_available"
+        if connected and display_coverage == "full"
+        else "limited_evidence"
+        if connected
+        else "retrieved_no_connection"
+        if any(item.get("coverage_level") == "full_text" for item in members)
+        else "not_assessed"
+    )
+    return {
+        "claim_id": claim.claim_id,
+        "paper_character_start": start,
+        "paper_character_end": end,
+        "student_text": text,
+        "display_student_text": display,
+        "citation_marker": claim.citation_marker,
+        "claim_type": claim.claim_type,
+        "page_locator": claim.page_locator,
+        "tone": tone,
+        "display_coverage": display_coverage,
+        "quotation_differences": [
+            difference
+            for item in members
+            for difference in (item.get("quotation_check") or {}).get("differences", [])
+        ],
+        "reference_mismatch_members": _reference_mismatch_members(extraction, start, end),
+        "reference_mismatch_details": _reference_mismatch_details(extraction, start, end),
+        "paper_location": _paper_location(paper_surface, passage_start=start, passage_end=end),
+        "members": members,
+    }
+
+
 def build_evidence_report_view(
     *,
     report: Report,
@@ -379,56 +417,34 @@ def build_evidence_report_view(
                 citation_has_attention = True
             members.append(item)
 
-        display_coverage = _citation_display_coverage(members)
-        citation_has_connected_evidence = any(
-            item.get("relevance_status") == "connected" for item in members
-        )
-        citation_has_retrieved_full_text = any(
-            item.get("coverage_level") == "full_text" for item in members
-        )
-        tone = (
-            "attention"
-            if citation_has_attention
-            else "evidence_available"
-            if citation_has_connected_evidence and display_coverage == "full"
-            else "limited_evidence"
-            if citation_has_connected_evidence
-            else "retrieved_no_connection"
-            if citation_has_retrieved_full_text
-            else "not_assessed"
-        )
-        quotation_differences = [
-            difference
-            for item in members
-            for difference in (item.get("quotation_check") or {}).get(
-                "differences", []
-            )
-        ]
-        citations.append(
-            {
-                "claim_id": claim.claim_id,
-                "paper_character_start": claim.passage_start,
-                "paper_character_end": claim.passage_end,
-                "student_text": claim.text,
-                "display_student_text": _normalize_display_text(_statement_text(claim)),
-                "citation_marker": claim.citation_marker,
-                "claim_type": claim.claim_type,
-                "page_locator": claim.page_locator,
-                "tone": tone,
-                "display_coverage": display_coverage,
-                "quotation_differences": quotation_differences,
-                "reference_mismatch_members": _reference_mismatch_members(
-                    extraction, claim.passage_start, claim.passage_end),
-                "reference_mismatch_details": _reference_mismatch_details(
-                    extraction, claim.passage_start, claim.passage_end),
-                "paper_location": _paper_location(
-                    paper_surface,
-                    passage_start=claim.passage_start,
-                    passage_end=claim.passage_end,
-                ),
-                "members": members,
-            }
-        )
+        from app.services.candidate_relationship_judgment import citation_clause_segments
+        whole = {"student_text": claim.text, "citation_marker": claim.citation_marker}
+        segments = (None if claim.citation_marker_type == "source_heading" or heading_citation(whole)
+                    else citation_clause_segments(claim, [m.get("reference_id") for m in group.get("members", [])]))
+        if not segments:
+            citations.append(_citation_entry(
+                extraction, paper_surface, claim, members, citation_has_attention,
+                claim.passage_start, claim.passage_end, claim.text,
+                _normalize_display_text(_statement_text(claim))))
+            continue
+        # One sentence, several sources' own clauses: each clause and its
+        # marker is its own citation, shown with ellipses where the sentence
+        # goes on (owner decision 2026-10-07). The highlight is narrowed to the
+        # clause when the page is drawn.
+        whole_location = _paper_location(paper_surface, passage_start=claim.passage_start,
+                                         passage_end=claim.passage_end)
+        for local_start, local_end, reference_ids, opens, closes in segments:
+            part = [m for m in members if m.get("reference_id") in reference_ids]
+            text = claim.text[local_start:local_end]
+            display = ("" if opens else "…") + _normalize_display_text(text) + ("" if closes else "…")
+            entry = _citation_entry(
+                extraction, paper_surface, claim, part,
+                any(f["level"] == "attention" for m in part for f in m.get("reference_findings") or [])
+                or any((m.get(k) or {}).get("attention") for m in part for k in ("quotation_check", "locator_check")),
+                claim.passage_start + local_start, claim.passage_start + local_end, text, display)
+            entry["paper_location"] = deepcopy(whole_location)
+            entry["clause_of"] = {"student_text": claim.text, "paper_character_start": claim.passage_start}
+            citations.append(entry)
 
     for marker in unresolved_marker_report_groups(extraction.citation_marker_census):
         missing_members = _missing_reference_members(extraction, marker["passage_start"], marker["passage_end"])
@@ -1399,7 +1415,11 @@ def _build_report_summary(
                           "target": _finding_target(f, j, all_citations, numbers)}
                          for _, j, f in ordered]
         elif kind == 'required_quotation_locator_missing':
-            claims = {c.get('claim_id'): i for i, c in enumerate(all_citations, 1) if c.get('claim_id')}
+            claims = {}
+            for i, c in enumerate(all_citations, 1):
+                if c.get('claim_id'):
+                    # A sentence split into clause citations is named by its first.
+                    claims.setdefault(c['claim_id'], i)
             count = len({f.get('claim_id') for _, f in placed})
             instances = []
             seen = set()
@@ -2786,6 +2806,27 @@ def normalize_reference_findings(findings: list[dict]) -> list[dict]:
             and not (f.get('finding_type') == 'bibliographic_conflict' and f.get('reference_id') in wrong_doi)]
 
 
+def _narrow_clause_citations(view: dict, document) -> None:
+    """A citation split from its sentence is highlighted on its own clause;
+    where the clause cannot be placed exactly, the sentence stays highlighted."""
+    split = [c for c in view.get('citations', []) if c.get('clause_of')]
+    if not split:
+        return
+    from app.services.judgment_layer import claim_span_rectangles
+    words = {page.number: page.get_text('words', sort=True) for page in document}
+    for citation in split:
+        whole = {'paper_location': citation.get('paper_location'),
+                 'student_text': citation['clause_of'].get('student_text'),
+                 'paper_character_start': citation['clause_of'].get('paper_character_start')}
+        rects, placement = claim_span_rectangles(
+            whole, [(citation['paper_character_start'], citation['paper_character_end'])], words)
+        if placement == 'exact' and rects:
+            location = dict(citation['paper_location'])
+            location['rectangles'] = rects
+            location['page_indexes'] = sorted({r['page_index'] for r in rects})
+            citation['paper_location'] = location
+
+
 def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     """Display retained findings on exact fields; never rewrite historical output."""
     result = deepcopy(view)
@@ -2796,6 +2837,7 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     if withheld:
         result['withheld_bibliographic_conflicts'] = withheld
         result['reference_practice'] = [f for f in result.get('reference_practice', []) if f not in withheld]
+    _narrow_clause_citations(result, document)
     members = [m for c in result.get('citations', []) for m in c.get('members', [])]
     from app.services.sentence_splitter import split_sentences
     paper_sentences = None
@@ -6265,7 +6307,10 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
     availability = (
         '<p class="source-unavailable"><strong>Source Not Retrieved</strong></p>'
         if member.get("availability") == "Source Not Retrieved" and not grouped
-        else f'<p>{escape(member["availability"])}</p>'
+        # The selector's "no clearly relevant passage" line gives way when the
+        # judge found evidence in the source (owner decision 2026-10-08).
+        else f'<p{" data-no-passage-note" if str(member["availability"]).startswith("No clearly relevant passage was found") else ""}>'
+             f'{escape(member["availability"])}</p>'
         if member.get("availability") and member.get("availability") != "Source Not Retrieved"
         else ""
     )
@@ -6483,8 +6528,10 @@ def _mismatch_lines(citation: dict, member_index: int) -> list[str]:
 
 
 def _judgment_slot(member: dict) -> str:
+    # Every judged-or-not record has a slot: only a full-text source is judged,
+    # but a "see" citation's note shows whatever text was retrieved (2026-10-07).
     record = str(member.get("verification_report_id") or "")
-    if member.get("coverage_level") != "full_text" or not record:
+    if not record:
         return ""
     return f'<div class="judgment-slot" data-judgment-record="{escape(record, quote=True)}"></div>'
 

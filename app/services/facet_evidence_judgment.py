@@ -1104,22 +1104,38 @@ def _active_cited_author_label(artifact) -> str:
     return ""
 
 
+_FRONT_MATTER_LABEL = re.compile(
+    r"(?m)^[ \t]*(A\s?B\s?S\s?T\s?R\s?A\s?C\s?T|Abstract|ABSTRACT|A\s?R\s?T\s?I\s?C\s?L\s?E\s+I\s?N\s?F\s?O|"
+    r"Article\s+info(?:rmation)?|Highlights|H\s?I\s?G\s?H\s?L\s?I\s?G\s?H\s?T\s?S)[ \t]*(?:\n|$)")
+_ABSTRACT_LABEL = re.compile(r"A\s?B\s?S\s?T\s?R\s?A\s?C\s?T|Abstract|ABSTRACT")
+
+
 def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
     spans = []
     start = 0
     text = passage.text
     boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
-    for match in boundary.finditer(text):
-        if re.search(r"\b[A-Z]\.\s*$", text[:match.start()]):
+    # A front-matter label line ("A B S T R A C T") ends what came before it and
+    # is no sentence; the title, author and affiliation lines before an
+    # abstract label are metadata, not evidence (the owner's article, 2026-10-07).
+    labels = list(_FRONT_MATTER_LABEL.finditer(text))
+    abstract_at = next((m.start() for m in labels if _ABSTRACT_LABEL.fullmatch(m.group(1))), None)
+    cuts = sorted([(m.start(), m.end(), "boundary") for m in boundary.finditer(text)]
+                  + [(m.start(), m.end(), "label") for m in labels])
+    for cut_start, cut_end, kind in cuts:
+        if cut_start < start:
+            continue
+        if kind == "boundary" and re.search(r"\b[A-Z]\.\s*$", text[:cut_start]):
             # A single capital plus period is normally an author initial, not a
             # sentence boundary (for example, "D. Ricardo").
             continue
-        end = match.start()
-        if trimmed := _trim_optional(text, start, end):
+        if trimmed := _trim_optional(text, start, cut_start):
             spans.append(trimmed)
-        start = match.end()
+        start = cut_end
     if trimmed := _trim_optional(text, start, len(text)):
         spans.append(trimmed)
+    if abstract_at is not None:
+        spans = [span for span in spans if span[0] >= abstract_at]
     sentences = []
     for start, end in spans:
         exact = text[start:end]

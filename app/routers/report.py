@@ -386,6 +386,7 @@ def get_report_successor_status(
         "processing": bool(
             (job.upload_evidence or {}).get("targeted_source_refresh")
         ),
+        "queued_uploads": len((job.upload_evidence or {}).get("queued_source_uploads") or []),
         "last_reanalysis_failure": failure or None,
     }
 
@@ -609,18 +610,13 @@ def upload_citation_source(
             detail="Citation-scoped source upload is not configured for this deployment scope",
         )
     view, _, _ = _load_bundle(session, backend, report_id, principal)
-    citation = next(
-        (
-            item
-            for item in view.get("citations", [])
-            if str(item.get("claim_id") or "") == claim_id
-        ),
-        None,
-    )
-    if claim_id is not None and citation is None:
+    # A sentence split into clause citations keeps one claim id: each clause's
+    # sources are candidates, and the file itself picks the one it matches.
+    selected = (view.get("citations", []) if claim_id is None else
+                [item for item in view.get("citations", []) if str(item.get("claim_id") or "") == claim_id])
+    if claim_id is not None and not selected:
         raise HTTPException(status_code=404, detail="Citation not found")
     from app.services.evidence_report import _member_accepts_upload
-    selected = [citation] if citation is not None else view.get("citations", [])
     candidates = [
         member
         for item in selected
@@ -856,7 +852,10 @@ def _start_uploaded_source_reanalysis(
         # The source is stored and accepted; another upload's refresh is running.
         # Queue this refresh to start when that one ends instead of refusing it
         # (2026-10-01: Langford was stored but reported as refused).
+        from app.services.paper_workflow import set_queued_source_upload
         from app.tasks.source_reanalysis import schedule_busy_upload_refresh
+        session.rollback()
+        set_queued_source_upload(session, report_id, reference_id, str(accepted[0].get("id") or ""), queued=True)
         task_id = schedule_busy_upload_refresh(report_id, reference_id, str(accepted[0].get("id") or ""))
         return {
             "reanalysis_status": "scheduled",

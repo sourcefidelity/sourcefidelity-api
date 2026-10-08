@@ -100,13 +100,20 @@ def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
     try:
         # A bare "This …" stored as unresolved reads as the previous sentence
         # (owner decision 2026-10-03), for the prompt and its interpretation alike.
-        from app.services.antecedent_resolver import previous_sentence_antecedent
+        from app.services.antecedent_resolver import (
+            _EXPLETIVE_IT, previous_sentence_antecedent, without_expletive_dependency)
+        candidates = VerificationCandidateSet.model_validate(payload.get("verification_candidates") or {})
+        # A stored part opening with a dummy "It" was marked as needing an
+        # antecedent, and the judge then declined it (citation 10, 2026-10-08).
+        candidates = candidates.model_copy(update={"candidates": [
+            candidate.model_copy(update={"requires_antecedent_context": False, "requires_parent_context": False})
+            if candidate.requires_antecedent_context and _EXPLETIVE_IT.match(candidate.text or "") else candidate
+            for candidate in candidates.candidates]})
         return SimpleNamespace(
-            claim=previous_sentence_antecedent(ClaimEvidence.model_validate(claim)),
+            claim=previous_sentence_antecedent(without_expletive_dependency(ClaimEvidence.model_validate(claim))),
             source_binding=CitationSourceBinding.model_validate(binding) if binding else None,
             source_identity=SimpleNamespace(status=(payload.get("source_identity") or {}).get("status")),
-            verification_candidates=VerificationCandidateSet.model_validate(
-                payload.get("verification_candidates") or {}),
+            verification_candidates=candidates,
             facet_evidence_foundation=FacetEvidenceFoundation.model_validate(
                 payload.get("facet_evidence_foundation") or {}),
             # Only page coordinates are read (locator status), never passage text.

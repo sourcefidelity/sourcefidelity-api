@@ -174,7 +174,22 @@ def resolve_claim_antecedents(
     )
 
 
+# "It is difficult for port cranes to …", "It is clear that …", "It seems
+# that …": a dummy subject, not a pronoun with a referent (the owner's article,
+# 2026-10-08).
+_EXPLETIVE_IT = re.compile(
+    r"^\s*it\s+(?:is|was|has\s+been|had\s+been|will\s+be|would\s+be|can\s+be|could\s+be|may\s+be|"
+    r"might\s+be|must\s+be|should\s+be|remains|remained|becomes|became|seems|seemed|appears|appeared)\s+"
+    r"(?:(?:not|also|often|still|increasingly|now|therefore|thus|clearly)\s+)*"
+    r"(?:(?:[a-z]+\s+){0,2}?(?:for|of)\s+[^,.;()]{1,80}?\s+to\s+[a-z]"
+    r"|(?:[a-z]+\s+){0,2}?(?:to|that|whether|how|why|what|when)\s"
+    r"|(?:[a-z]+ly\s+)?[a-z]+\s+(?:to|that|whether|how|why)\s)",
+    re.IGNORECASE)
+
+
 def _dependency_mention(claim):
+    if _EXPLETIVE_IT.match(claim.text):
+        return None
     marker_start = claim.text.find(claim.citation_marker) if claim.citation_marker else -1
     searchable = claim.text if marker_start < 0 else claim.text[:marker_start]
     match = _LEADING_DEPENDENCY.match(searchable)
@@ -565,11 +580,22 @@ def _marker_names(text: str) -> set[str]:
     return names
 
 
+def without_expletive_dependency(claim: ClaimEvidence) -> ClaimEvidence:
+    """A stored claim held unresolved only for a dummy "It" opening needs no
+    antecedent (2026-10-08); any other claim is returned unchanged."""
+    if claim.context_dependency_status == "unresolved" and _EXPLETIVE_IT.match(claim.text):
+        return claim.model_copy(update={"antecedent_dependencies": [], "context_dependency_status": "not_required"})
+    return claim
+
+
 def previous_sentence_antecedent(claim: ClaimEvidence) -> ClaimEvidence:
     """A statement opening with "This"/"That" (with or without a noun) whose
     referent no exact phrase settled refers to the discussion of the previous
-    sentence (owner decision 2026-10-03), unless that sentence cites another
-    source or is a heading. Returns the claim unchanged when it does not apply."""
+    sentence (owner decision 2026-10-03), unless that sentence is a heading.
+    A previous sentence citing other sources qualifies too (owner decision
+    2026-10-08): it only identifies what "this" means, and the statement judged
+    against the source stays its own wording. Returns the claim unchanged when
+    it does not apply."""
     if claim.context_dependency_status == "resolved":
         return claim
     mention = _dependency_mention(claim)
@@ -577,10 +603,6 @@ def previous_sentence_antecedent(claim: ClaimEvidence) -> ClaimEvidence:
         return claim
     previous = next((c for c in claim.antecedent_context if c.distance_before == 1), None)
     if previous is None or not re.search(r"[.!?][\"”’')\]]*\s*$", previous.text):
-        return claim
-    cited = _marker_names(previous.text)
-    claim_names = _marker_names(claim.text) | _marker_names(claim.citation_marker or "")
-    if cited and not cited & claim_names:
         return claim
     local_start, local_end, mention_text = mention[0], mention[1], mention[2]
     dependency = ClaimAntecedentDependency(

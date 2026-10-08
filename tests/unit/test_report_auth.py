@@ -306,7 +306,7 @@ def test_report_source_upload_is_member_bound_and_same_origin(monkeypatch):
 
 
 @pytest.mark.parametrize('route', ['citation/claim-1/source/upload', 'source/upload'])
-@pytest.mark.parametrize('duplicate', ['none', 'same', 'conflict'])
+@pytest.mark.parametrize('duplicate', ['none', 'same', 'conflict', 'split'])
 def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatch, route, duplicate):
     token = "v" * 48
     view = _view()
@@ -327,7 +327,15 @@ def test_citation_source_upload_identifies_exactly_one_missing_member(monkeypatc
             ],
         }
     ]
-    if duplicate != 'none':
+    if duplicate == 'split':
+        # One sentence split into clause citations keeps one claim id; the first
+        # clause's source is already complete (2026-10-07, the owner's article).
+        from copy import deepcopy
+        first, second = deepcopy(view['citations'][0]), deepcopy(view['citations'][0])
+        first['members'] = [{**first['members'][0], 'coverage_level': 'full_text'}]
+        second['members'] = second['members'][1:]
+        view['citations'] = [first, second]
+    elif duplicate != 'none':
         from copy import deepcopy
         second = deepcopy(view['citations'][0])
         second['claim_id'] = 'claim-2'

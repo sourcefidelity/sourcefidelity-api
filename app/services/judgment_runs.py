@@ -157,6 +157,15 @@ class _ScopedCache:
 
     def coaching_store(self, key: str, payload: dict) -> None:
         from app.models.judgment import JudgmentCoachingNote
+        existing = self.session.scalars(select(JudgmentCoachingNote).where(
+            JudgmentCoachingNote.scope_type == self.run.scope_type,
+            JudgmentCoachingNote.scope_id == self.run.scope_id,
+            JudgmentCoachingNote.cache_key == key)).first()
+        if existing is not None:
+            # A model note replaces a stored fallback; nothing else is overwritten.
+            if (existing.payload or {}).get("status") == "template" and payload.get("status") == "model":
+                existing.payload = payload
+            return
         try:
             with self.session.begin_nested():
                 self.session.add(JudgmentCoachingNote(

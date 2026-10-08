@@ -148,3 +148,31 @@ def test_a_note_giving_advice_is_rejected_and_old_notes_keep_only_their_descript
     old = ("The source says most teachers in the sample, not all teachers. Check how many teachers the "
            "source reports, and consider narrowing the statement.")
     assert without_advice(old) == "The source says most teachers in the sample, not all teachers."
+
+
+def test_the_statements_own_word_is_not_advice():
+    # "revising" in the statement (owner's article, 2026-10-07) rejected every note.
+    claim = "Ports use cranes for loading, revising schedules, and unloading (Rivera, 2019)."
+    _, bound = coaching_input("qualified", claim, "(Rivera, 2019)", FACETS, PANEL, SENTENCES)
+    note = "The source reports loading and unloading but says nothing about revising."
+    assert "advice" not in check_note(_note(note), bound)[1]
+    assert "advice" in check_note(_note("Consider revising the statement."), bound)[1]
+
+
+def test_a_result_resting_on_who_holds_the_statement_gives_the_note_the_reason():
+    # Owner decision 2026-10-08 (the owner's article, citation 10a): the label
+    # came from the speaker check while the note only saw the content.
+    facets = {**FACETS, "a": {"kind": "source_attribution", "text": "cited author's own voice",
+                              "material_to_aggregate": True}}
+    reason = "The matching content (s1) is text the source quotes from Rivera's survey tool, not the authors' own voice."
+    arms = [{**_arm(f"glm{i}"), "mappings": [*_arm(f"glm{i}")["mappings"],
+             {"facet_id": "a", "direction": "contradicts", "evidence_sentence_ids": ["s1"], "rationale": reason}]}
+            for i in range(3)]
+    payload, bound = coaching_input("contradicts", CLAIM, "(Rivera, 2019)", facets, {"arms": arms}, SENTENCES)
+    assert payload["speaker_reasons"] == [reason.replace(" (s1)", "")] and "speaker_instruction" in payload
+    note = "The matching passage is text the source quotes from another author's survey tool, not the authors' own claim."
+    assert "other_sources" not in check_note(_note(note), bound)[1]
+    # Without speaker reasons nothing changes: other sources stay out of notes.
+    plain_payload, plain_bound = coaching_input("contradicts", CLAIM, "(Rivera, 2019)", FACETS, PANEL, SENTENCES)
+    assert "speaker_reasons" not in plain_payload
+    assert "other_sources" in check_note(_note("Another author's survey says otherwise."), plain_bound)[1]

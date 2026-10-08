@@ -1688,6 +1688,57 @@ class SourceResolver:
                                        result=archived, required=False)
         return archived if archived.success else None
 
+    def stored_copy_available(self, reference) -> bool:
+        """Whether the source library now holds an accepted full text of this
+        work (an upload since the earlier run): a free check, no search."""
+        title = getattr(reference, "title", None) or ""
+        expected_kind = _expected_source_kind_assessment(
+            source_kind=getattr(reference, "source_kind", None),
+            source_kind_confidence=getattr(reference, "source_kind_confidence", None),
+            source_kind_evidence=getattr(reference, "source_kind_evidence", None) or [],
+            raw_ref=getattr(reference, "raw_ref", "") or "", title=title,
+            url=getattr(reference, "url", None) or None)
+        try:
+            found = self._check_local_cache(
+                getattr(reference, "doi", None) or None, getattr(reference, "isbn", None) or None, title or None,
+                author=getattr(reference, "author", None) or None, year=getattr(reference, "year", None) or None,
+                expected_source_kind=expected_kind)
+        except Exception:
+            return False
+        return bool(found.success and found.full_text)
+
+    def refetch_public_source(self, reference, href: str, *, provider: str,
+                              content_sha256: str) -> RetrievalResult | None:
+        """Download an earlier run's verified open-access copy again, without
+        any search (owner decision 2026-10-07): the same safety, identity and
+        completeness checks as acquisition, and the file must be byte-identical
+        to the one the earlier run verified. None when anything differs."""
+        title = getattr(reference, "title", None) or ""
+        expected_kind = _expected_source_kind_assessment(
+            source_kind=getattr(reference, "source_kind", None),
+            source_kind_confidence=getattr(reference, "source_kind_confidence", None),
+            source_kind_evidence=getattr(reference, "source_kind_evidence", None) or [],
+            raw_ref=getattr(reference, "raw_ref", "") or "", title=title,
+            url=getattr(reference, "url", None) or None)
+        result = RetrievalResult(
+            source_name=provider, success=False,
+            locations=[AcquisitionLocation(url=href, provider=provider, is_best=True)],
+            metadata={"requested_url_sha256": hashlib.sha256(href.encode()).hexdigest()})
+        try:
+            acquired = self._acquire_from_locations(
+                result, expected_doi=getattr(reference, "doi", None) or None, expected_title=title or None,
+                expected_author=getattr(reference, "author", None) or None,
+                expected_year=getattr(reference, "year", None) or None, expected_source_kind=expected_kind)
+        except Exception:
+            return None
+        representation = result.representation
+        if (not acquired or representation is None or not representation.content
+                or hashlib.sha256(representation.content).hexdigest() != content_sha256
+                or (result.metadata or {}).get("identity_confidence") != "high"):
+            return None
+        result.success = True
+        return result
+
     @observe_reference
     def check_submitted_links(self, reference) -> RetrievalResult:
         """Visit an uncited reference's own link or DOI, without any search.

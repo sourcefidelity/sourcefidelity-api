@@ -95,6 +95,14 @@ def test_article_bibliographic_endnotes_are_terminal_evidence():
     assert check_completeness(partial, document_kind="article").verdict != COMPLETE
 
 
+def test_journal_references_and_notes_heading_is_terminal_evidence():
+    # A science-journal article's "REFERENCES AND NOTES" (judged limited text, 2026-10-07).
+    from app.services.completeness_checker import _signal_back_matter
+    tail = "REFERENCES AND NOTES\n1. A. Author, First work (Press, 1999)."
+    payload = _pdf(["Article opening", "Article body", "Results", tail])
+    assert _signal_back_matter(payload, 4, document_kind="article")["vote"] == COMPLETE
+
+
 def test_bare_or_nonbibliographic_notes_do_not_establish_completeness():
     from app.services.completeness_checker import _signal_back_matter
     for notes in ["Notes", "Notes\n1. First observation\n2. Second observation\n3. Third observation"]:

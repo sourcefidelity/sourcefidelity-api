@@ -51,7 +51,31 @@ def _only_conventional(region: dict, start: int, spans: list[tuple[int, int]]) -
     return counted < raw and counted < pw.PARAPHRASE_MIN_MATCHED
 
 
-def _finding_rows(block: dict, known: Callable[[str], bool]) -> list[dict]:
+def _only_title_words(region: dict, start: int, spans: list[tuple[int, int]], title: str) -> bool:
+    """A close paraphrase whose matched words are the matched source's own title
+    words ("port crane automation … harbour logistics" against "Port crane
+    automation in harbour logistics"), or an acronym the student puts in
+    brackets ("(PCA)"), names the topic: at most one matched
+    word lies outside them (owner review, 2026-10-07). A title word among
+    otherwise borrowed wording does not excuse the rest."""
+    from app.services import patchwriting as pw
+    text = str(region.get("text") or "")
+    if not text or not title or region.get("text_truncated") or not spans:
+        return False
+    title_stems = {t.stem for t in pw.tokenize(title) if t.content}
+    bracketed = {m.start() + 1 for m in re.finditer(r"\(\s*[A-Za-z]*[A-Z][A-Za-z]*[A-Z][A-Za-z]*\s*\)", text)}
+    remaining = 0
+    for token in pw.tokenize(text, start):
+        if not token.content or not any(a <= token.start and token.end <= b for a, b in spans):
+            continue
+        if token.stem in title_stems or token.start - start in bracketed:
+            continue
+        remaining += 1
+    return remaining <= 1
+
+
+def _finding_rows(block: dict, known: Callable[[str], bool],
+                  title_of: Callable[[str], str] = lambda _r: "") -> list[dict]:
     rows = []
     for reference_id, entry in (block.get("sources") or {}).items():
         if not isinstance(entry, dict) or entry.get("status") != "compared" or not known(reference_id):
@@ -75,7 +99,12 @@ def _finding_rows(block: dict, known: Callable[[str], bool]) -> list[dict]:
                      for span in finding.get("student_matched_spans") or []
                      if isinstance(span, dict) and isinstance(span.get("paper_start"), int)
                      and isinstance(span.get("paper_end"), int)]
-            if finding["kind"] == "close_paraphrase" and _only_conventional(region, start, spans):
+            from app.services.text_extractor import _LICENCE_LINE
+            if _LICENCE_LINE.search(str(region.get("text") or "")) and "://" in str(region.get("text") or ""):
+                continue   # a page's licence footer read as paper text (2026-10-07)
+            if finding["kind"] == "close_paraphrase" and (
+                    _only_conventional(region, start, spans)
+                    or _only_title_words(region, start, spans, title_of(reference_id))):
                 continue
             sentence = finding.get("student_sentence") or {}
             rows.append({
@@ -279,7 +308,11 @@ def build_passages(block: dict | None, reference_view: Callable[[str], dict | No
 
     groups: list[list[dict]] = []
     end = -1
-    for row in _finding_rows(block, known):
+    def title_of(reference_id: str) -> str:
+        view = views.get(reference_id) or {}
+        return str(view.get("title") or (view.get("source") or {}).get("title") or "")
+
+    for row in _finding_rows(block, known, title_of):
         if groups and row["start"] < end:
             groups[-1].append(row)
             end = max(end, row["end"])

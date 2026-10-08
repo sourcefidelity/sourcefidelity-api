@@ -51,7 +51,8 @@ def refresh_evidence_report_projection(
     report = session.get(Report, parsed_id)
     if report is None:
         raise ValueError("Report not found")
-    job = session.scalar(select(Job).where(Job.id == report.job_id).with_for_update())
+    job = session.scalar(select(Job).where(Job.id == report.job_id).with_for_update()
+                         .execution_options(populate_existing=True))
     if job is None or str(job.status) != "completed":
         raise ValueError("Report job must be completed before projection correction")
     latest_report = session.scalar(

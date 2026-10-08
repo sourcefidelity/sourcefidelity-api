@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 import hashlib
 import re
+from types import SimpleNamespace
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -1378,6 +1379,83 @@ def _passage_matches_authorization(artifact, passage):
     )
 
 
+def parenthetical_markers(claim):
+    """The claim's parenthetical citation markers in text order. A narrative
+    citation's bracketed year ("Hartmn (2016) highlights …") is not one: only
+    markers recorded as parenthetical count."""
+    text = claim.text
+    brackets: dict[tuple[int, int], list] = {}
+    for m in claim.citation_markers or []:
+        if getattr(m, "marker_type", "parenthetical") != "parenthetical":
+            continue
+        start, end = m.local_start, m.local_end
+        if not m.text.lstrip().startswith("("):
+            # Sources sharing one bracket are stored one by one ("Bell, 2023"
+            # inside "(Bell, 2023; Cole, 2023)"): the whole bracket is each
+            # one's marker (2026-10-07).
+            opening = text.rfind("(", 0, start)
+            closing = text.find(")", end)
+            if opening < 0 or closing < 0 or ")" in text[opening:start] or "(" in text[end:closing]:
+                continue
+            start, end = opening, closing + 1
+        brackets.setdefault((start, end), []).append(m)
+    markers = []
+    for (start, end), members in brackets.items():
+        bracket = text[start:end] if 0 <= start < end <= len(text) else members[0].text
+        # A year alone ("(2016)") follows a name in the text: narrative.
+        if not re.search(r"\b[A-Z][\w'’-]+", bracket):
+            continue
+        if len(members) == 1 and members[0].text.lstrip().startswith("("):
+            markers.append(members[0])
+            continue
+        markers.append(SimpleNamespace(
+            text=bracket, local_start=start, local_end=end, marker_type="parenthetical",
+            reference_ids=list(dict.fromkeys(r for m in members for r in m.reference_ids or []))))
+    return sorted(markers, key=lambda m: m.local_start)
+
+
+def citation_clause_segments(claim, reference_ids):
+    """Where one sentence holds several sources' own clauses, each clause with
+    its marker as its own citation (owner decision 2026-10-07): [(local_start,
+    local_end, reference_ids, opens_sentence, closes_sentence)], or None when
+    the citation stays whole. Wording after the last marker that is more than
+    closing punctuation belongs to no citation. Every source must have exactly
+    one parenthetical marker, and the citation must be one sentence."""
+    text = claim.text
+    markers = parenthetical_markers(claim)
+    if not markers or not 0 <= markers[0].local_start:
+        return None
+    if any(not 0 <= m.local_start < m.local_end <= len(text) for m in markers):
+        return None
+    for reference_id in reference_ids:
+        if sum(reference_id in (m.reference_ids or []) for m in markers) != 1:
+            return None
+    if {r for m in markers for r in m.reference_ids or []} - set(reference_ids):
+        return None
+    last = markers[-1]
+    sentence_end = re.search(r"[.!?][\"”’')]*(?:\s+|$)", text[last.local_end:])
+    if sentence_end and last.local_end + sentence_end.end() < len(text.rstrip()):
+        return None  # a later sentence joined to the citation
+    if any(re.search(r"[.!?][\"”’')]*\s+[A-Z]", text[a.local_end:b.local_start])
+           for a, b in zip(markers, markers[1:])):
+        return None
+    remainder = text[last.local_end:]
+    closes = len(re.findall(r"[A-Za-z]{2,}", remainder)) < 3
+    if len(markers) == 1 and closes:
+        return None
+    segments, start = [], 0
+    for index, marker in enumerate(markers):
+        while start < marker.local_start and (text[start].isspace() or text[start] in ",;:–—-"):
+            start += 1
+        end = marker.local_end
+        is_last = index == len(markers) - 1
+        if is_last and closes:
+            end = len(text.rstrip())
+        segments.append((start, end, list(marker.reference_ids or []), index == 0, is_last and closes))
+        start = marker.local_end
+    return segments
+
+
 def _member_clause_spans(claim, reference_id):
     """The wording one source's own parenthetical marker covers (owner decision
     2026-10-07): from the previous parenthetical marker in the citation, or its
@@ -1388,14 +1466,7 @@ def _member_clause_spans(claim, reference_id):
     if not reference_id:
         return None
     text = claim.text
-    # A narrative citation's bracketed year ("Hartmn (2016) highlights …") is
-    # not a parenthetical marker: only markers recorded as parenthetical count.
-    markers = sorted((m for m in claim.citation_markers or []
-                      if getattr(m, "marker_type", "parenthetical") == "parenthetical"
-                      and m.text.lstrip().startswith("(")
-                      # A year alone ("(2016)") follows a name in the text: narrative.
-                      and re.search(r"\b[A-Z][\w'’-]+", m.text)),
-                     key=lambda m: m.local_start)
+    markers = parenthetical_markers(claim)
     mine = [m for m in markers if reference_id in (m.reference_ids or [])]
     if len(mine) != 1 or not 0 <= mine[0].local_start < mine[0].local_end <= len(text):
         return None
@@ -1515,6 +1586,9 @@ def _substantive_word_count(value):
 
 def _requires_parent_context(text, spans):
     rendered = " ".join(text[start:end].strip() for start, end in spans)
+    from app.services.antecedent_resolver import _EXPLETIVE_IT
+    if _EXPLETIVE_IT.match(rendered):
+        return False   # a dummy "It is difficult for … to" has no referent (2026-10-08)
     return bool(
         re.match(
             r"^(?:this|these|those|such|it|its|they|their|the former|the latter)\b",
@@ -1669,7 +1743,10 @@ def _participle_with_its_parent(left, right, left_positions, right_positions) ->
     # Only a main clause: a comma-split fragment ("with it …") and its
     # participle stay redundant and fail closed, as before.
     return any(child.generation_method == "participial_clause_with_exact_parent"
-               and parent.generation_method in {"structural_clause_fallback", "unsplit_predicate_clause"}
+               # A shared-subject predicate ("… and found that …") is a main
+               # clause too (the owner's article, 2026-10-07).
+               and parent.generation_method in {"structural_clause_fallback", "unsplit_predicate_clause",
+                                                "shared_subject_coordinated_predicate"}
                and parent_positions < child_positions
                for child, child_positions, parent, parent_positions in pairs)
 

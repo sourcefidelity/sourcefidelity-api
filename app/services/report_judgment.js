@@ -26,10 +26,19 @@
     groups.get(mark.group).marks.push(mark);
   }
   const ordered = [...groups.values()].sort((a, b) => (a.order - b.order) || ((a.citation || 0) - (b.citation || 0)));
-  const lanes = new Map();
+  // One underline per word (owner review 2026-10-08): a proposition takes a
+  // second, lower line only where it would overlap another one of its
+  // citation on the page, and never more than one: a third line ran into the
+  // line of text below.
+  const overlaps = (a, b) => a.page_index === b.page_index && a.x0 < b.x1 - 1 && b.x0 < a.x1 - 1
+    && a.y0 < b.y1 - 1 && b.y0 < a.y1 - 1;
+  const firstRects = group => (group.marks.find(m => m.placement === 'exact') || group.marks.find(m => m.rects.length) || {rects: []}).rects;
+  const laid = new Map();
   for (const group of ordered) {
-    const used = lanes.get(group.citation) || 0;
-    group.lane = used; lanes.set(group.citation, used + 1);
+    const placed = laid.get(group.citation) || [];
+    const mine = firstRects(group);
+    group.lane = placed.some(other => other.lane === 0 && firstRects(other).some(r => mine.some(q => overlaps(r, q)))) ? 1 : 0;
+    placed.push(group); laid.set(group.citation, placed);
   }
   const results = new Map();          // verification report id -> Map(candidate -> result item)
   const JUDGED = new Set(['supported', 'qualified', 'contradicts', 'insufficient']);
@@ -108,6 +117,10 @@
     for (const slot of panel.querySelectorAll(`[data-judgment-record="${CSS.escape(record)}"]`)) {
       slot.innerHTML = items.map(i => i.window_html).join('');
       const member = slot.closest('.member');
+      // The judge found evidence: the selector's "no clearly relevant passage"
+      // line no longer applies (owner decision 2026-10-08).
+      const judgeFound = items.some(i => (i.evidence || []).length || ['supported', 'qualified', 'contradicts'].includes(i.display_state));
+      member?.querySelectorAll('[data-no-passage-note]').forEach(note => { note.hidden = judgeFound; });
       let list = member?.querySelector('[data-evidence-list]');
       if (!list && items.some(i => (i.evidence || []).length)) {
         // No stored selection (a report checked before 2026-09-28, or the gate

@@ -307,10 +307,14 @@
   }
   selectText?.addEventListener('click', () => setMode(mode === 'text' ? 'none' : 'text'));
   setMode('none');
+  // Uploads made one after another (2026-10-07): the page moves to the updated
+  // report once, when no upload is still sending, refreshing or waiting, so a
+  // later upload is neither cut off nor shown as never made.
+  let uploadsSending=0;
   async function awaitSuccessor(url, message, attemptId) {
     try {
       const response=await fetch(url,{credentials:'same-origin'});if(!response.ok)throw new Error('Report update status is unavailable.');const data=await response.json();
-      if(data.successor_available){window.location.assign('/report/'+encodeURIComponent(data.latest_report_id)+window.location.search);return;}
+      if(data.successor_available&&!data.processing&&!data.queued_uploads&&!uploadsSending){window.location.assign('/report/'+encodeURIComponent(data.latest_report_id)+window.location.search);return;}
       const failure=data.last_reanalysis_failure;
       // A new search is watched for its own attempt only; the upload wording belongs to uploads.
       if(failure&&(attemptId===undefined||failure.attempt_id===attemptId)){message.textContent=attemptId===undefined?'The source was stored, but the report could not be updated. Retry the upload.':'The new search could not update the report.';return;}
@@ -327,9 +331,10 @@
   document.addEventListener('submit', async event => {
     const form=event.target;if(!form.classList.contains('source-upload'))return;event.preventDefault();
     const message=form.querySelector('.upload-status'),button=form.querySelector('button'),input=form.querySelector('input[type=file]');
-    button.disabled=true;message.textContent='Uploading and checking source…';
+    button.disabled=true;message.textContent='Uploading and checking source…';uploadsSending++;
     try{const response=await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin'}),data=await response.json();if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Source upload could not be completed.');message.textContent=data.message;input.disabled=true;if(data.status_url)awaitSuccessor(data.status_url,message);}
     catch(error){message.textContent=error.message;button.disabled=false;input.value='';}
+    finally{uploadsSending--;}
   });
   document.addEventListener('submit', async event => {
     const form=event.target;if(!form.classList.contains('search-again'))return;event.preventDefault();

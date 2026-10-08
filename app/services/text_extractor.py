@@ -437,6 +437,9 @@ def isolate_pdf_tables(text: str) -> str:
 _REFERENCE_LIST_HEADING = re.compile(r"(?im)^\s*(?:references|reference list|bibliography|works cited)\s*$")
 
 
+_KEYWORDS_LINE = re.compile(r"(?i)^(?:key\s*words?|index\s+terms)\s*[:：—–-]\s*\S")
+
+
 def isolate_pdf_headings(text: str, *, bold_lines: frozenset[str] = frozenset()) -> str:
     """A heading line the PDF prints without a blank line after it is not the
     start of the next sentence ("Conceptualisation of Identity and
@@ -452,8 +455,21 @@ def isolate_pdf_headings(text: str, *, bold_lines: frozenset[str] = frozenset())
         end = heading.start()
     lines = text[:end].split("\n")
     out = list(lines)
+    # A keywords line is front matter, not the start of the first sentence, and
+    # a heading may follow it (the owner's article, 2026-10-07).
+    keywords = {i for i, line in enumerate(lines) if _KEYWORDS_LINE.match(line.strip())}
+    for i in keywords:
+        out[i] = "\n" + lines[i] + "\n"
     for i in range(1, len(lines) - 1):
+        if i in keywords:
+            continue
         line, before, after = lines[i].strip(), lines[i - 1].strip(), lines[i + 1].strip()
+        if i - 1 in keywords:
+            before = "."
+            # One title-cased word right after the keywords is the first heading.
+            if (re.fullmatch(r"(?:\d+\.?\s+)?[A-Z][A-Za-z'’-]{3,}", line) and after[:1].isupper()):
+                out[i] = "\n" + lines[i] + "\n"
+                continue
         words = re.findall(r"[A-Za-z][\w'’-]*", line)
         long_words = [w for w in words if len(w) >= 4]
         # A line set wholly in bold is a heading in any case ("Performance and
@@ -467,6 +483,44 @@ def isolate_pdf_headings(text: str, *, bold_lines: frozenset[str] = frozenset())
     return "\n".join(out) + text[end:]
 
 
+# A publication footer: a licence statement, a bare address, or a journal
+# name with its issue date (the owner's article, page 1, 2026-10-07).
+_LICENCE_LINE = re.compile(
+    r"(?i)\b(?:CC[ -]BY(?:[ -][A-Z]{2})*|creative\s*commons|creativecommons\.org|open access under|"
+    r"licen[cs]ed under|all rights reserved)\b|©|\bcopyright\b")
+_FOOTER_LINE = re.compile(
+    r"(?i)^(?:(?:[A-Z][\w&:'’,.-]*\s+){0,8}?(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December|Spring|Summer|Autumn|Fall|Winter)?\s*\d{4}\s+)?"
+    r"(?:https?://\S+|doi:\s*\S+)(?:\s+(?:https?://\S+))*$"
+    r"|^(?:[A-Z][\w&:'’-]*\s+){1,8}?(?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+\d{4}(?:\s+https?://\S+)?$")
+
+
+def _strip_publication_footer(page: str) -> str:
+    """A page's closing licence block is not paper text: from its first footer
+    line among the last four lines, when one of them states a licence."""
+    lines = page.splitlines()
+    nonempty = [index for index, line in enumerate(lines) if line.strip()]
+    tail = nonempty[-4:]
+
+    def licence(line: str) -> bool:
+        # A short statement, not a sentence of the paper that cites a source.
+        return bool(_LICENCE_LINE.search(line)) and len(line.split()) <= 14 and not re.search(r"\(\D*\d{4}", line)
+
+    if not any(licence(lines[index]) for index in tail):
+        return page
+    cut = None
+    for index in reversed(tail):
+        line = lines[index].strip()
+        if licence(line) or _FOOTER_LINE.match(line):
+            cut = index
+        else:
+            break
+    if cut is None:
+        return page
+    return "\n".join(lines[:cut])
+
+
 def _strip_repeated_page_marginals(pages: list[str]) -> list[str]:
     """Remove only repeated running headers/footers from PDF semantic text.
 
@@ -475,6 +529,7 @@ def _strip_repeated_page_marginals(pages: list[str]) -> list[str]:
     repetition bound: a line must occur in the first/last three non-empty lines
     on a material number of pages.  Unique headings and body lines are retained.
     """
+    pages = [_strip_publication_footer(page) for page in pages]
     if len(pages) < 3:
         return pages
     page_lines = [page.splitlines() for page in pages]

@@ -64,7 +64,8 @@ _BACK_MATTER_WINDOW = 0.15
 
 _TERMINAL_HEADING_RE = re.compile(
     r"^(?:references|bibliography|works cited|reference list|index|"
-    r"author index|subject index)\s*$",
+    r"author index|subject index|references and notes|notes and references|"
+    r"literature cited)\s*$",
     re.IGNORECASE,
 )
 _EXPLICIT_PARTIAL_RE = re.compile(

@@ -74,3 +74,36 @@ def test_reused_link_checks_are_bound_to_the_new_reference():
     bound = {row.reference_snapshot_sha256 for row in initial_observations(new)}
     assert all(row["reference_id"] == "ref-new" for row in record["submitted_link_observations"])
     assert {row["reference_snapshot_sha256"] for row in record["submitted_link_observations"]} == bound
+
+
+def test_a_verified_open_access_copy_is_downloaded_again_instead_of_searched():
+    # paper-search-reuse-v4, owner decision 2026-10-07.
+    from app.services.search.rerun_reuse import public_copy
+    access = {"version": "verified-public-source-access-v1", "href": "https://repository.example/ames.pdf",
+              "content_sha256": "a" * 64}
+    item = {"status": "transient_authorized", "source_name": "openalex", "public_source_access": access}
+    assert _reusable(item) and public_copy(item)["href"] == access["href"]
+    assert not _reusable({**item, "public_source_access": {**access, "href": "http://repository.example/ames.pdf"}})
+    assert not _reusable({"status": "transient_authorized", "source_name": "openalex"})
+
+
+def test_a_downloaded_copy_must_be_the_file_the_earlier_run_verified(monkeypatch):
+    import hashlib
+    from app.services.source_resolver import SourceResolver
+    from app.services.retrieval.base import SourceRepresentation, RepresentationKind
+    resolver = SourceResolver.__new__(SourceResolver)
+    content = b"%PDF-1.7 the verified article"
+
+    def acquire(self, result, **kwargs):
+        result.set_representation(SourceRepresentation(kind=RepresentationKind.PDF, media_type="application/pdf",
+                                                       content=content, source_url=result.locations[0].url))
+        result.metadata = {**(result.metadata or {}), "identity_confidence": "high"}
+        return True
+    monkeypatch.setattr(SourceResolver, "_acquire_from_locations", acquire)
+    reference = SimpleNamespace(title="Ports", author="Ames, A.", year="2023", doi="", source_kind="journal_article",
+                                source_kind_confidence="high", source_kind_evidence=[], raw_ref="Ames, A. (2023). Ports.", url=None)
+    same = resolver.refetch_public_source(reference, "https://repository.example/ames.pdf", provider="openalex",
+                                          content_sha256=hashlib.sha256(content).hexdigest())
+    assert same is not None and same.representation.content == content
+    assert resolver.refetch_public_source(reference, "https://repository.example/ames.pdf", provider="openalex",
+                                          content_sha256="b" * 64) is None

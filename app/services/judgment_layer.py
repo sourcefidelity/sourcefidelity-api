@@ -54,11 +54,17 @@ def _citation_words(citation: dict, words_by_page: dict) -> list[tuple[int, tupl
     return words
 
 
-def _merge_per_line(boxes: list[tuple[int, tuple]]) -> list[dict]:
+def _merge_per_line(boxes: list[tuple[int, tuple]], indexes: list[int] | None = None) -> list[dict]:
     merged: list[dict] = []
-    for page, word in boxes:
+    last_index = None
+    for position, (page, word) in enumerate(boxes):
+        index = indexes[position] if indexes is not None else None
+        # Only neighbouring words share a box: a gap of unselected words on the
+        # same line (another proposition's words) is not underlined (2026-10-08).
+        adjacent = indexes is None or (last_index is not None and index == last_index + 1)
+        last_index = index
         previous = merged[-1] if merged else None
-        if (previous and previous["page_index"] == page and word[0] >= previous["x1"] - 1
+        if (previous and adjacent and previous["page_index"] == page and word[0] >= previous["x1"] - 1
                 and min(previous["y1"], word[3]) - max(previous["y0"], word[1])
                 > .5 * min(previous["y1"] - previous["y0"], word[3] - word[1])):
             previous.update(x1=word[2], y0=min(previous["y0"], word[1]), y1=max(previous["y1"], word[3]))
@@ -99,7 +105,8 @@ def claim_span_rectangles(citation: dict, ranges: list[tuple[int, int]],
                 selected.add(pdf_origin[at + position])
     if not selected:
         return whole, "citation_span"
-    return _merge_per_line([words[i] for i in sorted(selected)]), "exact"
+    ordered = sorted(selected)
+    return _merge_per_line([words[i] for i in ordered], ordered), "exact"
 
 
 def _record(session: Session, record_id, scope_type: str, scope_id: str, paper_version_id):
@@ -171,33 +178,47 @@ def _separate_contained(marks: list[dict], citation: dict, words_by_page: dict) 
     """A proposition judged with the clause it modifies ("…, allowing her to
     grow …" with its main clause) contains that clause's words. It is
     underlined and bolded only where it adds words, so the two do not overlap
-    (owner review 2026-09-29); what the judge read is unchanged."""
+    (owner review 2026-09-29); what the judge read is unchanged. Two
+    propositions that share only some words ("studied the cranes that …" in
+    both) are separated the same way: the smaller keeps the
+    shared words (owner review 2026-10-08: one underline per word)."""
     def positions(ranges):
         return {p for a, b in ranges for p in range(a, b)}
 
-    groups = {m["group"]: m["ranges"] for m in marks if m.get("ranges")}
-    for mark in marks:
-        own = positions(mark.get("ranges") or [])
-        inner = set()
-        for group, ranges in groups.items():
-            other = positions(ranges)
-            if group != mark["group"] and other and other < own:
-                inner |= other
-        if not inner:
-            continue
-        rest = sorted(own - inner)
+    def spans(values):
         shown = []
-        for p in rest:
+        for p in sorted(values):
             if shown and shown[-1][1] == p:
                 shown[-1][1] = p + 1
             else:
                 shown.append([p, p + 1])
-        shown = [(a, b) for a, b in shown if b - a > 1]
-        if not shown:
+        return [(a, b) for a, b in shown if b - a > 1]
+
+    groups = {m["group"]: positions(m["ranges"]) for m in marks if m.get("ranges")}
+    for mark in marks:
+        own = positions(mark.get("ranges") or [])
+        contained, shared = set(), set()
+        for group, other in groups.items():
+            if group == mark["group"] or not other or not other & own:
+                continue
+            if other < own:
+                contained |= other            # a proposition inside this one
+            elif len(other) < len(own):
+                shared |= other & own         # a smaller one sharing some words
+        if not contained and not shared:
             continue
-        rects, placement = claim_span_rectangles(citation, shown, words_by_page)
-        if placement == "exact":
-            mark["rects"], mark["display_ranges"] = rects, shown
+        underlined = spans(own - contained - shared)
+        if not underlined:
+            continue
+        rects, placement = claim_span_rectangles(citation, underlined, words_by_page)
+        if placement != "exact":
+            continue
+        mark["rects"] = rects
+        # The window bolds only the added words of a proposition containing
+        # another (2026-09-29); words merely shared with another stay bold, as
+        # judged (owner review 2026-10-08, citation 10a).
+        if contained:
+            mark["display_ranges"] = spans(own - contained)
 
 
 JUDGMENT_CSS = (

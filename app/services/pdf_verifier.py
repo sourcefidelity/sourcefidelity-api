@@ -235,6 +235,14 @@ def _aligned_title_containment(expected: str, found: str) -> bool:
 
 
 def _title_matches(provided: str, metadata: dict) -> bool:
+    # A line-break hyphen kept inside a word ("automa-tion") is also tried
+    # without it; a real hyphen still matches as written (2026-10-07).
+    joined = re.sub(r"(?<=[a-z])-(?=[a-z])", "", provided)
+    return _title_matches_as_written(provided, metadata) or (
+        joined != provided and _title_matches_as_written(joined, metadata))
+
+
+def _title_matches_as_written(provided: str, metadata: dict) -> bool:
     expected = _normalize(provided)
     found_title = _normalize(metadata.get("title") or "")
     page_text = _normalize(metadata.get("first_page_text") or "")

@@ -219,6 +219,7 @@ def prepare_search_again_refresh(
         raise PaperWorkflowError("report_missing", "Report does not exist")
     job = session.scalar(
         select(Job).where(Job.id == requested_report.job_id).with_for_update()
+        .execution_options(populate_existing=True)   # the current row, not the request's copy
     )
     if job is None or job.scope_type != scope_type or job.scope_id != scope_id:
         raise PaperWorkflowError("report_missing", "Report does not exist")

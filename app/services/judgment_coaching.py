@@ -248,6 +248,16 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
         for mapping in arm.get("mappings") or []:
             if (facets.get(mapping.get("facet_id")) or {}).get("kind") == "candidate_as_written" and mapping.get("rationale"):
                 rationales.append(mapping["rationale"][:240])
+    # The result rests on who holds the statement in the source (another
+    # speaker, or the authors' own opposite position): the note is given the
+    # judges' reasons so it can explain its label (owner decision 2026-10-08).
+    speaker_reasons = []
+    if state in {"contradicts", "qualified"}:
+        speaker_reasons = list(dict.fromkeys(
+            _without_judge_aliases(m["rationale"])[:300] for arm in arms for m in arm.get("mappings") or []
+            if (facets.get(m.get("facet_id")) or {}).get("kind") == "source_attribution"
+            and m.get("direction") in ({"contradicts"} if state == "contradicts" else {"qualifies", "mixed"})
+            and m.get("rationale")))[:2]
     shown = "undecided" if state == "split" else state
     payload = {
         "coaching_request": True, "result": shown, "result_meaning": STATE_MEANING[shown],
@@ -257,8 +267,15 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
         "judge_rationales": rationales[:6] if state == "split" else rationales[:3],
         "evidence_sentences": [{"sentence_id": s_alias[sid], "text": sentences[sid]} for sid in bound_sentences],
     }
+    if speaker_reasons:
+        payload["speaker_reasons"] = speaker_reasons
+        payload["speaker_instruction"] = (
+            "This result rests on who holds the statement in the source. Explain it: say whose words the "
+            "matching passage is (for example text the source quotes or reports from someone else), or what "
+            "position the source's own authors take instead, using only speaker_reasons and the evidence sentences.")
     bound = {"facets": f_alias, "sentences": s_alias, "claim": claim, "citation_marker": citation_marker,
-             "evidence_text": [sentences[sid] for sid in bound_sentences], "state": state}
+             "evidence_text": [sentences[sid] for sid in bound_sentences], "state": state,
+             "speaker_reasons": speaker_reasons}
     return payload, bound
 
 
@@ -282,13 +299,21 @@ def check_note(raw, bound: dict) -> tuple[dict | None, list[str]]:
         violations.append("too_long")
     if _REWRITE.search(note):
         violations.append("rewrite_wording")
-    if _OTHER_SOURCES.search(note):
+    # Another speaker named in the judges' speaker reasons is the point of
+    # such a note, not a suggestion to look elsewhere (2026-10-08).
+    speaker_words = set(_plain(" ".join(bound.get("speaker_reasons") or [])).split())
+    if any(not (speaker_words and set(_plain(m.group(0)).split()) <= speaker_words | {"other", "another", "author",
+                                                                                      "authors", "source", "sources"})
+           for m in _OTHER_SOURCES.finditer(note)):
         violations.append("other_sources")
     if _ALIAS_ID.search(note):
         violations.append("id_in_note")
     if _STUDENT_SUPPLIED_EVIDENCE.search(note):
         violations.append("evidence_attributed_to_student")
-    if _ADVICE.search(note):
+    # The statement's or the source's own word ("loading, revising and
+    # unloading") is a description, not advice (2026-10-07).
+    own_words = set(_plain(" ".join([bound.get("claim") or "", *(bound.get("evidence_text") or [])])).split())
+    if any(not set(_plain(m.group(0)).split()) <= own_words for m in _ADVICE.finditer(note)):
         violations.append("advice")
     if bound.get("state") in {"undecided", "split"} and _decides(note):
         violations.append("decides_result")
@@ -299,12 +324,12 @@ def check_note(raw, bound: dict) -> tuple[dict | None, list[str]]:
         own = set(_plain(" ".join([bound["claim"], *bound["evidence_text"]])).split())
         if any(not set(_plain(m.group(0)).split()) <= own for m in _DISAGREEMENT.finditer(note)):
             violations.append("mentions_answers")
-    cited = _plain(bound["citation_marker"])
+    cited = _plain(" ".join([bound["citation_marker"], *(bound.get("speaker_reasons") or [])]))
     for surname in _AUTHOR_YEAR.findall(note):
         if _plain(surname) not in cited:
             violations.append("other_sources")
             break
-    allowed = _plain(" ".join([bound["claim"], *bound["evidence_text"]]))
+    allowed = _plain(" ".join([bound["claim"], *bound["evidence_text"], *(bound.get("speaker_reasons") or [])]))
     for groups in _QUOTED.findall(note):
         words = _plain(next(g for g in groups if g))
         if len(words.split()) >= 4 and words not in allowed:
@@ -349,7 +374,9 @@ def coach(state: str, claim: str, citation_marker: str, facets: dict, panel: dic
     user_prompt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     key = coaching_cache_key(route, system_prompt, user_prompt, version)
     cached = cache_lookup(key) if cache_lookup else None
-    if cached:
+    # A stored fallback is tried again: the checks that rejected it may since
+    # have been corrected (2026-10-07).
+    if cached and cached.get("status") != "template":
         return {**cached, "cached": True, "cost_usd": 0.0}
     result = {"version": version, "cache_key": key, "cost_usd": 0.0, "cost_basis": "unpriced",
               "attempts": 0, "violations": []}

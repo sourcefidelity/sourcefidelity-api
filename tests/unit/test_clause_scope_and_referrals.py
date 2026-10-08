@@ -80,3 +80,56 @@ def test_one_wider_entry_does_not_hide_a_narrow_indent():
     assert not _hanging_indent_narrow([{"observed_points": 0.0}] * 10)
     assert not _hanging_indent_narrow([{"observed_points": 72.0}] * 10)
     assert not _hanging_indent_narrow([{}])
+
+
+def test_each_sources_clause_is_its_own_citation():
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    claim = _claim(LIST, ("(Ames, 2022)", "a"), ("(Bell & Cole, 2024)", "b"), ("(Dunn, 2023)", "d"))
+    pieces = [(LIST[s:e], refs, opens, closes) for s, e, refs, opens, closes in citation_clause_segments(claim, ["a", "b", "d"])]
+    assert pieces == [
+        ("While harbour cranes are impressive, they remain slow in storms (Ames, 2022)", ["a"], True, False),
+        ("fail to lift heavy loads (Bell & Cole, 2024)", ["b"], False, False),
+        ("and break often (Dunn, 2023).", ["d"], False, True)]
+
+
+def test_wording_after_a_single_citation_is_left_out_of_it():
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    text = "Many ports have encouraged automation (Ames, 2025), so the revision was a chance to guide its use."
+    [(s, e, refs, opens, closes)] = citation_clause_segments(_claim(text, ("(Ames, 2025)", "a")), ["a"])
+    assert (text[s:e], opens, closes) == ("Many ports have encouraged automation (Ames, 2025)", True, False)
+
+
+def test_citations_that_stay_whole():
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    # One marker at the end, two sources in one bracket, a later sentence, a narrative citation.
+    assert citation_clause_segments(_claim("Ports automate (Ames, 2025).", ("(Ames, 2025)", "a")), ["a"]) is None
+    both = "Ports automate (Ames, 2025; Bell, 2024)."
+    one = _claim(both, ("(Ames, 2025; Bell, 2024)", "a"))
+    one.citation_markers[0].reference_ids = ["a", "b"]
+    assert citation_clause_segments(one, ["a", "b"]) is None
+    later = "Ports automate (Ames, 2025), and cranes rust (Bell, 2024). Delays fall."
+    assert citation_clause_segments(_claim(later, ("(Ames, 2025)", "a"), ("(Bell, 2024)", "b")), ["a", "b"]) is None
+    narrative = "Ames (2025) argues ports automate, and cranes rust (Bell, 2024)."
+    assert citation_clause_segments(_claim(narrative, ("(2025)", "a"), ("(Bell, 2024)", "b")), ["a", "b"]) is None
+
+
+def test_an_upload_matches_a_title_with_a_line_break_hyphen():
+    # A reference list title broken at a line end keeps its hyphen ("automa-tion").
+    from app.services.pdf_verifier import _title_matches
+    page = {"title": "Harbour Studies", "first_page_text": "Harbours in the Era of Crane Automation (CA): "
+            "Understanding the Potential Benefits of Remote Loading"}
+    assert _title_matches("Harbours in the era of crane automa-tion (CA): Understanding the "
+                          "potential benefits of remote loading", page)
+    assert not _title_matches("Airports in the era of crane automa-tion (CA): Misreading the "
+                              "costs of remote parking", page)
+
+
+def test_sources_sharing_a_bracket_share_its_clause():
+    # Stored one by one, without the bracket (the owner's article, citation 3, 2026-10-07).
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    text = "Ports feared automation (Ames, 2023), as well as claims that cranes will change them (Bell, 2023; Cole, 2023)."
+    claim = _claim(text, ("(Ames, 2023)", "a"), ("Bell, 2023", "b"), ("Cole, 2023", "c"))
+    pieces = [(text[s:e], refs) for s, e, refs, _o, _c in citation_clause_segments(claim, ["a", "b", "c"])]
+    assert pieces == [("Ports feared automation (Ames, 2023)", ["a"]),
+                      ("as well as claims that cranes will change them (Bell, 2023; Cole, 2023).", ["b", "c"])]
+    assert [text[s:e] for s, e in _member_clause_spans(claim, "c")] == ["as well as claims that cranes will change them"]

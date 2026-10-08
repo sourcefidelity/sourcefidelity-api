@@ -116,6 +116,9 @@ from app.services.verification_run import (
 
 PAPER_WORKFLOW_VERSION = "paper-workflow-v7"
 TARGETED_SOURCE_REFRESH_KEY = "targeted_source_refresh"
+# Accepted uploads waiting for the report's running refresh to end, so the
+# page keeps waiting for them instead of showing a report without them.
+QUEUED_SOURCE_UPLOADS_KEY = "queued_source_uploads"
 MAX_REPORT_ABSTRACT_CHARACTERS = 6_000
 _STAGE_ORDER = {
     JobStage.UPLOADED: 0,
@@ -390,12 +393,43 @@ def retrieve_paper_sources(
                                          scope_type=job.scope_type, scope_id=job.scope_id)
             except Exception:
                 reused = None   # the stored source is no longer usable here: search again
-        if reused is not None:
+        if (reused is not None and not identity_only
+                and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
+            # A source uploaded since the earlier run is in the library now:
+            # resolve the reference, which finds it before any search (2026-10-07).
+            stored = getattr(active_resolver, "stored_copy_available", None)
+            if stored is not None and stored(reference):
+                reused = None
+        refetched = None
+        if reused is not None and reused.get("status") == "transient_authorized":
+            # An open-access copy is downloaded again from its verified address,
+            # never searched for (paper-search-reuse-v4, owner decision
+            # 2026-10-07); any difference searches again.
+            from app.services.search.rerun_reuse import public_copy
+            public = public_copy(reused)
+            refetch = getattr(active_resolver, "refetch_public_source", None)
+            refetched = (refetch(reference, public["href"], provider=public["provider"],
+                                 content_sha256=public["content_sha256"])
+                         if public and refetch and not identity_only else None)
+            if refetched is None:
+                reused = None
+            else:
+                refetched.metadata = {
+                    **(refetched.metadata or {}),
+                    "reference_discovery": reused.get("reference_discovery"),
+                    "reference_discovery_trace": reused.get("reference_discovery_trace"),
+                    "submitted_link_observations": reused.get("submitted_link_observations"),
+                }
+                result_record["search_reuse"] = {**reused["search_reuse"], "public_copy_downloaded": True}
+        if reused is not None and refetched is None:
             checkpoint(reused)
             continue
         try:
-            with search_memo_scope(memo_context):
-                result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
+            if refetched is not None:
+                result = refetched
+            else:
+                with search_memo_scope(memo_context):
+                    result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
         except SourceResolutionError as exc:
             result_record.update(
                 status="unavailable",
@@ -1187,6 +1221,29 @@ def begin_reference_search_refresh(
     return attempt_id
 
 
+def set_queued_source_upload(session: Session, report_id: str, reference_id: str,
+                             representation_id: str, *, queued: bool) -> None:
+    """Record (or clear) one accepted upload waiting for the report to be free."""
+    report = session.get(Report, uuid.UUID(str(report_id)))
+    if report is None:
+        return
+    job = session.scalar(select(Job).where(Job.id == report.job_id).with_for_update()
+                         .execution_options(populate_existing=True))
+    if job is None:
+        return
+    evidence = dict(job.upload_evidence or {})
+    entry = {"reference_id": reference_id, "representation_id": str(representation_id)}
+    waiting = [item for item in evidence.get(QUEUED_SOURCE_UPLOADS_KEY) or [] if item != entry]
+    if queued:
+        waiting.append(entry)
+    if waiting:
+        evidence[QUEUED_SOURCE_UPLOADS_KEY] = waiting
+    else:
+        evidence.pop(QUEUED_SOURCE_UPLOADS_KEY, None)
+    job.upload_evidence = evidence
+    session.commit()
+
+
 def prepare_uploaded_source_refresh(
     session: Session,
     backend: StorageBackend,
@@ -1210,7 +1267,11 @@ def prepare_uploaded_source_refresh(
     if requested_report is None:
         raise PaperWorkflowError("report_missing", "Report does not exist")
     job = session.scalar(
+        # The lock must read the current row: the request loaded this job before
+        # its upload checks, and another upload's refresh may have started since
+        # (2026-10-07: a stale "completed" status overwrote a running refresh).
         select(Job).where(Job.id == requested_report.job_id).with_for_update()
+        .execution_options(populate_existing=True)
     )
     if job is None or job.store_only or not job.extraction_payload:
         raise PaperWorkflowError(
@@ -1393,7 +1454,8 @@ def rollback_targeted_source_refresh(
 ) -> bool:
     """Restore the completed checkpoint after a failed targeted refresh."""
     parsed_job_id = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(str(job_id))
-    job = session.scalar(select(Job).where(Job.id == parsed_job_id).with_for_update())
+    job = session.scalar(select(Job).where(Job.id == parsed_job_id).with_for_update()
+                         .execution_options(populate_existing=True))
     if job is None:
         return False
     upload_evidence = dict(job.upload_evidence or {})

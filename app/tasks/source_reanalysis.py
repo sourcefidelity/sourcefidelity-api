@@ -7,8 +7,9 @@ from app.tasks.check_paper import dispatch_paper_workflow
 
 logger = logging.getLogger(__name__)
 # A busy report is usually finishing another upload's refresh within minutes.
-BUSY_RETRY_SECONDS = 60
-BUSY_MAX_RETRIES = 30
+# Checked often, so uploads made one after another follow each other quickly.
+BUSY_RETRY_SECONDS = 10
+BUSY_MAX_RETRIES = 180
 
 
 def schedule_uploaded_source_reanalysis(job_id: str, attempt_id: str) -> str | None:
@@ -29,7 +30,8 @@ def retry_uploaded_source_refresh(self, report_id: str, reference_id: str, repre
     file was stored but the report never updated). Prepare its refresh against the
     report's latest version once the job is free, then dispatch it."""
     from app.database import SessionLocal
-    from app.services.paper_workflow import PaperWorkflowError, prepare_uploaded_source_refresh
+    from app.services.paper_workflow import (
+        PaperWorkflowError, prepare_uploaded_source_refresh, set_queued_source_upload)
     from app.services.storage.backend import get_storage_backend
     with SessionLocal() as session:
         try:
@@ -37,10 +39,14 @@ def retry_uploaded_source_refresh(self, report_id: str, reference_id: str, repre
                 session, get_storage_backend(), report_id=report_id,
                 reference_id=reference_id, representation_id=representation_id)
         except PaperWorkflowError as exc:
-            if getattr(exc, "code", None) == "report_reanalysis_busy":
+            if getattr(exc, "code", None) == "report_reanalysis_busy" and self.request.retries < self.max_retries:
                 raise self.retry(countdown=BUSY_RETRY_SECONDS)
+            session.rollback()
+            set_queued_source_upload(session, report_id, reference_id, representation_id, queued=False)
             logger.warning("Uploaded source refresh not prepared (code=%s)", getattr(exc, "code", None))
             return {"status": "not_prepared", "code": getattr(exc, "code", None)}
+        # Prepared (the job now shows a running refresh) or already current.
+        set_queued_source_upload(session, report_id, reference_id, representation_id, queued=False)
     if not prepared.get("scheduled"):
         return {"status": str(prepared.get("status") or "already_current")}
     task_id = schedule_uploaded_source_reanalysis(str(prepared["job_id"]), prepared["attempt_id"])

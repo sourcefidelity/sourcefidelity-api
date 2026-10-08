@@ -12,8 +12,12 @@ searching. Only results that stand on their own are reused:
   for the reference's kind finished without locating it (the standard behind
   Cannot be verified), even if an optional route failed (2026-10-02).
 
-A transient text (``transient_authorized``) is never reused: its bytes were
-discarded after that run and its address was not kept. A search that was
+A transient text (``transient_authorized``) is not kept, but an open-access
+copy verified with high identity confidence keeps its public address and
+content hash (``verified-public-source-access-v1``): it is downloaded again
+with the same checks and used only if the file is byte-identical
+(``paper-search-reuse-v4``, owner decision 2026-10-07); otherwise the reference
+is searched again. A transient text without that record is searched again. A search that was
 incomplete, a reference whose parse changed, a cited reference whose earlier
 record was identity-only (or the reverse) and a targeted refresh with
 ``force_search`` all search again. The reused record keeps its original
@@ -26,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 
-POLICY = "paper-search-reuse-v3"
+POLICY = "paper-search-reuse-v4"
 _REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
 _INCOMPLETE_REASONS = frozenset({"full_text_search_incomplete", "transient_verification_run_unavailable",
                                  "transient_source_admission_failed", "durable_representation_not_authorized"})
@@ -57,7 +61,19 @@ def _required_searches_completed(item: dict, reference: dict | None) -> bool:
     return verdict.get("reason_code") == "suited_searches_completed_without_match"
 
 
+def public_copy(item: dict) -> dict | None:
+    """The earlier run's verified open-access address and file hash, if kept."""
+    access = item.get("public_source_access") or {}
+    href, digest = str(access.get("href") or ""), str(access.get("content_sha256") or "")
+    if (access.get("version") == "verified-public-source-access-v1" and href.startswith("https://")
+            and len(digest) == 64 and item.get("source_name")):
+        return {"href": href, "content_sha256": digest, "provider": str(item["source_name"])}
+    return None
+
+
 def _reusable(item: dict, reference: dict | None = None) -> bool:
+    if item.get("status") == "transient_authorized":
+        return public_copy(item) is not None
     if item.get("status") == "durable_authorized":
         # The text itself is stored; how the search ended does not matter.
         return bool(item.get("representation_id"))
