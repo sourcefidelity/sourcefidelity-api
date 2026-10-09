@@ -163,9 +163,10 @@ class Settings(BaseSettings):
     # Pace rate-limited providers (Semantic Scholar, CORE) across every worker
     # process through Redis; falls back to per-process pacing when unavailable.
     RETRIEVAL_SHARED_PACING_ENABLED: bool = True
-    # The web fallback after Brave and Exa: "searxng" (default), "tavily" or "none".
-    # Tavily is to be tested as SearXNG's replacement (owner decision 2026-09-25).
-    SEARCH_WEB_FALLBACK_PROVIDER: Literal["searxng", "tavily", "none"] = "searxng"
+    # The web fallback after Brave and Exa: "none" (default), "searxng" or "tavily".
+    # Neither fallback retrieved a source in production (STATE provider table), so
+    # none runs unless configured (owner decisions 2026-10-01 and 2026-10-09).
+    SEARCH_WEB_FALLBACK_PROVIDER: Literal["searxng", "tavily", "none"] = "none"
     # Your Tavily plan's price per credit, for Technical details; unset means
     # "no price on record", never zero.
     TAVILY_USD_PER_CREDIT: float | None = None

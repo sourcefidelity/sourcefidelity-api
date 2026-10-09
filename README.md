@@ -26,7 +26,7 @@ SourceFidelity targets source use directly. It does not try to detect AI use, bu
 ### Working now
 
 - **Source identification, verification and retrieval** — the core feature. Each reference is parsed and searched across academic metadata services, book and public-domain catalogues, and web search. Located works are retrieved as full text where permitted. A reference that every search suited to its kind has failed to locate is reported as **Cannot be verified**; a failed or incomplete search is reported as incomplete, never as a negative result. A retrieved web page counts as full text only when it shows no sign of being cut off and its length fits the kind of source cited.
-- **Citation–source relationship judgment** — runs automatically on every checked paper. Each citation is compared with evidence sentences selected from the retrieved source and labelled **Supports**, **Qualified or Mixed**, **Contradicts** or **Insufficient Evidence**; when the model cannot decide, the citation is labelled **LLM Undecided**. Every judgment links to the source sentences it is based on, so students can see how they used a source and instructors can see where a source may have been used incorrectly.
+- **Citation–source relationship judgment** — runs automatically on every checked paper. Each citation is compared with evidence sentences selected from the retrieved source and labelled **Supports**, **Qualified or Mixed**, **Contradicts** or **Not Supported**; when the model cannot decide, the citation is labelled **LLM Undecided**. Every judgment links to the source sentences it is based on, so students can see how they used a source and instructors can see where a source may have been used incorrectly.
 - **Academic-practice flags** — misquotation, patchwriting, secondary citation and related practices, with the student's wording shown above the source wording and copied words in bold.
 - **APA citation and referencing style checks** — for example, incorrect title formatting, missing quotation locators, missing DOIs or URLs for references that should have them, parenthetical citations placed after a sentence's final punctuation, and references that are not cited in the paper.
 - **Source upload** — in Personal deployments, users can upload sources the application could not retrieve.
@@ -73,9 +73,9 @@ SourceFidelity has one shared core with two deployment profiles.
 
 Personal deployment works on its own but takes some setup, because the application relies on several external services:
 
-- **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, Unpaywall, Elsevier (optional)
-- **Books and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource
-- **Web search:** Brave Search, Exa, Tavily, SearXNG (self-hosted, included)
+- **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, ERIC, Europe PMC, Unpaywall, Elsevier (optional)
+- **Books, archives and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource, Wayback Machine (archived copies of cited web pages)
+- **Web search:** Brave Search and Exa, both used for every web search; Tavily or the included self-hosted SearXNG can be configured as an optional backup
 - **LLMs:** DeepSeek, GLM (Z.ai); other providers can be configured behind the same interface
 
 ---
@@ -83,8 +83,8 @@ Personal deployment works on its own but takes some setup, because the applicati
 ## Tech stack
 
 - **Python 3.12**, FastAPI, Celery workers
-- **PostgreSQL** (jobs, reports, evidence packages), **Redis** (task broker), **MinIO / S3-compatible storage** (papers and sources)
-- **ClamAV** (virus scanning), **SearXNG** (self-hosted metasearch)
+- **PostgreSQL** (jobs, reports, evidence packages), **Redis** (task broker), **Silo / S3-compatible storage** (papers and sources)
+- **ClamAV** (virus scanning), **SearXNG** (self-hosted metasearch, optional backup search)
 - **Alembic** (database migrations)
 - **Docker Compose** (deployment)
 
@@ -105,7 +105,7 @@ cp .env.example .env
 In `.env`:
 
 - Set `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD` and `SEARXNG_SECRET`, and use the same database password in `DATABASE_URL`.
-- Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY` and any search keys (`BRAVE_SEARCH_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_BOOKS_API_KEY`).
+- Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY`, `BRAVE_SEARCH_API_KEY` and `EXA_API_KEY` (web searches stay incomplete without both), and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `TAVILY_API_KEY` only if Tavily is configured as the backup search.
 - For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
 - For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
 
@@ -115,7 +115,7 @@ In `.env`:
 docker compose up -d --build
 ```
 
-This starts the API, the paper and judgment workers, the scheduler, PostgreSQL, Redis, MinIO, ClamAV and SearXNG. ClamAV downloads its virus definitions on first start, which can take several minutes; the API waits for it.
+This starts the API, the paper and judgment workers, the scheduler, PostgreSQL, Redis, Silo (object storage), ClamAV and SearXNG. ClamAV downloads its virus definitions on first start, which can take several minutes; the API waits for it.
 
 **3. Create the database tables** (first run, and after each update)
 

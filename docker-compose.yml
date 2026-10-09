@@ -205,7 +205,11 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # Silo: community continuation of MinIO (pgsty/silo, AGPL-3.0). MinIO stopped
+    # publishing images and binaries in 2025-26 and archived its source; Silo keeps
+    # MinIO's storage format, MINIO_* settings and `server` command (verified on a
+    # copy of existing data, 2026-10-09).
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
     restart: unless-stopped
     environment:
       # Same as the app's S3_ACCESS_KEY / S3_SECRET_KEY (see config.py). Override
