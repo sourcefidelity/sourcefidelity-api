@@ -203,7 +203,8 @@ def _select(build, *, call=None, route=None):
     try:
         raw = (call or chat_completion_json)(request.system_prompt, request.user_prompt, temperature=0.0,
                                             max_tokens=route.max_output_tokens or 1_600, max_retries=1,
-                                            route=route, receipt=receipt)
+                                            route=route, receipt=receipt,
+                                            **({} if call else {"reuse_answer": True}))
         chosen = bind_response(raw, request)
     except LLMCallFailure as exc:
         return result("unavailable", model=route.model, endpoint_host=route.endpoint_host,

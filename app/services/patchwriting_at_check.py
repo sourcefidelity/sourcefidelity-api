@@ -166,6 +166,14 @@ class PatchwritingAtCheck:
         if not self.enabled:
             return
         try:
+            completeness = getattr(source, "completeness_verdict", None)
+            if completeness not in (None, "complete"):
+                # Only a complete full text is compared (ARCHITECTURE §6): a
+                # limited text could flag wording the rest of the source explains
+                # (the long article's two limited-text flags, 2026-10-08).
+                self.sources[reference_id] = {"policy_version": pw.POLICY_VERSION, "status": "not_assessed",
+                                              "reason": "source_text_not_complete"}
+                return
             body = self._ensure_body()
             if body.status != "ready":
                 self.sources[reference_id] = {"policy_version": pw.POLICY_VERSION,

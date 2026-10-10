@@ -175,8 +175,11 @@ Kind = Literal["unquoted_verbatim", "close_paraphrase"]
 Label = Literal["citation_statement_vs_cited_source", "body_sentence"]
 ExclusionKind = Literal[
     "double_quotation", "single_quotation", "unclosed_quotation", "block_quotation",
-    "citation_marker", "citation_parenthetical",
+    "citation_marker", "citation_parenthetical", "web_address",
 ]
+# A web address or DOI is a locator, never borrowed wording (the long article's
+# "https://doi.org/10.1075…" matched the source's own DOI, 2026-10-08).
+_WEB_ADDRESS = re.compile(r"(?:https?://|www\.|doi:\s*)\S+|\b10\.\d{4,9}/\S+", re.IGNORECASE)
 
 
 # --- Inputs -----------------------------------------------------------------
@@ -718,6 +721,8 @@ def _excluded_spans(text: str, *, marker_spans=(), block_ranges=(), claim_type: 
         spans.append(ExcludedStudentSpan(kind="block_quotation", local_start=start, local_end=end))
     for start, end in marker_spans:
         spans.append(ExcludedStudentSpan(kind="citation_marker", local_start=start, local_end=end))
+    for match in _WEB_ADDRESS.finditer(text):
+        spans.append(ExcludedStudentSpan(kind="web_address", local_start=match.start(), local_end=match.end()))
     if citation_parentheticals:
         for match in _CITATION_PARENTHETICAL.finditer(text):
             spans.append(ExcludedStudentSpan(kind="citation_parenthetical",
@@ -928,9 +933,9 @@ def _sentence_units(text: str, excluded: list[ExcludedStudentSpan], *,
                     statements: Sequence[CitationStatement] = ()) -> tuple[list[_StudentSentence], dict]:
     tokens = tokenize(text)
     quoted = [(s.local_start, s.local_end) for s in excluded
-              if s.kind not in {"citation_marker", "citation_parenthetical"}]
+              if s.kind not in {"citation_marker", "citation_parenthetical", "web_address"}]
     markers = [(s.local_start, s.local_end) for s in excluded
-               if s.kind in {"citation_marker", "citation_parenthetical"}]
+               if s.kind in {"citation_marker", "citation_parenthetical", "web_address"}]
     counts = {"total": len(tokens), "quotation": 0, "marker": 0, "compared": 0}
     quoted.sort()
     markers.sort()

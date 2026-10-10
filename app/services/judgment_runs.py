@@ -34,6 +34,7 @@ from app.models.report import Report, VerificationReportRecord
 from app.services.facet_evidence_judgment import FACET_JUDGMENT_VERSION, CandidateFacetFinding
 from app.services.judge_arms import JudgePanelUnavailable, coaching_route, formal_judge_arms, policy_hash
 from app.services.judgment_input import JudgmentInputUnavailable, judgment_eligibility, prepare_from_payload
+from app.services.citation_structure import describes_research_literature
 from app.services.judgment_coaching import COACHED_STATES, coach
 from app.services.judgment_report import candidate_text
 from app.services.judgment_panel import PANEL_VERSION, ArmResult, CandidatePanelResult, judge_candidate
@@ -331,7 +332,8 @@ def execute_run(
                                  context.claim.citation_marker or "", facets,
                                  wider_record.get("panel") or _panel_json(result), sentences,
                                  route=note_route, call=call, cache_lookup=cache.coaching_lookup,
-                                 cache_store=cache.coaching_store)
+                                 cache_store=cache.coaching_store,
+                                 describes_research=describes_research_literature(context.claim.text))
                 spend += coaching.get("cost_usd") or 0.0
                 coaching = {k: v for k, v in coaching.items() if k != "cache_key"}
             run.spend_usd += spend

@@ -110,7 +110,8 @@ def get_client() -> OpenAI:
     """Get or create the OpenAI client singleton."""
     global _client
     if _client is None:
-        client_kwargs = {"api_key": secret_value(settings.LLM_API_KEY)}
+        client_kwargs = {"api_key": secret_value(settings.LLM_API_KEY),
+                         "timeout": settings.LLM_CALL_TIMEOUT_SECONDS}
         if settings.LLM_BASE_URL:
             client_kwargs["base_url"] = settings.LLM_BASE_URL
         _client = OpenAI(**client_kwargs)
@@ -328,6 +329,7 @@ def chat_completion_json(
     allow_partial: bool = False,
     route: Optional[LLMRoute] = None,
     receipt: Optional[dict] = None,
+    reuse_answer: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Send a chat completion request expecting JSON output.
 
@@ -366,6 +368,27 @@ def chat_completion_json(
     config = route.provider_config if route is not None else get_provider_config(model)
     response_format = {"type": "json_object"} if config.json_mode else None
 
+    # An identical deterministic request inside a paper stage reuses its
+    # earlier answer (owner decision 2026-10-09); routed judges keep their own cache.
+    from app.services import llm_cache
+    # A routed call reuses answers only when its caller asks (Judgment's
+    # repeated samples must stay separate calls).
+    cache_key = who = None
+    reuse = (route is None) if reuse_answer is None else reuse_answer
+    if reuse and temperature == 0 and not allow_partial:
+        who = llm_cache.caller()
+        cache_key = llm_cache.request_key(
+            model=route.model if route is not None else model,
+            endpoint=route.endpoint_host if route is not None else None,
+            system_prompt=system_prompt, user_prompt=user_prompt, temperature=temperature,
+            max_tokens=max_tokens, response_format=response_format, disable_thinking=disable_thinking,
+            reasoning_effort=reasoning_effort)
+        remembered = llm_cache.lookup(cache_key, who)
+        if remembered is not None:
+            if receipt is not None:
+                receipt.update(cache_hit=True, reported_cost_usd=0.0, attempts=0)
+            return remembered
+
     empty_attempts = 0
     for attempt in range(max_retries + 1):
         try:
@@ -386,6 +409,8 @@ def chat_completion_json(
 
             # Parse JSON — success path
             data = json.loads(response_text.strip())
+            if cache_key is not None:
+                llm_cache.store(cache_key, who, route.model if route is not None else model, data)
             return data
 
         except json.JSONDecodeError:

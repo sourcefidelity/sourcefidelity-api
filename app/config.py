@@ -583,6 +583,10 @@ class Settings(BaseSettings):
     # Student URL download limits (R9)
     STUDENT_URL_MAX_SIZE_MB: int = 50
     STUDENT_URL_TIMEOUT_SECONDS: int = 30
+    # Seconds one model request may wait for its answer before it fails as a
+    # timeout (2026-10-08: a GLM request that never answered held a Judgment
+    # run for hours under the client's 600-second default and its retries).
+    LLM_CALL_TIMEOUT_SECONDS: float = Field(default=240.0, gt=0)
 
     # ── Completeness / Strictness (Phase 3.5 hardening) ──────
     # Strictness for instructor uploads:

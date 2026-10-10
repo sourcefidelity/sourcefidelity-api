@@ -22,6 +22,7 @@ from app.services.judgment_coaching import (
     UNDECIDED_NOTE_VERSION,
     without_advice,
 )
+from app.services.citation_structure import describes_research_literature
 from app.services.text_quality import readable_text
 
 # Result labels (owner-approved wording, 2026-09-28; "Not Supported" 2026-09-30).
@@ -38,6 +39,9 @@ LABELS = {
 UNDECIDED_NOTE = TEMPLATE_NOTES["undecided"]
 # Owner wording 2026-09-30, for a judge that could not resolve what the statement refers to.
 UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported. It could not tell what the statement refers to."
+# Owner-approved wording (2026-10-09), shown on a judged statement describing a body of research.
+EXAMPLE_OF_RESEARCH_NOTE = ("Judged as an example of the research the statement describes; the statement's "
+                            "overall picture of the research is the writer's own.")
 REFERRAL_NOTE = "Not judged: a \u201csee\u201d citation points to further reading rather than supporting a statement."
 
 
@@ -211,6 +215,8 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         evidence, _ = _cited(arms, sentences,
                              _reasoning(arms[0], facets) if arms else "",
                              _sentence_aliases(foundation, candidate))
+        if describes_research_literature((payload.get("claim") or {}).get("text") or ""):
+            parts.append(f'<p class="jw-coaching">{escape(EXAMPLE_OF_RESEARCH_NOTE)}</p>')
         coaching = row.get("coaching") or {}
         # A fixed note is shown in its current approved wording, not as stored.
         note = TEMPLATE_NOTES.get(state) if coaching.get("status") == "template" else coaching.get("note")

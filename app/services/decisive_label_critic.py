@@ -31,6 +31,12 @@ from app.services.verification_evidence import (
 )
 
 
+# The prompt names its one candidate by a fixed alias, not the run-specific
+# ID, so an identical request in a later run is answered from the model
+# answer cache (owner decision 2026-10-09).
+PROMPT_CANDIDATE_ID = "c1"
+
+
 DECISIVE_CRITIC_VERSION = "neutral-decisive-label-checklist-v3"
 CHECK_TYPES = (
     "missing_material_detail",
@@ -230,7 +236,7 @@ def apply_decisive_label_critic(
         locator_supplied = bool(locator.text.strip())
         prompt = json_data_envelope(
             {
-                "candidate_id": candidate_id,
+                "candidate_id": PROMPT_CANDIDATE_ID,
                 "proposed_outcome": proposed.derived_outcome,
                 "material_facets": facet_payload,
                 "original_mappings": original_mappings,
@@ -324,7 +330,7 @@ def _validated_finding(
     original_mappings,
     locator_supplied,
 ):
-    if response.candidate_id != candidate_id:
+    if response.candidate_id != PROMPT_CANDIDATE_ID:
         raise CriticContractError("candidate_id_mismatch")
     reviewed = list(dict.fromkeys(response.reviewed_facet_ids))
     if reviewed != response.reviewed_facet_ids or set(reviewed) != set(material_ids):

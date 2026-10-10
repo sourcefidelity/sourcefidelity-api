@@ -77,7 +77,8 @@ def _glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
         if "client" not in cache:
             from openai import OpenAI
             cache["client"] = OpenAI(api_key=secret_value(settings.OPENROUTER_API_KEY),
-                                     base_url=settings.OPENROUTER_BASE_URL)
+                                     base_url=settings.OPENROUTER_BASE_URL,
+                                     timeout=settings.LLM_CALL_TIMEOUT_SECONDS)
         return cache["client"]
 
     ceiling = [routing["max_price"]["prompt"], routing["max_price"]["completion"]]
@@ -128,7 +129,8 @@ def _zai_glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
     def client():
         if "client" not in cache:
             from openai import OpenAI
-            cache["client"] = OpenAI(api_key=secret_value(settings.ZAI_API_KEY), base_url=settings.ZAI_BASE_URL)
+            cache["client"] = OpenAI(api_key=secret_value(settings.ZAI_API_KEY), base_url=settings.ZAI_BASE_URL,
+                                     timeout=settings.LLM_CALL_TIMEOUT_SECONDS)
         return cache["client"]
 
     ceiling = [policy["max_price"]["prompt"], policy["max_price"]["completion"]]

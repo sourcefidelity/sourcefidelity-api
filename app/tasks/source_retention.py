@@ -54,3 +54,16 @@ def cleanup_expired_source_representations() -> dict[str, int | str]:
         "objects_deleted": objects_deleted,
         **{f"upload_intents_{key}": value for key, value in upload_cleanup.items()},
     }
+
+
+@celery_app.task(name="expire_paper_records", soft_time_limit=300, time_limit=360)
+def expire_paper_records_task() -> dict[str, int]:
+    """Delete paper records whose scope's report period has ended (owner
+    decision 2026-10-09); scopes without a report period are never touched.
+    Remembered model answers older than the reuse window go too."""
+    from app.services import llm_cache
+    from app.services.record_expiry import expire_paper_records
+    with SessionLocal() as session:
+        result = expire_paper_records(session, get_storage_backend())
+        result["model_answers_expired"] = llm_cache.expire(session)
+        return result

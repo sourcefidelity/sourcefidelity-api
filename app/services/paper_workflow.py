@@ -292,6 +292,12 @@ def retrieve_paper_sources(
         for reference_id in claim.reference_ids
     }
     active_resolver = resolver or SourceResolver()
+    # What this scope keeps (owner decision 2026-10-09).
+    from app.services.storage_policy import policy_for
+    try:
+        active_resolver.storage_policy = policy_for(session, job.scope_type, job.scope_id)
+    except AttributeError:
+        pass
     from app.services.bibliography_identity import eligible_identity_only, POLICY as IDENTITY_ONLY_POLICY
     # New bibliography-only work must not spend the shared resolver allowance
     # ahead of the pre-existing cited-source acquisition workload.
@@ -401,7 +407,8 @@ def retrieve_paper_sources(
             if stored is not None and stored(reference):
                 reused = None
         refetched = None
-        if reused is not None and reused.get("status") == "transient_authorized":
+        from app.services.search.rerun_reuse import downloadable
+        if reused is not None and downloadable(reused):
             # An open-access copy is downloaded again from its verified address,
             # never searched for (paper-search-reuse-v4, owner decision
             # 2026-10-07); any difference searches again.
@@ -462,6 +469,12 @@ def retrieve_paper_sources(
                 result_record["retryable_provider_dependencies"] = dependencies
             checkpoint(result_record)
             continue
+        # A validated public copy from any route is kept (owner decision
+        # 2026-10-09), so later runs and papers reuse it without a search.
+        retain = getattr(active_resolver, "retain_validated_copy", None)
+        if retain is not None:
+            retain(reference, result)
+            metadata = result.metadata or {}
         representation_id = metadata.get("repository_representation_id")
         admission = metadata.get("durable_admission") or {}
         if admission.get("state") == "accepted":
@@ -1105,7 +1118,11 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
             summary,
             previous_report=previous_report,
         )
-    report.report_json = {**aggregate_payload, "evidence_report": evidence_view}
+    from app.services.paper_reuse import FINGERPRINT_KEY, pipeline_fingerprint
+    # The code and settings that built this report: an unchanged resubmission
+    # under the same fingerprint gets this report back (owner decision 2026-10-09).
+    report.report_json = {**aggregate_payload, "evidence_report": evidence_view,
+                          FINGERPRINT_KEY: pipeline_fingerprint()}
     job.status = JobStatus.COMPLETED
     job.stage = JobStage.COMPLETED
     if refresh_reference_ids:

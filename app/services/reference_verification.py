@@ -216,6 +216,14 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
         # title cut short by parsing ("Party Dominance vs", Hao, 2026-10-06),
         # whatever the author's name order.
         return True
+    if (outcomes.get('author') in {'agreement', 'minor_difference'} and outcomes.get('year') == 'agreement'
+            and len(cited_words) >= 4 and observed_words[:len(cited_words)] == cited_words):
+        # The same author and year, the cited title (four words or more, read
+        # word by word so an unspaced dash separates words) the start of the
+        # record's: a title cut before its part or subtitle ("English in higher
+        # education–English medium" for "… English medium. Part 1: Literature
+        # review", Curle 2020, the long article, 2026-10-08).
+        return True
     if (outcomes.get('author') in {'agreement', 'minor_difference'}
             and candidate.get('provider') in BOOK_CATALOGUES | {'crossref', 'openalex'}
             and _same_main_title(expected.get('title'), observed)):

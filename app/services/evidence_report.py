@@ -883,7 +883,10 @@ def build_evidence_report_view(
     patchwriting_passages = build_passages(
         stored_block(job, aggregate),
         lambda reference_id: (_reference_view(references[reference_id], reference_layout.get(reference_id))
-                              if reference_id in references else None))
+                              if reference_id in references else None),
+        coverage_by_reference={member.get("reference_id"): member.get("coverage_level")
+                               for citation in citations for member in citation.get("members") or []
+                               if member.get("reference_id")})
     summary = _build_report_summary(
         citations=citations,
         overview=overview,

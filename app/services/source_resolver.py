@@ -1088,6 +1088,9 @@ class SourceResolver:
         # harnesses may set a bounded capability set to measure adapters, URLs,
         # publisher construction, and institutional routes independently.
         self._acquisition_capabilities: set[str] | None = None
+        # The checking scope's storage settings (owner decision 2026-10-09);
+        # None reads the deployment defaults. Set by the paper workflow.
+        self.storage_policy = None
         # Storage backend is optional — if S3/MinIO is unavailable, the
         # resolver still works (just without caching/persistence). This makes
         # the resolver robust to S3 outages and simplifies testing without Docker.
@@ -1723,7 +1726,8 @@ class SourceResolver:
         result = RetrievalResult(
             source_name=provider, success=False,
             locations=[AcquisitionLocation(url=href, provider=provider, is_best=True)],
-            metadata={"requested_url_sha256": hashlib.sha256(href.encode()).hexdigest()})
+            metadata={"requested_url_sha256": hashlib.sha256(href.encode()).hexdigest(),
+                      "earlier_verified_content_sha256": content_sha256})
         try:
             acquired = self._acquire_from_locations(
                 result, expected_doi=getattr(reference, "doi", None) or None, expected_title=title or None,
@@ -4060,6 +4064,14 @@ class SourceResolver:
                 )
                 return False, outcome, content_compatibility.reason[:160]
 
+        earlier = metadata.get("earlier_verified_content_sha256")
+        if (earlier and identity_confidence in {"medium", "low"}
+                and hashlib.sha256(content).hexdigest() == earlier):
+            # A re-download carries no search record, so provider identity is
+            # low; a file byte-identical to the copy an earlier run verified
+            # is that copy (Springer re-downloads, 2026-10-09).
+            identity_confidence = "high"
+            identity_reason = f"{identity_reason}; byte-identical to the copy verified in an earlier run"
         metadata["identity_confidence"] = identity_confidence
         metadata["identity_reason"] = identity_reason
         metadata["representation_kind"] = kind.value
@@ -6412,7 +6424,7 @@ class SourceResolver:
 
                 if should_cache and downloaded_via_publisher and not is_oa:
                     # Paywalled content accessed via campus IP
-                    if not settings.CACHE_PAYWALLED_PDFS:
+                    if not self._storage().sources.keep_licensed_copies:
                         should_cache = False
                         logger.info(
                             "Paywalled PDF for %s verified in-memory, NOT cached "
@@ -6498,20 +6510,25 @@ class SourceResolver:
         result: RetrievalResult,
         *,
         downloaded_via_publisher: bool,
+        policy=None,
     ) -> tuple[str | None, str]:
+        if policy is None:
+            from app.services.storage_policy import deployment_defaults
+            policy = deployment_defaults()
         metadata = result.metadata or {}
         explicit = metadata.get("license_class")
         if explicit in LICENSE_CLASSES:
             return explicit, "explicit_representation_metadata"
-        if result.source_name in {"gutenberg", "wikisource"}:
+        keep_public = policy.sources.keep_public_copies != "none"
+        if keep_public and result.source_name in {"gutenberg", "wikisource"}:
             return "public_domain", "public_domain_adapter_policy"
-        if _check_is_oa(result) or any(
+        if keep_public and (_check_is_oa(result) or any(
             location.access_type in {"open_access", "public_domain"}
             for location in result.locations
-        ):
+        )):
             return "open_access", "provider_oa_or_licence_evidence"
         if (
-            settings.CACHE_PAYWALLED_PDFS
+            policy.sources.keep_licensed_copies
             and (downloaded_via_publisher or result.source_name == "elsevier")
         ):
             return "paywalled_db_retrieved", "deployment_subscription_retention_policy"
@@ -6530,10 +6547,7 @@ class SourceResolver:
                 for location in result.locations
             )
         )
-        if (
-            publicly_downloaded
-            and settings.PUBLIC_RETRIEVAL_RETENTION_POLICY == "store_scoped"
-        ):
+        if publicly_downloaded and policy.sources.keep_public_copies == "all":
             # Public reachability is not a licence conclusion. The deployment
             # has chosen scoped retention, so keep the representation under the
             # neutral restricted class and preserve the policy basis.
@@ -6560,9 +6574,11 @@ class SourceResolver:
         representation = result.representation
         if representation is None or not representation.content:
             return
+        policy = self._storage()
         license_class, retention_basis = self._retrieval_retention_decision(
             result,
             downloaded_via_publisher=downloaded_via_publisher,
+            policy=policy,
         )
         result.metadata = result.metadata or {}
         if license_class is None:
@@ -6607,13 +6623,10 @@ class SourceResolver:
             }
 
         license_expires_at = None
-        if (
-            license_class == "paywalled_db_retrieved"
-            and settings.CAMPUS_ACCESS_TTL_DAYS > 0
-        ):
-            license_expires_at = datetime.now(timezone.utc) + timedelta(
-                days=settings.CAMPUS_ACCESS_TTL_DAYS
-            )
+        keep_days = (policy.sources.licensed_copy_days if license_class == "paywalled_db_retrieved"
+                     else policy.sources.public_copy_days)
+        if keep_days > 0:
+            license_expires_at = datetime.now(timezone.utc) + timedelta(days=keep_days)
 
         factory = self._repository_session_factory
         with factory() as session:
@@ -6660,6 +6673,7 @@ class SourceResolver:
                     "public_retrieval_retention_policy": (
                         settings.PUBLIC_RETRIEVAL_RETENTION_POLICY
                     ),
+                    "storage_policy": policy.model_dump(mode="json"),
                 }
                 ocr_evidence = result.metadata.get("ocr_derivative")
                 if ocr_evidence and result.parent_representation is not None:
@@ -6770,6 +6784,54 @@ class SourceResolver:
             except Exception:
                 rollback_source_admissions(session, self._backend)
                 raise
+
+    def _storage(self):
+        from app.services.storage_policy import deployment_defaults
+        return getattr(self, "storage_policy", None) or deployment_defaults()
+
+    def retain_validated_copy(self, reference, result: RetrievalResult) -> None:
+        """Keep a validated public copy whatever route found it (owner decision
+        2026-10-09): web search and web-page routes never offered theirs for
+        storage, so each re-run and each later paper fetched or searched for
+        them again. Only a high-identity, clean, publicly addressed copy that
+        no earlier step has already decided on is offered; the deployment's
+        retention policy still decides (`_retrieval_retention_decision`), and
+        a copy without an open-access signal is kept as rights_unclassified,
+        never as openly licensed. Never fails the run."""
+        metadata = result.metadata or {}
+        representation = result.representation
+        if (not self._durable_repository_active() or representation is None or not representation.content
+                or metadata.get("identity_confidence") != "high"
+                or metadata.get("durable_admission") or metadata.get("repository_representation_id")
+                or not str(representation.source_url or "").casefold().startswith(("https://", "http://"))):
+            return
+        from app.services.source_repository import ACCEPTABLE_COMPLETENESS
+        completeness = str(representation.completeness or metadata.get("completeness") or "").casefold()
+        if completeness not in ACCEPTABLE_COMPLETENESS:
+            # A partial copy would wait for review and never be reused.
+            return
+        try:
+            safety_report = None
+            if representation.kind is RepresentationKind.PDF:
+                safety_report = inspect_uploaded_pdf(representation.content)
+                if safety_report.verdict is not SafetyVerdict.CLEAN:
+                    return
+            title = getattr(reference, "title", None) or None
+            self._persist_retrieved_representation(
+                result, ref_doi=getattr(reference, "doi", None) or None, ref_title=title,
+                ref_author=getattr(reference, "author", None) or None,
+                ref_year=getattr(reference, "year", None) or None, identity_confidence="high",
+                identity_reason=metadata.get("identity_reason", ""), downloaded_via_publisher=False,
+                safety_report=safety_report,
+                expected_source_kind=_expected_source_kind_assessment(
+                    source_kind=getattr(reference, "source_kind", None),
+                    source_kind_confidence=getattr(reference, "source_kind_confidence", None),
+                    source_kind_evidence=getattr(reference, "source_kind_evidence", None) or [],
+                    raw_ref=getattr(reference, "raw_ref", "") or "", title=title or "",
+                    url=getattr(reference, "url", None) or None))
+        except Exception as exc:
+            result.metadata = {**metadata, "durable_admission": {"state": "not_stored", "reason": "retention_failed"}}
+            logger.warning("Validated copy was not kept (type=%s)", type(exc).__name__)
 
     def _cache_key_for_verified(
         self,

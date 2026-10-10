@@ -133,3 +133,67 @@ def test_sources_sharing_a_bracket_share_its_clause():
     assert pieces == [("Ports feared automation (Ames, 2023)", ["a"]),
                       ("as well as claims that cranes will change them (Bell, 2023; Cole, 2023).", ["b", "c"])]
     assert [text[s:e] for s, e in _member_clause_spans(claim, "c")] == ["as well as claims that cranes will change them"]
+
+
+def _cue(text):
+    from app.services.candidate_relationship_judgment import research_cue_spans
+    out = research_cue_spans(text, [(0, len(text))])
+    return None if out is None else [text[a:b] for a, b in out]
+
+
+def test_only_what_the_research_found_is_judged():
+    # Owner decision 2026-10-09 (the owner's long article): the writer's own study is not judged against the source.
+    assert _cue("Harbour crews need training in automation, though research has shown that their supervisors "
+                "rarely receive it") == ["their supervisors rarely receive it"]
+    assert _cue("They support studies that find crews use cranes strategically and with care") == [
+        "crews use cranes strategically and with care"]
+    assert _cue("The interviewed crews and supervisors believe that cranes can reduce injuries at night, "
+                "corroborating early studies in busy ports") == ["cranes can reduce injuries at night"]
+    assert _cue("They believe the cranes help new workers learn quickly, as found in research on dock crews") == [
+        "the cranes help new workers learn quickly"]
+    assert _cue("Peer observers watched the crews, which has been shown to improve safety reports and crew trust") == [
+        "which has been shown to improve safety reports and crew trust"]
+
+
+def test_ordinary_statements_and_the_writers_own_study_are_left_whole():
+    assert _cue("Cranes reduce delays in busy ports") is None
+    assert _cue("Our studies have shown that cranes reduce delays in busy ports") is None
+    assert _cue("Research has shown that") is None
+
+
+def test_sources_sharing_an_ending_or_a_research_opening_are_judged_on_it():
+    text = ("Research on ports in general (Ames, 2020), and on river ports in particular (Bell, 2021), "
+            "has shown that crane training is essential for crews.")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    spans = lambda ref: [text[a:b] for a, b in _member_clause_spans(claim, ref)]
+    assert spans("a") == ["Research on ports in general",
+                          "has shown that crane training is essential for crews"]
+    assert spans("b") == ["and on river ports in particular",
+                          "has shown that crane training is essential for crews"]
+    text = ("Crews think cranes can speed loading, as found in research on river ports (Ames, 2020) "
+            "and sea ports (Bell, 2021).")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    assert [text[a:b] for a, b in _member_clause_spans(claim, "b")] == [
+        "Crews think cranes can speed loading, as found in research on river ports", "and sea ports"]
+
+
+def test_a_list_of_separate_claims_shares_nothing():
+    claim = _claim(LIST, ("(Ames, 2022)", "a"), ("(Bell & Cole, 2024)", "b"), ("(Dunn, 2023)", "d"))
+    assert [LIST[a:b] for a, b in _member_clause_spans(claim, "b")] == ["fail to lift heavy loads"]
+    text = "Crews preferred cranes (Ames, 2020), and owners cut costs (Bell, 2021), so ports grew."
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    assert [text[a:b] for a, b in _member_clause_spans(claim, "b")] == ["and owners cut costs"]
+
+
+def test_a_sentence_whose_sources_share_wording_stays_one_citation():
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    text = ("Research on ports in general (Ames, 2020), and on river ports in particular (Bell, 2021), "
+            "has shown that crane training is essential for crews.")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    for m in claim.citation_markers:
+        m.marker_type = "parenthetical"
+    assert citation_clause_segments(claim, ["a", "b"]) is None
+    claim = _claim(LIST, ("(Ames, 2022)", "a"), ("(Bell & Cole, 2024)", "b"), ("(Dunn, 2023)", "d"))
+    for m in claim.citation_markers:
+        m.marker_type = "parenthetical"
+    assert len(citation_clause_segments(claim, ["a", "b", "d"])) == 3

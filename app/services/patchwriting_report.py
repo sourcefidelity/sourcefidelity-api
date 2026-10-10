@@ -75,10 +75,19 @@ def _only_title_words(region: dict, start: int, spans: list[tuple[int, int]], ti
 
 
 def _finding_rows(block: dict, known: Callable[[str], bool],
-                  title_of: Callable[[str], str] = lambda _r: "") -> list[dict]:
+                  title_of: Callable[[str], str] = lambda _r: "",
+                  coverage_by_reference: dict | None = None) -> list[dict]:
     rows = []
     for reference_id, entry in (block.get("sources") or {}).items():
         if not isinstance(entry, dict) or entry.get("status") != "compared" or not known(reference_id):
+            continue
+        # Only a source the report shows as full text (2026-10-08: two flags
+        # against limited texts on the long article).
+        shown = (coverage_by_reference or {}).get(reference_id)
+        if shown is not None:
+            if shown != "full_text":
+                continue
+        elif ((entry.get("coverage") or {}).get("completeness_verdict") or "complete") != "complete":
             continue
         for finding in entry.get("findings") or []:
             if not isinstance(finding, dict) or finding.get("kind") not in _RANK:
@@ -102,6 +111,9 @@ def _finding_rows(block: dict, known: Callable[[str], bool],
             from app.services.text_extractor import _LICENCE_LINE
             if _LICENCE_LINE.search(str(region.get("text") or "")) and "://" in str(region.get("text") or ""):
                 continue   # a page's licence footer read as paper text (2026-10-07)
+            from app.services.patchwriting import _WEB_ADDRESS
+            if not _WEB_ADDRESS.sub("", str(region.get("text") or "")).strip(" .,;:()[]"):
+                continue   # only a web address or DOI (2026-10-08)
             if finding["kind"] == "close_paraphrase" and (
                     _only_conventional(region, start, spans)
                     or _only_title_words(region, start, spans, title_of(reference_id))):
@@ -295,7 +307,8 @@ def _comparison(row: dict) -> dict:
     return {"student": _student_segments(row, marked, student), "excerpts": excerpts}
 
 
-def build_passages(block: dict | None, reference_view: Callable[[str], dict | None]) -> list[dict]:
+def build_passages(block: dict | None, reference_view: Callable[[str], dict | None],
+                   coverage_by_reference: dict | None = None) -> list[dict]:
     """Merge overlapping findings into numbered passages; never raises on bad rows."""
     if not block:
         return []
@@ -312,7 +325,7 @@ def build_passages(block: dict | None, reference_view: Callable[[str], dict | No
         view = views.get(reference_id) or {}
         return str(view.get("title") or (view.get("source") or {}).get("title") or "")
 
-    for row in _finding_rows(block, known, title_of):
+    for row in _finding_rows(block, known, title_of, coverage_by_reference):
         if groups and row["start"] < end:
             groups[-1].append(row)
             end = max(end, row["end"])

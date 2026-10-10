@@ -61,6 +61,10 @@ celery_app.conf.update(
                 settings.SOURCE_RETENTION_CLEANUP_INTERVAL_SECONDS,
             ),
         },
+        "expire-paper-records": {
+            "task": "expire_paper_records",
+            "schedule": max(60, settings.SOURCE_RETENTION_CLEANUP_INTERVAL_SECONDS),
+        },
         "cleanup-stale-verification-runs": {
             "task": "cleanup_stale_verification_runs",
             "schedule": max(

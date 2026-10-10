@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import settings
 from app.services.citation_structure import (
+    describes_research_literature,
     interpretive_result_spans,
     shared_qualifier_coordination_spans,
     shared_predicate_component_spans,
@@ -136,6 +137,28 @@ supports, contradicts, qualifies, mixed, and evidence-related uncertain require
 supplied evidence IDs; none has none. Only unresolved/ambiguous student context may
 use uncertain without evidence IDs. Return no prose outside JSON. Rationale <=240
 characters; <=2 short limitations per mapping."""
+
+
+# Added only for a statement describing a body of research, so every other
+# prompt keeps its exact bytes (owner decision 2026-10-09).
+_EXAMPLE_OF_RESEARCH_PROMPT = _SYSTEM_PROMPT + """
+
+citation_function example_of_described_research: the student describes a body
+of research and cites this work as one example of it. For every facet, including
+source_attribution, judge whether the source is research of the kind described
+(its subject, population, setting and focus), using the source's own statements
+of its topic, aims, methods or findings. Words about the body of research as a
+whole (quantity, prevalence, scarcity, trend or recency, such as most, much
+less, few, growing, all, in the last few years) are the student's synthesis:
+never require the source to state them, and never use their absence for none or
+qualifies. supports: the source is such research; qualifies: it matches only
+part of the described subject or focus; none: it is research of another kind."""
+
+
+# The prompt names its one candidate by a fixed alias, not the run-specific
+# ID, so an identical request in a later run is answered from the model
+# answer cache (owner decision 2026-10-09).
+PROMPT_CANDIDATE_ID = "c1"
 
 
 class _MappingResponse(BaseModel):
@@ -531,6 +554,8 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             }
         )
 
+    example_of_research = describes_research_literature(artifact.claim.text)
+    system_prompt = _EXAMPLE_OF_RESEARCH_PROMPT if example_of_research else _SYSTEM_PROMPT
     items: list = []
     for bundle in foundation.candidate_bundles:
         candidate = candidates.get(bundle.candidate_id)
@@ -754,12 +779,13 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
         redactions.update(masked_author.redaction_counts)
         prompt = json_data_envelope(
             {
-                "candidate_id": candidate.candidate_id,
+                "candidate_id": PROMPT_CANDIDATE_ID,
                 "requires_antecedent_context": candidate.requires_antecedent_context,
                 "local_context_resolution": local_context_status,
                 "locally_resolved_antecedents": resolved_antecedent_payload,
                 "cited_author_label": masked_author.text,
                 "complete_citation_unit": masked_unit.text,
+                **({"citation_function": "example_of_described_research"} if example_of_research else {}),
                 "student_context": context_payload,
                 "facets": masked_facets,
                 "evidence_sentences": sentence_payload,
@@ -767,7 +793,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
         )
         try:
             enforce_complete_prompt_budget(
-                _SYSTEM_PROMPT,
+                system_prompt,
                 prompt,
                 max_input_tokens=max_input_tokens,
             )
@@ -787,7 +813,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
                 bundle=bundle,
                 candidate=candidate,
                 local_context_status=local_context_status,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 facet_aliases=facet_aliases,
                 sentence_aliases=sentence_aliases,

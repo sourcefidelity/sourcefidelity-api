@@ -345,3 +345,38 @@ def _substantive_words(text: str) -> int:
         token.group(0).casefold() not in ignored
         for token in _WORD_TOKEN.finditer(text)
     )
+
+
+# A statement describing a body of research ("Most research on X focuses on
+# Y (A; B)", "There is much less research investigating X (A; B)") cites its
+# works as examples of that research (owner decision 2026-10-09). A statement
+# of what research found ("Several studies show that P") is not one.
+_LIT_BODY = (r"(?:most|much|many|several|some|few|little|less|limited|recent|previous|prior|existing|"
+             r"growing|increasing|the (?:majority|bulk) of|a (?:growing|large|small|limited) (?:body|amount) of)"
+             r"\s+(?:of\s+)?(?:the\s+)?(?:research|studies|literature|scholarship)")
+_LIT_SUBJECT = re.compile(rf"\b(?:{_LIT_BODY}|research|studies|literature|scholarship)\b", re.I)
+_LIT_TOPIC_PREDICATE = re.compile(
+    r"\b(?:focus(?:es|ed)? (?:on|upon)|ha(?:s|ve) (?:largely |mostly |primarily |mainly |also )?"
+    r"(?:focused|examined|investigated|explored|addressed|studied|looked at|considered)|"
+    r"examines|investigates|explores|addresses|concerns|deals with)\b", re.I)
+_LIT_FINDING = re.compile(
+    r"\b(?:shows?|showed|shown|finds?|found|suggests?|suggested|indicates?|indicated|demonstrates?|"
+    r"demonstrated|reveals?|revealed|reports?|reported|that)\b", re.I)
+_LIT_THERE_IS = re.compile(
+    r"\bthere (?:is|are|has been|have been) (?:(?:very|much|far|relatively|comparatively|still)\s+)?"
+    r"(?:little|less|few|fewer|limited|no|some|more|growing|increasing|a growing body of|"
+    r"a (?:small|large|limited) (?:body|number) of)\s+(?:research|studies|literature|scholarship)\b", re.I)
+
+
+def describes_research_literature(text: str) -> bool:
+    """True when the statement describes a body of research (its topic,
+    focus or amount) rather than reporting what the research found."""
+    text = " ".join(str(text or "").split())
+    if _LIT_THERE_IS.search(text):
+        return True
+    for subject in _LIT_SUBJECT.finditer(text):
+        rest = text[subject.end():subject.end() + 160]
+        predicate = _LIT_TOPIC_PREDICATE.search(rest)
+        if predicate and not _LIT_FINDING.search(rest[:predicate.start()]) and "." not in rest[:predicate.start()]:
+            return True
+    return False

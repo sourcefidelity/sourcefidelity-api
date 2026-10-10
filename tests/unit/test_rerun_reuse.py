@@ -1,4 +1,5 @@
 """paper-search-reuse-v1 (owner decision 2026-10-01): a re-run reuses unchanged references' results."""
+import pytest
 from types import SimpleNamespace
 
 from app.services.search.rerun_reuse import _reusable, reference_signature, reused_result
@@ -107,3 +108,63 @@ def test_a_downloaded_copy_must_be_the_file_the_earlier_run_verified(monkeypatch
     assert same is not None and same.representation.content == content
     assert resolver.refetch_public_source(reference, "https://repository.example/ames.pdf", provider="openalex",
                                           content_sha256="b" * 64) is None
+
+
+def test_a_copy_whose_admission_lapsed_mid_run_is_downloaded_again():
+    # The long article, 2026-10-08: texts verified, then lost when a 58-minute run outlived their lease.
+    from app.services.search.rerun_reuse import downloadable
+    access = {"version": "verified-public-source-access-v1", "href": "https://repository.example/ames.pdf",
+              "content_sha256": "a" * 64}
+    lapsed = {"status": "unavailable", "reason_code": "transient_verification_run_unavailable",
+              "source_name": "openalex", "public_source_access": access}
+    assert downloadable(lapsed) and _reusable(lapsed)
+    assert not _reusable({**lapsed, "public_source_access": None})
+    assert not downloadable({**lapsed, "reason_code": "source_not_found"})
+
+
+@pytest.mark.parametrize("same_bytes", [True, False])
+def test_a_redownload_identical_to_the_verified_copy_keeps_its_identity(monkeypatch, same_bytes):
+    # A re-download has no search record, so its provider identity is low; a
+    # byte-identical file is the copy an earlier run verified (2026-10-09).
+    import hashlib
+    from types import SimpleNamespace
+    import fitz
+    import app.services.source_resolver as module
+    from app.services.file_safety import SafetyVerdict
+    from app.services.retrieval.base import RepresentationKind, RetrievalResult, SourceRepresentation
+    from app.services.source_type import SourceKindAssessment
+    doc = fitz.open(); doc.new_page().insert_text((72, 72), "Harbour cranes in river ports. Ames 2020."); content = doc.tobytes()
+    resolver = object.__new__(module.SourceResolver)
+    monkeypatch.setattr(resolver, "_durable_repository_active", lambda: True)
+    monkeypatch.setattr(resolver, "_retain_provisional_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(module, "inspect_uploaded_pdf", lambda _: SimpleNamespace(verdict=SafetyVerdict.CLEAN, findings=[]))
+    monkeypatch.setattr(module, "validate_retrieved_pdf", lambda *a, **k: SimpleNamespace(
+        identity_confidence="medium", completeness="complete", text_quality="digital",
+        reason="fixture", source_kind_verdict="compatible", observed_source_kind="journal_article"))
+    earlier = hashlib.sha256(content if same_bytes else b"other").hexdigest()
+    result = RetrievalResult(source_name="test", success=True, metadata={"earlier_verified_content_sha256": earlier},
+        representation=SourceRepresentation(kind=RepresentationKind.PDF, media_type="application/pdf",
+                                            content=content, source_url="https://ports.example/ames.pdf"))
+    accepted, _, _ = resolver._preflight_acquired_representation(
+        result, expected_doi=None, expected_title="Harbour cranes in river ports", expected_author="Ames",
+        expected_year="2020", expected_source_kind=SourceKindAssessment("journal_article", "high"))
+    assert accepted is same_bytes
+    assert (result.metadata["identity_confidence"] == "high") is same_bytes
+
+
+def test_another_paper_citing_the_same_work_in_its_own_format_reuses_the_result():
+    from app.services.search.rerun_reuse import parsed_signature, reference_signature
+    parsed = dict(source_kind="journal_article", title="Harbour cranes in river ports", author="Ames, A.",
+                  year="2020", container_title="Port Studies", doi="10.1234/ports.1")
+    mine = SimpleNamespace(raw_ref="Ames, A. (2020). Harbour cranes in river ports. Port Studies.",
+                           reference_id="ref-0001-new", **parsed)
+    theirs = {"raw_ref": "AMES A 2020 'Harbour cranes in river ports' Port Studies", **parsed}
+    item = {"reference_id": "ref-0009-old", "status": "abstract_only", "reference_discovery": {}}
+    key = reference_signature(theirs, identity_only=False)
+    index = {key: ("job-1", item), parsed_signature(key): ("job-1", item)}
+    reused = reused_result(index, mine, identity_only=False)
+    assert reused["reference_id"] == "ref-0001-new" and reused["search_reuse"]["from_job_id"] == "job-1"
+    # A thin parse does not name one work, so only identical reference text matches.
+    thin = dict(parsed, doi="", year="")
+    index = {parsed_signature(reference_signature({"raw_ref": "x", **thin}, identity_only=False)): ("job-1", item)}
+    assert reused_result(index, SimpleNamespace(raw_ref="y", reference_id="r", **thin), identity_only=False) is None

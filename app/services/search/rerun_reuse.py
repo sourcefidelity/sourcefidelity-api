@@ -71,9 +71,18 @@ def public_copy(item: dict) -> dict | None:
     return None
 
 
+def downloadable(item: dict) -> bool:
+    """A verified open-access copy can be downloaded again: a transient text,
+    or one whose admission lapsed during a long run after it was verified
+    (`transient_verification_run_unavailable`, the long article, 2026-10-08)."""
+    return public_copy(item) is not None and (
+        item.get("status") == "transient_authorized"
+        or item.get("reason_code") == "transient_verification_run_unavailable")
+
+
 def _reusable(item: dict, reference: dict | None = None) -> bool:
-    if item.get("status") == "transient_authorized":
-        return public_copy(item) is not None
+    if item.get("status") == "transient_authorized" or downloadable(item):
+        return downloadable(item)
     if item.get("status") == "durable_authorized":
         # The text itself is stored; how the search ended does not matter.
         return bool(item.get("representation_id"))
@@ -150,11 +159,20 @@ def prior_results_index(session, job) -> dict:
         return {}
     from app.models.job import Job, JobStatus
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    prior = (session.query(Job)
-             .filter(Job.scope_type == job.scope_type, Job.scope_id == job.scope_id, Job.id != job.id,
-                     Job.status == JobStatus.COMPLETED, Job.created_at >= since,
-                     Job.source_results.isnot(None), Job.extraction_payload.isnot(None))
-             .order_by(Job.created_at.desc()).limit(50).all())
+    base = (session.query(Job)
+            .filter(Job.scope_type == job.scope_type, Job.scope_id == job.scope_id, Job.id != job.id,
+                    Job.status == JobStatus.COMPLETED, Job.created_at >= since,
+                    Job.source_results.isnot(None), Job.extraction_payload.isnot(None)))
+    prior = base.order_by(Job.created_at.desc()).limit(50).all()
+    # The same paper's own earlier runs always count, however many other
+    # papers ran since (2026-10-08: the long article's run had fallen out of
+    # the 50 most recent, so none of its 65 results was reused).
+    filename = getattr(job, "filename", None)
+    if filename:
+        seen = {item.id for item in prior}
+        same = base.filter(Job.filename == filename).order_by(Job.created_at.desc()).limit(10).all()
+        prior = sorted([*prior, *(item for item in same if item.id not in seen)],
+                       key=lambda item: item.created_at, reverse=True)
     index: dict = {}
     for earlier in prior:
         references = {ref.get("reference_id"): ref for ref in (earlier.extraction_payload or {}).get("references") or []}
@@ -164,12 +182,29 @@ def prior_results_index(session, job) -> dict:
                 continue
             key = reference_signature(reference, identity_only=bool(item.get("identity_only_policy")))
             index.setdefault(key, (str(earlier.id), item))
+            index.setdefault(parsed_signature(key), (str(earlier.id), item))
     return index
+
+
+def parsed_signature(signature: tuple) -> tuple:
+    """The same work parsed identically, whatever the reference's punctuation
+    or layout: another paper citing it in its own format reuses the result
+    (owner decision 2026-10-09). The reference text itself is left out."""
+    return ("parsed",) + tuple(signature[1:])
+
+
+def _identifying(signature: tuple) -> bool:
+    """A parse with a DOI, or a title with an author and year, names one work."""
+    _, _, title, author, year, _, doi, _ = signature
+    return bool(doi) or bool(title and author and year)
 
 
 def reused_result(index: dict, reference, *, identity_only: bool) -> dict | None:
     """A copy of the earlier result for this reference, re-keyed to it, or None."""
-    found = index.get(reference_signature(reference, identity_only=identity_only))
+    signature = reference_signature(reference, identity_only=identity_only)
+    found = index.get(signature)
+    if found is None and _identifying(signature):
+        found = index.get(parsed_signature(signature))
     if found is None:
         return None
     prior_job_id, item = found

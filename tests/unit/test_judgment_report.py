@@ -97,3 +97,39 @@ def test_candidate_wording_and_paper_ranges_are_exact():
     assert candidate_text(PAYLOAD, "c1") == "Teachers <b>said</b> feedback helped"
     assert candidate_paper_ranges(PAYLOAD, "c1") == [(100, 135)]
     assert candidate_paper_ranges(PAYLOAD, "missing") == []
+
+
+def test_a_statement_describing_research_is_judged_as_an_example_of_it():
+    # Owner decision and wording 2026-10-09.
+    from app.services.citation_structure import describes_research_literature as describes
+    assert describes("Most research on harbour cranes focuses on safety (Ames, 2020; Bell, 2021).")
+    assert describes("There is much less research investigating river ports, all published recently (Cole, 2023).")
+    assert describes("Few studies have examined crane training (Ames, 2020).")
+    assert not describes("Several studies show that cranes speed loading (Ames, 2020).")
+    assert not describes("In most studies of ports, crews feel training is too short (Bell, 2021).")
+    assert not describes("Research has shown that ports that examine their cranes save money (Ames, 2020).")
+    assert not describes("The most recent work to feature the harbour is a film (Cole, 2020).")
+    payload = {**PAYLOAD, "claim": {"text": "Most research on harbour cranes focuses on safety (Rivera, 2019)."}}
+    line = ("Judged as an example of the research the statement describes; the statement&#x27;s overall "
+            "picture of the research is the writer&#x27;s own.")
+    assert line in judgment_result(_row("supported", "judge_supports"), payload, None)["html"]
+    assert line not in judgment_result(_row("supported", "judge_supports"), PAYLOAD, None)["html"]
+
+
+def test_only_a_research_description_gets_the_example_question():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_facet_evidence_judgment import _prepared
+    from app.services import facet_evidence_judgment as judge
+    source = "This study examines crane safety training in river ports."
+    for claim, expected in (("Most research on river ports focuses on crane safety (Wood, 2012).", True),
+                            ("River ports train crane crews in safety (Wood, 2012).", False)):
+        prepared = judge.prepare_candidate_prompts(_prepared(source, claim, "(Wood, 2012)"), max_input_tokens=100_000)
+        items = [i for i in prepared.items if isinstance(i, judge.PreparedCandidate)]
+        assert items
+        for item in items:
+            assert (item.system_prompt == judge._EXAMPLE_OF_RESEARCH_PROMPT) is expected
+            assert ('"example_of_described_research"' in item.user_prompt) is expected
+            if not expected:
+                assert item.system_prompt == judge._SYSTEM_PROMPT
