@@ -113,3 +113,9 @@ def test_the_upload_route_returns_the_existing_report_without_a_new_run(monkeypa
     assert response.json()["reused_existing_report"] is True
     assert not create.called
     assert found.call_args.kwargs["content"] == CONTENT and found.call_args.kwargs["scope_id"] == "owner-1"
+
+
+def test_a_run_excluded_from_reuse_checks_it_again(session, monkeypatch):
+    job, _ = _job(session)
+    monkeypatch.setattr(paper_reuse.settings, "SEARCH_REUSE_EXCLUDED_JOBS", f" other , {str(job.id).upper()}")
+    assert _find(session) is None

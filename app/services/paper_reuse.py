@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, settings
 from app.models.job import Job, JobStatus
 from app.models.report import Report
+from app.services.search.rerun_reuse import excluded_job_ids
 
 FINGERPRINT_KEY = "pipeline_fingerprint"
 REUSE_KEY = "paper_reuse"
@@ -78,7 +79,10 @@ def find_reusable_report(
                           Job.scope_type == scope_type, Job.scope_id == scope_id,
                           Job.filename == filename)
         .order_by(Job.created_at.desc()).limit(5))
+    excluded = excluded_job_ids()
     for job in jobs:
+        if str(job.id).lower() in excluded:
+            continue
         evidence = job.upload_evidence or {}
         if (job.store_only or (job.assessment_id or None) != (assessment_id or None)
                 or evidence.get("assessment_configuration") != assessment_configuration):

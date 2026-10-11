@@ -21,6 +21,7 @@ the rate, as Semantic Scholar already does.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 import threading
 import time
 import uuid
@@ -36,6 +37,12 @@ _UNSHARED_MULTIPLIER = 4
 _local_lock = threading.Lock()
 _local_next: dict[str, float] = {}
 _local_places: dict[str, threading.BoundedSemaphore] = {}
+_clients: dict[tuple[str, int], object] = {}
+# Crossref reports its pool's limits as `X-Rate-Limit-*` headers; its live
+# polite pool said 3 per 1 s and 3 in flight (2026-10-11), not the documented
+# 10 per second. Pacing stays this fraction under a reported rate, so network
+# jitter cannot bunch four starts into one of its one-second windows.
+_REPORTED_RATE_MARGIN = 0.9
 
 
 class ProviderBusy(Exception):
@@ -67,6 +74,14 @@ def interval_for(provider: str, default_interval: float = 0.0) -> float:
     if rate:
         return 1.0 / rate
     return max(0.0, float(default_interval or 0.0))
+
+
+def places_for(provider: str, default_places: int | None) -> int | None:
+    """In-flight places: the adapter's, lowered to a concurrency limit the provider reported."""
+    learned = (shared_pacing.stored_limits(provider) or {}).get("in_flight")
+    if isinstance(learned, int) and learned > 0:
+        return min(default_places, learned) if default_places else learned
+    return default_places
 
 
 def _wait_budget(max_wait: float | None) -> float:
@@ -154,6 +169,8 @@ def learn_limits(provider: str, headers) -> dict | None:
     one-second window becomes the pacing rate; the longest window's limit and
     remainder are kept for operators. Values are numbers only.
     """
+    if headers.get("X-Rate-Limit-Limit") or headers.get("x-rate-limit-limit"):
+        return _learn_interval_limits(provider, headers)
     limits = _header_values(headers, "X-RateLimit-Limit")
     policies = _header_values(headers, "X-RateLimit-Policy")
     left = _header_values(headers, "X-RateLimit-Remaining")
@@ -177,13 +194,68 @@ def learn_limits(provider: str, headers) -> dict | None:
     return learned
 
 
+def _header(headers, name: str) -> str:
+    return str(headers.get(name) or headers.get(name.lower()) or "").strip()
+
+
+def _learn_interval_limits(provider: str, headers) -> dict | None:
+    """Crossref's form: `X-Rate-Limit-Limit: 3`, `X-Rate-Limit-Interval: 1s`,
+    `X-Concurrency-Limit: 3`. Stored only when it changes."""
+    try:
+        limit = int(_header(headers, "X-Rate-Limit-Limit"))
+        interval = _header(headers, "X-Rate-Limit-Interval").lower()
+        seconds = float(interval[:-1]) if interval.endswith("s") else float(interval)
+        concurrency = _header(headers, "X-Concurrency-Limit")
+        in_flight = int(concurrency) if concurrency else None
+    except ValueError:
+        return None
+    if limit <= 0 or seconds <= 0:
+        return None
+    learned = {"policy_version": POLICY, "reported_limit": limit, "reported_interval_seconds": seconds,
+               "per_second": round(limit / seconds * _REPORTED_RATE_MARGIN, 4)}
+    if in_flight and in_flight > 0:
+        learned["in_flight"] = in_flight
+    stored = shared_pacing.stored_limits(provider) or {}
+    if {k: stored.get(k) for k in learned if k != "policy_version"} != {
+            k: v for k, v in learned.items() if k != "policy_version"}:
+        shared_pacing.store_limits(provider, {**learned, "observed_at": int(time.time())})
+    return learned
+
+
 def reported_limits(provider: str) -> dict | None:
     """The limits `provider` last reported (for operators and tests)."""
     return shared_pacing.stored_limits(provider)
 
 
-def paced_get(provider: str, default_interval: float, url: str, *, places: int | None = None, **kwargs):
-    """`httpx.get` through `provider`'s gate (raises ProviderBusy when held back)."""
+def _client(provider: str):
+    """One keep-alive client per provider and process, so each request does
+    not open a new TLS connection (created after the worker fork)."""
     import httpx
-    with turn(provider, interval=interval_for(provider, default_interval), places=places):
-        return httpx.get(url, **kwargs)
+    key = (provider, os.getpid())
+    with _local_lock:
+        client = _clients.get(key)
+        if client is None:
+            client = _clients[key] = httpx.Client()
+        return client
+
+
+def paced_get(provider: str, default_interval: float, url: str, *, places: int | None = None,
+              keep_alive: bool = False, **kwargs):
+    """`httpx.get` through `provider`'s gate (raises ProviderBusy when held back).
+
+    Limits the provider reports in its headers are learned for every process,
+    and a 429 holds every process back for its Retry-After (default 2 s)."""
+    import httpx
+    with turn(provider, interval=interval_for(provider, default_interval),
+              places=places_for(provider, places)):
+        response = _client(provider).get(url, **kwargs) if keep_alive else httpx.get(url, **kwargs)
+    headers = getattr(response, "headers", None)
+    if headers is not None and (headers.get("X-Rate-Limit-Limit") or headers.get("x-rate-limit-limit")):
+        learn_limits(provider, headers)
+    if getattr(response, "status_code", None) == 429:
+        try:
+            retry_after = float(headers.get("Retry-After") or 2.0) if headers is not None else 2.0
+        except ValueError:
+            retry_after = 2.0
+        defer(provider, retry_after)
+    return response

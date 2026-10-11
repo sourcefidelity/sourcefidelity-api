@@ -168,3 +168,32 @@ def test_another_paper_citing_the_same_work_in_its_own_format_reuses_the_result(
     thin = dict(parsed, doi="", year="")
     index = {parsed_signature(reference_signature({"raw_ref": "x", **thin}, identity_only=False)): ("job-1", item)}
     assert reused_result(index, SimpleNamespace(raw_ref="y", reference_id="r", **thin), identity_only=False) is None
+
+
+def test_a_run_excluded_from_reuse_contributes_no_results(monkeypatch):
+    import hashlib
+    from datetime import datetime, timezone
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from app.models import Base
+    from app.models.job import Job, JobStage, JobStatus
+    from app.services.search import rerun_reuse
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    item = {"reference_id": "ref-1", "status": "unavailable", "reason_code": "full_text_unavailable",
+            "reference_discovery": {"outcome": "unlocated_after_search", "created_at": "t0"}}
+
+    def job(name, version):
+        return Job(filename=name, status=JobStatus.COMPLETED, stage=JobStage.COMPLETED, paper_version_id=version,
+                   scope_type="personal_owner", scope_id="owner-1", input_sha256=hashlib.sha256(b"x").hexdigest(),
+                   input_media_type="application/pdf", input_byte_size=1, input_expires_at=datetime.now(timezone.utc),
+                   extraction_payload={"references": [REF]}, source_results=[item])
+
+    with Session(engine) as session:
+        earlier, current = job("ports.pdf", "paper:1"), job("ports.pdf", "paper:2")
+        session.add_all([earlier, current])
+        session.commit()
+        assert rerun_reuse.prior_results_index(session, current)
+        monkeypatch.setattr(rerun_reuse.settings, "SEARCH_REUSE_EXCLUDED_JOBS", str(earlier.id))
+        assert rerun_reuse.prior_results_index(session, current) == {}

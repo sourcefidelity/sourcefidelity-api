@@ -152,6 +152,12 @@ def _network_failed(discovery: dict) -> bool:
     return bool(adapters) and failed * 2 >= len(adapters)
 
 
+def excluded_job_ids() -> frozenset[str]:
+    """Runs whose results are never reused (``SEARCH_REUSE_EXCLUDED_JOBS``)."""
+    raw = getattr(settings, "SEARCH_REUSE_EXCLUDED_JOBS", "") or ""
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 def prior_results_index(session, job) -> dict:
     """signature -> (prior job id, result item), most recent completed run first."""
     days = int(getattr(settings, "SEARCH_RERUN_REUSE_DAYS", 0) or 0)
@@ -173,8 +179,11 @@ def prior_results_index(session, job) -> dict:
         same = base.filter(Job.filename == filename).order_by(Job.created_at.desc()).limit(10).all()
         prior = sorted([*prior, *(item for item in same if item.id not in seen)],
                        key=lambda item: item.created_at, reverse=True)
+    excluded = excluded_job_ids()
     index: dict = {}
     for earlier in prior:
+        if str(earlier.id).lower() in excluded:
+            continue
         references = {ref.get("reference_id"): ref for ref in (earlier.extraction_payload or {}).get("references") or []}
         for item in earlier.source_results or []:
             reference = references.get(item.get("reference_id"))

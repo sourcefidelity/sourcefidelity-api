@@ -479,6 +479,10 @@ class Settings(BaseSettings):
     # unchanged reference within this many days (paper-search-reuse-v4,
     # owner decision 2026-10-01). 0 disables reuse.
     SEARCH_RERUN_REUSE_DAYS: int = Field(default=30, ge=0)
+    # Comma-separated job ids whose results and reports are never reused, for
+    # runs spoiled by a local fault (2026-10-11: three runs made while name
+    # lookups returned reserved addresses and no source could download).
+    SEARCH_REUSE_EXCLUDED_JOBS: str = ""
     # Comma-separated paid/bounded fallbacks, tried only when the primary
     # provider returns no usable candidates. Exact queries are cached per run.
     SEARCH_ESCALATION_PROVIDERS: str = "tavily,exa"

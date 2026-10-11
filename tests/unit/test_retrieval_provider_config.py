@@ -54,7 +54,7 @@ def test_crossref_records_calls_and_outcomes(monkeypatch) -> None:
         }
     }
     request = Mock(side_effect=[_response(200, payload), _response(404)])
-    monkeypatch.setattr("app.services.retrieval.crossref.httpx.get", request)
+    monkeypatch.setattr("app.services.retrieval.provider_gate._client", lambda provider: Mock(get=request))
 
     retriever = CrossrefRetriever()
     assert retriever.search_by_doi("10.1234/example").success is True
@@ -67,3 +67,27 @@ def test_crossref_records_calls_and_outcomes(monkeypatch) -> None:
         "server_errors": 0,
         "network_errors": 0,
     }
+
+
+def test_crossref_retries_a_dropped_connection_and_a_server_error(monkeypatch) -> None:
+    from app.services.retrieval import crossref, provider_gate
+    payload = {"message": {"DOI": "10.1234/example", "title": ["Example"], "issued": {"date-parts": [[2024]]}}}
+    request = Mock(side_effect=[httpx.ConnectError("eof"), _response(503), _response(200, payload)])
+    monkeypatch.setattr("app.services.retrieval.provider_gate._client", lambda provider: Mock(get=request))
+    monkeypatch.setattr(crossref.time, "sleep", lambda seconds: None)
+    held = []
+    monkeypatch.setattr(provider_gate, "defer", lambda provider, seconds: held.append(seconds))
+    retriever = CrossrefRetriever()
+    assert retriever.search_by_doi("10.1234/example").success is True
+    assert request.call_count == 3 and retriever.provider_metrics["network_errors"] == 1 and held == []
+
+
+def test_crossref_still_refusing_after_retries_fails_and_holds_back(monkeypatch) -> None:
+    from app.services.retrieval import crossref, provider_gate
+    request = Mock(side_effect=httpx.ConnectError("eof"))
+    monkeypatch.setattr("app.services.retrieval.provider_gate._client", lambda provider: Mock(get=request))
+    monkeypatch.setattr(crossref.time, "sleep", lambda seconds: None)
+    held = []
+    monkeypatch.setattr(provider_gate, "defer", lambda provider, seconds: held.append(seconds))
+    result = CrossrefRetriever().search_by_doi("10.1234/example")
+    assert result.success is False and request.call_count == 3 and held == [10.0]

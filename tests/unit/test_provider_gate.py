@@ -267,3 +267,26 @@ def test_a_glm_request_with_no_free_place_is_rate_limited_and_never_sent(monkeyp
     with pytest.raises(LLMCallFailure) as failure:
         chat_completion("s", "u", route=route)
     assert failure.value.category == "rate_limited" and not sent
+
+
+def test_crossref_limits_are_read_from_its_headers(monkeypatch):
+    stored = {}
+    monkeypatch.setattr(provider_gate.shared_pacing, "store_limits", lambda provider, limits: stored.update(limits))
+    monkeypatch.setattr(provider_gate.shared_pacing, "stored_limits", lambda provider: dict(stored) or None)
+    headers = {"x-rate-limit-limit": "3", "x-rate-limit-interval": "1s", "x-concurrency-limit": "1"}
+    learned = provider_gate.learn_limits("crossref", headers)
+    # Paced a tenth under the reported rate; the reported values are kept.
+    assert learned["per_second"] == pytest.approx(2.7) and learned["reported_limit"] == 3
+    assert provider_gate.interval_for("crossref", 0.125) == pytest.approx(1 / 2.7)
+    assert provider_gate.places_for("crossref", 3) == 1
+    assert provider_gate.learn_limits("crossref", {"x-rate-limit-limit": "three"}) is None
+
+
+def test_a_refused_request_holds_every_process_back(monkeypatch):
+    held = []
+    monkeypatch.setattr(provider_gate, "defer", lambda provider, seconds: held.append((provider, seconds)))
+    monkeypatch.setattr(provider_gate.shared_pacing, "stored_limits", lambda provider: None)
+    refused = Mock(status_code=429, headers={"Retry-After": "4"})
+    monkeypatch.setattr(provider_gate, "_client", lambda provider: Mock(get=Mock(return_value=refused)))
+    assert provider_gate.paced_get("crossref", 0, "https://api.crossref.org/works", keep_alive=True) is refused
+    assert held == [("crossref", 4.0)]
