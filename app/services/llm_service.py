@@ -45,6 +45,9 @@ class LLMRoute:
     price_context: Callable[[str], dict] = lambda model: {}
     # Output allowance for this arm when it must reason before answering.
     max_output_tokens: int | None = None
+    # Requests this endpoint may have in flight across every worker process
+    # (provider-gate-v1 places); 0 leaves the endpoint unlimited.
+    max_in_flight: int = 0
 
 
 def _receipt_from_response(response, receipt: dict) -> None:
@@ -93,6 +96,9 @@ class LLMCallFailure(RuntimeError):
 
 
 def _request_failure_category(error: Exception) -> str:
+    from app.services.retrieval.provider_gate import ProviderBusy
+    if isinstance(error, ProviderBusy):
+        return "rate_limited"   # no place freed within the call timeout; never sent
     if isinstance(error, APITimeoutError):
         return "timeout"
     if isinstance(error, APIConnectionError):
@@ -240,7 +246,16 @@ def chat_completion(
             # default endpoint is used when no base URL is configured.
             endpoint_host = urlsplit(settings.LLM_BASE_URL).hostname if settings.LLM_BASE_URL else 'api.openai.com'
         record_llm_attempt(model=model, endpoint_host=endpoint_host)
-        response = client.chat.completions.create(**kwargs)
+        if route is not None and route.max_in_flight > 0:
+            from app.services.retrieval import provider_gate
+            # The account's in-flight limit is shared by every process; a
+            # request waits for a place rather than being refused (1302).
+            with provider_gate.turn(f"llm:{route.endpoint_host}", interval=0, places=route.max_in_flight,
+                                    hold_seconds=float(settings.LLM_CALL_TIMEOUT_SECONDS) + 30,
+                                    max_wait=float(settings.LLM_CALL_TIMEOUT_SECONDS)):
+                response = client.chat.completions.create(**kwargs)
+        else:
+            response = client.chat.completions.create(**kwargs)
         record_llm_usage(response.usage, price_context=price_context, model=model, endpoint_host=endpoint_host)
         if receipt is not None:
             _receipt_from_response(response, receipt)

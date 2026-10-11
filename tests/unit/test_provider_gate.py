@@ -27,10 +27,11 @@ def gate_on(monkeypatch):
 def test_requests_start_an_interval_apart_without_redis():
     starts = []
     for _ in range(3):
-        with provider_gate.turn("test", interval=0.01):
+        with provider_gate.turn("test", interval=0.05):
             starts.append(time.monotonic())
-    # One process alone paces at a quarter of the rate: 0.04 s apart.
-    assert all(later - earlier >= 0.035 for earlier, later in zip(starts, starts[1:]))
+    # One process alone paces at a quarter of the rate: 0.2 s apart (the
+    # margin absorbs scheduling delay before a start is recorded).
+    assert all(later - earlier >= 0.15 for earlier, later in zip(starts, starts[1:]))
 
 
 def test_a_caller_that_cannot_wait_books_nothing():
@@ -216,3 +217,53 @@ def test_run_ceiling_is_one_locked_step(retriever, monkeypatch):
     for thread in threads:
         thread.join()
     assert granted.count(True) == 4
+
+
+def _route(max_in_flight, create):
+    from app.services.llm_service import LLMRoute, get_provider_config
+    client = Mock()
+    client.chat.completions.create.side_effect = create
+    return LLMRoute(arm_id="zai_glm", model="glm-test", endpoint_host="glm.example",
+                    client_factory=lambda: client, provider_config=get_provider_config("glm-test"),
+                    max_in_flight=max_in_flight)
+
+
+def _response():
+    usage = Mock(total_tokens=3, prompt_tokens=2, completion_tokens=1, prompt_tokens_details=None)
+    return Mock(usage=usage, choices=[Mock(message=Mock(content="ok"))])
+
+
+def test_glm_requests_in_flight_never_exceed_the_account_limit(monkeypatch):
+    from app.services.llm_service import chat_completion
+    monkeypatch.setattr(provider_gate, "_UNSHARED_MULTIPLIER", 1)   # one process holds every place
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def create(**kwargs):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return _response()
+
+    route = _route(3, create)
+    threads = [threading.Thread(target=lambda: chat_completion("s", "u", route=route)) for _ in range(9)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert peak[0] == 3
+
+
+def test_a_glm_request_with_no_free_place_is_rate_limited_and_never_sent(monkeypatch):
+    from app.services.llm_service import LLMCallFailure, chat_completion
+
+    def busy(*args, **kwargs):
+        raise provider_gate.ProviderBusy(provider_gate.ProviderBusy.reason_code)
+    monkeypatch.setattr(provider_gate, "turn", busy)
+    sent = []
+    route = _route(3, lambda **kwargs: sent.append(1) or _response())
+    with pytest.raises(LLMCallFailure) as failure:
+        chat_completion("s", "u", route=route)
+    assert failure.value.category == "rate_limited" and not sent

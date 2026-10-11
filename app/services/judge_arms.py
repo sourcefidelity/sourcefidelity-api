@@ -140,6 +140,7 @@ def _zai_glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
         # Thinking cannot be disabled on GLM-5.3-Flash; lowest effort, room to answer.
         extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": settings.ZAI_REASONING_EFFORT},
         max_output_tokens=_GLM_MAX_OUTPUT_TOKENS,
+        max_in_flight=max(0, int(settings.ZAI_MAX_IN_FLIGHT)),
         # The list price when one is on record; the ceiling bounds the estimate otherwise.
         price_context=lambda model: {"pricing_basis": "configured_ceiling",
                                      "ceiling_usd_per_million": ceiling, "model": model,

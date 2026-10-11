@@ -146,6 +146,11 @@ class Settings(BaseSettings):
     # the lowest effort keeps the answer inside the output allowance.
     ZAI_REASONING_EFFORT: str = "low"
     ZAI_TERMS_VERIFIED_ON: str | None = None
+    # GLM requests in flight across every worker process. Zhipu limits them
+    # per account by spending tier; the account's console showed 50 for
+    # glm-5.3-flash on 2026-10-11. 45 leaves room for other use of the
+    # account. 0 = no cap.
+    ZAI_MAX_IN_FLIGHT: int = 45
     ZAI_MAX_PROMPT_USD_PER_MILLION: float = 0.15
     ZAI_MAX_COMPLETION_USD_PER_MILLION: float = 0.50
     # Spend limits for Judgment runs, in USD. Unset until measured spend lets
