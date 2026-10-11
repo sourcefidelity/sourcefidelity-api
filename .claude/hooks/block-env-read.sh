@@ -33,9 +33,19 @@ deny_credential() {
 # the Settings object with live keys.
 ENV_DUMP_RE='(^|[;&|(`[:space:]])(printenv|export[[:space:]]+-p|declare[[:space:]]+-x)([[:space:]]|$|[;&|)])|(^|[;&|(`[:space:]])env[[:space:]]*($|[;&|)])|docker[[:space:]]+(container[[:space:]]+)?inspect|docker(-|[[:space:]]+)compose([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+config|environ([^[:alnum:]_]|$)|/proc/[^[:space:]]*/environ'
 # Inline code that reads a credential setting or unwraps a secret.
-CREDENTIAL_CODE_RE='settings[.][A-Z0-9_]*(API_KEY|_TOKEN|SECRET_KEY|ACCESS_KEY|PASSWORD|DATABASE_URL|REDIS_URL|BROKER_URL|RESULT_BACKEND)|secret_value[[:space:]]*[(]|get_secret_value|model_dump|getattr[(][[:space:]]*settings'
+CREDENTIAL_CODE_RE='settings[.][A-Z0-9_]*(API_KEY|_TOKEN|SECRET_KEY|ACCESS_KEY|PASSWORD|DATABASE_URL|REDIS_URL|BROKER_URL|RESULT_BACKEND)|secret_value[[:space:]]*[(]|get_secret_value|model_dump'
+# getattr(settings, ...) is refused only when the name looks like a credential
+# or is not written out (a loop could print every setting). A named ordinary
+# setting such as getattr(settings, "PROVIDER_GATE_ENABLED", True) is allowed
+# (loosened 2026-10-11: the blanket rule refused routine setting reads).
+GETATTR_DYNAMIC_RE="getattr[(][[:space:]]*settings[[:space:]]*,[[:space:]]*[^\"'[:space:]]"
+GETATTR_CREDENTIAL_RE="getattr[(][[:space:]]*settings[[:space:]]*,[[:space:]]*[\"'][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_URL|DSN|BACKEND)"
 [[ $command_text =~ $ENV_DUMP_RE ]] && deny_credential
 [[ $command_text =~ $CREDENTIAL_CODE_RE ]] && deny_credential
+[[ $command_text =~ $GETATTR_DYNAMIC_RE ]] && deny_credential
+[[ $command_text =~ $GETATTR_CREDENTIAL_RE ]] && deny_credential
+# A bare "getattr(settings" with nothing after it on this command stays refused.
+[[ $command_text =~ getattr[\(][[:space:]]*settings[[:space:]]*$ ]] && deny_credential
 
 probe=${command_text//.env.example/}
 [[ $probe =~ $SECRET_FILE_RE ]] || exit 0

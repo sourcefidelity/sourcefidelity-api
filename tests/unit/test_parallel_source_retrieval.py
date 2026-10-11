@@ -23,7 +23,7 @@ from app.services.source_resolver import SourceResolutionError
 from tests.unit.test_paper_workflow import MemoryStorage, Resolver
 
 
-def _three_source_paper() -> bytes:
+def _three_source_paper(*, uncited: bool = False) -> bytes:
     document = Document()
     document.add_paragraph("Cranes lift containers (Ames, 2020).")
     document.add_paragraph("Ports automate slowly (Bell, 2021).")
@@ -32,6 +32,8 @@ def _three_source_paper() -> bytes:
     document.add_paragraph("Ames, J. (2020). Lifting containers. Harbour Press.")
     document.add_paragraph("Bell, A. (2021). Slow automation. Harbour Press.")
     document.add_paragraph("Cole, R. (2022). Competing on time. Harbour Press.")
+    if uncited:
+        document.add_paragraph("Dunn, K. (2019). Quiet harbours. Harbour Press.")
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -60,7 +62,7 @@ class SlowResolver(Resolver):
                 self.active -= 1
 
 
-def _retrieve(monkeypatch, workers, resolver):
+def _retrieve(monkeypatch, workers, resolver, *, uncited=False):
     monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _content: (SafetyVerdict.CLEAN, "OK"))
     monkeypatch.setattr(settings, "PAPER_SOURCE_RETRIEVAL_WORKERS", workers)
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
@@ -68,7 +70,7 @@ def _retrieve(monkeypatch, workers, resolver):
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     storage = MemoryStorage()
     with factory() as session:
-        job = create_paper_job(session, storage, content=_three_source_paper(), filename="ports.docx",
+        job = create_paper_job(session, storage, content=_three_source_paper(uncited=uncited), filename="ports.docx",
                                media_type=DOCX_MEDIA_TYPE, scope_id="personal-default")
         extract_paper_job(session, storage, job.id, llm_enabled=False)
         counts = retrieve_paper_sources(session, storage, job.id, resolver=resolver)
@@ -98,7 +100,7 @@ def _plan(reference_id, doi):
 def test_references_to_one_work_run_one_after_another():
     spans, lock = {}, threading.Lock()
 
-    def acquire(plan, context):
+    def acquire(plan, context, resolver=None):
         start = time.monotonic()
         time.sleep(0.05)
         with lock:
@@ -117,7 +119,7 @@ def test_references_to_one_work_run_one_after_another():
 def test_a_failed_search_stops_the_stage_only_after_every_worker_has_finished():
     finished = []
 
-    def acquire(plan, context):
+    def acquire(plan, context, resolver=None):
         if plan["reference"].reference_id == "bad":
             time.sleep(0.03)   # "slow" is under way; a search not yet started is cancelled
             raise RuntimeError("provider exploded")
@@ -195,3 +197,80 @@ def test_a_reference_never_reports_the_previous_references_doi_mismatch(monkeypa
     discovery.clear()
     second = resolver.resolve_reference(reference("Second"))
     assert "doi_title_mismatch" not in second.metadata["reference_discovery"]
+
+
+def test_each_worker_thread_uses_its_own_resolver_copy():
+    made, used, lock = [], {}, threading.Lock()
+
+    def for_worker():
+        copy = object()
+        with lock:
+            made.append(copy)
+        return copy
+
+    def acquire(plan, context, resolver=None):
+        time.sleep(0.02)
+        with lock:
+            used.setdefault(threading.current_thread().name, set()).add(id(resolver))
+        return "result", None
+
+    plans = [_plan(f"r{i}", f"10.1/{i}") for i in range(8)]
+    _acquire_in_parallel(plans, acquire, lambda *args: None,
+                         SearchMemoContext(scope_type="personal", scope_id="p"), 3, resolver_for_worker=for_worker)
+    assert 1 <= len(made) <= 3
+    assert all(len(ids) == 1 for ids in used.values())          # one copy per thread
+    assert len({next(iter(ids)) for ids in used.values()}) == len(used)
+
+
+def test_cited_references_finish_before_bibliography_only_lookups(monkeypatch):
+    calls, lock = [], threading.Lock()
+
+    class Ordered(SlowResolver):
+        def resolve_reference(self, reference, *, identity_only=False):
+            with lock:
+                calls.append(("identity" if identity_only else "cited", time.monotonic()))
+            if identity_only:
+                raise SourceResolutionError("identity lookup only")
+            result = super().resolve_reference(reference)
+            with lock:
+                calls.append(("cited_end", time.monotonic()))
+            return result
+
+    import app.services.bibliography_identity as identity
+    monkeypatch.setattr(identity, "eligible_identity_only", lambda reference: True)
+    _retrieve(monkeypatch, 4, Ordered(), uncited=True)
+    ends = [at for kind, at in calls if kind == "cited_end"]
+    identity_starts = [at for kind, at in calls if kind == "identity"]
+    assert len(ends) == 3 and len(identity_starts) == 1
+    assert identity_starts[0] >= max(ends)
+
+
+def test_a_worker_copy_shares_the_run_budget_but_not_the_web_search_tier(monkeypatch):
+    from app.services.retrieval.web_search import WebSearchRetriever
+    from app.services.source_resolver import SourceResolver
+    main = object.__new__(SourceResolver)
+    web = WebSearchRetriever(health_store=None)
+    academic = SimpleNamespace(name="openalex")
+    main._retrieval_sources = [academic, web]
+    monkeypatch.setattr(WebSearchRetriever, "__init__", lambda self, *a, **k: setattr(self, "search_metrics", None))
+    worker = main.for_worker()
+    worker_web = worker._retrieval_sources[1]
+    assert worker._retrieval_sources[0] is academic
+    assert worker_web is not web and worker_web.search_metrics is web.search_metrics
+    assert worker_web._call_lock() is web._call_lock()
+    assert worker._source_inspection_cache is main._source_inspection_cache
+    assert worker._source_inspection_lock is main._source_inspection_lock
+
+
+def test_core_waits_for_its_process_lock_only_within_the_reference_budget():
+    from app.services.retrieval import core
+    from app.services.retrieval_deadline import deadline_scope
+    core._core_lock.acquire()
+    try:
+        started = time.monotonic()
+        with deadline_scope(0.2):
+            with pytest.raises(core.CoreBusy):
+                core._core_request("https://core.example/search", {})
+        assert time.monotonic() - started < 1.0
+    finally:
+        core._core_lock.release()

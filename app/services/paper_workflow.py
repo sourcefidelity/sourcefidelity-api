@@ -377,19 +377,20 @@ def retrieve_paper_sources(
     author_lookup_slots = sum('author_metadata_lookup' in r for r in results)
     refetch = getattr(active_resolver, "refetch_public_source", None)
 
-    def acquire(plan: dict, context: SearchMemoContext) -> tuple:
+    def acquire(plan: dict, context: SearchMemoContext, resolver=None) -> tuple:
         """Search for or re-download one reference's source. Safe on a worker
         thread: it never uses the job's session (search memos go through
         `context`)."""
         reference, identity_only = plan["reference"], plan["identity_only"]
+        resolver = resolver or active_resolver
         result = None
         if plan["public"] is not None:
             # An open-access copy is downloaded again from its verified address,
             # never searched for (paper-search-reuse-v4, owner decision
             # 2026-10-07); any difference searches again.
             public, reused = plan["public"], plan["reused"]
-            result = refetch(reference, public["href"], provider=public["provider"],
-                             content_sha256=public["content_sha256"])
+            result = resolver.refetch_public_source(reference, public["href"], provider=public["provider"],
+                                                    content_sha256=public["content_sha256"])
             if result is not None:
                 result.metadata = {
                     **(result.metadata or {}),
@@ -401,13 +402,13 @@ def retrieve_paper_sources(
         if result is None:
             try:
                 with search_memo_scope(context):
-                    result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
+                    result = resolver.resolve_reference(reference, identity_only=True) if identity_only else resolver.resolve_reference(reference)
             except SourceResolutionError as exc:
                 return None, exc
         if not identity_only:
             # A validated public copy from any route is kept (owner decision
             # 2026-10-09), so later runs and papers reuse it without a search.
-            retain = getattr(active_resolver, "retain_validated_copy", None)
+            retain = getattr(resolver, "retain_validated_copy", None)
             if retain is not None:
                 retain(reference, result)
         return result, None
@@ -645,7 +646,16 @@ def retrieve_paper_sources(
         else:
             planned.append(plan)
     if planned:
-        _acquire_in_parallel(planned, acquire, record_acquisition, memo_context, workers)
+        # One resolver copy per worker thread (`SourceResolver.for_worker`);
+        # an injected resolver without one is shared as it is.
+        for_worker = getattr(active_resolver, "for_worker", None)
+        # Cited references first, as one at a time: bibliography-only lookups
+        # must not spend the run's search allowance ahead of them.
+        for phase in ([plan for plan in planned if not plan["identity_only"]],
+                      [plan for plan in planned if plan["identity_only"]]):
+            if phase:
+                _acquire_in_parallel(phase, acquire, record_acquisition, memo_context, workers,
+                                     resolver_for_worker=for_worker)
         # Back in reference order, as one-at-a-time retrieval leaves them.
         position = {reference.reference_id: index for index, reference in enumerate(ordered_references)}
         results.sort(key=lambda item: position.get(item.get("reference_id"), len(position)))
@@ -1784,7 +1794,8 @@ def _canonical_work_id(reference) -> str:
     return f"work:{digest}"
 
 
-def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, workers: int) -> None:
+def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, workers: int,
+                         *, resolver_for_worker=None) -> None:
     """Run `acquire` for the planned references on up to `workers` threads and
     `record` each outcome on this thread as it arrives.
 
@@ -1802,6 +1813,16 @@ def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, wor
     from app.services.search.search_memo import DeferredSearchMemoStore
 
     lock = threading.Lock()
+    local = threading.local()
+
+    def resolver():
+        """This thread's own resolver copy, made on its first reference."""
+        if resolver_for_worker is None:
+            return None
+        if getattr(local, "resolver", None) is None:
+            local.resolver = resolver_for_worker()
+        return local.resolver
+
     groups: dict[str, list[dict]] = {}
     for plan in planned:
         groups.setdefault(_canonical_work_id(plan["reference"]), []).append(plan)
@@ -1811,7 +1832,7 @@ def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, wor
         for plan in group:
             store = (DeferredSearchMemoStore(memo_context.store, lock)
                      if memo_context.store is not None else None)
-            outcomes.append((plan, store, acquire(plan, dataclasses.replace(memo_context, store=store))))
+            outcomes.append((plan, store, acquire(plan, dataclasses.replace(memo_context, store=store), resolver())))
         return outcomes
 
     with ThreadPoolExecutor(max_workers=min(workers, len(groups)),

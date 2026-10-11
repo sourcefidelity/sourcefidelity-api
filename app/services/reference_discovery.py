@@ -978,8 +978,11 @@ def build_reference_discovery_candidate(
             container = titles[0]
     container = container if isinstance(container, str) and len(container) <= 1000 else ''
     pages = pages if isinstance(pages, str) and len(pages) <= 100 else ''
-    volume = metadata.get('volume') or ''
-    issue = metadata.get('issue') or ''
+    # Some adapters pass their provider's whole record as metadata; OpenAlex
+    # returned a structured `volume` on 2026-10-11 and the comparison below
+    # failed the paper run. Only a short text or whole number is a volume.
+    volume = _component_scalar(metadata.get('volume'))
+    issue = _component_scalar(metadata.get('issue'))
     for field, observed_value in [('container_title', container), ('pages', pages),
                                   ('volume', volume), ('issue', issue),
                                   ('publisher', observed_publisher)]:
@@ -1116,6 +1119,15 @@ def build_reference_discovery_candidate(
             candidate.registration_observation_sha256 = hashlib.sha256(
                 candidate.observed.model_dump_json().encode()).hexdigest()
     return candidate
+
+
+def _component_scalar(value) -> str:
+    """A volume or issue as text, or '' when the provider gave anything else."""
+    if isinstance(value, bool):
+        return ''
+    if isinstance(value, int):
+        return str(value)
+    return value.strip() if isinstance(value, str) and len(value) <= 80 else ''
 
 
 def _comparison(

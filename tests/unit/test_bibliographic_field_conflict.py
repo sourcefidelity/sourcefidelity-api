@@ -239,3 +239,19 @@ class TestObservedSideIsSurfaced:
         source = inspect.getsource(reference_discovery.build_reference_discovery_candidate)
         assert "('volume', volume)" in source
         assert "('issue', issue)" in source
+
+
+def test_a_structured_volume_from_a_provider_record_never_fails_the_run():
+    # OpenAlex, 2026-10-11: the whole work record is the candidate's metadata
+    # and its `volume` was an object; comparing it failed the paper run.
+    from app.services.reference_discovery import ExpectedBibliographicFields, build_reference_discovery_candidate
+    from app.services.retrieval.base import RetrievalResult
+    expected = ExpectedBibliographicFields(title="Harbour cranes", authors=["Ames, J."], year="2020",
+                                           volume="12", issue="3")
+    result = RetrievalResult(source_name="openalex", success=True, title="Harbour cranes", year="2020",
+                             metadata={"volume": {"value": "12"}, "issue": 3})
+    candidate = build_reference_discovery_candidate(attempt_id="a1", provider="openalex",
+                                                    expected=expected, result=result)
+    outcomes = {c.field_name: c.outcome for c in candidate.comparisons}
+    assert outcomes["volume"] == "unknown"      # not a volume: treated as missing
+    assert outcomes["issue"] == "agreement"     # a whole number is read as text

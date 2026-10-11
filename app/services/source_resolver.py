@@ -8,9 +8,10 @@ import hashlib
 import html
 import logging
 import re
+import threading
 import unicodedata
 import time
-from copy import deepcopy
+from copy import copy as shallow_copy, deepcopy
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
@@ -1111,6 +1112,34 @@ class SourceResolver:
         )
         self._retrieval_sources = get_retrieval_sources()
         self._lookup_cache = RetrievalLookupCache()
+
+    def for_worker(self) -> "SourceResolver":
+        """A copy for one source-retrieval worker thread (owner decision 2026-10-09).
+
+        The academic adapters are shared: their prefetched lookups and run-wide
+        provider cut-offs belong to the whole run, and every request passes the
+        shared provider gate. The web-search tier is the worker's own, because
+        its providers report each call's outcome and cost through attributes
+        read after the call; it shares the run's call counts and their lock,
+        so the per-run ceilings hold across workers. The source-inspection
+        budget and its lock are shared as well.
+        """
+        if getattr(self, "_source_inspection_cache", None) is None:
+            self._source_inspection_cache = {}
+        lock = self.__dict__.setdefault("_source_inspection_lock", threading.Lock())
+        worker = shallow_copy(self)
+        worker._source_inspection_cache = self._source_inspection_cache
+        worker._source_inspection_lock = lock
+        sources = []
+        for source in self._retrieval_sources:
+            if source.name == "web_search" and hasattr(source, "share_run_budget_with"):
+                own = type(source)()
+                own.share_run_budget_with(source)
+                sources.append(own)
+            else:
+                sources.append(source)
+        worker._retrieval_sources = sources
+        return worker
 
     # ── Public API ────────────────────────────────────────
 
@@ -3768,11 +3797,14 @@ class SourceResolver:
         cache = getattr(self, '_source_inspection_cache', None)
         if cache is None:
             cache = self._source_inspection_cache = {}
-        if key in cache:
-            return cache[key]
-        if len(cache) >= max(0, min(settings.SOURCE_INSPECTION_MAX_CALLS, 12)):
-            return {'status': 'not_run', 'reason_code': 'inspection_budget_exhausted', 'decision_applied': False}
-        cache[key] = {'status': 'incomplete', 'reason_code': 'inspection_unavailable', 'decision_applied': False}
+        # One check-and-claim step, so worker copies sharing this run's budget
+        # (`for_worker`) cannot both take its last inspection.
+        with self.__dict__.setdefault('_source_inspection_lock', threading.Lock()):
+            if key in cache:
+                return cache[key]
+            if len(cache) >= max(0, min(settings.SOURCE_INSPECTION_MAX_CALLS, 12)):
+                return {'status': 'not_run', 'reason_code': 'inspection_budget_exhausted', 'decision_applied': False}
+            cache[key] = {'status': 'incomplete', 'reason_code': 'inspection_unavailable', 'decision_applied': False}
         try:
             limitations = []
             if pdf:

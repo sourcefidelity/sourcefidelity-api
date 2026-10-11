@@ -458,6 +458,12 @@ class WebSearchRetriever(RetrievalSource):
             self._policy_query_cache[key] = results, [attempt]
         return results, [attempt]
 
+    def share_run_budget_with(self, other: "WebSearchRetriever") -> None:
+        """Count calls against `other`'s per-run ceilings (one paper run's
+        worker threads each hold their own retriever; `SourceResolver.for_worker`)."""
+        self.search_metrics = other.search_metrics
+        self.__dict__["_call_lock_instance"] = other._call_lock()
+
     def _call_lock(self) -> threading.Lock:
         return self.__dict__.setdefault("_call_lock_instance", threading.Lock())
 

@@ -329,8 +329,14 @@ def _canonical_work(session: Session, identity: WorkIdentity, *, separate_previe
     doi = _normalize_doi(identity.doi)
     isbn = _normalize_isbn(identity.isbn)
     normalized_title = _normalize_title(identity.title)
-    identity_key = doi or isbn or f"{normalized_title}\0{identity.author}\0{identity.year}"
-    _advisory_transaction_lock(session, "canonical-work", identity_key)
+    # One lock per identifier the work may be stored under, in a fixed order:
+    # a chapter admitted by its book's ISBN alone and another by DOI and ISBN
+    # at the same time would otherwise both create the ISBN's row.
+    identity_keys = sorted(key for key in (f"doi:{doi}" if doi else "", f"isbn:{isbn}" if isbn else "") if key)
+    if not identity_keys:
+        identity_keys = [f"{normalized_title}\0{identity.author}\0{identity.year}"]
+    for identity_key in identity_keys:
+        _advisory_transaction_lock(session, "canonical-work", identity_key)
     existing = None
     if doi:
         existing = session.scalar(
