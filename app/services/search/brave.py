@@ -106,6 +106,20 @@ def _request_cost(served: bool) -> float | None:
     return float(price) if served and price is not None else None
 
 
+def _observe_limits(resp) -> None:
+    """Learn the plan's windows from Brave's X-RateLimit headers (sent on every
+    response) and, after a 429, hold every process until the per-second window
+    resets (provider-gate-v1)."""
+    from app.services.retrieval import provider_gate
+    try:
+        provider_gate.learn_limits("brave", resp.headers)
+        if resp.status_code == 429:
+            reset = str(resp.headers.get("X-RateLimit-Reset") or "").split(",")[0].strip()
+            provider_gate.defer("brave", float(reset) if reset else 1.0)
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
 class BraveSearch(SearchProvider):
     """Brave Search API implementation."""
 
@@ -134,6 +148,7 @@ class BraveSearch(SearchProvider):
         }
         try:
             resp = httpx.get(_BRAVE_URL, headers=headers, params=params, timeout=remaining(15))
+            _observe_limits(resp)
             resp.raise_for_status()
             # A request Brave served is billed whatever its content; an error
             # status is assumed unbilled (the pricing page does not say).

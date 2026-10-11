@@ -18,6 +18,8 @@ import re
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.log_safety import safe_exception_code
 from app.services.retrieval.base import SCHOLARLY_PAPER_KINDS, OBSERVED_AUTHOR_LIMIT, RetrievalResult, RetrievalSource
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
@@ -89,7 +91,7 @@ class EricRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request("eric")
         try:
-            response = httpx.get(
+            response = provider_gate.paced_get("eric", self.policy.min_interval_seconds,
                 ERIC_SEARCH,
                 params={
                     "search": f'title:"{cleaned}"',

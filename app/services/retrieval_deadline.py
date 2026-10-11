@@ -41,6 +41,12 @@ def remaining(timeout):
     return value
 
 
+def remaining_seconds():
+    """Seconds left in this reference's budget, or None outside one."""
+    deadline = _DEADLINE.get()
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
 @contextmanager
 def deadline_scope(seconds=REFERENCE_SECONDS):
     deadline = time.monotonic() + seconds

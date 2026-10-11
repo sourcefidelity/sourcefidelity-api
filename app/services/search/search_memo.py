@@ -182,6 +182,46 @@ class SearchMemoStore:
         self._guarded(remove)
 
 
+class DeferredSearchMemoStore:
+    """One reference's memo store while it is resolved off the job's thread.
+
+    Reads use the job's session under `lock` and return a detached copy, so no
+    later commit reloads the row from another thread. Writes and deletes wait
+    in `pending` until the job's thread applies them just before the
+    reference's checkpoint, keeping the rule that a memo commits with it.
+    """
+
+    def __init__(self, store: SearchMemoStore, lock) -> None:
+        self._store = store
+        self._lock = lock
+        self.pending: list[tuple[str, tuple, dict]] = []
+
+    def get(self, scope_type: str, scope_id: str, key: str):
+        from types import SimpleNamespace
+        with self._lock:
+            record = self._store.get(scope_type, scope_id, key)
+            if record is None:
+                return None
+            return SimpleNamespace(**{name: getattr(record, name) for name in (
+                "id", "memo_policy_version", "search_policy_version", "outcome_summary",
+                "created_at", "expires_at")})
+
+    def put(self, *args, **kwargs):
+        self.pending.append(("put", args, kwargs))
+
+    def delete(self, *args, **kwargs):
+        self.pending.append(("delete", args, kwargs))
+
+    def apply(self) -> None:
+        """Run the waiting writes on the job's thread; never fails the run."""
+        pending, self.pending = self.pending, []
+        for operation, args, kwargs in pending:
+            try:
+                getattr(self._store, operation)(*args, **kwargs)
+            except Exception as exc:  # A memo is an optimization.
+                logger.warning("Search memo not updated (type=%s)", type(exc).__name__)
+
+
 def completed_search_summary(trace_payload: dict | None, outcome: str | None) -> dict | None:
     """The memo summary for a completed web search, or None when it must stay retryable."""
     from app.services.reference_discovery import ReferenceDiscoveryTrace, full_text_search_incompleteness

@@ -14,6 +14,8 @@ import re
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.log_safety import safe_exception_code
 from app.services.retrieval.base import OBSERVED_AUTHOR_LIMIT, BOOK_SOURCE_KINDS, RetrievalResult, RetrievalSource
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
@@ -95,7 +97,7 @@ class OpenLibraryRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request("open_library")
         try:
-            response = httpx.get(
+            response = provider_gate.paced_get("open_library", self.policy.min_interval_seconds,
                 OPEN_LIBRARY_SEARCH,
                 params=params,
                 headers=_HEADERS,
@@ -176,7 +178,7 @@ class OpenLibraryRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request("open_library")
         try:
-            response = httpx.get(
+            response = provider_gate.paced_get("open_library", self.policy.min_interval_seconds,
                 f"{OPEN_LIBRARY_BASE}{key}/editions.json",
                 params={"limit": _MAX_EDITIONS},
                 headers=_HEADERS,

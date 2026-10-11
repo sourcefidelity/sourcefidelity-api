@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from functools import wraps
 import logging
 import re
+import threading
 import time
 from collections import Counter
 from typing import Callable, Optional
@@ -44,6 +45,7 @@ from app.services.retrieval.provider_runtime import (
     provider_policy,
 )
 from app.services.search import get_search_provider
+from app.services.retrieval.provider_gate import ProviderBusy
 from app.services.safe_fetch import safe_fetch_bytes
 from app.services.search.base import SearchProvider
 from app.services.search.base import classify_search_failure
@@ -394,8 +396,12 @@ class WebSearchRetriever(RetrievalSource):
             outcome, reason = "access_restricted", "search_retention_permission_unconfirmed"
         elif provider is None:
             outcome, reason = "operational_failure", "provider_not_configured"
-        elif name != "searxng" and not self._policy_call_permitted(name):
+        elif name != "searxng" and not self._reserve_policy_call(name):
             outcome, reason = "budget_skipped", "configured_call_ceiling"
+            self.search_metrics[f"budget_skips:{name}"] += 1
+        elif name != "searxng" and (daily := self._reserve_daily_call(name))[0]:
+            self._release_policy_call(name)
+            outcome, reason = "budget_skipped", daily[0]
             self.search_metrics[f"budget_skips:{name}"] += 1
         elif name == "searxng":
             # Reuse the existing per-engine health, pacing and recovery path.
@@ -411,15 +417,11 @@ class WebSearchRetriever(RetrievalSource):
             self._policy_query_cache[key] = results, attempts
             return results, attempts
         else:
+            from app.services.retrieval import provider_gate
             calls = 1
-            if self.search_metrics[metric] >= self._escalation_limits.get(name, 0):
-                self.search_metrics[f"floor_calls:{name}"] += 1
-            self.search_metrics[metric] += 1
-            reference_calls = _REFERENCE_PROVIDER_CALLS.get()
-            if reference_calls is not None:
-                reference_calls[name] += 1
             try:
-                results = provider.search(query, num_results=num_results)
+                with provider_gate.turn(name, interval=provider_gate.interval_for(name)):
+                    results = provider.search(query, num_results=num_results)
                 # Only adapters that explicitly supply an application-owned
                 # bounded reason expose it; never copy response/error bodies.
                 provider_reason = getattr(provider, "last_reason_code", None)
@@ -428,11 +430,19 @@ class WebSearchRetriever(RetrievalSource):
                 outcome = _provider_search_outcome(provider, results)
                 if not results and getattr(provider, "last_status", None) != "completed" and outcome == "no_results":
                     outcome = "operational_failure"
+            except provider_gate.ProviderBusy:
+                # Never sent (provider-gate-v1): not a call and not a provider failure.
+                calls, results = 0, []
+                outcome, reason = "budget_skipped", provider_gate.ProviderBusy.reason_code
+                self.search_metrics[f"budget_skips:{name}"] += 1
+                self._release_policy_call(name)
+                from app.services.search import search_budget
+                search_budget.release(daily[1])
             except Exception as exc:
                 outcome = classify_search_failure(exc)
             finally:
                 from app.services.processing_metrics import record_search_usage
-                record_search_usage(name, calls, getattr(provider, 'last_cost_usd', None))
+                record_search_usage(name, calls, getattr(provider, 'last_cost_usd', None) if calls else None)
         elapsed = time.monotonic() - started
         self.search_metrics[f"latency_seconds:{name}"] += elapsed
         if calls:
@@ -442,10 +452,48 @@ class WebSearchRetriever(RetrievalSource):
                    "provider_calls": calls, "latency_seconds": elapsed,
                    "cost_usd": getattr(provider, "last_cost_usd", None) if calls else None,
                    "credits_remaining": None, "reason_code": reason}
-        # No Brave response survives a query/tier in the retriever instance.
-        if name != "brave" or not settings.BRAVE_SEARCH_TRANSIENT_ENABLED:
+        # No Brave response survives a query/tier in the retriever instance,
+        # and a call the gate held back may be made later in the run.
+        if (name != "brave" or not settings.BRAVE_SEARCH_TRANSIENT_ENABLED) and reason != ProviderBusy.reason_code:
             self._policy_query_cache[key] = results, [attempt]
         return results, [attempt]
+
+    def _call_lock(self) -> threading.Lock:
+        return self.__dict__.setdefault("_call_lock_instance", threading.Lock())
+
+    def _reserve_policy_call(self, name: str) -> bool:
+        """Check the per-run ceilings and count the call in one locked step,
+        so references searched at once cannot both take the last call."""
+        with self._call_lock():
+            if not self._policy_call_permitted(name):
+                return False
+            metric = f"provider_calls:{name}"
+            if self.search_metrics[metric] >= self._escalation_limits.get(name, 0):
+                self.search_metrics[f"floor_calls:{name}"] += 1
+            self.search_metrics[metric] += 1
+            reference_calls = _REFERENCE_PROVIDER_CALLS.get()
+            if reference_calls is not None:
+                reference_calls[name] += 1
+            return True
+
+    def _release_policy_call(self, name: str) -> None:
+        """Give back a call `_reserve_policy_call` counted but that was not made."""
+        with self._call_lock():
+            metric = f"provider_calls:{name}"
+            self.search_metrics[metric] -= 1
+            if self.search_metrics[metric] >= self._escalation_limits.get(name, 0):
+                self.search_metrics[f"floor_calls:{name}"] -= 1
+            reference_calls = _REFERENCE_PROVIDER_CALLS.get()
+            if reference_calls is not None:
+                reference_calls[name] -= 1
+
+    @staticmethod
+    def _reserve_daily_call(name: str) -> tuple[str | None, list[str]]:
+        """The deployment's and the checking scope's daily budgets (search-daily-budget-v1)."""
+        from app.services.search import search_budget, search_memo
+        context = search_memo.active_context()
+        scope = (context.scope_type, context.scope_id) if context is not None else None
+        return search_budget.reserve(name, scope)
 
     def _policy_call_permitted(self, name: str) -> bool:
         """Job-wide ceiling first, then a bounded per-reference floor.

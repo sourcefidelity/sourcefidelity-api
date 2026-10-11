@@ -17,6 +17,8 @@ import re
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.log_safety import safe_exception_code
 from app.services.processing_metrics import record_provider_request
 from app.services.retrieval.base import (
@@ -76,7 +78,7 @@ class EuropePmcRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request(self.name)
         try:
-            response = httpx.get(SEARCH_URL, params={"query": query, "format": "json", "resultType": "core",
+            response = provider_gate.paced_get("europepmc", self.policy.min_interval_seconds, SEARCH_URL, params={"query": query, "format": "json", "resultType": "core",
                                                      "pageSize": 3}, headers=_HEADERS,
                                  timeout=self.policy.timeout_seconds)
         except httpx.TimeoutException:

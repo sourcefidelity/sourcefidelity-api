@@ -371,73 +371,51 @@ def retrieve_paper_sources(
         session.commit()
 
     from app.services.required_reference_author import eligible_author_lookup, discover_author_metadata
+    from app.services.search.rerun_reuse import downloadable, public_copy
     # Bibliography-only inspection is independent of successful author linking.
     # Keep this new registration path bounded; never acquire an uncited source.
     author_lookup_slots = sum('author_metadata_lookup' in r for r in results)
-    for reference in ordered_references:
-        if (reference.reference_id not in cited_reference_ids
-                and reference.reference_id not in completed_reference_ids
-                and artifact.citation_format.lower() == 'apa'
-                and eligible_author_lookup(reference, artifact.required_author_policy_version)):
-            checkpoint(discover_author_metadata(reference,
-                getattr(active_resolver, '_retrieval_sources', []),
-                permitted=author_lookup_slots < 2))
-            author_lookup_slots += 1
-        if (
-            (reference.reference_id not in cited_reference_ids and not eligible_identity_only(reference))
-            or reference.reference_id in completed_reference_ids
-        ):
-            continue
-        result_record = {"reference_id": reference.reference_id}
-        identity_only = reference.reference_id not in cited_reference_ids
-        if identity_only:
-            result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
-        reused = reused_result(rerun_index, reference, identity_only=identity_only)
-        if reused is not None and reused.get("status") == "durable_authorized":
-            try:
-                authorize_representation(session, backend, representation_id=reused["representation_id"],
-                                         scope_type=job.scope_type, scope_id=job.scope_id)
-            except Exception:
-                reused = None   # the stored source is no longer usable here: search again
-        if (reused is not None and not identity_only
-                and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
-            # A source uploaded since the earlier run is in the library now:
-            # resolve the reference, which finds it before any search (2026-10-07).
-            stored = getattr(active_resolver, "stored_copy_available", None)
-            if stored is not None and stored(reference):
-                reused = None
-        refetched = None
-        from app.services.search.rerun_reuse import downloadable
-        if reused is not None and downloadable(reused):
+    refetch = getattr(active_resolver, "refetch_public_source", None)
+
+    def acquire(plan: dict, context: SearchMemoContext) -> tuple:
+        """Search for or re-download one reference's source. Safe on a worker
+        thread: it never uses the job's session (search memos go through
+        `context`)."""
+        reference, identity_only = plan["reference"], plan["identity_only"]
+        result = None
+        if plan["public"] is not None:
             # An open-access copy is downloaded again from its verified address,
             # never searched for (paper-search-reuse-v4, owner decision
             # 2026-10-07); any difference searches again.
-            from app.services.search.rerun_reuse import public_copy
-            public = public_copy(reused)
-            refetch = getattr(active_resolver, "refetch_public_source", None)
-            refetched = (refetch(reference, public["href"], provider=public["provider"],
-                                 content_sha256=public["content_sha256"])
-                         if public and refetch and not identity_only else None)
-            if refetched is None:
-                reused = None
-            else:
-                refetched.metadata = {
-                    **(refetched.metadata or {}),
+            public, reused = plan["public"], plan["reused"]
+            result = refetch(reference, public["href"], provider=public["provider"],
+                             content_sha256=public["content_sha256"])
+            if result is not None:
+                result.metadata = {
+                    **(result.metadata or {}),
                     "reference_discovery": reused.get("reference_discovery"),
                     "reference_discovery_trace": reused.get("reference_discovery_trace"),
                     "submitted_link_observations": reused.get("submitted_link_observations"),
                 }
-                result_record["search_reuse"] = {**reused["search_reuse"], "public_copy_downloaded": True}
-        if reused is not None and refetched is None:
-            checkpoint(reused)
-            continue
-        try:
-            if refetched is not None:
-                result = refetched
-            else:
-                with search_memo_scope(memo_context):
+                plan["record"]["search_reuse"] = {**reused["search_reuse"], "public_copy_downloaded": True}
+        if result is None:
+            try:
+                with search_memo_scope(context):
                     result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
-        except SourceResolutionError as exc:
+            except SourceResolutionError as exc:
+                return None, exc
+        if not identity_only:
+            # A validated public copy from any route is kept (owner decision
+            # 2026-10-09), so later runs and papers reuse it without a search.
+            retain = getattr(active_resolver, "retain_validated_copy", None)
+            if retain is not None:
+                retain(reference, result)
+        return result, None
+
+    def record_acquisition(plan: dict, result, exc) -> None:
+        """Admit one acquired source and checkpoint it, on the job's thread."""
+        reference, result_record = plan["reference"], plan["record"]
+        if exc is not None:
             result_record.update(
                 status="unavailable",
                 reason_code="source_not_found",
@@ -452,14 +430,14 @@ def retrieve_paper_sources(
             if dependencies:
                 result_record["retryable_provider_dependencies"] = dependencies
             checkpoint(result_record)
-            continue
+            return
         metadata = result.metadata or {}
         result_record["reference_discovery_trace"] = metadata.get(
             "reference_discovery_trace"
         )
         result_record["reference_discovery"] = metadata.get("reference_discovery")
         result_record["submitted_link_observations"] = metadata.get("submitted_link_observations")
-        if identity_only:
+        if plan["identity_only"]:
             # Identity observations do not authorize a representation, abstract,
             # verification run or source admission, even from an injected adapter.
             result_record.update(status="metadata_only", reason_code="bibliography_identity_only")
@@ -468,13 +446,7 @@ def retrieve_paper_sources(
             if dependencies:
                 result_record["retryable_provider_dependencies"] = dependencies
             checkpoint(result_record)
-            continue
-        # A validated public copy from any route is kept (owner decision
-        # 2026-10-09), so later runs and papers reuse it without a search.
-        retain = getattr(active_resolver, "retain_validated_copy", None)
-        if retain is not None:
-            retain(reference, result)
-            metadata = result.metadata or {}
+            return
         representation_id = metadata.get("repository_representation_id")
         admission = metadata.get("durable_admission") or {}
         if admission.get("state") == "accepted":
@@ -505,7 +477,7 @@ def retrieve_paper_sources(
                     source_name=result.source_name,
                 )
             checkpoint(result_record)
-            continue
+            return
         representation = result.representation
         if representation is None or not representation.content:
             abstract_evidence = _bounded_abstract_evidence(
@@ -529,7 +501,7 @@ def retrieve_paper_sources(
             if abstract_evidence:
                 result_record["abstract_evidence"] = abstract_evidence
             checkpoint(result_record)
-            continue
+            return
         try:
             cleanliness = _transient_cleanliness(representation)
         except PaperWorkflowError as exc:
@@ -538,7 +510,7 @@ def retrieve_paper_sources(
                 reason_code=exc.code,
             )
             checkpoint(result_record)
-            continue
+            return
         confidence = metadata.get("identity_confidence")
         provisional = metadata.get('provisional_source') or {}
         possible_match = bool(confidence == 'medium'
@@ -558,7 +530,7 @@ def retrieve_paper_sources(
         if confidence != "high" and not possible_match and not corroborated_landing:
             result_record.update(status="unavailable", reason_code="identity_not_verified")
             checkpoint(result_record)
-            continue
+            return
         completeness = (
             representation.completeness
             or metadata.get("completeness")
@@ -620,6 +592,64 @@ def retrieve_paper_sources(
             if isinstance(stated, dict):
                 result_record['stated_page_completeness'] = dict(stated)
         checkpoint(result_record)
+
+    # References are searched for at the same time (owner decision
+    # 2026-10-09): planning and recording stay on this thread, in reference
+    # order; only `acquire` runs on worker threads.
+    workers = max(1, int(settings.PAPER_SOURCE_RETRIEVAL_WORKERS or 1))
+    planned: list[dict] = []
+    for reference in ordered_references:
+        if (reference.reference_id not in cited_reference_ids
+                and reference.reference_id not in completed_reference_ids
+                and artifact.citation_format.lower() == 'apa'
+                and eligible_author_lookup(reference, artifact.required_author_policy_version)):
+            checkpoint(discover_author_metadata(reference,
+                getattr(active_resolver, '_retrieval_sources', []),
+                permitted=author_lookup_slots < 2))
+            author_lookup_slots += 1
+        if (
+            (reference.reference_id not in cited_reference_ids and not eligible_identity_only(reference))
+            or reference.reference_id in completed_reference_ids
+        ):
+            continue
+        result_record = {"reference_id": reference.reference_id}
+        identity_only = reference.reference_id not in cited_reference_ids
+        if identity_only:
+            result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
+        reused = reused_result(rerun_index, reference, identity_only=identity_only)
+        if reused is not None and reused.get("status") == "durable_authorized":
+            try:
+                authorize_representation(session, backend, representation_id=reused["representation_id"],
+                                         scope_type=job.scope_type, scope_id=job.scope_id)
+            except Exception:
+                reused = None   # the stored source is no longer usable here: search again
+        if (reused is not None and not identity_only
+                and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
+            # A source uploaded since the earlier run is in the library now:
+            # resolve the reference, which finds it before any search (2026-10-07).
+            stored = getattr(active_resolver, "stored_copy_available", None)
+            if stored is not None and stored(reference):
+                reused = None
+        public = None
+        if reused is not None and downloadable(reused):
+            public = public_copy(reused)
+            if not (public and refetch and not identity_only):
+                public = reused = None
+        if reused is not None and public is None:
+            checkpoint(reused)
+            continue
+        plan = {"reference": reference, "record": result_record, "identity_only": identity_only,
+                "reused": reused, "public": public}
+        if workers == 1:
+            record_acquisition(plan, *acquire(plan, memo_context))
+        else:
+            planned.append(plan)
+    if planned:
+        _acquire_in_parallel(planned, acquire, record_acquisition, memo_context, workers)
+        # Back in reference order, as one-at-a-time retrieval leaves them.
+        position = {reference.reference_id: index for index, reference in enumerate(ordered_references)}
+        results.sort(key=lambda item: position.get(item.get("reference_id"), len(position)))
+        job.source_results = list(results)
     # Uncited references are not searched, but their own links are visited so
     # a dead or wrong link is reported (owner decision 2026-10-02).
     check_links = getattr(active_resolver, "check_submitted_links", None)
@@ -1752,6 +1782,52 @@ def _canonical_work_id(reference) -> str:
     identity = reference.doi or reference.title or reference.raw_ref
     digest = hashlib.sha256(identity.strip().casefold().encode("utf-8")).hexdigest()
     return f"work:{digest}"
+
+
+def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, workers: int) -> None:
+    """Run `acquire` for the planned references on up to `workers` threads and
+    `record` each outcome on this thread as it arrives.
+
+    References naming the same work run one after another in one thread, so
+    the later one finds the copy the earlier one stored. Each reference's
+    search memo writes wait for its checkpoint (`DeferredSearchMemoStore`);
+    the job's session is used by one thread at a time under `lock`. Every
+    worker has finished before this returns or raises, so nothing touches the
+    session afterwards.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import contextvars
+    import dataclasses
+    import threading
+    from app.services.search.search_memo import DeferredSearchMemoStore
+
+    lock = threading.Lock()
+    groups: dict[str, list[dict]] = {}
+    for plan in planned:
+        groups.setdefault(_canonical_work_id(plan["reference"]), []).append(plan)
+
+    def run(group: list[dict]) -> list[tuple]:
+        outcomes = []
+        for plan in group:
+            store = (DeferredSearchMemoStore(memo_context.store, lock)
+                     if memo_context.store is not None else None)
+            outcomes.append((plan, store, acquire(plan, dataclasses.replace(memo_context, store=store))))
+        return outcomes
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(groups)),
+                            thread_name_prefix="source-retrieval") as executor:
+        futures = [executor.submit(contextvars.copy_context().run, run, group) for group in groups.values()]
+        try:
+            for future in as_completed(futures):
+                for plan, store, (result, error) in future.result():
+                    with lock:
+                        if store is not None:
+                            store.apply()
+                        record(plan, result, error)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def _refresh_reference_ids(job: Job) -> list[str]:

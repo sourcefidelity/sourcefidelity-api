@@ -10,6 +10,8 @@ import logging
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.config import settings
 from app.log_safety import safe_exception_code
 from app.services.doi_cache import doi_request_segment
@@ -51,8 +53,12 @@ class CrossrefRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request("crossref")
         try:
-            resp = httpx.get(
+            # The mailto header puts requests in Crossref's polite pool: 10 per
+            # second and 3 in flight (crossref.org REST API access, 2026-10-11).
+            resp = provider_gate.paced_get(
+                "crossref", 0.125,
                 url,
+                places=3,
                 headers=self._headers(),
                 params=params,
                 timeout=self.policy.timeout_seconds,

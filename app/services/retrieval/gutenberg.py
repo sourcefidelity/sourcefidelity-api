@@ -10,6 +10,8 @@ from zipfile import BadZipFile, ZipFile
 from bs4 import BeautifulSoup
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.log_safety import safe_exception_code
 from app.services.relevance import extract_surnames, score_relevance
 from app.services.retrieval.base import (
@@ -78,7 +80,7 @@ class GutenbergRetriever(RetrievalSource):
             query = f"{title} {surname}"
         try:
             record_provider_request("gutenberg")
-            response = httpx.get(
+            response = provider_gate.paced_get("gutenberg", self.policy.min_interval_seconds,
                 GUTENBERG_SEARCH,
                 params={"query": query},
                 headers=_HEADERS,
@@ -106,7 +108,7 @@ class GutenbergRetriever(RetrievalSource):
 
     def _fetch_edition(self, item_url: str) -> RetrievalResult:
         record_provider_request("gutenberg")
-        response = httpx.get(
+        response = provider_gate.paced_get("gutenberg", self.policy.min_interval_seconds,
             item_url,
             headers=_HEADERS,
             timeout=self.policy.timeout_seconds,
@@ -151,7 +153,7 @@ class GutenbergRetriever(RetrievalSource):
             return result
         try:
             record_provider_request("gutenberg")
-            response = httpx.get(
+            response = provider_gate.paced_get("gutenberg", self.policy.min_interval_seconds,
                 result.full_text_url,
                 headers=_HEADERS,
                 timeout=max(60, self.policy.timeout_seconds),

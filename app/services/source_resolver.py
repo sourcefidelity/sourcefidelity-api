@@ -23,6 +23,10 @@ from app.services.retrieval_deadline import bounded_reference, expired, POLICY a
 
 # Reference-local fallback only: never an accepted location or reusable cache hit.
 _PROVISIONAL_CANDIDATES: ContextVar = ContextVar("provisional_candidates", default=None)
+# The current reference's candidate graph. Kept per reference, not on the
+# resolver: a reference resolved before building its own graph read the
+# previous reference's rejected DOI as its own (2026-10-10).
+_LAST_GRAPH: ContextVar = ContextVar("last_canonical_work_graph", default=None)
 
 
 def _timed_retrieval(operation):
@@ -1843,6 +1847,7 @@ class SourceResolver:
                 "No completed-search route policy exists for this source kind."
             )
         provisional_token = _PROVISIONAL_CANDIDATES.set([])
+        graph_token = _LAST_GRAPH.set(None)
         try:
             if identity_only:
                 result = self._resolve_identity_only(reference, expected)
@@ -1909,6 +1914,7 @@ class SourceResolver:
                     discovery_payload["doi_title_mismatch"] = mismatch
             return result
         finally:
+            _LAST_GRAPH.reset(graph_token)
             _PROVISIONAL_CANDIDATES.reset(provisional_token)
             _ACTIVE_DISCOVERY_TRACE.reset(token)
 
@@ -2035,7 +2041,7 @@ class SourceResolver:
         invention, so the graph refuses the merge; the discrepancy itself is
         what an instructor needs to see.
         """
-        graph = getattr(self, "_last_graph", None)
+        graph = _LAST_GRAPH.get()
         for candidate in getattr(graph, "rejected_candidates", None) or []:
             if candidate.get("rejection_code") == "doi_registers_a_different_title":
                 return {
@@ -2840,7 +2846,7 @@ class SourceResolver:
                 if result and result.abstract:
                     best_abstract_result = result
 
-            graph = self._last_graph = CanonicalWorkGraph(
+            graph = CanonicalWorkGraph(
                 expected_doi=doi,
                 expected_title=title,
                 expected_author=author,
@@ -2852,6 +2858,7 @@ class SourceResolver:
                 expected_source_kind_confidence=expected_kind.confidence,
                 expected_source_kind_evidence=expected_kind.evidence,
             )
+            _LAST_GRAPH.set(graph)
             # Accuracy first: every adapter still runs whenever the identity
             # question is open. Efficiency second: once the fast metadata
             # routes have confirmed the work *and* a route to its text exists,

@@ -14,6 +14,8 @@ import re
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.log_safety import safe_exception_code
 from app.services.doi_cache import doi_request_segment
 from app.services.retrieval.base import SCHOLARLY_PAPER_KINDS, OBSERVED_AUTHOR_LIMIT, RetrievalResult, RetrievalSource
@@ -79,7 +81,7 @@ class DataCiteRetriever(RetrievalSource):
         self.provider_metrics["calls"] += 1
         record_provider_request("datacite")
         try:
-            response = httpx.get(
+            response = provider_gate.paced_get("datacite", self.policy.min_interval_seconds,
                 url, params=params, headers=_HEADERS,
                 timeout=self.policy.timeout_seconds,
             )

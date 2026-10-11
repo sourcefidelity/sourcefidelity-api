@@ -43,6 +43,16 @@ _CIRCUIT_STATUSES = frozenset({401, 402})
 _RETRY_STATUSES = frozenset({503})
 
 
+def _defer_after_refusal(resp) -> None:
+    """Hold every process back for the Retry-After Exa sent with a 429
+    (exa.ai/docs/admin/billing: limits apply to the whole team)."""
+    from app.services.retrieval import provider_gate
+    try:
+        provider_gate.defer("exa", float(resp.headers.get("Retry-After") or 1.0))
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+
 class ExaSearch(SearchProvider):
     """Exa neural search API implementation."""
 
@@ -77,6 +87,8 @@ class ExaSearch(SearchProvider):
             if resp.status_code in _RETRY_STATUSES:
                 time.sleep(1.0)
                 resp = httpx.post(_EXA_URL, headers=headers, json=payload, timeout=remaining(15))
+            if resp.status_code == 429:
+                _defer_after_refusal(resp)
             resp.raise_for_status()
             data = resp.json()
             items = data["results"]

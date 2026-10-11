@@ -7,6 +7,8 @@ def _process_local_provider_pacing(monkeypatch):
     """Provider pacing tests control their own clock; never touch a real Redis."""
     from app.config import settings
     monkeypatch.setattr(settings, "RETRIEVAL_SHARED_PACING_ENABLED", False)
+    # The cross-process request gate is tested on its own (test_provider_gate.py).
+    monkeypatch.setattr(settings, "PROVIDER_GATE_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)

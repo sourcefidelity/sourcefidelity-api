@@ -6,6 +6,8 @@ import re
 
 import httpx
 
+from app.services.retrieval import provider_gate
+
 from app.config import secret_value, settings
 from app.log_safety import safe_exception_code
 from app.services.retrieval.base import (
@@ -98,7 +100,7 @@ class OpenAlexRetriever(RetrievalSource):
         try:
             self.provider_metrics["calls"] += 1
             record_provider_request("openalex")
-            response = httpx.get(
+            response = provider_gate.paced_get("openalex", 0.0,
                 url,
                 headers=self._headers(),
                 params=params,

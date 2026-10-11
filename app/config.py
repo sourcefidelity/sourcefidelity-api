@@ -191,6 +191,10 @@ class Settings(BaseSettings):
     # transient source alive for the bounded paper workflow without weakening
     # the shorter default lease used by individual verification operations.
     PAPER_SOURCE_RETRIEVAL_LEASE_SECONDS: int = 86_400
+    # References whose sources are searched for at the same time in one paper
+    # (owner decision 2026-10-09). 1 searches them one after another; keep 1
+    # until the search layer is safe to share between threads (STATE §5).
+    PAPER_SOURCE_RETRIEVAL_WORKERS: int = 1
     # Student-paper uploads are temporary workflow inputs, not source-repository
     # objects. The locator is committed before upload and stale cleanup removes
     # an object after this recovery window even if a worker exits hard.
@@ -488,6 +492,19 @@ class Settings(BaseSettings):
     # Lowered from brave:200,exa:150 on 2026-09-29: the spend audit
     # (tmp/search_spend_audit_v1) found no run above brave 91 / exa 51 calls.
     WEB_SEARCH_HARD_MAX_CALLS: str = "brave:120,exa:80"
+    # Paid searches per UTC day for the whole deployment and for each checking
+    # scope (search-daily-budget-v1), e.g. "brave:5000,exa:3000"; empty means
+    # no cap. A refused call leaves the search incomplete, never "not found".
+    WEB_SEARCH_DAILY_MAX_CALLS: str = ""
+    WEB_SEARCH_SCOPE_DAILY_MAX_CALLS: str = ""
+    # Request starts per second shared by every worker process
+    # (provider-gate-v1), below each provider's documented limit (checked
+    # 2026-10-11): Exa 10/s per team (exa.ai/docs/admin/billing), OpenAlex
+    # 100/s (help.openalex.org rate limits). Brave's limit depends on the plan
+    # and is read from its X-RateLimit headers once seen; 1/s until then.
+    # Crossref follows its pool (crossref.py).
+    PROVIDER_REQUESTS_PER_SECOND: str = "brave:1,exa:8,openalex:50"
+    PROVIDER_GATE_ENABLED: bool = True
     GOOGLE_SEARCH_API_KEY: SecretStr | None = None
     GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
     # SearXNG (self-hosted meta-search — recommended for institutions)
