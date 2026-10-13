@@ -1,7 +1,7 @@
 """Whether the application could confirm that a cited work exists.
 
 Owner-approved 2026-09-24 as `reference-verification-v1`; the current policy is
-v2 (2026-09-29/30, see POLICY). This replaces the
+v3 (2026-10-12, see POLICY). This replaces the
 former "potentially fabricated" review flag. The application cannot decide
 fabrication; it can say, truthfully, that the searches suited to the kind of
 work did not locate it. That statement is an Evidence finding, not an Academic
@@ -34,8 +34,16 @@ from app.services.source_type import is_bibliographically_searchable, normalize_
 # Books title searches) and 2026-10-01 (a required web provider skipped by our
 # own budget leaves the search incomplete). v1 values stay readable; nothing
 # parses this string back.
-POLICY = 'reference-verification-v2'
-POLICY_VERSIONS = ('reference-verification-v1', POLICY)
+# v3 (owner decision 2026-10-12): a likely other-language work, a candidate
+# whose title could not be compared across writing systems and a supplied link
+# that answered with unreadable text stay neutral, and a web page confirmed by
+# discovery is verified whatever its link check says. A likely other-language
+# work can be found unverifiable only after its native-script route
+# (native-script-route-v1) completed; a failed or unattempted route stays
+# neutral, and that route's searches neither complete nor fail the ordinary
+# required routes.
+POLICY = 'reference-verification-v3'
+POLICY_VERSIONS = ('reference-verification-v1', 'reference-verification-v2', POLICY)
 FINDING_TYPE = 'unverified_reference'
 LABEL = 'Cannot be verified'
 # Owner wording 2026-09-30.
@@ -120,6 +128,54 @@ def registered_unread_doi(reference, discovery: dict | None, link_observations) 
     if found.group(1) and issue.isdigit() and int(found.group(1)) != int(issue):
         return 'registered'
     return 'agrees'
+
+
+# Reasons that mean every search suited to the kind completed without
+# locating the work; the neutral ones withhold the finding for a reason the
+# searches could not overcome (reference-verification-v3).
+COMPLETED_WITHOUT_MATCH_REASONS = frozenset({
+    'suited_searches_completed_without_match', 'cross_script_candidate_unresolved',
+    'other_language_route_not_searched', 'submitted_link_unreadable',
+})
+
+# Moved to app/services/other_language.py so discovery can trigger the
+# native-script route (native-script-route-v1); re-exported here.
+from app.services.other_language import (  # noqa: E402
+    CJK as _CJK, other_language_signals, split_cited_title,
+)
+
+
+NATIVE_SCRIPT_ROUTE_POLICIES = ('native-script-route-v1',)
+
+
+def _native_script_route_state(discovery: dict) -> str:
+    """'completed', 'incomplete' or 'not_searched' for the work's own script.
+
+    A recorded native-script route (`native-script-route-v1`) decides: only a
+    route whose adapter and web searches completed counts; a route that failed,
+    was skipped by a budget or had no query text stays incomplete. Without a
+    route record, a reference cited in its own script was searched in that
+    script by the ordinary route when a completed query carries Han, kana or
+    Hangul.
+    """
+    route = discovery.get('native_script_route')
+    if isinstance(route, dict) and route.get('policy_version') in NATIVE_SCRIPT_ROUTE_POLICIES:
+        return 'completed' if route.get('status') == 'completed' else 'incomplete'
+    if any(q.get('execution_outcome') in COMPLETED_QUERY and _CJK.search(str(q.get('normalized_query') or ''))
+           for q in discovery.get('queries') or []):
+        return 'completed'
+    return 'not_searched'
+
+
+def _link_unreadable(discovery: dict, link_observations) -> bool:
+    """A supplied link answered, but no readable text could be taken from it."""
+    if any(a.get('reason_code') == 'link_text_unreadable' for a in discovery.get('attempts') or []):
+        return True
+    return any(isinstance(request, dict) and request.get('outcome') == 'response'
+               and isinstance(request.get('http_status'), int) and 200 <= request['http_status'] < 300
+               and request.get('page_observation') == 'readable_text_unavailable'
+               for row in link_observations or [] if isinstance(row, dict)
+               for request in row.get('requests') or [])
 
 
 def _outcomes(candidate: dict) -> dict:
@@ -307,6 +363,11 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         if web_page_check.get('archive') == 'matched':
             result.update(status='verified', reason_code='archived_page_confirmed')
             return result
+        if isinstance(discovery, dict) and discovery.get('outcome') in CONFIRMED:
+            # Discovery confirmed the work (a student link named it across
+            # writing systems, 2026-10-12): the link check cannot undo that.
+            result.update(status='verified', reason_code=discovery['outcome'])
+            return result
         if web_page_check.get('link') == 'near':
             # The linked page carries nearly the cited title: shown, never flagged.
             result.update(status='possible_match', reason_code='submitted_page_near_title')
@@ -365,7 +426,12 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
     queries = {q.get('query_id'): q for q in discovery.get('queries') or []}
     title = text_key(expected.get('title') or getattr(reference, 'title', '') or '')
     completed, failed, web, self_skipped = set(), set(), set(), set()
+    # The native-script route has its own completion record; its searches
+    # neither complete nor fail the ordinary required routes.
+    native_attempts = set((discovery.get('native_script_route') or {}).get('attempt_ids') or [])
     for attempt in discovery.get('attempts') or []:
+        if attempt.get('attempt_id') in native_attempts:
+            continue
         category, provider = attempt.get('route_category'), attempt.get('provider')
         attempted = [queries[q] for q in attempt.get('query_ids') or [] if q in queries]
         route_done = attempt.get('permitted') and attempt.get('completed_at') and attempt.get('outcome') in COMPLETED_ROUTE
@@ -411,6 +477,27 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         return result
     if doi_state:
         result['reason_code'] = 'registered_doi_unread'
+        return result
+    # Owner decision 2026-10-12: searches that could not reach the work are
+    # no sign that it is missing. A candidate titled in another writing
+    # system that nothing compared, a work in another language that no search
+    # looked for in its own script, and a supplied link that answered with
+    # text that could not be read all leave the reference not assessed.
+    if any(c.get('field_name') == 'title' and c.get('reason_code') == 'cross_script_title_unresolved'
+           for candidate in candidates for c in candidate.get('comparisons') or []):
+        result['reason_code'] = 'cross_script_candidate_unresolved'
+        return result
+    signals = other_language_signals(reference)
+    native_state = _native_script_route_state(discovery) if signals else 'completed'
+    if native_state != 'completed':
+        # Only a completed search in the work's own script can stand behind
+        # the finding; a failed or unattempted one stays neutral (2026-10-12).
+        result.update(reason_code=('other_language_route_incomplete' if native_state == 'incomplete'
+                                   else 'other_language_route_not_searched'),
+                      other_language_signals=signals)
+        return result
+    if _link_unreadable(discovery, link_observations):
+        result['reason_code'] = 'submitted_link_unreadable'
         return result
     searched = [PROVIDER_NAMES.get(p, p) for p in required] + [PROVIDER_NAMES[p] for p in sorted(web)]
     finding = dict(

@@ -100,12 +100,13 @@ class OpenAlexRetriever(RetrievalSource):
         try:
             self.provider_metrics["calls"] += 1
             record_provider_request("openalex")
-            response = provider_gate.paced_get("openalex", 0.0,
+            response = provider_gate.retry_unopened_connection(lambda: provider_gate.paced_get(
+                "openalex", 0.0,
                 url,
                 headers=self._headers(),
                 params=params,
                 timeout=self.policy.timeout_seconds,
-            )
+            ))
         except httpx.HTTPError as exc:
             self.provider_metrics["network_errors"] += 1
             raise RuntimeError(

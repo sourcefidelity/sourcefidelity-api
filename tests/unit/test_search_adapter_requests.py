@@ -143,3 +143,33 @@ def test_tavily_price_accepts_a_currency_sign(raw):
 
 def test_blank_tavily_price_is_unpriced():
     assert Settings(_env_file=None, TAVILY_USD_PER_CREDIT="").TAVILY_USD_PER_CREDIT is None
+
+
+def test_a_connection_that_never_opened_is_tried_once_more(monkeypatch):
+    # 2026-10-11: bursts of dropped connections failed Brave, Exa and OpenAlex
+    # calls; a request that never connected was never billed.
+    from app.services.retrieval import provider_gate
+    from app.services.search.brave import BraveSearch
+    monkeypatch.setattr(provider_gate.time, "sleep", lambda seconds: None)
+    post = Mock(side_effect=[httpx.ConnectError("eof"), _json(200, {"results": []})])
+    monkeypatch.setattr("app.services.search.exa.httpx.post", post)
+    provider = ExaSearch("test-key")
+    assert provider.search("q") == [] and provider.last_status == "completed" and post.call_count == 2
+    get = Mock(side_effect=httpx.ConnectError("eof"))
+    monkeypatch.setattr("app.services.search.brave.httpx.get", get)
+    brave = BraveSearch("test-key")
+    assert brave.search("q") == [] and brave.last_status != "completed" and get.call_count == 2
+
+
+def test_a_timeout_or_a_spent_budget_is_not_retried(monkeypatch):
+    from app.services.retrieval import provider_gate
+    monkeypatch.setattr(provider_gate.time, "sleep", lambda seconds: None)
+    timed_out = Mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(httpx.ReadTimeout):
+        provider_gate.retry_unopened_connection(timed_out)
+    assert timed_out.call_count == 1
+    refused = Mock(side_effect=httpx.ConnectError("eof"))
+    monkeypatch.setattr(provider_gate, "remaining_seconds", lambda: 3.0)
+    with pytest.raises(httpx.ConnectError):
+        provider_gate.retry_unopened_connection(refused)
+    assert refused.call_count == 1

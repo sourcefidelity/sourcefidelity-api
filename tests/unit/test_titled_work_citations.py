@@ -61,3 +61,36 @@ def test_a_file_carrying_a_borrowed_doi_must_show_the_cited_title():
     data = document.tobytes(); document.close()
     assert _cited_title_on_front_pages(data, "Creative Sustainability of Screen Business in the Regions")
     assert not _cited_title_on_front_pages(data, "Dependency and Sustainability in the Australian Film Industry")
+
+
+def test_a_quoted_title_with_a_reference_is_not_named_missing():
+    """A title some reference carries is not a missing entry (owner decision 2026-10-12)."""
+    from app.services.schemas import ParsedReference
+    sentence = 'The later "Rules on Network Audio Services" (2016) extend this.'
+    found = marker(sentence, 2016)
+    rules = ParsedReference(reference_id="r1", author="Northfield Ministry of Media", year="2016",
+                            title="Rules on network audio services")
+    extraction = SimpleNamespace(citations=[], citation_marker_census=[found], references=[rules])
+    assert _missing_reference_members(extraction, found.passage_start, found.passage_end) == []
+    extraction.references = []
+    assert _missing_reference_members(extraction, found.passage_start, found.passage_end) == [
+        'Rules on Network Audio Services, 2016']
+
+
+def test_straight_single_and_mixed_quotes_name_a_missing_title():
+    assert members("Section 7 of 'Measures for Broadcast Archives' (2010) applies.", 2010) == [
+        'Measures for Broadcast Archives, 2010']
+    assert members("Section 7 of ‘Measures for Broadcast Archives' (2010) applies.", 2010) == [
+        'Measures for Broadcast Archives, 2010']
+
+
+def test_an_apostrophe_inside_a_word_is_not_a_quote():
+    from app.services.citation_extractor import quoted_title_before
+    text = "the People's Archive' (2016)"
+    assert quoted_title_before(text, text.index("(")) is None
+    text = "under 'The People's Archive Rules' (2016)"
+    assert quoted_title_before(text, text.index("("))[1] == "The People's Archive Rules"
+    # A closing mark followed by more words is another quotation, not one title.
+    text = "the 'best' students' (2016)"
+    assert quoted_title_before(text, text.index("(")) is None
+    assert members("Coverage rose among the publishers' (2016) members.", 2016) == []

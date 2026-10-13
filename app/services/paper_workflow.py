@@ -286,11 +286,7 @@ def retrieve_paper_sources(
     artifact = _extraction(job)
     _enter(job, JobStage.RETRIEVING)
     session.commit()
-    cited_reference_ids = {
-        reference_id
-        for claim in artifact.citation_claims
-        for reference_id in claim.reference_ids
-    }
+    cited_reference_ids = _cited_reference_ids(artifact)
     active_resolver = resolver or SourceResolver()
     # What this scope keeps (owner decision 2026-10-09).
     from app.services.storage_policy import policy_for
@@ -484,6 +480,7 @@ def retrieve_paper_sources(
             abstract_evidence = _bounded_abstract_evidence(
                 result.abstract,
                 source_name=result.source_name,
+                provenance=metadata.get("abstract_provenance"),
             )
             # A required web search that was skipped (call ceiling, cooldown,
             # elapsed budget) or failed did not finish; "not retrieved" would
@@ -537,6 +534,18 @@ def retrieve_paper_sources(
             or metadata.get("completeness")
             or "not_assessed"
         )
+        if getattr(representation, "kind", None) == RepresentationKind.PLAIN_TEXT:
+            # Every route ends here, reuse included (2026-10-13): an index record
+            # is not the work, and a page of notes or listings is never whole.
+            from app.services.abstract_only_pages import mostly_notes_or_listings
+            from app.services.source_validator import _detect_nonwork_listing
+            text = representation.content.decode("utf-8", "replace")
+            if _detect_nonwork_listing(" ".join(text.split()), getattr(reference, "title", None)):
+                result_record.update(status="unavailable", reason_code="representation_is_a_listing")
+                checkpoint(result_record)
+                return
+            if str(completeness).casefold() == "complete" and mostly_notes_or_listings(text):
+                completeness = "not_assessed"
         try:
             run = begin_verification_run(
                 session,
@@ -978,7 +987,7 @@ def verify_paper_sources(
         "report_ids": report_ids,
         "source_failures": failures,
         "submitted_link_observations": project_observations(artifact.references, source_results,
-            cited_reference_ids={ref_id for claim in artifact.citation_claims for ref_id in claim.reference_ids}),
+            cited_reference_ids=_cited_reference_ids(artifact)),
         "citation_groups": _citation_group_index(
             artifact.citation_claims,
             report_members,
@@ -1152,6 +1161,14 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
             evidence_view,
             backend.download(paper_artifact.presentation_storage_key),
         )
+    # Evidence sentences shown in another language than the statement carry
+    # their English translation (owner decision 2026-10-13); never fails the run.
+    from app.services.evidence_translation import stored_translations, translate_report_view
+    translations, evidence_view = translate_report_view(
+        evidence_view, enabled=settings.PAPER_LLM_PROCESSING_ENABLED,
+        known=stored_translations(previous_report.report_json if previous_report else None))
+    if translations:
+        aggregate_payload["evidence_translations"] = translations
     if previous_report and refresh:
         aggregate_payload["amendment"] = _targeted_amendment_manifest(
             refresh,
@@ -1610,12 +1627,21 @@ def _shadow_artifact(
     source_title: str = "",
     scope_excerpt: str = "",
 ) -> VerificationEvidenceArtifact:
+    # A source in another writing system than the statement
+    # (cross-language-evidence-v1): recorded on the evidence, the quotation
+    # check is not assessable, and the statement translated into the source's
+    # language is searched as extra, labelled retrieval queries.
+    from app.services.cross_language_evidence import claim_inputs
+    cross_language, translated_queries = claim_inputs(source, getattr(claim, "text", "") or "",
+                                                      llm_enabled=llm_enabled)
     evidence = build_passage_evidence(
         source,
         claim=claim,
         top_k=3,
         active_reference_id=active_reference_id,
         cited_author_label=cited_author_label,
+        cross_language=cross_language,
+        translated_queries=translated_queries,
     )
     if source.identity_verdict == 'possible_match' and identity_reason:
         evidence.source_identity.limitations.append(identity_reason[:1000])
@@ -1637,7 +1663,8 @@ def _shadow_artifact(
         )
     evidence = attach_evidence_obligations(evidence)
     if not topically_mismatched:
-        evidence = attach_candidate_passage_retrieval(source, evidence)
+        evidence = attach_candidate_passage_retrieval(source, evidence,
+                                                      translated_queries=translated_queries)
     if llm_enabled and not topically_mismatched:
         evidence = apply_passage_relevance_gate(evidence, source_title=source_title)
         if (
@@ -1657,6 +1684,14 @@ def _shadow_artifact(
             evidence = evidence.model_copy(update={
                 "joint_evidence_selection": select_joint_evidence(evidence, source_title=source_title),
             })
+    if (settings.CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED and not topically_mismatched
+            and (evidence.cross_language or {}).get("differs")):
+        # A source in another writing system (cross-language-whole-source-v1,
+        # owner decision 2026-10-13): the selector and the Judgment foundation
+        # read the whole source when it fits, since a translated query can
+        # miss a passage worded differently.
+        from app.services.cross_language_whole_source import attach_whole_source
+        evidence = attach_whole_source(source, evidence)
     if llm_enabled and not topically_mismatched:
         # The citation's one evidence list (owner decision 2026-09-28): GLM picks
         # the numbered source sentences; without it the gate's display is used.
@@ -1767,7 +1802,7 @@ def _transient_cleanliness(representation) -> str:
     return "clean"
 
 
-def _bounded_abstract_evidence(value, *, source_name: str) -> dict | None:
+def _bounded_abstract_evidence(value, *, source_name: str, provenance: dict | None = None) -> dict | None:
     """Retain bounded abstract evidence without treating it as full text."""
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
@@ -1785,6 +1820,9 @@ def _bounded_abstract_evidence(value, *, source_name: str) -> dict | None:
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "truncated": len(bounded) < len(text),
         "source_name": str(source_name or "scholarly metadata service")[:200],
+        # Why this abstract stands in for a page, and where it came from
+        # (doi-abstract-over-short-page-v1, landing-abstract-back-matter-v1).
+        **({"provenance": dict(provenance)} if isinstance(provenance, dict) else {}),
     }
 
 
@@ -2033,6 +2071,24 @@ def _report_source_failure_reason(source_result: dict) -> str:
         if other_candidate_found
         else "cited_webpage_unavailable"
     )
+
+
+def _cited_reference_ids(artifact) -> set[str]:
+    """References a citation in the paper links to, so they are searched.
+
+    The claims' references, plus those an accepted citation links to whose
+    claim was rejected at the claim boundary (a marker whose membership could
+    not be bound, 2026-10-12): the claim stays rejected, but the reference is
+    cited and is searched and verified like any other.
+    """
+    cited = {reference_id for claim in artifact.citation_claims for reference_id in claim.reference_ids}
+    rejected = {(item.passage_start, item.passage_end, item.citation_marker)
+                for item in getattr(artifact, "claim_boundary_rejections", None) or []}
+    for citation in (getattr(artifact, "citations", None) or []) if rejected else []:
+        if (citation.drop_reason is None and citation.link_status == "linked"
+                and (citation.passage_start, citation.passage_end, citation.citation_marker) in rejected):
+            cited.update(citation.reference_ids)
+    return cited
 
 
 def _claims_by_reference(claims: list) -> dict[str, list]:

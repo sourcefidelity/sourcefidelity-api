@@ -185,6 +185,8 @@ class CanonicalWorkGraph:
                     for result in self.accepted_results
                     if result.abstract
                 ],
+                # The record whose abstract the merged result carries.
+                "abstract_provider": abstract_result.source_name if abstract_result else None,
                 "representation_providers": [
                     result.source_name
                     for result in self.accepted_results

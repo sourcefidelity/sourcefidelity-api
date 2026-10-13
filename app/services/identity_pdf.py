@@ -19,7 +19,8 @@ from app.services.safe_fetch import (
 )
 from app.services.source_validator import (
     _has_prominent_front_title_support, _detect_nonwork_listing,
-    _explicit_first_page_document_years, _normalize_identity_text,
+    _explicit_first_page_document_years, _explicit_opening_byline,
+    _normalize_identity_text,
 )
 
 POLICY = "identity-only-pdf-metadata-v1"
@@ -62,11 +63,7 @@ def _observed_fields(content):
             title = _extract_title_from_first_page(content, page_index=index) or ""
         if not title or not _has_prominent_front_title_support(content, title):
             continue
-        author = str(metadata.get("author") or "")[:300].strip()
-        opening = _normalize_identity_text(text[:2500])
-        if not author or _normalize_identity_text(author) not in opening:
-            match = re.search(r"(?im)^by[ \t]+([^\n]{3,150})$", text[:2500])
-            author = match.group(1).strip() if match else ""
+        author = _explicit_opening_byline(text[:2500], metadata.get("author"))
         # A title or generic heading alone cannot adjudicate a work's identity.
         if not author or len(re.findall(r"[^\W\d_]+", author)) < 2:
             continue

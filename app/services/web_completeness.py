@@ -105,6 +105,9 @@ def assess_web_completeness(html: str, extracted: str) -> dict:
         if restricted and method != 'explicit_article_body':continue
         if re.search(r'\b(?:subscribe to (?:continue|read)|sign in to (?:continue|read)|remaining article|unlock this article)\b',body,re.I):continue
         if all(normalize(p) in actual for p in body.split('\n') if normalize(p) and not _PROMOTION.match(p)):
+            from app.services.abstract_only_pages import mostly_notes_or_listings
+            if mostly_notes_or_listings(extracted):
+                return {**result,'reason':'mostly_notes_or_listings'}
             return {**result,'verdict':'complete','reason':'explicit_article_body_fully_extracted','method':method,
                     'body_sha256':hashlib.sha256(body.encode()).hexdigest(),'body_words':len(expected.split()),
                     'html_sha256':hashlib.sha256(html.encode()).hexdigest(),
@@ -160,6 +163,9 @@ def stated_page_completeness(html: str, text: str, kind: str | None) -> dict:
         return {**result, "reason": "cut_off_signal"}
     if words < STATED_PAGE_MIN_WORDS:
         return {**result, "reason": "too_short_for_a_whole_work"}
+    from app.services.abstract_only_pages import mostly_notes_or_listings
+    if mostly_notes_or_listings(text):
+        return {**result, "reason": "mostly_notes_or_listings"}
     fits = length_fits_kind(words, kind)
     if fits is None:
         return {**result, "reason": "kind_unknown"}

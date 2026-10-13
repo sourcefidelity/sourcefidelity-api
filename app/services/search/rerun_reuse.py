@@ -18,7 +18,9 @@ content hash (``verified-public-source-access-v1``): it is downloaded again
 with the same checks and used only if the file is byte-identical
 (``paper-search-reuse-v4``, owner decision 2026-10-07); otherwise the reference
 is searched again. A transient text without that record is searched again. A search that was
-incomplete, a reference whose parse changed, a cited reference whose earlier
+incomplete, a likely other-language work whose earlier search did not complete
+a search in the work's own script (``native-script-route-v1``,
+``paper-search-reuse-v5``, owner decision 2026-10-12), a reference whose parse changed, a cited reference whose earlier
 record was identity-only (or the reverse) and a targeted refresh with
 ``force_search`` all search again. The reused record keeps its original
 discovery record and dates, so the report reads the original search.
@@ -30,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 
-POLICY = "paper-search-reuse-v4"
+POLICY = "paper-search-reuse-v5"
 _REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
 _INCOMPLETE_REASONS = frozenset({"full_text_search_incomplete", "transient_verification_run_unavailable",
                                  "transient_source_admission_failed", "durable_representation_not_authorized"})
@@ -48,17 +50,17 @@ def reference_signature(reference, *, identity_only: bool) -> tuple:
 
 
 def _required_searches_completed(item: dict, reference: dict | None) -> bool:
-    """reference-verification-v2 found every required search complete."""
+    """reference-verification found every required search complete."""
     if not reference:
         return False
-    from app.services.reference_verification import assess_reference_verification
+    from app.services.reference_verification import COMPLETED_WITHOUT_MATCH_REASONS, assess_reference_verification
     from app.services.schemas import ParsedReference
     try:
         parsed = ParsedReference.model_validate(reference)
     except Exception:
         return False
     verdict = assess_reference_verification(parsed, item.get("reference_discovery"))
-    return verdict.get("reason_code") == "suited_searches_completed_without_match"
+    return verdict.get("reason_code") in COMPLETED_WITHOUT_MATCH_REASONS
 
 
 def public_copy(item: dict) -> dict | None:
@@ -86,6 +88,8 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if item.get("status") == "durable_authorized":
         # The text itself is stored; how the search ended does not matter.
         return bool(item.get("representation_id"))
+    if native_script_route_due(item, reference):
+        return False
     discovery = item.get("reference_discovery") or {}
     if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
             and (reference.get("container_title") or "").strip()
@@ -111,6 +115,25 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if discovery.get("outcome") == "search_incomplete":
         return _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
     return bool(discovery)
+
+
+def native_script_route_due(item: dict, reference) -> bool:
+    """A likely other-language work whose earlier result has no completed
+    search in its own script, and was not confirmed, is searched again
+    (native-script-route-v1): reusing it would keep the reference neutral
+    forever, or reuse a search that never looked where the work is."""
+    if not isinstance(reference, dict):
+        return False
+    from app.services.other_language import other_language_signals
+    if not other_language_signals(reference):
+        return False
+    discovery = item.get("reference_discovery") or {}
+    if discovery.get("outcome") in {"confirmed", "confirmed_with_minor_differences"}:
+        return False
+    from app.services.reference_verification import NATIVE_SCRIPT_ROUTE_POLICIES
+    route = (discovery.get("native_script_route")
+             or (item.get("reference_discovery_trace") or {}).get("native_script_route") or {})
+    return not (route.get("policy_version") in NATIVE_SCRIPT_ROUTE_POLICIES and route.get("status") == "completed")
 
 
 def _no_provider_at_fault(discovery: dict) -> bool:

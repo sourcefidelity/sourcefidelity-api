@@ -247,6 +247,95 @@ def test_title_case_and_missing_publication_details():
     assert found == {('0', TITLE_CASE_TEXT), ('0', PUBLICATION_MISSING_TEXT)}
 
 
+# The mixed-case rule reads the English word lists the image installs; tests
+# use a fixed list so they do not depend on the machine.
+_TEST_COMMON_WORDS = frozenset('''interim provisions administration rules management online services
+commentary ports commerce northern trade relations united provinces regulating everyday life power press
+broadcasting may film industry speaking plainly benjamin pierce warner family corporate transcending time narrative decline actress encyclopedia'''.split())
+
+
+@pytest.fixture(autouse=True)
+def _english_word_list(monkeypatch):
+    from app.services import reference_formatting
+    monkeypatch.setattr(reference_formatting, '_common_words', lambda: _TEST_COMMON_WORDS)
+
+
+def test_mixed_title_and_sentence_case_is_the_same_title_finding():
+    # Owner decision 2026-10-12: counted and shown as the existing title finding.
+    from app.services.reference_formatting import (MIXED_CASE_TEXT, mixed_case_title,
+                                                   reference_entry_findings)
+    assert mixed_case_title('Interim Rules on the Management of Internet publishing')
+    assert mixed_case_title('Rules for the Management of Online services: A commentary')
+    # Sentence case: "Internet" and proper nouns are not title case.
+    assert not mixed_case_title('Regulating the Internet in everyday life')
+    assert not mixed_case_title('Trade relations between Avonia and the United Provinces')
+    assert not mixed_case_title('Trade relations between Avonia and the United Provinces in the nineteenth century')
+    assert not mixed_case_title('The Washington Post and the New York Times coverage of Iraq')
+    assert not mixed_case_title('Power without responsibility: Press, broadcasting and the internet in Britain')
+    # A bracketed translation is ignored.
+    assert not mixed_case_title('Wangluo guanli banfa (Measures on the Governance of Online information)')
+    # Names a located sentence-case record capitalises do not count.
+    assert mixed_case_title('Ports of Commerce and the Northern trade')
+    assert not mixed_case_title('Ports of Commerce and the Northern trade',
+                                ['Ports of Commerce and the Northern trade in grain'])
+    # A located record in title case says nothing about names.
+    assert mixed_case_title('Ports of Commerce and the Northern trade',
+                            ['Ports of Commerce and the Northern Trade'])
+    refs = {}
+    for i, raw in enumerate(['Office, S. (2021). Interim Rules on the Management of Internet publishing. Office Press.',
+                             'Adams, A. (2021). Trade relations between Avonia and the United Provinces. Journal Name, 4(2), 11-19.',
+                             'Lee, B. (2020). Regulating the Internet in everyday life. University Press.']):
+        ref = extract_fields_apa(raw); ref.reference_id = str(i); refs[str(i)] = ref
+    found = [(f['reference_id'], f['finding'], f['rule_id']) for f in reference_entry_findings(refs)
+             if f['finding_type'] == 'reference_title_style']
+    assert found == [('0', MIXED_CASE_TEXT, 'apa7_title_mixed_case_v1')]
+    # Names the word lists only spell capitalised never count (2026-10-12 corpus check).
+    assert not mixed_case_title('Ella May Thorvald and the British film industry')
+    assert not mixed_case_title("Enduring time: Jean Okafor and Hollywood's narrative of decline")
+    assert not mixed_case_title('Vivien Okonkwo | British actress | Encyclopedia')
+    assert not mixed_case_title('Speaking plainly: Ella May Thorvald, Walter Benjamin, and the possibilities of film')
+    assert not mixed_case_title('Hildred Pierce, Warner Bros., and the corporate family')
+    with pytest.MonkeyPatch.context() as patch:
+        # No installed word list: the rule abstains.
+        from app.services import reference_formatting
+        patch.setattr(reference_formatting, '_common_words', lambda: frozenset())
+        assert not mixed_case_title('Interim Rules on the Management of Internet publishing')
+    refs['0'].needs_review = True
+    assert not [f for f in reference_entry_findings(refs) if f['finding_type'] == 'reference_title_style']
+
+
+def test_mixed_case_uses_the_located_records_capitalisation():
+    from datetime import datetime, timezone
+    from app.services.reference_discovery import (ExpectedBibliographicFields, ReferenceRouteAttempt,
+                                                  build_reference_discovery_candidate,
+                                                  derive_reference_discovery_record)
+    from app.services.reference_formatting import located_titles, reference_entry_findings
+    from app.services.retrieval.base import RetrievalResult
+    ref = extract_fields_apa('Adams, A. (2021). Ports of Commerce and the Northern trade. Office Press.')
+    ref.reference_id = 'r'
+
+    def discovery(located):
+        expected = ExpectedBibliographicFields(title=ref.title, year=ref.year, author=ref.author)
+        candidate = build_reference_discovery_candidate(
+            attempt_id='a', provider='crossref', expected=expected,
+            result=RetrievalResult(source_name='crossref', success=True, title=located,
+                                   year=ref.year, authors=['A. Adams']))
+        now = datetime.now(timezone.utc)
+        attempt = ReferenceRouteAttempt(attempt_id='a', provider='crossref', route_category='academic_adapter',
+            required=True, permitted=True, outcome='candidate_found', started_at=now, completed_at=now)
+        record = derive_reference_discovery_record(reference_id='r', expected=expected,
+            required_route_categories=['academic_adapter'], queries=[], attempts=[attempt],
+            candidates=[candidate])
+        return record.model_dump(mode='json')
+
+    titled = lambda d: [f for f in reference_entry_findings({'r': ref}, {'r': d})
+                        if f['finding_type'] == 'reference_title_style']
+    assert titled(None)
+    sentence = discovery('Ports of Commerce and the Northern trade')
+    assert located_titles(ref, sentence) == ['Ports of Commerce and the Northern trade']
+    assert not titled(sentence)
+
+
 def test_title_case_and_publication_checks_are_apa_only():
     # Owner request 2026-10-04: other styles capitalise titles differently.
     from app.services.reference_formatting import reference_style_findings

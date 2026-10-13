@@ -56,6 +56,14 @@ _PRE_CALL_REASONS = (
 )
 
 
+
+def _whole_source_read(payload: dict, candidate_id: str) -> bool:
+    """The candidate's foundation held every sentence of the source."""
+    whole = (payload.get("cross_language") or {}).get("whole_source") or {}
+    found = (whole.get("foundation") or {}).get(candidate_id) or {}
+    return (whole.get("status") == "applied" and found.get("truncated") is False
+            and bool(found.get("whole_source_sentences")))
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -215,6 +223,7 @@ def execute_run(
     call=chat_completion_json,
     wider_search_factory: Callable | None = None,
     coaching_route_factory: Callable | None = None,
+    translation_call: Callable | None = None,
 ) -> JudgmentRun:
     """Judge every eligible candidate of one run; safe to call twice.
 
@@ -246,6 +255,12 @@ def execute_run(
         return finish("failed", "report_not_in_scope")
     view = (report.report_json or {}).get("evidence_report") or {}
     cache = _ScopedCache(session, run)
+    # Judge-cited sentences in another language than the statement get their
+    # English translation (evidence-translation-v1); kept ones are not re-sent.
+    from app.services.evidence_translation import (
+        VERSION as TRANSLATION_VERSION, call_cost, judgment_translations, stored_translations,
+    )
+    known_translations = stored_translations(report.report_json)
     seq = 0
     # DeepSeek writes the notes whichever model judges (owner decision 2026-09-27).
     note_route = next((r for r in routes if r.arm_id == "deepseek"), None)
@@ -299,7 +314,12 @@ def execute_run(
             spend = result.spend_usd
             consecutive_failures = consecutive_failures + 1 if result.reason_code == "judge_failed" else 0
             wider = None
-            if result.display_state == "insufficient":
+            if result.display_state == "insufficient" and _whole_source_read(payload, item.bundle.candidate_id):
+                # The judge read every sentence of the source and none supports
+                # the statement: no wider search is left, so it stands
+                # (owner decision 2026-10-13, cross-language-whole-source-v1).
+                result.reason_code = "whole_source_read"
+            elif result.display_state == "insufficient":
                 # Red only after a wider search of new sentences agrees again.
                 outcome = wider_search(context, item, routes, run, cache, call) if wider_search else None
                 if outcome is None:
@@ -336,11 +356,24 @@ def execute_run(
                                  describes_research=describes_research_literature(context.claim.text))
                 spend += coaching.get("cost_usd") or 0.0
                 coaching = {k: v for k, v in coaching.items() if k != "cache_key"}
+            panel = _panel_json(result)
+            cited = {sid: sentence.text for sid, sentence in prepared.sentences.items()}
+            cited.update((wider or {}).get("sentences") or {})
+            translated, made = judgment_translations((wider or {}).get("panel") or panel, cited,
+                                                     context.claim.text, known=known_translations,
+                                                     completion=translation_call,
+                                                     enabled=settings.PAPER_LLM_PROCESSING_ENABLED)
+            if translated:
+                known_translations.update(translated)
+                panel["evidence_translations"] = translated
+            if made:
+                panel["evidence_translation"] = {"version": TRANSLATION_VERSION, "calls": made}
+                spend += call_cost(made)
             run.spend_usd += spend
             run.unpriced_calls += sum(1 for a in result.arms if not a.cached and a.cost_basis == "unpriced"
                                       and a.receipt)
             write(citation_number, record_id, item.bundle.candidate_id, result.display_state,
-                  result.reason_code, panel=_panel_json(result),
+                  result.reason_code, panel=panel,
                   wider={k: v for k, v in (wider or {}).items() if k != "sentences"} or None,
                   arm_ids=cache.ids([a.cache_key for a in result.arms if a.status == "valid"]),
                   spend=spend, coaching=coaching)

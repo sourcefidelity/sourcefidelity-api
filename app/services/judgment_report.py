@@ -43,6 +43,9 @@ UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported
 EXAMPLE_OF_RESEARCH_NOTE = ("Judged as an example of the research the statement describes; the statement's "
                             "overall picture of the research is the writer's own.")
 REFERRAL_NOTE = "Not judged: a \u201csee\u201d citation points to further reading rather than supporting a statement."
+# Owner-approved wording (2026-10-12) for a citation that is only a quotation; since
+# 2026-10-13 it replaces the window heading (report_judgment.js), not a note.
+QUOTATION_ONLY_NOTE = "Not Judged - Quotation only"
 
 
 def display_state(state: str | None, reason: str | None) -> str:
@@ -63,8 +66,9 @@ _BRACKETED_ONLY = re.compile(r"\((\x00[^\x00]+\x00(?:\s*(?:[-–,]|and)\s*\x00[^
 
 def _sentences(payload: dict, reserve: dict | None) -> dict:
     """sentence id -> {key, text, page}; key = page and absolute position, as the selector's."""
+    from app.services.cross_language_whole_source import stored_passages
     from app.services.evidence_report import evidence_sentence_key
-    passages = {p.get("passage_id"): p for p in [*(payload.get("passages") or []),
+    passages = {p.get("passage_id"): p for p in [*stored_passages(payload),
                                                    *((reserve or {}).get("passages") or [])]}
     found = {}
     for source in (payload.get("facet_evidence_foundation") or {}, (reserve or {}).get("foundation") or {}):
@@ -195,8 +199,18 @@ def _with_references(tokenized: str) -> str:
     return "".join(parts)
 
 
-def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_panel: bool = False) -> dict:
-    """{state, label, html, evidence}: the block below the evidence list, and the sentences it cites."""
+def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_panel: bool = False,
+                    translations: dict | None = None) -> dict:
+    """{state, label, html, evidence}: the block below the evidence list, and the sentences it cites.
+
+    `translations` (sentence key -> English, evidence-translation-v1) adds a
+    `translation` to each cited sentence that has one.
+    """
+    from app.services.evidence_translation import sentence_key, translation_html
+
+    def translated(sentence: dict) -> dict:
+        value = (translations or {}).get(sentence_key(sentence.get("text") or "")) if translations else None
+        return {**sentence, "translation": value} if value else sentence
     state = display_state(row.get("display_state"), row.get("reason_code"))
     reason = row.get("reason_code") or ""
     parts = [f'<section class="judgment-window" data-state="{escape(state)}" data-reason="{escape(reason)}">']
@@ -215,6 +229,7 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         evidence, _ = _cited(arms, sentences,
                              _reasoning(arms[0], facets) if arms else "",
                              _sentence_aliases(foundation, candidate))
+        evidence = [translated(sentence) for sentence in evidence]
         if describes_research_literature((payload.get("claim") or {}).get("text") or ""):
             parts.append(f'<p class="jw-coaching">{escape(EXAMPLE_OF_RESEARCH_NOTE)}</p>')
         coaching = row.get("coaching") or {}
@@ -233,12 +248,13 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
             parts.append(f'<p class="jw-coaching">{escape(UNDECIDED_NOTE)}</p>')
         key = _key_sentence(arms, facets, sentences) if state == "supported" else None
         if key is not None:
+            key = translated({**key, "alternatives": [translated(a) for a in key["alternatives"]]})
             # Shown outside the collapsed list; the page script leaves it out of that list.
             parts.append(
                 f'<ul class="evidence-sentences jw-key-evidence"><li data-key-evidence="{escape(key["key"], quote=True)}" '
-                f'data-key-alternatives="{escape(json.dumps([{"key": a["key"], "text": a["text"], "page": a.get("page")} for a in key["alternatives"]]), quote=True)}">'
+                f'data-key-alternatives="{escape(json.dumps([{"key": a["key"], "text": a["text"], "page": a.get("page"), **({"translation": a["translation"]} if a.get("translation") else {})} for a in key["alternatives"]]), quote=True)}">'
                 + (f'<span class="ev-page">p. {escape(str(key["page"]))}</span> ' if key.get("page") else "")
-                + f'<q>{escape(key["text"])}</q></li></ul>')
+                + f'<q>{escape(key["text"])}</q>{translation_html(key.get("translation"))}</li></ul>')
     elif state == "undecided":
         # Answers with no shared result show their note about the statement and the
         # source (2026-10-03), else the fixed note; otherwise the statement was unresolved.

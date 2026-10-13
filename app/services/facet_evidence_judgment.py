@@ -62,6 +62,7 @@ FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v7"
 # at real sentences; longer ones are merged far less.
 MAX_EVIDENCE_SENTENCES_PER_CANDIDATE = 128
 MIN_EVIDENCE_SENTENCES_PER_CANDIDATE = 24
+_PROMPT_OVER_BUDGET = "The fixed facet prompt exceeded its configured budget."
 MAX_FOUNDATION_SOURCE_SENTENCES = 1024
 
 _SYSTEM_PROMPT = """Map fixed student facet IDs to fixed source-sentence IDs.
@@ -284,8 +285,16 @@ class _EvidenceSentenceBudgetExceeded(ValueError):
 def _build_facet_evidence_foundation(
     artifact: VerificationEvidenceArtifact,
     max_sentences: int | None = None,
+    retrieved_only: frozenset = frozenset(),
 ) -> VerificationEvidenceArtifact:
-    """Attach exact facets and sentence-like evidence spans without a model."""
+    """Attach exact facets and sentence-like evidence spans without a model.
+
+    For a source in another writing system whose whole text fit the evidence
+    selector (cross-language-whole-source-v1), a candidate's sentences come
+    from the whole source within the same cap; `retrieved_only` names the
+    candidates whose whole-source prompt would exceed the Judgment input
+    budget, which keep their retrieved sentences.
+    """
     if max_sentences is None:
         max_sentences = MAX_EVIDENCE_SENTENCES_PER_CANDIDATE
     candidate_set = artifact.verification_candidates
@@ -319,6 +328,8 @@ def _build_facet_evidence_foundation(
     bundles: list[CandidateFacetBundle] = []
     incomplete = bool(candidate_set.uncovered_segments)
     routed_ids = routed_relationship_candidate_ids(artifact)
+    whole_source = getattr(artifact, "_whole_source", None)
+    whole_source_counts: dict[str, dict] = {}
 
     for candidate in candidate_set.candidates:
         if (
@@ -339,15 +350,25 @@ def _build_facet_evidence_foundation(
                     (selected.rank, passage, _passage_sentences(passage))
                 )
         all_sentence_count = sum(len(group) for _, _, group in sentence_groups)
-        bounded_sentences = _annotate_source_discourse(
-            _bounded_evidence_sentences(
+        if whole_source is not None and candidate.candidate_id not in retrieved_only:
+            from app.services.cross_language_whole_source import foundation_sentences
+            chosen, counts = foundation_sentences(
+                whole_source, artifact, sentence_groups,
+                cap=max(1, max_sentences - len(document_scope_sentences)))
+            whole_source_counts[candidate.candidate_id] = counts
+            # Whole sentences are chosen, never coalesced.
+            all_sentence_count = len(chosen)
+        else:
+            chosen = _bounded_evidence_sentences(
                 sentence_groups,
                 max_sentences=max(
                     1,
                     max_sentences
                     - len(document_scope_sentences),
                 ),
-            ),
+            )
+        bounded_sentences = _annotate_source_discourse(
+            chosen,
             document_scope_sentences,
         )
         has_source_attribution_context = bool(document_scope_sentences) or any(
@@ -393,7 +414,7 @@ def _build_facet_evidence_foundation(
         # Too many distinct sentences across this claim's candidates: merge more
         # rather than fail the record (a long field never fails a paper run).
         return _build_facet_evidence_foundation(
-            artifact, max(MIN_EVIDENCE_SENTENCES_PER_CANDIDATE, max_sentences // 2))
+            artifact, max(MIN_EVIDENCE_SENTENCES_PER_CANDIDATE, max_sentences // 2), retrieved_only)
     if not bundles:
         return _foundation_not_assessed(
             artifact,
@@ -411,7 +432,31 @@ def _build_facet_evidence_foundation(
             "Material qualifier facets overlap the complete candidate intentionally and act as conservative aggregation gates.",
         ],
     )
-    return artifact.model_copy(update={"facet_evidence_foundation": foundation})
+    built = artifact.model_copy(update={"facet_evidence_foundation": foundation})
+    if whole_source is None:
+        return built
+    return _within_judgment_budget(built, max_sentences, retrieved_only, whole_source_counts)
+
+
+def _within_judgment_budget(artifact, max_sentences, retrieved_only, whole_source_counts):
+    """A whole-source candidate whose Judgment prompt would not fit keeps its retrieved sentences."""
+    from app.services.cross_language_whole_source import record_foundation
+    try:
+        prepared = prepare_candidate_prompts(artifact, max_input_tokens=settings.JUDGMENT_MAX_INPUT_TOKENS)
+    except Exception:  # noqa: BLE001 - unchecked: keep the retrieved sentences, never fail the run
+        return _build_facet_evidence_foundation(artifact, max_sentences,
+                                                retrieved_only | frozenset(whole_source_counts))
+    over = frozenset(
+        item.candidate_id for item in prepared.items
+        if isinstance(item, CandidateFacetFinding) and item.candidate_id in whole_source_counts
+        and _PROMPT_OVER_BUDGET in item.limitations
+    )
+    if over:
+        return _build_facet_evidence_foundation(artifact, max_sentences, retrieved_only | over)
+    record = {candidate_id: {**counts, "path": "whole_source"}
+              for candidate_id, counts in whole_source_counts.items()}
+    record.update({candidate_id: {"path": "retrieved_over_judgment_budget"} for candidate_id in retrieved_only})
+    return record_foundation(artifact, record)
 
 
 def apply_facet_evidence_judgment(
@@ -801,7 +846,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "The fixed facet prompt exceeded its configured budget.",
+                    _PROMPT_OVER_BUDGET,
                     context_resolution=(
                         "unresolved" if candidate.requires_antecedent_context else "not_required"
                     ),
@@ -1140,7 +1185,10 @@ def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
     spans = []
     start = 0
     text = passage.text
-    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
+    # Han, kana and Hangul sentences end at 。！？ with no following space; the
+    # closing quotation mark stays with its sentence (cross-language-evidence-v1).
+    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}"
+                          r"|(?<=[。！？])(?![”’」』）\s]|$)|(?<=[。！？][”’」』）])(?!$)")
     # A front-matter label line ("A B S T R A C T") ends what came before it and
     # is no sentence; the title, author and affiliation lines before an
     # abstract label are metadata, not evidence (the owner's article, 2026-10-07).

@@ -19,6 +19,7 @@ from app.services.body_title_formatting import BodyTitleAssessment, assess_body_
 from app.services.citation_extractor import SignalConfig, extract_citations
 from app.services.antecedent_resolver import resolve_claim_antecedents
 from app.services.discourse_context import resolve_claim_discourse_dependencies
+from app.services.quotation_form import QUOTATION_FORM_VERSION, claim_quotation_form
 from app.services.claim_atomizer import (
     AtomizationArtifact,
     atomize_claim_unit,
@@ -270,6 +271,10 @@ def extract_paper_evidence(
             )
             parent_claim = resolve_claim_antecedents(body_text, parent_claim)
             parent_claim = resolve_claim_discourse_dependencies(parent_claim)
+            parent_claim = parent_claim.model_copy(update={
+                "quotation_form": claim_quotation_form(parent_claim, references),
+                "quotation_form_version": QUOTATION_FORM_VERSION,
+            })
         except ValueError as exc:
             claim_boundary_rejections.append(
                 ClaimBoundaryRejection(
@@ -413,6 +418,13 @@ def _build_marker_census(
                 report_passage_start=(report_span[0] if report_span else None),
                 report_passage_end=(report_span[1] if report_span else None),
                 report_text=(report_span[2] if report_span else None),
+                # A tolerant link's differences stay with its marker, so grouping
+                # the sentence with another citation never hides them.
+                link_differences=(
+                    list(dict.fromkeys(d for citation in members for d in citation.link_differences))
+                    if link_status == "linked" and len(member_labels) == 1
+                    else []
+                ),
             )
         )
     broad_parenthetical = re.compile(

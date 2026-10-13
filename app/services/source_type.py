@@ -217,6 +217,32 @@ _JOURNAL_VOLUME_ISSUE_RE = re.compile(
     r",\s*\d{1,4}\s*\(\s*\d{1,4}\s*\)\s*\.?\s*(?=(?:https?://|www\.|$))",
     re.IGNORECASE,
 )
+# A journal numbered by issue alone, "Journal Name, (11), 6-9.": no volume,
+# so the shapes above miss it. The issue must be followed by a page range.
+_JOURNAL_ISSUE_ONLY_RE = re.compile(
+    r",\s*\(\s*\d{1,3}\s*\)\s*,\s*(?:pp?\.\s*)?[A-Za-z]?\d{1,6}\s*[-–—]\s*[A-Za-z]?\d{1,6}(?=[.,;\s]|$)",
+    re.IGNORECASE,
+)
+# A note copied from a translation tool after a reference, "[<title in the
+# original script> (Name Translate).]". It names the tool, not the work, and
+# kept in place it hid the journal that precedes it. Only a bracket that ends
+# with the tool's name in parentheses is recognised; raw_ref keeps it.
+_TRANSLATION_TOOL_NOTE_RE = re.compile(
+    r"\s*[\[【]\s*[^\[\]【】]{0,400}?[(（]\s*(?:[A-Z][A-Za-z]{1,20}\s+Translat(?:e|or|ion)|DeepL)\s*[)）]"
+    r"\s*[.。]?\s*[\]】]"
+)
+
+
+def has_translation_tool_note(text: str | None) -> bool:
+    return bool(_TRANSLATION_TOOL_NOTE_RE.search(str(text or "")))
+
+
+def without_translation_tool_notes(text: str | None) -> str:
+    """The reference text without translation-tool notes, for field parsing only."""
+    value = str(text or "")
+    if not has_translation_tool_note(value):
+        return value
+    return re.sub(r"[ \t]{2,}", " ", _TRANSLATION_TOOL_NOTE_RE.sub(" ", value)).strip()
 # Literal emphasis around the journal or journal-plus-volume can survive in
 # submitted text. Require the complete container/volume/page-range structure;
 # an emphasized phrase alone is not evidence of an article.
@@ -390,7 +416,7 @@ def classify_reference_source_kind(
     typed.  Explicit labels and distinctive container structures are strong;
     a bare URL is only weak evidence for a generic web resource.
     """
-    raw = " ".join((raw_ref or "").split())
+    raw = " ".join(without_translation_tool_notes(raw_ref).split())
     combined = " ".join(part for part in (raw, title or "", url or "") if part)
     normalized_url = (url or "").casefold()
 
@@ -424,7 +450,7 @@ def classify_reference_source_kind(
     if is_traditional_media(raw):
         return _assessment("traditional_media", "high", "explicit media role or format marker")
     if (_JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_VOLUME_ISSUE_RE.search(raw)
-            or _MARKED_JOURNAL_STRUCTURE_RE.search(raw)):
+            or _MARKED_JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_ISSUE_ONLY_RE.search(raw)):
         return _assessment("journal_article", "high", "journal volume/issue/page structure")
     if re.search(r"\bISBN(?:-1[03])?\b", raw, re.I) or _BOOK_EDITION_RE.search(raw):
         return _assessment("monograph", "high", "ISBN or edition marker")

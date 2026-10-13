@@ -178,3 +178,52 @@ def test_chapter_without_editors_keeps_its_book_and_pages():
     assert parsed.pages == '75-116' and parsed.source_kind == 'book_section'
     whole = extract_fields_apa('Rivers, A. (2006). In the shadow of things. Example Press.')
     assert whole.source_kind != 'book_section' and not whole.container_title
+
+
+# 2026-10-12: other-language references. Invented fixtures.
+ROMANISED_CHAPTER = (
+    'Ren, B., Tao, M., & Wen, K. (2018). Meiti ronghe beijing xia de xinwen chuanbo yanjiu '
+    '(A study of news communication under media convergence). In C. Lo (Ed.), Report on the Example '
+    'Media Industry {year} (pp. 117-123). Example Academic Press. https://books.example.org/item/123')
+
+
+@pytest.mark.parametrize('year', ['(2018)', '（2018）'])
+def test_a_bracketed_year_in_a_book_title_keeps_the_container_and_pages(year):
+    parsed = extract_fields_apa(ROMANISED_CHAPTER.format(year=year))
+    assert parsed.container_title == f'Report on the Example Media Industry {year}'
+    assert parsed.pages == '117-123' and parsed.source_kind == 'book_section'
+
+
+def test_a_bracket_other_than_a_year_still_ends_the_container():
+    parsed = extract_fields_apa(
+        'Ames, T. (2017). A part. In B. Poore (Ed.), The book (draft copy) (pp. 1-9). Example Press.')
+    assert parsed.container_title != 'The book (draft copy)'
+
+
+def test_a_translation_tool_note_is_ignored_for_parsing_and_kept_in_the_raw_reference():
+    raw = ('Pan, Y., & Fu, S. (2016). Shuju quanli yu falv baohu yanjiu (Research on data rights and legal '
+           'protection). Example Law and Economy, (11), 6-9.[数据权利与法律保护研究 (Example Translate).] '
+           'https://link.example.net/urlid/abc123')
+    parsed = extract_fields_apa(raw)
+    assert parsed.raw_ref == raw
+    assert parsed.title == 'Shuju quanli yu falv baohu yanjiu (Research on data rights and legal protection)'
+    assert (parsed.container_title, parsed.volume, parsed.issue, parsed.pages) == ('Example Law and Economy', '', '11', '6-9')
+    assert parsed.source_kind == 'journal_article' and parsed.publisher == ''
+    assert parsed.url == 'https://link.example.net/urlid/abc123'
+
+
+def test_an_issue_only_journal_repeated_after_its_url_keeps_the_clean_name():
+    parsed = extract_fields_apa(
+        'Quill, I. (2012). Screen roles. Example Journal of Screen Media, (4), 97-115. Available online: '
+        'https://www.examplejournal.com/Example Journal of Screen Media, (4), 97-115.')
+    assert (parsed.container_title, parsed.issue, parsed.pages) == ('Example Journal of Screen Media', '4', '97-115')
+
+
+def test_only_a_bracket_naming_a_translation_tool_is_a_note():
+    from app.services.source_type import has_translation_tool_note, without_translation_tool_notes
+    assert has_translation_tool_note('Title. Journal, 2(1), 1-9. [原题 (Example Translator)]')
+    assert has_translation_tool_note('Title. Journal, 2(1), 1-9.【原题（DeepL）。】')
+    for kept in ('A study [Doctoral dissertation, Example University].',
+                 'Why we translate [Why We Translate]. Example Press.',
+                 'Title [Translated by A. Person]. Example Press.'):
+        assert not has_translation_tool_note(kept) and without_translation_tool_notes(kept) == kept

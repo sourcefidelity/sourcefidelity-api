@@ -517,6 +517,39 @@ def test_cited_sources_keep_priority_over_uncited_search_budget(monkeypatch):
         assert calls == [(cited_id, False), ("alphabetically-first-uncited", True)]
 
 
+def test_a_reference_linked_only_from_a_rejected_claim_is_still_searched(monkeypatch):
+    """2026-10-12: a claim rejected at the claim boundary stays rejected, but
+    the reference its citation links to is cited and is searched."""
+    from app.services.source_resolver import SourceResolutionError
+    factory, storage, job_id = _retry_test_job(monkeypatch)
+    calls = []
+    class NoSources:
+        def resolve_reference(self, reference, *, identity_only=False):
+            calls.append((reference.reference_id, identity_only))
+            raise SourceResolutionError("Synthetic unavailable source")
+    with factory() as session:
+        job = session.get(Job, job_id)
+        payload = dict(job.extraction_payload)
+        cited_id = payload["references"][0]["reference_id"]
+        webpage = dict(payload["references"][0], source_kind="webpage", needs_review=True)
+        payload["references"] = [*payload["references"], dict(webpage, reference_id="rejected-claim-only"),
+                                 dict(webpage, reference_id="genuinely-uncited")]
+        citation = dict(payload["citations"][0], reference_ids=["rejected-claim-only"], link_status="linked",
+                        citation_marker="(Pan & Fu, 2016)", passage_start=900, passage_end=960)
+        payload["citations"] = [*payload["citations"], citation]
+        payload["claim_boundary_rejections"] = [{"passage_start": 900, "passage_end": 960,
+                                                 "citation_marker": "(Pan & Fu, 2016)",
+                                                 "reason": "citation_marker_membership_incomplete"}]
+        job.extraction_payload = payload
+        job.source_results = []
+        job.stage = "extracted"
+        session.commit()
+        retrieve_paper_sources(session, storage, job_id, resolver=NoSources())
+        assert calls == [(cited_id, False), ("rejected-claim-only", False)]
+        assert "rejected-claim-only" not in {r for c in job.extraction_payload["citation_claims"]
+                                             for r in c["reference_ids"]}
+
+
 @pytest.mark.parametrize("store_only", [False, True])
 def test_finalization_resumes_after_projection_failure(monkeypatch, store_only):
     from app.services import paper_workflow

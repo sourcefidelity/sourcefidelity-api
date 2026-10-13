@@ -250,7 +250,7 @@ def _johnson(*, unscoped_title_searches, structured=False):
 def test_doi_naming_a_different_work_then_unscoped_title_searches_without_match_cannot_be_verified():
     result = assess_reference_verification(ref(), _johnson(unscoped_title_searches=True))
     assert result['status'] == 'cannot_be_verified'
-    assert result['policy_version'] == 'reference-verification-v2'
+    assert result['policy_version'] == 'reference-verification-v3'
 
 
 def test_a_structured_unscoped_title_query_counts_as_title_led():
@@ -453,3 +453,112 @@ def test_a_chapters_book_is_looked_up_under_its_editors():
     assert chapter_editors("Gray, R. (2005). Chapter. In Cooper-Lane, A. (Ed.). Global media (pp. 17-35). Erlbaum.") == "Cooper-Lane, A"
     assert chapter_editors("Elm, T. (1998). Chapter. In S. Neale, & M. Smith (Ed.), Cinema (pp.191-206).") == "S. Neale, & M. Smith"
     assert chapter_editors("Stone, T. (2010). A whole book. Routledge.") == ""
+
+
+# reference-verification-v3 (owner decision 2026-10-12): searches that could
+# not reach a work are no sign that it is missing. Invented fixtures.
+from app.services.reference_verification import other_language_signals
+
+ROMANISED = 'Shuju quanli yu falv baohu yanjiu (Research on data rights and legal protection)'
+
+
+def other_ref(title=ROMANISED, raw=None, kind='journal_article'):
+    return SimpleNamespace(reference_id='ref-0001-000000000001', title=title, source_kind=kind,
+                           raw_ref=raw or f'Pan, Y. (2016). {title}. Example Law Review, 3(11), 6-9.')
+
+
+def searched(reference, **change):
+    """The completed searches of `discovery`, run under this reference's title."""
+    record = discovery(**change)
+    record['expected']['title'] = reference.title
+    for q in record['queries']:
+        q['normalized_query'] = (q['normalized_query'].replace(TITLE.lower(), reference.title.lower())
+                                 .replace(TITLE, reference.title))
+    return record
+
+
+def test_an_ordinary_english_reference_still_cannot_be_verified():
+    result = assess_reference_verification(ref(), discovery())
+    assert result['status'] == 'cannot_be_verified' and result['policy_version'] == 'reference-verification-v3'
+    english = other_ref(title='Can men change (A study of masculinity in example towns)')
+    assert other_language_signals(english) == []
+    assert assess_reference_verification(english, searched(english))['status'] == 'cannot_be_verified'
+
+
+@pytest.mark.parametrize('title', [
+    'Learning to teach (A practical guide)',
+    'Can men change (A study of masculinity)',
+    'Long ago and far away (Revised edition)',
+    'Ma and Pa (Two stories)',
+    'Guide to dune homes (Field notes)',
+])
+def test_an_english_title_with_a_parenthetical_subtitle_has_no_other_language_signal(title):
+    assert other_language_signals(other_ref(title=title)) == []
+
+
+@pytest.mark.parametrize('reference,signal', [
+    (other_ref(), 'romanised_title_with_translation'),
+    (other_ref(title='Rivers of the plain', raw='Lin, Q. (2021). 北方平原的河流 [Rivers of the plain]. Example Press.'),
+     'cjk_characters'),
+    (other_ref(title='Rivers of the plain',
+               raw='Lin, Q. (2021). Rivers of the plain. Example Press. [平原 (Example Translate).]'),
+     'translation_tool_note'),
+])
+def test_a_likely_other_language_work_is_not_assessed(reference, signal):
+    result = assess_reference_verification(reference, searched(reference))
+    assert result['status'] == 'not_assessed' and result['findings'] == []
+    assert result['reason_code'] == 'other_language_route_not_searched'
+    assert signal in result['other_language_signals']
+
+
+def test_a_completed_search_in_the_original_script_restores_the_ordinary_rule():
+    reference = other_ref(title='北方平原的河流', raw='Lin, Q. (2021). 北方平原的河流. Example Press.')
+    assert assess_reference_verification(reference, searched(reference))['status'] == 'cannot_be_verified'
+
+
+def test_a_candidate_titled_in_another_writing_system_leaves_the_reference_not_assessed():
+    page = {'provider': 'web_search', 'observed': {'title': '数据权利与法律保护研究'},
+            'comparisons': [{'field_name': 'title', 'outcome': 'unknown', 'reason_code': 'cross_script_title_unresolved'}]}
+    result = assess_reference_verification(ref(), discovery(candidates=[page]))
+    assert result['status'] == 'not_assessed' and result['reason_code'] == 'cross_script_candidate_unresolved'
+    assert result['findings'] == []
+
+
+def _unreadable_link(status=200, observation='readable_text_unavailable', outcome='response'):
+    return [{'kind': 'url', 'requests': [{'outcome': outcome, 'http_status': status,
+                                         'page_observation': observation}]}]
+
+
+def test_a_supplied_link_that_loads_but_cannot_be_read_leaves_a_book_section_not_assessed():
+    adapters = ('google_books', 'open_library', 'crossref', 'openalex')
+    section = ref('book_section')
+    result = assess_reference_verification(section, discovery(kind='book_section', adapters=adapters),
+                                           None, _unreadable_link())
+    assert result['status'] == 'not_assessed' and result['reason_code'] == 'submitted_link_unreadable'
+    # The same answer recorded on the discovery attempt is enough on its own.
+    record = discovery(kind='book_section', adapters=adapters)
+    record['attempts'].append({'route_category': 'student_url', 'provider': 'student_url_html',
+                               'outcome': 'no_match', 'reason_code': 'link_text_unreadable'})
+    assert assess_reference_verification(section, record)['reason_code'] == 'submitted_link_unreadable'
+    # A missing page is no such answer.
+    missing = assess_reference_verification(section, discovery(kind='book_section', adapters=adapters),
+                                            None, _unreadable_link(404, 'not_assessed', 'not_found'))
+    assert missing['status'] == 'cannot_be_verified'
+
+
+def test_neutral_completed_searches_are_still_reused_on_a_rerun():
+    from app.services.search.rerun_reuse import _required_searches_completed
+    reference = {'reference_id': 'ref-0001-000000000001', 'title': ROMANISED, 'source_kind': 'journal_article',
+                 'raw_ref': f'Pan, Y. (2016). {ROMANISED}. Example Law Review, 3(11), 6-9.'}
+    assert _required_searches_completed({'reference_discovery': searched(other_ref())}, reference)
+
+
+def test_a_confirmed_discovery_outranks_a_link_that_does_not_tell():
+    page = ref('webpage')
+    record = discovery(kind='webpage', adapters=(), outcome='confirmed')
+    check = {'policy_version': 'webpage-verification-v1', 'link': 'not_telling', 'link_reason': 'link_response',
+             'archive': 'not_checked'}
+    result = assess_reference_verification(page, record, check)
+    assert result['status'] == 'verified' and result['reason_code'] == 'confirmed'
+    record['outcome'] = 'search_incomplete'
+    assert assess_reference_verification(page, record, check)['reason_code'] == 'web_page_link_not_telling'

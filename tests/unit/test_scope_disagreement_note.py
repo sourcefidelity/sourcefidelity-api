@@ -203,3 +203,89 @@ def test_a_member_carries_no_field_without_a_consumer():
     assert '"source_completeness"' not in source
     # The verdict itself still reaches the reader, through the message.
     assert "Only part of the source is available" in source
+
+
+class TestEveryAbstractShowsItsComparison:
+    """Owner decision 2026-10-12: the stored subject comparison is shown for
+    every abstract-backed source, also where nothing disagrees."""
+
+    RELEVANT = dict(relevance="generally_relevant", attention=False, stated_scope_conflict="absent",
+                    discrepancy=None, source_scope="", claim_scope="", scope_dimension="")
+
+    def test_a_relevant_abstract_with_empty_scopes_gets_the_note(self):
+        from app.services.report_layers import abstract_scope_note
+        member = _member(_scope(**self.RELEVANT))
+        assert scope_disagreement(member, CITATION) is None
+        note = abstract_scope_note(member, CITATION)
+        assert note == {"note": "The abstract concerns Australian filmmaking; the statement concerns "
+                                "Hollywood. Read the source to judge whether it supports the statement."}
+
+    @pytest.mark.parametrize("change", ["abstract_hash", "claim_hash", "identity", "llm_off",
+                                        "incomplete", "no_comparison", "full_text", "coverage_mismatch",
+                                        "truncated_display"])
+    def test_unbound_or_unidentified_gets_none(self, change):
+        from app.services.report_layers import abstract_scope_note
+        scope = _scope(**self.RELEVANT)
+        member = _member(scope)
+        if change == "abstract_hash":
+            member["best_evidence"] = {"text": TEXT + " More."}
+        elif change == "claim_hash":
+            scope["claim_sha256"] = member["abstract_relevance"]["claim_sha256"] = "0" * 64
+        elif change == "identity":
+            member["reference_identity"] = {"status": "possible_match"}
+        elif change == "llm_off":
+            member["abstract_relevance"] = {"status": "not_assessed",
+                                            "outcome": "abstract_relevance_unavailable"}
+        elif change == "incomplete":
+            scope["status"] = "not_assessed"
+        elif change == "no_comparison":
+            scope["subject_comparison"] = ""
+        elif change == "full_text":
+            member["coverage_level"] = "full_text"
+        elif change == "coverage_mismatch":
+            scope["scope_coverage"] = "full_text"
+        elif change == "truncated_display":
+            member["best_evidence"]["excerpt_truncated"] = True
+        assert abstract_scope_note(member, CITATION) is None
+
+    def test_a_topical_mismatch_keeps_its_mark(self):
+        from app.services.report_layers import abstract_scope_note
+        member = _member()
+        assert topical_mismatch(member, CITATION)
+        assert abstract_scope_note(member, CITATION) is None
+
+    @staticmethod
+    def _with_note(**over):
+        member = TestTheNoteReachesTheReader()._member_with_note()
+        member.pop("scope_disagreement")
+        member["abstract_scope_note"] = {"note": "The abstract concerns Australian filmmaking. "
+                                                 "Read the source to judge whether it supports the statement."}
+        member.update(over)
+        return member
+
+    def test_the_window_shows_it_muted(self):
+        from app.services.evidence_report import _render_member
+        html = _render_member(self._with_note())
+        assert ('<p class="muted">The abstract concerns Australian filmmaking. '
+                'Read the source to judge whether it supports the statement.</p>') in html
+        assert "Judgment" not in html
+
+    def test_a_limited_text_window_shows_it(self):
+        # Owner decision 2026-10-13: limited text gets the note as well.
+        from app.services.evidence_report import _render_member
+        assert "Australian filmmaking" in _render_member(self._with_note(coverage_level="partial_text"))
+
+    def test_a_full_text_source_does_not_show_it(self):
+        from app.services.evidence_report import _render_member
+        assert "Australian filmmaking" not in _render_member(self._with_note(coverage_level="full_text"))
+
+    def test_a_mark_takes_precedence(self):
+        from app.services.evidence_report import _render_member
+        html = _render_member(self._with_note(
+            abstract_scope_attention=True,
+            abstract_relevance={"scope_assessment": {"rationale": "Stated scopes differ."}}))
+        assert "Stated scopes differ." in html and "Read the source to judge" not in html
+
+    def test_the_portable_export_shows_it(self):
+        from app.services.report_export import _portable_member_html
+        assert "Australian filmmaking" in _portable_member_html(self._with_note())

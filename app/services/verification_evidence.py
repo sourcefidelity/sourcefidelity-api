@@ -9,7 +9,7 @@ relationship signal runs is ``inconclusive`` or ``not_assessed``.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -17,10 +17,10 @@ import math
 import re
 import unicodedata
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 import fitz
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_serializer, model_validator
 
 from app.services.schemas import (
     BoundedFieldsMixin,
@@ -240,6 +240,13 @@ class ClaimEvidence(BoundedFieldsMixin):
     paper_version_id: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1, max_length=50_000)
     claim_type: Literal["quotation", "paraphrase"] = "paraphrase"
+    # Quotation only, or quoted words in the student's own claim (owner rule
+    # 2026-10-12, `quotation_form.py`). Omitted when unset, so a claim
+    # extracted before it dumps and hashes exactly as it did.
+    quotation_form: Literal["quotation_only", "embedded", "title", "none"] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+    quotation_form_version: str | None = Field(
+        default=None, max_length=64, exclude_if=lambda value: value is None)
     granularity: Literal["citation_unit", "atomic_claim"] = "citation_unit"
     atomization_method: str = "not_run"
     parent_claim_id: str | None = Field(default=None, max_length=128)
@@ -1443,6 +1450,13 @@ class VerificationEvidenceArtifact(BaseModel):
     # serialized, never part of the Evidence Package or its digest; persisted
     # beside the verification report only when Judgment is enabled.
     _judgment_reserve: dict | None = PrivateAttr(default=None)
+    # Translation-derived retrieval queries (cross-language-evidence-v1).
+    # Private: never serialized; only their hashes are kept in `cross_language`.
+    _translated_queries: list[str] = PrivateAttr(default_factory=list)
+    # The whole source's sentences for a claim in another writing system
+    # (cross-language-whole-source-v1). Private: never serialized; the
+    # `cross_language` record keeps its coordinates and hashes only.
+    _whole_source: Any = PrivateAttr(default=None)
 
     artifact_version: str = ARTIFACT_VERSION
     verification_id: str
@@ -1517,6 +1531,18 @@ class VerificationEvidenceArtifact(BaseModel):
     verdict: VerificationVerdict
     reason_codes: list[str] = Field(default_factory=list)
     retrieval_route: str
+    # The source is written in another writing system than the statement
+    # (cross-language-evidence-v1): scripts, and the provenance of any
+    # translation-derived retrieval queries. Data only; never serialized when
+    # absent, so earlier artifacts and their digests are unchanged.
+    cross_language: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_cross_language(self, handler):
+        payload = handler(self)
+        if self.cross_language is None and isinstance(payload, dict):
+            payload.pop("cross_language", None)
+        return payload
 
     def report_payload(self) -> dict:
         """Return the inspectable JSON-safe payload without source binaries."""
@@ -1716,6 +1742,18 @@ def authorize_representation(
         repairs = validated_repairs(receipt, digest)
         if receipt.get("status") == "repaired" and repairs is None:
             raise EvidenceAuthorizationError("Page repair receipt does not validate")
+    completeness_verdict = record.completeness_verdict
+    if record.representation_kind == "plain_text":
+        # Copies stored before 2026-10-13 are read again wherever they are
+        # used: an index record is not the work, and a page of notes or
+        # listings is never its whole text.
+        from app.services.abstract_only_pages import mostly_notes_or_listings
+        from app.services.source_validator import _detect_nonwork_listing
+        text = content.decode("utf-8", "replace")
+        if _detect_nonwork_listing(" ".join(text.split())):
+            raise SourceTextUnusable("Representation is a listing, not the cited work")
+        if str(completeness_verdict or "").casefold() == "complete" and mostly_notes_or_listings(text):
+            completeness_verdict = "not_assessed"
     return AuthorizedRepresentation(
         representation_id=str(record.id),
         canonical_work_id=str(record.canonical_work_id),
@@ -1729,7 +1767,7 @@ def authorize_representation(
         scope_id=record.scope_id,
         identity_verdict=record.identity_verdict,
         identity_confidence=record.identity_confidence,
-        completeness_verdict=record.completeness_verdict,
+        completeness_verdict=completeness_verdict,
         text_quality=record.text_quality or "unknown",
         edition_or_version=record.edition_or_version,
         created_at=record.created_at,
@@ -1833,8 +1871,17 @@ def build_passage_evidence(
     top_k: int = 3,
     active_reference_id: str | None = None,
     cited_author_label: str | None = None,
+    cross_language: dict | None = None,
+    translated_queries: list[str] | None = None,
 ) -> VerificationEvidenceArtifact:
-    """Retrieve bounded inspectable passages and safely abstain from judgment."""
+    """Retrieve bounded inspectable passages and safely abstain from judgment.
+
+    ``cross_language`` (cross-language-evidence-v1) records that the source is
+    written in another writing system than the statement; then the quotation
+    check is not assessable, and ``translated_queries`` (translation-derived,
+    never evidence) are searched in addition to the unchanged ordinary
+    channels, their passages labelled ``translated_query_lexical``.
+    """
     if source.identity_verdict == 'possible_match' and not source.verification_run_id:
         raise EvidenceAuthorizationError('Possible matches require a submission-scoped verification run')
     _validate_derivative_provenance(source)
@@ -1855,6 +1902,16 @@ def build_passage_evidence(
             source.text_quality == "scan_ocr" and source.derivation_method
         ),
     )
+    if translated_queries and len(candidates) < bounded_top_k:
+        seen = {(c.page_index, c.start, c.end) for c in candidates}
+        for query in translated_queries:
+            for candidate in _retrieve_candidates(pages, claim_text=query, claim_type="paraphrase",
+                                                  page_locator=claim.page_locator, top_k=bounded_top_k):
+                key = (candidate.page_index, candidate.start, candidate.end)
+                if key in seen or len(candidates) >= bounded_top_k:
+                    continue
+                seen.add(key)
+                candidates.append(replace(candidate, method="translated_query_lexical"))
     passages = [
         _passage_evidence(source, candidate) for candidate in candidates
     ]
@@ -1915,6 +1972,18 @@ def build_passage_evidence(
         pages=pages,
         passages=passages,
     )
+    if cross_language and cross_language.get("differs") and claim.quotation_form == "quotation_only":
+        # A quotation of a source in another language is a translation, so a
+        # paraphrase, and is judged as one (owner decision 2026-10-13).
+        claim = claim.model_copy(update={"quotation_form": "embedded"})
+    if cross_language and cross_language.get("differs") and claim.claim_type == "quotation":
+        # Quoted wording in one language cannot be located word for word in a
+        # source written in another; not a located difference.
+        quotation_check = AcademicPracticeCheckEvidence(
+            status="not_assessable", outcome="source_language_differs")
+        if claim.page_locator:
+            locator_check = AcademicPracticeCheckEvidence(
+                status="not_assessable", outcome="quotation_not_located")
     if source.identity_verdict == 'possible_match':
         identity.limitations.insert(0, 'Possible source match—identity not confirmed')
         quotation_check = AcademicPracticeCheckEvidence(status='not_assessable',
@@ -1931,7 +2000,7 @@ def build_passage_evidence(
         source.representation_id,
         source.content_sha256,
     )
-    return VerificationEvidenceArtifact(
+    artifact = VerificationEvidenceArtifact(
         verification_id=verification_id,
         created_at=datetime.now(timezone.utc),
         claim=claim,
@@ -1945,7 +2014,11 @@ def build_passage_evidence(
         verdict=verdict,
         reason_codes=reason_codes,
         retrieval_route=source.provenance,
+        **({"cross_language": dict(cross_language)} if cross_language and cross_language.get("differs") else {}),
     )
+    if translated_queries:
+        artifact._translated_queries = list(translated_queries)
+    return artifact
 
 
 def _source_binding(
@@ -2079,8 +2152,13 @@ def attach_candidate_passage_retrieval(
     top_k: int = MAX_CANDIDATE_PASSAGES,
     accepted_facet_queries_by_candidate: dict[str, list[str]] | None = None,
     excluded_passage_ids_by_candidate: dict[str, set[str]] | None = None,
+    translated_queries: list[str] | None = None,
 ) -> VerificationEvidenceArtifact:
     """Search the complete authorized source separately for each fixed candidate.
+
+    ``translated_queries`` (cross-language-evidence-v1) are the statement in
+    the source's language: translation-derived retrieval text, searched as
+    extra facet channels labelled ``translated`` beside the unchanged ones.
 
     ``excluded_passage_ids_by_candidate`` (Judgment wider-search reserve only)
     skips passages already selected, so the same ranking yields the next ones.
@@ -2091,6 +2169,8 @@ def attach_candidate_passage_retrieval(
     No search result changes a verdict.
     """
     _validate_derivative_provenance(source)
+    if translated_queries is None:
+        translated_queries = list(getattr(artifact, "_translated_queries", None) or [])
     from app.services.citation_use_router import (
         attach_citation_use_routes,
         routed_relationship_candidate_ids,
@@ -2219,6 +2299,7 @@ def attach_candidate_passage_retrieval(
             accepted_facet_queries=(accepted_facet_queries_by_candidate or {}).get(
                 candidate.candidate_id, []
             ),
+            translated_queries=translated_queries,
         )
         items: list[CandidatePassageSelectionItem] = []
         rank = 0
@@ -3640,8 +3721,13 @@ def _candidate_union_candidates(
     top_k: int,
     include_document_metadata: bool = False,
     accepted_facet_queries: list[str] | None = None,
+    translated_queries: list[str] | None = None,
 ) -> tuple[list[tuple[_PassageCandidate, list[str]]], bool, list[str]]:
-    """Union bounded channels and preserve distinct material-facet evidence."""
+    """Union bounded channels and preserve distinct material-facet evidence.
+
+    Translated queries (cross-language-evidence-v1) follow the ordinary facet
+    queries as their own facet slots, channels ``candidate_facet_N_translated_*``.
+    """
     entries: dict[
         tuple[int | None, int, int], tuple[_PassageCandidate, set[str]]
     ] = {}
@@ -3721,6 +3807,18 @@ def _candidate_union_candidates(
             if query and query.strip() and query.strip() != query_text.strip()
         )
     )[:4]
+    translated = [query for query in dict.fromkeys(q.strip() for q in translated_queries or [] if q and q.strip())
+                  if query not in facet_queries][:3]
+    for offset, translated_query in enumerate(translated, start=len(facet_queries) + 1):
+        for candidate in _retrieve_candidates(
+            pages, claim_text=translated_query, claim_type="paraphrase",
+            page_locator=page_locator, top_k=max(top_k * 2, top_k),
+        ):
+            add(candidate, f"candidate_facet_{offset}_translated_lexical")
+        for candidate in _bm25_concept_candidates(
+            pages, query_text=translated_query, page_locator=page_locator, top_k=top_k,
+        ):
+            add(candidate, f"candidate_facet_{offset}_translated_bm25")
     for index, facet_query in enumerate(facet_queries, start=1):
         for candidate in _retrieve_candidates(
             pages,
@@ -3832,6 +3930,7 @@ def _candidate_union_candidates(
         list(entries.values()),
         page_text_by_index={page.index: page.text for page in pages},
     )
+    facet_queries = facet_queries + translated
     ranked = _select_diverse_candidate_entries(
         consolidated,
         query_text=query_text,
@@ -4679,12 +4778,27 @@ _STOPWORDS = frozenset(
 )
 
 
+# Han, kana and Hangul runs. These scripts are written without spaces between
+# words (Hangul with spaces between phrases), so a run is one regex "word";
+# overlapping character pairs stand in for words in retrieval
+# (`cjk-bigram-retrieval-tokens-v1`, cross-language-evidence-v1). Other text
+# is tokenized exactly as before.
+_CJK_RUN = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]+")
+
+
 def _meaningful_tokens(value: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[\w]+", unicodedata.normalize("NFKC", value).casefold())
-        if len(token) >= 3 and token not in _STOPWORDS
-    ]
+    tokens: list[str] = []
+    for token in re.findall(r"[\w]+", unicodedata.normalize("NFKC", value).casefold()):
+        if not _CJK_RUN.search(token):
+            if len(token) >= 3 and token not in _STOPWORDS:
+                tokens.append(token)
+            continue
+        for piece in _CJK_RUN.split(token):
+            if len(piece) >= 3 and piece not in _STOPWORDS:
+                tokens.append(piece)
+        for run in _CJK_RUN.findall(token):
+            tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
+    return tokens
 
 
 _CONCEPT_EQUIVALENTS = {
@@ -5953,6 +6067,11 @@ def claim_terms_present_in_source(
     document = " ".join(
         str(getattr(page, "text", "") or "") for page in pages).lower()
     if not document:
+        return 0, 0
+    from app.services.cross_language_evidence import language_profile
+    if language_profile(document, claim_text)["differs"]:
+        # A source in another writing system cannot contain the statement's
+        # words; their absence is not measured (cross-language-evidence-v1).
         return 0, 0
     present = 0
     for term in terms:

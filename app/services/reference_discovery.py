@@ -17,6 +17,11 @@ from app.services.schemas import bound_text_fields, declared_max_length, note_bo
 
 from app.services.relevance import extract_surnames, score_title_relevance, verify_authors
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
+from app.services.cross_language_identity import (
+    compare_authors as compare_romanised_authors,
+    compare_titles as compare_romanised_titles,
+    latin_title_part_match,
+)
 from app.services.retrieval.base import OBSERVED_AUTHOR_LIMIT, RetrievalResult
 from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, REQUIRED_API_PROVIDERS
 from app.services.search.transient import TransientSearchAudit
@@ -369,6 +374,25 @@ class BibliographicFieldComparison(BaseModel):
     observed_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     outcome: FieldComparisonOutcome
     reason_code: str = Field(min_length=1, max_length=100)
+    # The comparison procedure when it is not the ordinary spelling
+    # comparison (`cross-language-identity-v1`); never serialized when
+    # absent, so stored comparisons and their hashes are unchanged.
+    method: str | None = Field(default=None, max_length=60)
+
+    @model_serializer(mode='wrap')
+    def _omit_absent_method(self, handler):
+        payload = handler(self)
+        if self.method is None:
+            payload.pop('method', None)
+        return payload
+
+
+_ROMANISED_REASONS = frozenset({
+    "romanised_title_match", "romanised_main_title_match", "romanised_title_near_match",
+    "romanised_title_prefix_match", "romanised_near_match_model_same_work",
+    "romanised_title_conflict", "romanised_title_part_match", "cited_translation_title_match",
+    "romanised_author_match", "romanised_author_partial_match", "romanised_author_conflict",
+})
 
 
 class BookEditionMetadata(BaseModel):
@@ -742,6 +766,12 @@ def _title_absence_reason(result, acquisition_outcome: str) -> str | None:
     return None
 
 
+def _organisation_author(authors) -> bool:
+    """A cited author that names an organisation, not people."""
+    from app.services.source_validator import _cited_personal_surnames
+    return bool(authors) and not _cited_personal_surnames(" & ".join(authors))
+
+
 def build_reference_discovery_candidate(
     *,
     attempt_id: str,
@@ -820,7 +850,17 @@ def build_reference_discovery_candidate(
     cross_script_judgment = (result.metadata or {}).get("cross_script_judgment") or {}
     if expected.title or result.title:
         if expected.title and result.title:
-            if cross_script_comparison_unresolved(expected.title, result.title):
+            if cross_script_comparison_unresolved(expected.title, result.title) and (
+                    romanised := compare_romanised_titles(expected.title, result.title)):
+                # A Han-script title read as the cited romanised title
+                # (cross-language-identity-v1, owner decision 2026-10-12).
+                title_outcome = romanised["outcome"]
+                title_reason = romanised["reason_code"]
+                if title_outcome == "minor_difference" and cross_script_judgment.get("same_work") == "yes":
+                    # A near reading the model also judged the same work.
+                    title_outcome, title_reason = "agreement", "romanised_near_match_model_same_work"
+                title_relevant = title_outcome in {"agreement", "minor_difference"}
+            elif cross_script_comparison_unresolved(expected.title, result.title):
                 # The configured model's comparison across writing systems
                 # (cross-script-identity-v1, owner decision 2026-10-06).
                 same_work = cross_script_judgment.get("same_work")
@@ -828,6 +868,12 @@ def build_reference_discovery_candidate(
                 title_reason = {"yes": "cross_script_model_same_work", "no": "cross_script_model_different_work",
                                 "unsure": "cross_script_model_unsure"}.get(same_work, "cross_script_title_unresolved")
                 title_relevant = same_work == "yes"
+            elif part_match := latin_title_part_match(expected.title, result.title):
+                # The record carries only the cited romanised title or only
+                # its cited translation (cross-language-identity-v1).
+                title_outcome = part_match["outcome"]
+                title_reason = part_match["reason_code"]
+                title_relevant = True
             elif _normalize_text(expected.title) == _normalize_text(result.title):
                 title_outcome: FieldComparisonOutcome = "agreement"
                 title_reason = "normalized_title_match"
@@ -894,7 +940,25 @@ def build_reference_discovery_candidate(
 
     if expected.authors or result.authors:
         judged_author = cross_script_judgment.get("author")
-        if expected.authors and result.authors and judged_author in {"agrees", "differs"}:
+        romanised_author = (compare_romanised_authors(expected_author_names, observed_author_names)
+                            if expected.authors and result.authors else None)
+        if (romanised_author and romanised_author["outcome"] == "material_conflict"
+                and _organisation_author(expected.authors)):
+            # A cited organisation against people a page in another language
+            # names (its editor): a translation, not a conflict (2026-10-13).
+            author_outcome, author_reason = "unknown", "cross_script_organisation_author_unresolved"
+        elif romanised_author:
+            # Han-script names read as the cited romanised names
+            # (cross-language-identity-v1).
+            author_outcome = romanised_author["outcome"]
+            author_reason = romanised_author["reason_code"]
+        elif (expected.authors and result.authors and judged_author == "differs"
+                and _organisation_author(expected.authors)):
+            # An organisation named in another language is a translation, and
+            # translations vary ("Central Government" for two named ministries):
+            # no conflict either way (owner decision 2026-10-13).
+            author_outcome, author_reason = "unknown", "cross_script_organisation_author_unresolved"
+        elif expected.authors and result.authors and judged_author in {"agrees", "differs"}:
             author_outcome = "agreement" if judged_author == "agrees" else "material_conflict"
             author_reason = "cross_script_model_author_" + judged_author
         elif expected.authors and result.authors:
@@ -948,6 +1012,12 @@ def build_reference_discovery_candidate(
             year_reason = "year_missing_on_one_side"
         if (result.metadata or {}).get("web_identity", {}).get("date_method") == "catalog_publication_date" and observed_year:
             year_reason = "catalog_publication_year_" + year_outcome
+        if (year_outcome == "material_conflict" and cross_script_judgment.get("same_work") == "yes"
+                and int(observed_year) > int(expected_year)):
+            # A page in another writing system judged to be the cited work and
+            # dated later was posted or republished then (a regulation reposted
+            # years after it was issued, 2026-10-12); the date is not the work's.
+            year_outcome, year_reason = "unknown", "cross_script_page_dated_later"
         if year_outcome == "material_conflict" and is_edition_sensitive_reference(expected) and not edition_match:
             year_outcome, year_reason = "unknown", "book_edition_year_unresolved"
         comparisons.append(
@@ -1138,6 +1208,7 @@ def _comparison(
     reason_code: str,
 ) -> BibliographicFieldComparison:
     return BibliographicFieldComparison(
+        **({"method": "cross-language-identity-v1"} if reason_code in _ROMANISED_REASONS else {}),
         field_name=field_name,
         expected_sha256=_value_hash(expected) if expected else None,
         observed_sha256=_value_hash(observed) if observed else None,

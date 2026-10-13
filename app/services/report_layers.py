@@ -205,6 +205,38 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
         and str(scope.get('rationale') or '').strip())
 
 
+SCOPE_NOTE_CLOSING = 'Read the source to judge whether it supports the statement.'
+
+
+def abstract_scope_note(member: dict, citation: dict) -> dict | None:
+    """The stored subject comparison for an abstract-backed source (owner
+    decision 2026-10-12) or a limited-text source (2026-10-13), shown even
+    where the comparison found nothing to disagree about.
+
+    Separate from `scope_disagreement` and from the topical-mismatch mark,
+    which keep their own presentation. Only a complete assessment bound by
+    hash to the abstract shown and the statement as written, for a reference
+    whose work was identified, qualifies; no model is called.
+    """
+    if member.get('coverage_level') not in {'abstract_only', 'partial_text'}:
+        return None
+    if not _reference_identified(member) or topical_mismatch(member, citation):
+        return None
+    text, bound = _scope_source_text(member)
+    claim = str(citation.get('student_text') or '')
+    assessment = member.get('abstract_relevance') or {}
+    scope = assessment.get('scope_assessment') or {}
+    hashes = {'abstract_sha256': hashlib.sha256(text.encode()).hexdigest(),
+              'claim_sha256': hashlib.sha256(claim.encode()).hexdigest()}
+    comparison = str(scope.get('subject_comparison') or '').strip()
+    if not (text and claim and bound and comparison
+            and assessment.get('status') == scope.get('status') == 'complete'
+            and all(assessment.get(k) == value == scope.get(k) for k, value in hashes.items())
+            and _scope_coverage_agrees(member, scope)):
+        return None
+    return {'note': comparison.rstrip('. ') + '. ' + SCOPE_NOTE_CLOSING}
+
+
 def locator_attention(member: dict) -> bool:
     """A quotation located outside the supplied locator: an Academic Practice
     issue, marked yellow on the citation (owner request 2026-10-03), not orange."""
@@ -315,7 +347,7 @@ def scope_disagreement(member: dict, citation: dict) -> dict | None:
         # The reader gets the comparison and what to do with it. The
         # dissent stays in `reasons` for diagnosis, not in the note.
         'note': (comparison.rstrip('. ')
-                 + '. Read the source to judge whether it supports the statement.'),
+                 + '. ' + SCOPE_NOTE_CLOSING),
         'source_scope': str(scope.get('source_scope') or '').strip(),
         'claim_scope': str(scope.get('claim_scope') or '').strip(),
         'scope_dimension': str(scope.get('scope_dimension') or '').strip(),

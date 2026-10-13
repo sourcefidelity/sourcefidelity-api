@@ -20,6 +20,7 @@ import unicodedata
 from typing import Optional
 
 from app.services.schemas import ParsedReference
+from app.services.source_type import without_translation_tool_notes
 
 logger = logging.getLogger(__name__)
 
@@ -293,15 +294,18 @@ def extract_authorless_apa_fields(ref: str) -> Optional[ParsedReference]:
 # merge attached whichever record shared those two words.
 # A full stop after "(Ed.)" and an edition between the book title and the
 # pages are common too (Gershon, Elsaesser; 2026-10-04).
+# A book title may carry its own year in brackets, "Report on the Industry
+# (2018) (pp. 117-123)"; any other bracket still ends the container.
+_CONTAINER_TITLE = r'(?P<container>(?:[^()]|\(\s*(?:1[5-9]|20)\d{2}\s*\)){3,300}?)'
 _CONTAINER_IN_RE = re.compile(
-    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*(?P<container>[^()]{3,300}?)\s*'
+    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*' + _CONTAINER_TITLE + r'\s*'
     r'(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?'
     r'(?:\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)|[.,])',
     re.IGNORECASE)
 
 
 _CONTAINER_IN_PAGES_RE = re.compile(
-    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*(?P<container>[^()]{3,300}?)\s*'
+    r'\bIn\s+[^()]{2,120}?\(\s*Eds?\.?\s*\)\s*[,.]\s*' + _CONTAINER_TITLE + r'\s*'
     r'(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?'
     r'\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)',
     re.IGNORECASE)
@@ -312,7 +316,7 @@ _CONTAINER_IN_PAGES_RE = re.compile(
 # a book (Franchise 1, 2026-09-29: read as a whole book, the chapter title was
 # searched as a book and the containing book was never looked up).
 _CONTAINER_IN_NO_EDITOR_RE = re.compile(
-    r'\.\s+In\s+(?P<container>[^()]{3,300}?)\s*'
+    r'\.\s+In\s+' + _CONTAINER_TITLE + r'\s*'
     r'\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)',
     re.IGNORECASE)
 
@@ -338,6 +342,12 @@ _JOURNAL_RE = re.compile(
     r'(?:\(\s*(?P<issue>[^)\n]{1,24})\s*\))?\s*'
     r'(?:,\s*(?P<pages>[A-Za-z]?\d{1,6}\s*[-\u2013\u2014]\s*[A-Za-z]?\d{1,6}|e\d{3,8}))?',
     re.UNICODE)
+# A journal numbered by issue alone, "Law and Society, (11), 6-9." (no volume).
+_JOURNAL_ISSUE_ONLY_RE = re.compile(
+    r'(?:^|(?<=\.)|(?<=\?)|(?<=!))\s*(?P<container>[^\W\d_][^.\n]{2,120}?)\s*,\s*'
+    r'\(\s*(?P<issue>\d{1,3})\s*\)\s*,\s*(?:pp?\.\s*)?'
+    r'(?P<pages>[A-Za-z]?\d{1,6}\s*[-\u2013\u2014]\s*[A-Za-z]?\d{1,6})(?=[.,;\s]|$)',
+    re.UNICODE)
 # Emphasis marks survive docx conversion around "*Journal, 131*(5)" and would
 # otherwise split the journal from its volume.
 _EMPHASIS = re.compile(r'[*_]+')
@@ -353,7 +363,16 @@ def _journal_parts(ref: str) -> tuple[str, str, str, str]:
         if candidate.group('issue') or candidate.group('pages'):
             match = candidate
     if not match:
-        return '', '', '', ''
+        # A journal name repeated straight after a URL ("…journal.com/Name,
+        # (4), 97-115.") would start inside the address.
+        issue_only = [m for m in _JOURNAL_ISSUE_ONLY_RE.finditer(text)
+                      if not re.search(r'/|www\.|\.(?:com|org|net)\b', m.group('container') or '')]
+        if not issue_only:
+            return '', '', '', ''
+        match = issue_only[-1]
+        container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')
+        pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', match.group('pages').strip())
+        return container, '', match.group('issue'), pages
     container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')
     pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', (match.group('pages') or '').strip())
     volume = (match.group('volume') or '').strip()
@@ -461,7 +480,9 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     Returns:
         ParsedReference with fields populated, or None if extraction failed.
     """
-    ref = ref.strip()
+    # A translation-tool note is not part of the reference; raw_ref keeps it.
+    raw = ref.strip()
+    ref = without_translation_tool_notes(raw)
     if not ref:
         return None
 
@@ -475,7 +496,7 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
         r'^(?P<title>[^\n()]{3,250}?)\s*\((?P<studio>[^()]{2,100})\)\.\s*'
         r'\((?P<year>(?:19|20)\d{2})\)\.\s*(?P<credit>[^\n]{2,100}?)\s+Pressbook\.', ref, re.I)
     if pressbook and re.sub(r'\W', '', pressbook['studio']).casefold() == re.sub(r'\W', '', pressbook['credit']).casefold():
-        return ParsedReference(raw_ref=ref, title=pressbook['title'].strip(),
+        return ParsedReference(raw_ref=raw, title=pressbook['title'].strip(),
             author=pressbook['studio'], year=pressbook['year'], doi=doi, url=url,
             citation_key=_make_citation_key(pressbook['studio'], pressbook['year']),
             extraction_method='regex', source_kind='report', source_kind_confidence='high',
@@ -528,7 +549,7 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     if (author and year_match and url and not doi
             and re.fullmatch(r'[\s.,;:]*(?:(?:retrieved?|available|accessed)\b[^:/]{0,40}:?\s*)?\S*https?://.+',
                              after_date, re.IGNORECASE | re.DOTALL)):
-        return ParsedReference(author='', year=year or 'n.d.', title=author, url=url, raw_ref=ref,
+        return ParsedReference(author='', year=year or 'n.d.', title=author, url=url, raw_ref=raw,
                                citation_key=_make_citation_key(author, year), extraction_method='regex')
 
     # Success check — need both author and title
@@ -547,7 +568,7 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     # trailing-element rule that finds a book's imprint reads the journal
     # name instead, which put a false publisher on 59 of 179 articles and
     # fed bogus publisher agreement into the merge score.
-    periodical = bool(journal and volume)
+    periodical = bool(journal and (volume or issue))
     from app.services.source_type import classify_reference_source_kind
     kind = classify_reference_source_kind(ref, title=title, url=url).kind
 
@@ -557,7 +578,7 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
         title=title,
         doi=doi,
         url=url,
-        raw_ref=ref,
+        raw_ref=raw,
         citation_key=citation_key,
         container_title=container_title,
         volume=volume,
@@ -595,7 +616,8 @@ def extract_fields_mla(ref: str) -> Optional[ParsedReference]:
     Returns:
         ParsedReference with fields populated, or None if extraction failed.
     """
-    ref = ref.strip()
+    raw = ref.strip()
+    ref = without_translation_tool_notes(raw)
     if not ref:
         return None
 
@@ -655,7 +677,7 @@ def extract_fields_mla(ref: str) -> Optional[ParsedReference]:
         title=title,
         doi=doi,
         url=url,
-        raw_ref=ref,
+        raw_ref=raw,
         citation_key=citation_key,
         extraction_method="regex",
     )

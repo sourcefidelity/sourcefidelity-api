@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 
 import hashlib
@@ -266,6 +267,12 @@ def build_inspectable_report_payload(
         "verdict": artifact.verdict.value,
         "reason_codes": list(artifact.reason_codes),
         "retrieval_route": artifact.retrieval_route,
+        # A source in another writing system (cross-language-evidence-v1 and
+        # cross-language-whole-source-v1): scripts, hashes, counts and
+        # whole-source page coordinates; data only, no source text. Absent
+        # for every other claim, whose payload is unchanged.
+        **({"cross_language": copy.deepcopy(artifact.cross_language)}
+           if artifact.cross_language is not None else {}),
         "report_limits": [
             "This report presents inspectable evidence, not a determination of intent or misconduct.",
             "Passage excerpts are bounded; source binaries and unrestricted full text are not stored in the report.",
@@ -1069,6 +1076,29 @@ def _validate_candidate_passage_retrieval(artifact, supplied_ids):
             )
 
 
+def _whole_source_passage_ids(artifact, passages: dict) -> set:
+    """Add the whole-source passages to `passages`; every passage it may bind to.
+
+    Only an artifact carrying its in-memory whole-source plan qualifies, and
+    each whole-source passage must belong to the admitted representation.
+    """
+    plan = getattr(artifact, "_whole_source", None)
+    if plan is None:
+        return set()
+    identity = artifact.source_identity
+    for passage in plan.passages:
+        if (
+            passage.representation_id != identity.representation_id
+            or passage.content_sha256 != identity.content_sha256
+            or passage.authorization_scope_type != identity.authorization_scope_type
+            or passage.authorization_scope_id != identity.authorization_scope_id
+            or passage.verification_run_id != identity.verification_run_id
+        ):
+            raise ReportAuthorizationError("Whole-source passage does not match its admitted representation")
+        passages.setdefault(passage.passage_id, passage)
+    return set(passages)
+
+
 def _validate_facet_evidence(artifact):
     foundation = artifact.facet_evidence_foundation
     ledger = artifact.facet_evidence_ledger
@@ -1089,6 +1119,10 @@ def _validate_facet_evidence(artifact):
         raise ReportAuthorizationError("Facet foundation did not cover every eligible candidate")
 
     passages = {passage.passage_id: passage for passage in artifact.passages}
+    # A source in another writing system whose whole text the selector read
+    # (cross-language-whole-source-v1): its sentences bind to whole-source
+    # passages of the same admitted representation.
+    whole_source_ids = _whole_source_passage_ids(artifact, passages)
     sentences = {sentence.sentence_id: sentence for sentence in foundation.source_sentences}
     if len(sentences) != len(foundation.source_sentences):
         raise ReportAuthorizationError("Facet foundation contains duplicate evidence sentences")
@@ -1201,7 +1235,8 @@ def _validate_facet_evidence(artifact):
             sentence = sentences.get(sentence_id)
             if sentence is None:
                 raise ReportAuthorizationError("Facet bundle refers to an unknown evidence sentence")
-            if sentence.passage_id not in selected_by_candidate.get(bundle.candidate_id, set()):
+            if (sentence.passage_id not in selected_by_candidate.get(bundle.candidate_id, set())
+                    and sentence.passage_id not in whole_source_ids):
                 raise ReportAuthorizationError("Facet bundle uses evidence not selected for its candidate")
             if any(
                 scope_id not in bundle.source_discourse_sentence_ids

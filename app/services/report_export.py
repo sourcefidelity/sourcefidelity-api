@@ -21,6 +21,7 @@ from app.services.evidence_report import (
     project_reference_flags,
 )
 from app.services.storage.backend import StorageBackend
+from app.services.evidence_translation import translated_text_html
 from app.services.report_member_navigation import member_targets, marker_words
 from app.services.highlight_priority import LINK_MARKER_FINDINGS, SUBMITTED_LINK_FINDINGS
 
@@ -425,7 +426,8 @@ def _append_evidence(document, citations, findings, view) -> dict:
             blocks.append(credibility_records_html(finding))
         if finding.get('finding_type') == 'source_topical_mismatch':
             blocks.append('<h3>Selected Citation</h3><blockquote>'+escape(finding['citation_text'])+
-                '</blockquote><h3>Abstract</h3><blockquote>'+escape(finding['abstract_text'])+
+                '</blockquote><h3>Abstract</h3><blockquote>'+translated_text_html(
+                    finding['abstract_text'], finding.get('evidence_translations'), plain=True)+
                 '</blockquote>')
         difference = finding.get('field_difference') or {}
         if difference and finding.get('finding_type') == 'bibliographic_conflict':
@@ -566,16 +568,19 @@ def _portable_member_html(member: dict) -> str:
         _member_is_media, _display_evidence_note, _member_evidence_extracts,
         _member_evidence_contexts, _panel_statement,
     )
+    translations = member.get('evidence_translations') or {}
     media = _member_is_media(member)
     parts = ['<h3>Media Reference - Cannot Retrieve</h3>'] if media else []
     parts.append('<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or 'Reference unavailable'))+'</p>')
     if not media and member.get('availability') and member['availability'] != 'Source Not Retrieved':
         parts.append('<p>'+escape(_panel_statement(member['availability']))+'</p>')
-    disagreement = member.get('scope_disagreement') or {}
+    disagreement = member.get('scope_disagreement') or (
+        member.get('abstract_scope_note') if member.get('coverage_level') in {'abstract_only', 'partial_text'} else None) or {}
     if not media and disagreement.get('note'):
         parts.append('<p class="muted">'+escape(_panel_statement(disagreement['note']))+'</p>')
     for primary in _member_evidence_extracts(member):
-        parts.append('<blockquote>'+escape(str(primary.get('display_text', primary.get('text')) or ''))+_inline_locator(primary)+'</blockquote>')
+        parts.append('<blockquote>'+translated_text_html(primary.get('display_text', primary.get('text')) or '', translations, plain=True)
+                     +_inline_locator(primary)+'</blockquote>')
         for key in ('evidence_note',):
             if primary.get(key):
                 note = _display_evidence_note(member, primary)
@@ -585,7 +590,8 @@ def _portable_member_html(member: dict) -> str:
     if contexts:
         parts.append('<h4>Additional Evidence and Context</h4>')
     for item in contexts:
-        parts.append('<blockquote>'+escape(str(item['context_text']))+_inline_locator(item)+'</blockquote>')
+        parts.append('<blockquote>'+translated_text_html(item['context_text'], translations, plain=True)
+                     +_inline_locator(item)+'</blockquote>')
         note = _display_evidence_note(member, item)
         if note:
             parts.append('<p class="muted">'+escape(note)+'</p>')

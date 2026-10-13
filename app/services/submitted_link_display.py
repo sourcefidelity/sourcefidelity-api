@@ -80,6 +80,8 @@ def render_link_checks(values):
                 'readable_text_unavailable': 'Usable article text could not be extracted from the response.',
                 'source_kind_unconfirmed': 'The response did not establish the expected type of source.',
             }.get(request.page_observation, '')
+            if request.cross_script_judgment is not None and request.destination_identity == 'confirmed':
+                page = ''   # the model resolved the comparison across writing systems
             identity = {
                 'not_assessed': 'Destination identity was not assessed.',
                 'confirmed': 'The destination’s bibliographic identity was confirmed.',

@@ -147,7 +147,9 @@ class BraveSearch(SearchProvider):
             **_REQUEST_SETTINGS,
         }
         try:
-            resp = httpx.get(_BRAVE_URL, headers=headers, params=params, timeout=remaining(15))
+            from app.services.retrieval.provider_gate import retry_unopened_connection
+            resp = retry_unopened_connection(
+                lambda: httpx.get(_BRAVE_URL, headers=headers, params=params, timeout=remaining(15)))
             _observe_limits(resp)
             resp.raise_for_status()
             # A request Brave served is billed whatever its content; an error

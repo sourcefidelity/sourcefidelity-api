@@ -66,6 +66,10 @@ def build_judgment_reserve(source, artifact) -> dict | None:
         known_text = {" ".join(s.text.split()) for s in original.source_sentences}
         # The same ranking, skipping every passage the first selection used.
         wide = attach_candidate_passage_retrieval(source, artifact, excluded_passage_ids_by_candidate=used)
+        # The reserve is the next retrieved passages: a whole-source plan
+        # (cross-language-whole-source-v1) shaped the first foundation only.
+        wide = wide.model_copy()
+        wide._whole_source = None
         foundation = attach_facet_evidence_foundation(wide).facet_evidence_foundation
         if foundation.status not in {"complete", "incomplete"}:
             return None

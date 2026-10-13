@@ -113,6 +113,14 @@
       const part = label.querySelector('.judgment-part'), sep = label.querySelector('.judgment-sep');
       if (part) { part.textContent = NAMES[state]; part.hidden = false; }
       if (sep) sep.hidden = false;
+      // A citation that is only a quotation reads "Not Judged - Quotation only"
+      // in place of its evidence kind (owner decision 2026-10-13).
+      const kind = label.querySelector('.evidence-kind');
+      if (kind) {
+        kind.dataset.kindText ??= kind.textContent;
+        const quotationOnly = state === 'not_judged' && items.length && items.every(i => i.reason_code === 'quotation_only');
+        kind.textContent = quotationOnly ? 'Quotation only' : kind.dataset.kindText;
+      }
     }
     for (const slot of panel.querySelectorAll(`[data-judgment-record="${CSS.escape(record)}"]`)) {
       slot.innerHTML = items.map(i => i.window_html).join('');
@@ -186,13 +194,55 @@
       if (disclosure) disclosure.hidden = !list.querySelector('li:not([hidden])');
     }
   }
+  // A sentence in another language than the statement is followed by its
+  // English translation in brackets (owner decision 2026-10-13). Translations
+  // arrive with the results; each stays with the sentence it was written for.
+  const translationOf = new WeakMap();
+  const sentenceSpans = () => panel.querySelectorAll('.evidence-sentences li > .ev-translation');
+  const quoteOf = span => span.parentNode?.querySelector(':scope > q');
+  function noteTranslations() {
+    for (const span of sentenceSpans()) {
+      if (!translationOf.has(span)) translationOf.set(span, quoteOf(span)?.textContent ?? '');
+    }
+  }
+  function showTranslations() {
+    const known = new Map();
+    for (const byCandidate of results.values()) {
+      for (const item of byCandidate.values()) {
+        for (const sentence of item.evidence || []) if (sentence.translation) known.set(sentence.text, sentence.translation);
+      }
+    }
+    for (const shown of panel.querySelectorAll('[data-key-alternatives]')) {
+      let alternatives = [];
+      try { alternatives = JSON.parse(shown.dataset.keyAlternatives || '[]'); } catch (e) { alternatives = []; }
+      for (const a of alternatives) if (a.translation) known.set(a.text, a.translation);
+    }
+    noteTranslations();
+    for (const li of panel.querySelectorAll('.evidence-sentences li')) {
+      const q = li.querySelector(':scope > q');
+      if (!q) continue;
+      let span = li.querySelector(':scope > .ev-translation');
+      if (span && translationOf.get(span) !== q.textContent) {
+        const gap = span.previousSibling;
+        if (gap && gap.nodeType === Node.TEXT_NODE && gap.textContent === ' ') gap.remove();
+        span.remove(); span = null;
+      }
+      const value = known.get(q.textContent);
+      if (!span && value) {
+        span = document.createElement('span'); span.className = 'ev-translation'; span.textContent = `[${value}]`;
+        q.after(' ', span); translationOf.set(span, q.textContent);
+      }
+    }
+  }
   function fillPanel() {
     if (filling) return;
     filling = true;
     try {
+      noteTranslations();
       const records = new Set([...panel.querySelectorAll('[data-judgment-record],[data-judgment-label]')]
         .map(el => el.dataset.judgmentRecord || el.dataset.judgmentLabel));
       records.forEach(fillRecord);
+      showTranslations();
     } finally { filling = false; }
   }
   new MutationObserver(() => fillPanel()).observe(panel, {childList: true});

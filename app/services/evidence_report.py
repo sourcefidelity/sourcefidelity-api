@@ -35,6 +35,7 @@ from app.services.paper_extraction import (
     unresolved_marker_report_groups,
 )
 from app.services.sentence_splitter import split_sentences
+from app.services.evidence_translation import translated_text_html, translation_html
 from app.services.storage.backend import StorageBackend
 from app.services.highlight_priority import (
     SUBMITTED_LINK_FINDINGS, LINK_MARKER_FINDINGS, REFERENCE_DIFFERENCE_FINDINGS, UNVERIFIED_FINDINGS, finding_category,
@@ -187,6 +188,16 @@ def _hanging_indent_narrow(differences: list[dict]) -> bool:
     return 6.0 <= typical < HANGING_INDENT_POINTS - HANGING_INDENT_TOLERANCE_POINTS
 
 
+def _effective_claim_type(claim_type, members) -> str:
+    """A quotation of a source in another language is a translation, so a
+    paraphrase (owner decision 2026-10-13): counted and treated as one when
+    every cited source with retrieved text is in another writing system."""
+    read = [item for item in members if item.get("status") == "evidence_available"]
+    if claim_type == "quotation" and read and all(item.get("source_language_differs") for item in read):
+        return "paraphrase"
+    return claim_type
+
+
 def _citation_entry(extraction, paper_surface, claim, members, has_attention, start, end, text, display) -> dict:
     """One citation of the report: the wording from start to end and its sources."""
     display_coverage = _citation_display_coverage(members)
@@ -209,7 +220,7 @@ def _citation_entry(extraction, paper_surface, claim, members, has_attention, st
         "student_text": text,
         "display_student_text": display,
         "citation_marker": claim.citation_marker,
-        "claim_type": claim.claim_type,
+        "claim_type": _effective_claim_type(claim.claim_type, members),
         "page_locator": claim.page_locator,
         "tone": tone,
         "display_coverage": display_coverage,
@@ -401,10 +412,16 @@ def build_evidence_report_view(
             # One flag, not a gradient: where the judgment stopped short
             # of a mark, the comparison and the reason go in the evidence
             # window instead of beside the citation.
-            from app.services.report_layers import scope_disagreement
+            from app.services.report_layers import abstract_scope_note, scope_disagreement
             disagreement = scope_disagreement(item, {"student_text": claim.text})
             if disagreement:
                 item["scope_disagreement"] = disagreement
+            else:
+                # An abstract's or limited text's stored subject comparison is
+                # shown even without a disagreement (owner decisions 2026-10-12/13).
+                note = abstract_scope_note(item, {"student_text": claim.text})
+                if note:
+                    item["abstract_scope_note"] = note
             citation_has_evidence = citation_has_evidence or bool(
                 item.get("best_evidence")
             )
@@ -586,7 +603,7 @@ def build_evidence_report_view(
     ):
         finding['source'] = _reference_view(references[finding['reference_id']], None)
         reference_practice.append(finding)
-    for finding in reference_style_findings(formatting, references):
+    for finding in reference_style_findings(formatting, references, discovery_by_reference):
         reference = references[finding['reference_id']]
         finding['source'] = _reference_view(reference, reference_layout.get(reference.reference_id))
         reference_practice.append(finding)
@@ -955,7 +972,9 @@ def build_evidence_report_view(
         "citation_use_assessment": None,
         "limits": limits,
     }
-    return view
+    # English translations of other-language evidence sentences (owner decision 2026-10-13).
+    from app.services.evidence_translation import apply_translations, stored_translations
+    return apply_translations(view, stored_translations(aggregate))
 
 
 def _locator_inventory_view(extraction, surface=None) -> dict | None:
@@ -2970,6 +2989,7 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
                 # The text the topic was judged against: a retrieved document's
                 # leading excerpt has no best evidence (Regulation 4, 2026-10-06).
                 'abstract_text': _scope_source_text(member)[0],
+                'evidence_translations': dict(member.get('evidence_translations') or {}),
                 'scope_rationale': scope['rationale'],
                 'field_difference': {'submitted_value': source['raw_reference']},
                 'rectangles': [],
@@ -3212,12 +3232,19 @@ def _reference_mismatch_details(extraction, start: int, end: int) -> list[dict]:
     for marker in getattr(extraction, "citation_marker_census", []) or []:
         if getattr(marker, "link_differences", None) and start <= marker.passage_start < end:
             # A year-only marker ("(2016)") follows the author's name in the sentence.
-            year_only = re.match(r'\(\s*(?:\d{4}|n\.d\.)', str(marker.text or '').strip())
-            row = {"label": _narrative_label(marker) if marker.marker_type == "narrative" or year_only
-                   else str(marker.text or '').strip('() '),
+            text = str(marker.text or '').strip()
+            year_only = re.match(r'\(\s*(?:\d{4}|n\.d\.)', text)
+            row = {"label": text if marker.marker_type == "narrative" and not text.startswith('(')
+                   else _narrative_label(marker) if marker.marker_type == "narrative" or year_only
+                   else text.strip('() '),
                    "difference": phrase(marker.link_differences),
                    "differences": list(marker.link_differences),
                    "reference_ids": list(marker.reference_ids or marker.candidate_reference_ids or [])}
+            # The citation that carries this marker may already list it.
+            if any(other["difference"] == row["difference"] and other["label"] and row["label"]
+                   and (row["label"] in other["label"] or other["label"] in row["label"])
+                   for other in found.values()):
+                continue
             found.setdefault((row["label"], row["difference"]), row)
     return list(found.values())
 
@@ -3267,9 +3294,11 @@ def _missing_reference_members(extraction, start: int, end: int) -> list[str]:
                 and re.fullmatch(r'(?:19|20)\d{2}[a-z]?', member)):
             # A film or Act named with its year and no reference-list entry
             # ("Princess Iron Fan" (1941), "… Corporation Act (1970)") is a
-            # citation without an entry (owner decision 2026-10-02).
+            # citation without an entry (owner decision 2026-10-02); a title
+            # some reference carries is not missing (owner decision 2026-10-12).
+            from app.services.citation_extractor import quoted_title_references
             work = _titled_work_before(marker)
-            if work:
+            if work and not quoted_title_references(work, member, getattr(extraction, 'references', None) or [])[0]:
                 missing.append(f"{work}, {member}")
     return list(dict.fromkeys(missing))
 
@@ -3289,10 +3318,11 @@ def _titled_work_before(marker) -> str:
     text, origin = str(getattr(marker, 'report_text', '') or ''), getattr(marker, 'report_passage_start', None)
     if not text or not isinstance(origin, int) or not 0 <= marker.passage_start - origin <= len(text):
         return ''
+    from app.services.citation_extractor import quoted_title_before
     before = text[:marker.passage_start - origin].rstrip()
-    quoted = re.search(r'[“"‘]([^”"’“‘]{2,150})[”"’]\s*$', before)
+    quoted = quoted_title_before(before, len(before))
     if quoted:
-        return quoted[1].strip(' ,.')
+        return quoted[1]
     act = re.search(r"((?:[A-Z][\w'’&-]*\s+){1,10}Act)$", before)
     return act[1].strip() if act else ''
 
@@ -3413,8 +3443,9 @@ def _with_sentence_evidence(view: dict, record, claim) -> dict:
     selection = payload.get("sentence_evidence") or {}
     if selection.get("status") not in {"selected", "empty"}:
         return view
+    from app.services.cross_language_whole_source import stored_passages
     from app.services.text_quality import readable_text
-    passages = {item.get("passage_id"): item for item in payload.get("passages") or []}
+    passages = {item.get("passage_id"): item for item in stored_passages(payload)}
     items = []
     for item in selection.get("items") or []:
         passage = passages.get(item.get("passage_id")) or {}
@@ -3617,9 +3648,14 @@ def _available_member_view(
             "claim_terms_present": scope_record.get("claim_terms_present"),
             "claim_terms_total": scope_record.get("claim_terms_total"),
         }}
+    cross_language = ((record.report_payload or {}).get("cross_language")
+                      or package.get("cross_language") or {})
     return {
         "status": "evidence_available",
         "identity_status": "possible_match" if provisional else "verified",
+        # The source is in another writing system than the statement
+        # (cross-language-evidence-v1); its quotations are paraphrases.
+        "source_language_differs": bool(cross_language.get("differs")),
         "coverage_level": (package.get("coverage") or {}).get(
             "level", "unavailable"
         ),
@@ -5917,7 +5953,7 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
                 f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
                 f'<p>{escape(finding["finding"])}</p><h3>Selected Citation</h3>'
                 f'<blockquote>{escape(finding["citation_text"])}</blockquote><h3>Abstract</h3>'
-                f'<blockquote>{escape(finding["abstract_text"])}</blockquote></template>')
+                f'<blockquote>{translated_text_html(finding["abstract_text"], finding.get("evidence_translations"))}</blockquote></template>')
     if finding.get('finding_type') == 'submitted_link_issue':
         return (f'<template id="reference-panel-{index}"><h2>Submitted-Link Issue</h2>'
                 f'<p>{escape(finding["finding"])}</p><p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'
@@ -6252,7 +6288,8 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
             f'<li data-evidence-key="{escape(item["key"], quote=True)}"'
             + (f' data-reason="{escape(str(item["reason"]), quote=True)}"' if item.get("reason") else '') + '>'
             + (f'<span class="ev-page">p. {escape(str(item["page"]))}</span> ' if item.get("page") else "")
-            + f'<q>{escape(item["text"])}</q></li>' for item in member["evidence_sentences"]) + '</ul></details>')
+            + f'<q>{escape(item["text"])}</q>{translation_html(item.get("translation"))}</li>'
+            for item in member["evidence_sentences"]) + '</ul></details>')
     evidence += _abstract_disclosure(member)
     additional = ""
     more_context = ""  # Candidate reserves stay in the package, not the reader's window.
@@ -6310,6 +6347,13 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
             '<p class="muted">'
             f'{escape(_panel_statement(member["scope_disagreement"]["note"]))}</p>'
         )
+    elif ((member.get("abstract_scope_note") or {}).get("note")
+          and member.get("coverage_level") in {"abstract_only", "partial_text"}):
+        # Shown the same muted way (owner decisions 2026-10-12, limited text 2026-10-13).
+        scope_notice = (
+            '<p class="muted">'
+            f'{escape(_panel_statement(member["abstract_scope_note"]["note"]))}</p>'
+        )
     availability = (
         '<p class="source-unavailable"><strong>Source Not Retrieved</strong></p>'
         if member.get("availability") == "Source Not Retrieved" and not grouped
@@ -6344,7 +6388,7 @@ def _abstract_disclosure(member: dict) -> str:
     if abstract is None or member.get("coverage_level") != "abstract_only":
         return ""
     return ('<details class="abstract-disclosure"><summary>Abstract</summary>'
-            f'<blockquote>{escape(str(abstract["text"]))}</blockquote></details>')
+            f'<blockquote>{translated_text_html(abstract["text"], member.get("evidence_translations"))}</blockquote></details>')
 
 
 _RETRIEVED_TEXT_ACTIONS = frozenset({'verified_public_source_available', 'authenticated_source_view_available',

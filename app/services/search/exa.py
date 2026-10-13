@@ -83,7 +83,9 @@ class ExaSearch(SearchProvider):
             "type": "auto",  # auto = let Exa decide keyword vs neural
         }
         try:
-            resp = httpx.post(_EXA_URL, headers=headers, json=payload, timeout=remaining(15))
+            from app.services.retrieval.provider_gate import retry_unopened_connection
+            resp = retry_unopened_connection(
+                lambda: httpx.post(_EXA_URL, headers=headers, json=payload, timeout=remaining(15)))
             if resp.status_code in _RETRY_STATUSES:
                 time.sleep(1.0)
                 resp = httpx.post(_EXA_URL, headers=headers, json=payload, timeout=remaining(15))

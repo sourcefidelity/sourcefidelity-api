@@ -474,6 +474,10 @@ class Settings(BaseSettings):
     # Results are stored under the verification summary and shown in the report
     # (yellow Academic Practice marks and window lines).
     PATCHWRITING_AT_CHECK_ENABLED: bool = True
+    # Whole other-language source to the GLM selector and Judgment foundation
+    # when it fits (cross-language-whole-source-v1, owner decision 2026-10-13).
+    # On since the owner extended the GLM payload row in AGENTS.md (2026-10-13).
+    CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED: bool = True
     SEARCH_REUSE_PAUSE_DAYS: int = Field(default=30, ge=0)
     # A re-run of a paper reuses an earlier run's completed result for each
     # unchanged reference within this many days (paper-search-reuse-v4,

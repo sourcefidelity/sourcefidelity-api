@@ -227,6 +227,24 @@ def reported_limits(provider: str) -> dict | None:
     return shared_pacing.stored_limits(provider)
 
 
+def retry_unopened_connection(request, *, delay: float = 1.0):
+    """Run `request()`, and once more after `delay` when the connection never
+    opened (`httpx.ConnectError`, including a TLS handshake cut off), while the
+    reference's budget allows. Such a request never reached the provider, so a
+    paid search is not billed twice; a timeout or a refused request is not
+    retried here (2026-10-11: bursts of dropped connections failed Brave, Exa
+    and OpenAlex calls)."""
+    import httpx
+    try:
+        return request()
+    except httpx.ConnectError:
+        left = remaining_seconds()
+        if left is not None and left <= delay + 5.0:
+            raise
+        time.sleep(delay)
+        return request()
+
+
 def _client(provider: str):
     """One keep-alive client per provider and process, so each request does
     not open a new TLS connection (created after the worker fork)."""

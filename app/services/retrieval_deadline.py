@@ -64,3 +64,20 @@ def bounded_reference(function):
         with deadline_scope():
             return function(*args, **kwargs)
     return bounded
+
+
+# native-script-route-v1: the search in a work's own script runs after the
+# reference's ordinary routes and has its own allowance, so a long ordinary
+# search cannot leave it unattempted (which would keep the reference neutral).
+NATIVE_ROUTE_SECONDS = 120.0
+
+
+@contextmanager
+def separate_deadline_scope(seconds=NATIVE_ROUTE_SECONDS):
+    """A fresh allowance for one follow-on route, replacing the current one
+    for its duration and restoring it afterwards."""
+    token = _DEADLINE.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)

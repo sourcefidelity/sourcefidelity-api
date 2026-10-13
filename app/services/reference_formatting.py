@@ -7,7 +7,9 @@ style verdict. Each rule remains independently assessed or not assessed.
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 import hashlib
+from pathlib import Path
 import re
 from typing import Literal
 
@@ -399,7 +401,8 @@ def book_publication_year_discrepancy(reference: ParsedReference, discovery: dic
     )
 
 
-def reference_style_findings(assessment: dict, references: dict[str, ParsedReference]) -> list[dict]:
+def reference_style_findings(assessment: dict, references: dict[str, ParsedReference],
+                             discovery_by_reference: dict | None = None) -> list[dict]:
     """Project stored v2 results only; never upgrade historical assessments."""
     if assessment.get('assessment_version') != 'reference-formatting-v2':
         return []
@@ -448,12 +451,15 @@ def reference_style_findings(assessment: dict, references: dict[str, ParsedRefer
                     observed_reference_order=result.observed_order,
                     rectangles=[], localization_status='not_assessed'))
     if assessment.get('citation_format') == 'apa':
-        findings.extend(reference_entry_findings(references))
+        findings.extend(reference_entry_findings(references, discovery_by_reference))
     return findings
 
 
-# Owner wording 2026-10-04.
-TITLE_CASE_TEXT = 'This title uses title case; APA uses sentence case for article and book titles in the reference list.'
+# Owner wording 2026-10-04, revised 2026-10-13 (the check covers every kind of work).
+TITLE_CASE_TEXT = 'This title uses title case; APA uses sentence case for the titles of works in the reference list.'
+# Owner wording 2026-10-13, for a title that turns from title case to sentence case.
+MIXED_CASE_TEXT = ('This title mixes title case and sentence case; APA uses sentence case for the '
+                   'titles of works in the reference list.')
 PUBLICATION_MISSING_TEXT = 'This reference does not name a journal or publisher.'
 SPLIT_ENTRY_TEXT = 'This reference is split into two entries in the reference list.'
 _MEDIA_KINDS = frozenset({'traditional_media', 'video', 'podcast_episode'})
@@ -487,8 +493,170 @@ def title_case_title(title: str) -> bool:
     return capitalised >= 3
 
 
-def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dict]:
-    """Title capitalisation and missing publication details (owner decision 2026-10-04)."""
+# Capitalised mid-title in most titles whatever their style.
+_NEUTRAL_CAPITALISED = frozenset({'internet'})
+
+
+@lru_cache(maxsize=1)
+def _common_words() -> frozenset[str]:
+    """Words the installed English lists spell in lower case, so not names
+    ("administration" yes; "Okafor", "Thorvald", "British" no). Empty when no list
+    is installed, and the mixed-case rule then abstains."""
+    from app.services.text_quality import WORD_LIST_PATHS
+    words: set[str] = set()
+    for path in WORD_LIST_PATHS:
+        try:
+            lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        words.update(line.strip() for line in lines if line.strip().islower())
+    return frozenset(words)
+
+
+def _ordinary_word(head: str, common: frozenset[str]) -> bool:
+    word = re.sub(r"['’]s$", '', head).casefold()
+    return word in common
+_SENTENCE_CAPITAL_BREAK = (':', '?', '!', '—', '–')
+
+
+def _located_proper_nouns(located_titles) -> set[str]:
+    """Words a located record capitalises mid-title in a sentence-case title.
+
+    Only a located title that is itself in sentence case (an ordinary
+    lower-case word, and not title case) says anything about proper nouns: a
+    record in title case capitalises every word.
+    """
+    proper: set[str] = set()
+    for located in located_titles or ():
+        located = re.sub(r'[(\[][^)\]]*[)\]]', ' ', str(located or ''))
+        if not located.strip() or title_case_title(located):
+            continue
+        words = [m for m in re.finditer(r"[^\s]+", located)]
+        heads = [re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', m.group()).split('-')[0] for m in words]
+        if not any(len(h) >= 4 and h[:1].islower() and h.casefold() not in _LOWER_IN_TITLE_CASE
+                   for h in heads):
+            continue
+        for index, (match, head) in enumerate(zip(words, heads)):
+            if (index and head[:1].isupper()
+                    and not located[:match.start()].rstrip().endswith(_SENTENCE_CAPITAL_BREAK)):
+                proper.add(head.casefold())
+    return proper
+
+
+def mixed_case_title(title: str, located_titles=()) -> bool:
+    """A title that opens in title case and then turns to sentence case
+    (owner decision 2026-10-12): "Interim Rules on the Management of
+    Internet publishing".
+
+    Conservative. From the title's first word, or the first after a colon,
+    every word up to the first ordinary lower-case word of four or more
+    letters is capitalised or a short function word, and that run holds at
+    least two capitalised words, besides the first, in two places separated
+    by other words. A run of adjacent capitalised words after the first word
+    ("New York Times") is likely a name, so the title is not assessed; one
+    opening with "The", "A" or "An" ("The Washington Post") is not counted.
+    Text in parentheses or brackets (a translation) is ignored; "Internet",
+    acronyms, words a located sentence-case record capitalises and words the
+    English word lists only spell capitalised (names) neither count nor join
+    a run.
+    """
+    common = _common_words()
+    if not common:
+        return False
+    proper = _located_proper_nouns(located_titles)
+    text = re.sub(r'[(\[][^)\]]*[)\]]', ' ', title)
+    if re.search(r'[()\[\]]', text):
+        return False  # unbalanced brackets: abstain
+    for segment in re.split(r'[:?!—–]', text):
+        kinds: list[tuple[str, str]] = []
+        for token in segment.split():
+            word = re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', token)
+            if not word or any(ch.isdigit() for ch in word) or not word[0].isalpha():
+                kinds.append(('other', word))
+                continue
+            head = word.split('-')[0]
+            if not kinds or all(kind == 'other' for kind, _ in kinds):
+                kinds.append(('first', head))
+            elif head[:1].islower():
+                if len(head) >= 4 and head.casefold() not in _LOWER_IN_TITLE_CASE:
+                    kinds.append(('content', head))
+                    break
+                kinds.append(('minor', head))
+            elif ((head.isupper() and len(head) > 1) or len(head) < 2
+                    or head.casefold() in _NEUTRAL_CAPITALISED or head.casefold() in proper):
+                kinds.append(('other', head))
+            elif not _ordinary_word(head, common):
+                # A capitalised word no list spells in lower case is a name.
+                kinds.append(('name', head))
+            else:
+                kinds.append(('capital', head))
+        # A capitalised word beside a name belongs to it ("Ella May Thorvald",
+        # "Hildred Pierce"), even when a list also spells it in lower case.
+        named = [kind == 'name' or (kind == 'first' and not _ordinary_word(head, common))
+                 for kind, head in kinds]
+        kinds = [('other', head) if kind == 'name' or (
+                     kind == 'capital' and ((index and named[index - 1])
+                                            or (index + 1 < len(kinds) and named[index + 1])))
+                 else (kind, head) for index, (kind, head) in enumerate(kinds)]
+        if not kinds or kinds[-1][0] != 'content':
+            continue
+        # Adjacent capitalised words form one group.
+        groups: list[list[tuple[str, str]]] = []
+        previous = ''
+        for kind, head in kinds:
+            if kind in {'first', 'capital'}:
+                if previous in {'first', 'capital'}:
+                    groups[-1].append((kind, head))
+                else:
+                    groups.append([(kind, head)])
+            previous = kind
+        counted_groups = counted = 0
+        for group in groups:
+            capitals = [head for kind, head in group if kind == 'capital']
+            if group[0][0] == 'first':
+                if group[0][1].casefold() in {'the', 'a', 'an'}:
+                    continue
+            elif len(group) > 1:
+                return False  # likely a name
+            if capitals:
+                counted_groups += 1
+                counted += len(capitals)
+        if counted >= 2 and counted_groups >= 2:
+            return True
+    return False
+
+
+def located_titles(reference: ParsedReference, discovery: dict | None) -> list[str]:
+    """Titles of located records that agree with this reference's title as it
+    reads now; used only for their capitalisation."""
+    from app.services.reference_discovery import ReferenceDiscoveryRecord, _value_hash
+    if not discovery:
+        return []
+    try:
+        record = ReferenceDiscoveryRecord.model_validate(discovery)
+    except ValueError:
+        return []
+    if record.reference_id != reference.reference_id:
+        return []
+    titles = []
+    for candidate in record.candidates:
+        if not candidate.is_credible:
+            continue
+        title = next((c for c in candidate.comparisons if c.field_name == 'title'), None)
+        observed = str(getattr(candidate.observed, 'title', '') or '').strip()
+        if (title is not None and title.outcome == 'agreement' and observed
+                and title.expected_sha256 == _value_hash(reference.title)):
+            titles.append(observed)
+    return titles
+
+
+def reference_entry_findings(references: dict[str, ParsedReference],
+                             discovery_by_reference: dict | None = None) -> list[dict]:
+    """Title capitalisation and missing publication details (owner decision 2026-10-04).
+
+    A title in mixed title and sentence case is counted and shown as the same
+    title-formatting finding (owner decision 2026-10-12).
+    """
     findings = []
     for reference_id, ref in references.items():
         if len(getattr(ref, 'split_parts', None) or []) == 2:
@@ -500,9 +668,14 @@ def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dic
         if (ref.needs_review or ref.source_kind in _MEDIA_KINDS or len(title.split()) < 3
                 or ref.raw_ref.count(title) != 1):
             continue
-        if title_case_title(title):
+        rule_id = ('apa7_title_sentence_case_v1' if title_case_title(title) else
+                   'apa7_title_mixed_case_v1' if mixed_case_title(
+                       title, located_titles(ref, (discovery_by_reference or {}).get(reference_id)))
+                   else None)
+        if rule_id:
             findings.append(dict(finding_type='reference_title_style', reference_id=reference_id,
-                finding=TITLE_CASE_TEXT, rule_id='apa7_title_sentence_case_v1', rule_source=APA_TITLE_RULE_SOURCE,
+                finding=MIXED_CASE_TEXT if rule_id == 'apa7_title_mixed_case_v1' else TITLE_CASE_TEXT,
+                rule_id=rule_id, rule_source=APA_TITLE_RULE_SOURCE,
                 field_difference={'field_name': 'title', 'submitted_value': title},
                 rectangles=[], localization_status='not_assessed'))
         tail = ref.raw_ref[ref.raw_ref.index(title) + len(title):]
