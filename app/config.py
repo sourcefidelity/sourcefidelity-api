@@ -197,9 +197,11 @@ class Settings(BaseSettings):
     # the shorter default lease used by individual verification operations.
     PAPER_SOURCE_RETRIEVAL_LEASE_SECONDS: int = 86_400
     # References whose sources are searched for at the same time in one paper
-    # (owner decision 2026-10-09). 1 searches them one after another; keep 1
-    # until the search layer is safe to share between threads (STATE §5).
-    PAPER_SOURCE_RETRIEVAL_WORKERS: int = 1
+    # (owner decision 2026-10-09). 1 searches them one after another. Four
+    # (owner decision 2026-10-13): measured 2026-10-11, source finding 5.8 times
+    # faster than one at a time with identical results and the same cost;
+    # provider pacing is shared across every worker.
+    PAPER_SOURCE_RETRIEVAL_WORKERS: int = 4
     # Student-paper uploads are temporary workflow inputs, not source-repository
     # objects. The locator is committed before upload and stale cleanup removes
     # an object after this recovery window even if a worker exits hard.
