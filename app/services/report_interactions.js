@@ -311,14 +311,14 @@
   // report once, when no upload is still sending, refreshing or waiting, so a
   // later upload is neither cut off nor shown as never made.
   let uploadsSending=0;
-  async function awaitSuccessor(url, message, attemptId) {
+  async function awaitSuccessor(url, message, attemptId, failureText) {
     try {
       const response=await fetch(url,{credentials:'same-origin'});if(!response.ok)throw new Error('Report update status is unavailable.');const data=await response.json();
       if(data.successor_available&&!data.processing&&!data.queued_uploads&&!uploadsSending){window.location.assign('/report/'+encodeURIComponent(data.latest_report_id)+window.location.search);return;}
       const failure=data.last_reanalysis_failure;
       // A new search is watched for its own attempt only; the upload wording belongs to uploads.
-      if(failure&&(attemptId===undefined||failure.attempt_id===attemptId)){message.textContent=attemptId===undefined?'The source was stored, but the report could not be updated. Retry the upload.':'The new search could not update the report.';return;}
-      setTimeout(()=>awaitSuccessor(url,message,attemptId),1500);
+      if(failure&&(attemptId===undefined||failure.attempt_id===attemptId)){message.textContent=failureText||(attemptId===undefined?'The source was stored, but the report could not be updated. Retry the upload.':'The new search could not update the report.');return;}
+      setTimeout(()=>awaitSuccessor(url,message,attemptId,failureText),1500);
     }catch(error){message.textContent=error.message;}
   }
   document.addEventListener('click', event => {
@@ -348,6 +348,21 @@
       else if(response.status===409){message.textContent='The report is already being updated.';button.disabled=false;}
       else{message.textContent='';button.disabled=false;}}
     catch(error){message.textContent='';button.disabled=false;}
+    form.removeAttribute('aria-busy');
+  });
+  document.addEventListener('submit', async event => {
+    const form=event.target;if(!form.classList.contains('check-again'))return;event.preventDefault();
+    const message=form.querySelector('.upload-status'),button=form.querySelector('button');
+    // Owner-approved wording (2026-10-13).
+    const failed='The paper could not be checked again.';
+    button.disabled=true;form.setAttribute('aria-busy','true');message.textContent='Checking again…';
+    try{const response=await fetch(form.action,{method:'POST',credentials:'same-origin'}),data=await response.json().catch(()=>({}));
+      if(response.ok&&data.reused&&data.report_id){window.location.assign('/report/'+encodeURIComponent(data.report_id)+window.location.search);return;}
+      if(response.ok&&data.status_url&&data.attempt_id){awaitSuccessor(data.status_url,message,String(data.attempt_id),failed);return;}
+      if(response.status===410){form.remove();return;}   // no longer kept, or marks released
+      if(response.status===409){message.textContent='The report is already being updated.';button.disabled=false;}
+      else{message.textContent=failed;button.disabled=false;}}
+    catch(error){message.textContent=failed;button.disabled=false;}
     form.removeAttribute('aria-busy');
   });
   // view-state:start

@@ -264,8 +264,10 @@ def extract_paper_job(
         retention_policy = resolve_paper_retention_policy(retention_mode)
     except PaperRetentionPolicyError as exc:
         raise PaperWorkflowError(exc.code, str(exc)) from exc
+    from app.services.recheck_copy import kept_by_policy
+    # A file kept for checking again stays until the check ends (`recheck-copy-v1`).
     retention = retention_policy.after_extraction(
-        lambda: cleanup_paper_job_input(session, backend, job.id)
+        (lambda: True) if kept_by_policy(job) else (lambda: cleanup_paper_job_input(session, backend, job.id))
     )
     if not retention.completed:
         job.input_expires_at = datetime.now(timezone.utc)
@@ -1180,6 +1182,13 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     # under the same fingerprint gets this report back (owner decision 2026-10-09).
     report.report_json = {**aggregate_payload, "evidence_report": evidence_view,
                           FINGERPRINT_KEY: pipeline_fingerprint()}
+    # A submitted file the scope keeps for checking again (`recheck-copy-v1`)
+    # is marked before the job completes, so the scheduled clean-up waits.
+    from app.services.recheck_copy import kept_by_policy, mark_kept
+    keep_file = bool(kept_by_policy(job) and job.input_storage_key and job.input_deleted_at is None
+                     and not (job.upload_evidence or {}).get("input_cleanup_started"))
+    if keep_file:
+        mark_kept(job)
     job.status = JobStatus.COMPLETED
     job.stage = JobStage.COMPLETED
     if refresh_reference_ids:
@@ -1195,7 +1204,7 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     # Checks every finished report (owner decision 2026-10-07); never fails the run.
     from app.services.report_check import record_report_check
     record_report_check(session, backend, report, job)
-    cleaned = cleanup_paper_job_input(session, backend, job.id)
+    cleaned = False if keep_file else cleanup_paper_job_input(session, backend, job.id)
     return {"job_id": str(job.id), "report_id": str(report.id), "input_cleaned": cleaned}
 
 

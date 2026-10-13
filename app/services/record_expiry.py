@@ -66,6 +66,16 @@ def delete_paper_record(session: Session, backend, job: Job, *, now: datetime | 
     untouched when the stored paper copy cannot be deleted first."""
     from app.services.report_paper_artifact import cleanup_report_paper_artifact
     report_ids = list(session.scalars(select(Report.id).where(Report.job_id == job.id)))
+    # A submitted file still kept (for checking again) goes with the record.
+    if job.input_storage_key and job.input_deleted_at is None:
+        try:
+            backend.delete(job.input_storage_key)
+            gone = not backend.exists(job.input_storage_key)
+        except Exception:
+            gone = False
+        if not gone:
+            session.rollback()
+            return False
     for artifact in session.scalars(select(ReportPaperArtifactRecord).where(ReportPaperArtifactRecord.job_id == job.id)):
         if not cleanup_report_paper_artifact(session, backend, artifact, now=now):
             session.rollback()

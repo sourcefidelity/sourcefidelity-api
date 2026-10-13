@@ -36,6 +36,8 @@ from app.config import settings
 
 POLICY_VERSION = "storage-policy-v1"
 Profile = Literal["personal", "institutional"]
+PAPER_COPY_OUTLIVES_REPORT = "the paper copy cannot outlive its report"
+SUBMITTED_FILE_OUTLIVES_REPORT = "the submitted file cannot outlive its report"
 # The deployment-wide Institutional settings row every institutional scope inherits.
 INSTITUTIONAL_SCOPE = ("deployment", "institutional")
 
@@ -55,6 +57,11 @@ class PaperStorage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # The copy of the paper shown beside its report.
     paper_copy_days: int = Field(default=7, ge=1)
+    # The submitted file, kept so the paper can be checked again without a new
+    # upload (`recheck-copy-v1`, owner decision 2026-10-13). An operational
+    # copy inside temporary paper retention: never a comparison corpus.
+    keep_submitted_file: bool = False
+    submitted_file_days: int = Field(default=30, ge=0)
 
 
 class ReportStorage(BaseModel):
@@ -74,7 +81,11 @@ class StoragePolicy(BaseModel):
     @model_validator(mode="after")
     def _paper_copy_within_report(self):
         if self.reports.report_days and self.papers.paper_copy_days > self.reports.report_days:
-            raise ValueError("the paper copy cannot outlive its report")
+            raise ValueError(PAPER_COPY_OUTLIVES_REPORT)
+        days = self.papers.submitted_file_days
+        if self.reports.report_days and self.papers.keep_submitted_file and (
+                days == 0 or days > self.reports.report_days):
+            raise ValueError(SUBMITTED_FILE_OUTLIVES_REPORT)
         return self
 
 
@@ -93,7 +104,10 @@ def deployment_defaults(profile: Profile = "personal") -> StoragePolicy:
             keep_licensed_copies=bool(settings.CACHE_PAYWALLED_PDFS),
             licensed_copy_days=max(0, int(settings.CAMPUS_ACCESS_TTL_DAYS)),
         ),
-        papers=PaperStorage(paper_copy_days=max(1, int(settings.FORMATIVE_REPORT_PAPER_RETENTION_DAYS))),
+        # The submitted file is kept 30 days in Personal and not kept in
+        # Institutional until the administrator decides (owner decision 2026-10-13).
+        papers=PaperStorage(paper_copy_days=max(1, int(settings.FORMATIVE_REPORT_PAPER_RETENTION_DAYS)),
+                            keep_submitted_file=profile == "personal"),
     )
 
 
@@ -119,8 +133,9 @@ def policy_for(session: Session | None, scope_type: str, scope_id: str) -> Stora
             record = _record(session, *key)
         except Exception:
             return defaults
-        if record is not None and record.settings:
-            merged = _merged(merged, record.settings)
+        settings_row = getattr(record, "settings", None)
+        if isinstance(settings_row, dict) and settings_row:
+            merged = _merged(merged, settings_row)
     try:
         return StoragePolicy.model_validate(merged)
     except ValidationError:

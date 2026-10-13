@@ -20,12 +20,19 @@ from app.security import (
     get_authenticated_principal,
     require_same_origin_request,
 )
-from app.services.storage_policy import StoragePolicy, policy_for, set_policy, settings_scope_for
+from app.services.storage_policy import (
+    SUBMITTED_FILE_OUTLIVES_REPORT,
+    StoragePolicy,
+    policy_for,
+    set_policy,
+    settings_scope_for,
+)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 PAPER_LONGER_THAN_REPORT = "The paper cannot be kept longer than its report."
 DAYS_OR_UNTIL_DELETED = "Enter a number of days or choose Until deleted."
+SUBMITTED_FILE_LONGER_THAN_REPORT = "The submitted file cannot be kept longer than its report."
 _PUBLIC_CHOICES = (("all", "All"), ("open_access_only", "Open access only"), ("none", "None"))
 
 
@@ -51,6 +58,10 @@ def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
         f'<label><input type="radio" name="keep_licensed_copies" value="{value}"'
         f'{" checked" if sources.keep_licensed_copies == (value == "on") else ""}> {label}</label>'
         for value, label in (("on", "On"), ("off", "Off")))
+    submitted = "".join(
+        f'<label><input type="radio" name="keep_submitted_file" value="{value}"'
+        f'{" checked" if papers.keep_submitted_file == (value == "on") else ""}> {label}</label>'
+        for value, label in (("on", "On"), ("off", "Off")))
     alert = f'<p role="alert">{escape(error)}</p>' if error else ""
     body = (
         '<h1>Storage</h1>' + alert + '<form method="post" action="/settings/storage">'
@@ -63,6 +74,9 @@ def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
         + '</fieldset><fieldset><legend>Papers</legend>'
         + _days("paper_copy_days", "Keep the paper beside its report for", papers.paper_copy_days,
                 until_deleted=False)
+        + f'<fieldset><legend>Keep the submitted file</legend>{submitted}</fieldset>'
+        + _days("submitted_file_days", "Keep the submitted file for", papers.submitted_file_days,
+                until_deleted=True)
         + '</fieldset><fieldset><legend>Reports</legend>'
         + _days("report_days", "Keep reports for", reports.report_days, until_deleted=True)
         + '</fieldset><button type="submit">Save</button></form>')
@@ -101,14 +115,21 @@ def _changes(form) -> dict:
 
     public = form.get("keep_public_copies")
     licensed = form.get("keep_licensed_copies")
-    if public not in {value for value, _ in _PUBLIC_CHOICES} or licensed not in {"on", "off"}:
+    kept = form.get("keep_submitted_file")
+    if (public not in {value for value, _ in _PUBLIC_CHOICES} or licensed not in {"on", "off"}
+            or kept not in {"on", "off"}):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+    papers = {"paper_copy_days": days("paper_copy_days", until_deleted=False), "keep_submitted_file": kept == "on"}
+    # With the file not kept, an empty days box leaves the stored period as it is.
+    if (kept == "on" or str(form.get("submitted_file_days") or "").strip()
+            or form.get("submitted_file_days_until_deleted") == "true"):
+        papers["submitted_file_days"] = days("submitted_file_days", until_deleted=True)
     return {
         "sources": {"keep_public_copies": public,
                     "public_copy_days": days("public_copy_days", until_deleted=True),
                     "keep_licensed_copies": licensed == "on",
                     "licensed_copy_days": days("licensed_copy_days", until_deleted=True)},
-        "papers": {"paper_copy_days": days("paper_copy_days", until_deleted=False)},
+        "papers": papers,
         "reports": {"report_days": days("report_days", until_deleted=True)},
     }
 
@@ -131,15 +152,18 @@ async def save_storage_settings(request: Request,
         changes = _changes(await request.form())
     except _MissingDays:
         return _page(policy_for(session, *scope), DAYS_OR_UNTIL_DELETED)
+    current = policy_for(session, *scope)
     try:
-        StoragePolicy.model_validate({**changes, "version": "storage-policy-v1"})
-    except ValidationError:
-        submitted = policy_for(None, *scope).model_copy(update={})
+        StoragePolicy.model_validate({"version": "storage-policy-v1", "sources": changes["sources"],
+                                      "papers": {**current.papers.model_dump(), **changes["papers"]},
+                                      "reports": changes["reports"]})
+    except ValidationError as exc:
         shown = StoragePolicy.model_construct(
-            sources=submitted.sources.model_copy(update=changes["sources"]),
-            papers=submitted.papers.model_copy(update=changes["papers"]),
-            reports=submitted.reports.model_copy(update=changes["reports"]))
-        return _page(shown, PAPER_LONGER_THAN_REPORT)
+            sources=current.sources.model_copy(update=changes["sources"]),
+            papers=current.papers.model_copy(update=changes["papers"]),
+            reports=current.reports.model_copy(update=changes["reports"]))
+        return _page(shown, SUBMITTED_FILE_LONGER_THAN_REPORT if SUBMITTED_FILE_OUTLIVES_REPORT in str(exc)
+                     else PAPER_LONGER_THAN_REPORT)
     set_policy(session, *scope, changes, updated_by=f"{principal.provider}:{principal.subject}")
     session.commit()
     return RedirectResponse("/settings/storage", status_code=status.HTTP_303_SEE_OTHER)

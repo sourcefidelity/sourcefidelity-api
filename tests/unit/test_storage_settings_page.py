@@ -20,7 +20,7 @@ from app.services.storage_policy import INSTITUTIONAL_SCOPE, policy_for
 
 FORM = {"keep_public_copies": "open_access_only", "public_copy_days": "30", "keep_licensed_copies": "on",
         "licensed_copy_days": "", "licensed_copy_days_until_deleted": "true", "paper_copy_days": "14",
-        "report_days": "365"}
+        "report_days": "365", "keep_submitted_file": "on", "submitted_file_days": "30"}
 
 
 @pytest.fixture
@@ -51,7 +51,8 @@ def test_the_page_shows_only_the_approved_wording_and_current_values(database):
                  "<legend>Keep downloaded sources</legend>", "Keep downloaded sources for",
                  "<legend>Keep library-licensed sources</legend>", "Keep library-licensed sources for",
                  "<legend>Papers</legend>", "Keep the paper beside its report for", "<legend>Reports</legend>",
-                 "Keep reports for", "Until deleted", "Open access only", ">Save</button>"):
+                 "Keep reports for", "Until deleted", "Open access only", ">Save</button>",
+                 "<legend>Keep the submitted file</legend>", "Keep the submitted file for"):
         assert text in page.text
     # Defaults: sources and reports until deleted, the paper copy for 7 days.
     assert 'name="public_copy_days_until_deleted" value="true" checked' in page.text
@@ -111,3 +112,28 @@ def test_an_empty_days_box_without_until_deleted_asks_for_one(database):
     assert "Enter a number of days or choose Until deleted." in response.text
     with database() as db:
         assert db.query(StoragePolicyRecord).count() == 0
+
+
+def test_a_submitted_file_kept_longer_than_its_report_is_refused(database):
+    response = _client(_personal_principal()).post(
+        "/settings/storage", data={**FORM, "submitted_file_days": "", "submitted_file_days_until_deleted": "true"})
+    assert response.status_code == 400
+    assert "The submitted file cannot be kept longer than its report." in response.text
+    with database() as db:
+        assert db.query(StoragePolicyRecord).count() == 0
+
+
+def test_the_submitted_file_defaults_and_an_empty_box_when_not_kept(database):
+    page = _client(_personal_principal()).get("/settings/storage")
+    # Personal keeps the submitted file 30 days by default (owner decision 2026-10-13).
+    assert 'name="keep_submitted_file" value="on" checked' in page.text
+    assert 'name="submitted_file_days" min="1" step="1" value="30"' in page.text
+    saved = _client(_personal_principal()).post(
+        "/settings/storage", data={**FORM, "keep_submitted_file": "off", "submitted_file_days": ""},
+        follow_redirects=False)
+    assert saved.status_code == 303
+    with database() as db:
+        papers = policy_for(db, "personal_owner", _personal_principal().scope_id).papers
+    assert papers.keep_submitted_file is False and papers.submitted_file_days == 30
+    with database() as db:
+        assert policy_for(db, "assessment", "assessment-1").papers.keep_submitted_file is False

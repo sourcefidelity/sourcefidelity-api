@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 import hashlib
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import re
 import uuid
 from io import BytesIO
@@ -20,6 +20,7 @@ import fitz
 from app.database import get_db
 from app.security import (
     AuthenticatedPrincipal,
+    PAPER_CHECK_CAPABILITY,
     REPORT_PAPER_CAPABILITY,
     REPORT_SOURCE_CAPABILITY,
     REPORT_SESSION_COOKIE,
@@ -154,6 +155,7 @@ def get_report(
     view = enable_authenticated_paper_actions(
         view, report_id=report_id,
         search_again_enabled=not _report_marks_released(session, report_id, principal))
+    view["check_again_action"] = _check_again_action(session, report_id, principal)
     with fitz.open(stream=paper_content, filetype="pdf") as document:
         view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
         view["paper_surface"]["selectable_words"] = {
@@ -378,6 +380,22 @@ def get_report_successor_status(
     failure = dict(
         (job.upload_evidence or {}).get("last_targeted_source_refresh_failure") or {}
     )
+    # A "Check Again" run is the same submission's next version (recheck-copy-v1):
+    # the newest completed re-check's report is the successor.
+    from app.models.job import JobStatus
+    from app.services.recheck_copy import lineage
+    rechecking = False
+    for later in lineage(session, job)[1:]:
+        if later.status == JobStatus.COMPLETED:
+            newer = session.scalar(select(Report).where(Report.job_id == later.id)
+                                   .order_by(Report.report_version.desc(), Report.created_at.desc()).limit(1))
+            latest = newer or latest
+            rechecking = False
+        elif later.status == JobStatus.FAILED:
+            failure = {"attempt_id": str(later.id), "code": "recheck_failed"}
+            rechecking = False
+        else:
+            rechecking = True
     return {
         "requested_report_id": str(requested.id),
         "latest_report_id": str(latest.id),
@@ -385,10 +403,83 @@ def get_report_successor_status(
         "successor_available": latest.id != requested.id,
         "processing": bool(
             (job.upload_evidence or {}).get("targeted_source_refresh")
-        ),
+        ) or rechecking,
         "queued_uploads": len((job.upload_evidence or {}).get("queued_source_uploads") or []),
         "last_reanalysis_failure": failure or None,
     }
+
+
+def _report_job(session: Session, report_id: str, principal) -> Job | None:
+    """The report's job when it belongs to the viewer's scope, else None."""
+    try:
+        report = session.get(Report, uuid.UUID(str(report_id)))
+    except ValueError:
+        return None
+    if not isinstance(report, Report):
+        return None
+    job = session.get(Job, report.job_id)
+    if (not isinstance(job, Job) or job.scope_type != principal.scope_type
+            or job.scope_id != principal.scope_id):
+        return None
+    return job
+
+
+def _check_again_action(session: Session, report_id: str, principal) -> dict | None:
+    """The "Check Again" control while the submitted file is still kept (recheck-copy-v1)."""
+    from app.services.recheck_copy import available, lineage
+    if PAPER_CHECK_CAPABILITY not in principal.capabilities or not isinstance(session, Session):
+        return None
+    job = _report_job(session, report_id, principal)
+    if job is None or _report_marks_released(session, report_id, principal):
+        return None
+    if not any(available(item) for item in lineage(session, job)):
+        return None
+    return {"enabled": True, "href": f"/report/{quote(str(report_id), safe='')}/check-again"}
+
+
+@router.post("/{report_id}/check-again")
+def check_paper_again(
+    report_id: str,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_report_principal),
+    session: Session = Depends(get_db),
+    backend: StorageBackend = Depends(get_storage_backend),
+):
+    """Check the kept submitted file again (owner decision 2026-10-13, S1 step 3c).
+
+    The page then follows the newest version exactly as after a source upload;
+    an unchanged paper under unchanged rules returns its existing report.
+    """
+    from app.services.paper_dispatch import attempt_id_for
+    from app.services.paper_upload import PaperUploadError
+    from app.services.recheck_copy import RecheckInProgress, RecheckUnavailable, start_recheck
+    from app.tasks.check_paper import check_paper_task
+    principal.require(PAPER_CHECK_CAPABILITY)
+    require_same_origin_request(request)
+    _load_bundle(session, backend, report_id, principal)
+    job = _report_job(session, report_id, principal)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if _report_marks_released(session, report_id, principal):
+        raise HTTPException(status_code=410, detail="Marks are released for this assessment")
+    try:
+        outcome, value = start_recheck(session, backend, job, scope_type=principal.scope_type,
+                                       scope_id=principal.scope_id)
+    except RecheckInProgress as exc:
+        raise HTTPException(status_code=409, detail="The report is already being updated.") from exc
+    except RecheckUnavailable as exc:
+        raise HTTPException(status_code=410, detail="The submitted file is no longer kept") from exc
+    except PaperUploadError as exc:
+        raise HTTPException(status_code=503, detail=exc.code) from exc
+    if outcome == "reused":
+        return {"reused": True, "report_id": str(value.id)}
+    try:
+        queued = check_paper_task.delay(str(value.id), attempt_id_for(value))
+        value.task_id = queued.id
+        session.commit()
+    except Exception:
+        session.rollback()
+    return {"status_url": f"/report/{quote(str(report_id), safe='')}/successor", "attempt_id": str(value.id)}
 
 
 @router.get("/{report_id}/paper")

@@ -19,6 +19,7 @@ from app.services.paper_upload import (
     PaperUploadError,
     create_paper_job,
 )
+from app.services.recheck_copy import retention_at_upload as recheck_retention_at_upload
 from app.services.storage.backend import StorageBackend, get_storage_backend
 from app.tasks.check_paper import check_paper_task
 from app.services.paper_dispatch import attempt_id_for
@@ -100,6 +101,8 @@ def check_paper(
             assessment_id=assessment_id,
             scope_type=principal.scope_type,
             scope_id=principal.scope_id,
+            recheck_copy=None if store_only else recheck_retention_at_upload(
+                session, principal.scope_type, principal.scope_id),
         )
     except PaperUploadError as exc:
         code = 503 if exc.code in {"storage_unavailable", "malware_scan_unavailable"} else 422
