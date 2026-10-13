@@ -8,7 +8,7 @@ from app.log_safety import configure_sensitive_transport_logging
 
 configure_sensitive_transport_logging()
 
-from app.routers import assessments, health, check, status, report, sources, edition_reviews, judgment
+from app.routers import assessments, health, check, status, report, sources, edition_reviews, judgment, storage_settings
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -42,6 +42,7 @@ app.include_router(judgment.router, prefix="/report", tags=["judgment"])
 app.include_router(sources.router)  # prefix "/sources" set in the router
 app.include_router(edition_reviews.router)
 app.include_router(assessments.router)  # prefix "/assessments" set in the router
+app.include_router(storage_settings.router)  # prefix "/settings" set in the router
 
 
 @app.get("/")

@@ -17,6 +17,12 @@ otherwise:
 
 A day count of 0 means "until deleted". A scope's row holds only its
 differences from the defaults; anything invalid fails closed to the defaults.
+
+Who sets them (owner decision 2026-10-13): the Personal owner for their own
+scope; in Institutional, the administrator who deploys the application, for
+the whole deployment (`INSTITUTIONAL_SCOPE`), because the choices must follow
+university policy. Instructors cannot change them, and the settings page
+writes no course or assessment scope row.
 """
 from __future__ import annotations
 
@@ -30,6 +36,8 @@ from app.config import settings
 
 POLICY_VERSION = "storage-policy-v1"
 Profile = Literal["personal", "institutional"]
+# The deployment-wide Institutional settings row every institutional scope inherits.
+INSTITUTIONAL_SCOPE = ("deployment", "institutional")
 
 
 class SourceStorage(BaseModel):
@@ -102,18 +110,33 @@ def policy_for(session: Session | None, scope_type: str, scope_id: str) -> Stora
     defaults = deployment_defaults(profile_for(scope_type))
     if session is None:
         return defaults
-    from app.models.storage_policy import StoragePolicyRecord
+    keys = [(scope_type, scope_id)]
+    if profile_for(scope_type) == "institutional" and (scope_type, scope_id) != INSTITUTIONAL_SCOPE:
+        keys.insert(0, INSTITUTIONAL_SCOPE)
+    merged = defaults.model_dump()
+    for key in keys:
+        try:
+            record = _record(session, *key)
+        except Exception:
+            return defaults
+        if record is not None and record.settings:
+            merged = _merged(merged, record.settings)
     try:
-        record = session.scalar(select(StoragePolicyRecord).where(
-            StoragePolicyRecord.scope_type == scope_type, StoragePolicyRecord.scope_id == scope_id))
-    except Exception:
-        return defaults
-    if record is None or not record.settings:
-        return defaults
-    try:
-        return StoragePolicy.model_validate(_merged(defaults.model_dump(), record.settings))
+        return StoragePolicy.model_validate(merged)
     except ValidationError:
         return defaults
+
+
+def settings_scope_for(scope_type: str, scope_id: str) -> tuple[str, str]:
+    """The row a settings-page save writes: the Personal owner's own scope,
+    or the deployment-wide Institutional row."""
+    return (scope_type, scope_id) if profile_for(scope_type) == "personal" else INSTITUTIONAL_SCOPE
+
+
+def _record(session: Session, scope_type: str, scope_id: str):
+    from app.models.storage_policy import StoragePolicyRecord
+    return session.scalar(select(StoragePolicyRecord).where(
+        StoragePolicyRecord.scope_type == scope_type, StoragePolicyRecord.scope_id == scope_id))
 
 
 def set_policy(session: Session, scope_type: str, scope_id: str, changes: dict, *, updated_by: str | None = None

@@ -31,6 +31,10 @@ EDITION_REVIEW_CAPABILITY = "source:edition:review"
 # Instructor/administrator: record that marks are released for an assessment
 # (assessment_marks.py). Never granted to the report browser session.
 ASSESSMENT_MARKS_RELEASE_CAPABILITY = "assessment:marks:release"
+# Storage settings (owner decision 2026-10-13): the Personal owner, or in
+# Institutional the administrator who deploys the application for the
+# university; never an instructor, since the choices follow university policy.
+STORAGE_SETTINGS_CAPABILITY = "storage:settings:manage"
 
 _bearer = HTTPBearer(auto_error=False)
 REPORT_SESSION_COOKIE = "sourcefidelity_report_session"
@@ -259,6 +263,7 @@ def _personal_principal(*, provider: str = "personal_bearer") -> AuthenticatedPr
                 SOURCE_REPOSITORY_READ_CAPABILITY,
                 SOURCE_REPOSITORY_WRITE_CAPABILITY,
                 EDITION_REVIEW_CAPABILITY,
+                STORAGE_SETTINGS_CAPABILITY,
                 # No marks release in Personal (owner decision 2026-09-29).
             }
         ),
