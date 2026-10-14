@@ -131,7 +131,11 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
                 authors = [bylines[0]]
                 author_method = 'visible_journal_header_byline'
     if not authors and fields.get("author"):
-        authors = re.split(r"\s*;\s*", fields["author"])
+        # "François Dupuis, Vice-President and Chief Economist • Francis
+        # Généreux, Senior Economist" (Desjardins, 2026-10-14) comes back as
+        # four names; a bullet separates people and a title-only part is none.
+        authors = [part for part in re.split(r"\s*[;•]\s*", fields["author"])
+                   if part and not _TITLE_ONLY.fullmatch(part)]
         author_method = "trafilatura_metadata"
     # Some article headers use an ordinary visible byline, not author metadata.
     # Restrict fallback to a short explicit byline near the article heading;
@@ -271,6 +275,14 @@ _JOB_TITLE = re.compile(
     r"shopping|lifestyle|opinion|review|reviews|video|audio|investigative|special|senior)\s+)*"
     r"(?:reporter|writer|editor|correspondent|contributor|columnist|journalist|producer|critic)s?$",
     re.IGNORECASE)
+
+
+# A byline part made only of position words: "Vice-President", "Chief
+# Economist", "Senior Economist".
+_TITLE_ONLY = re.compile(
+    r"(?:(?:vice-president|president|vice|chief|senior|junior|principal|lead|head|deputy|associate|"
+    r"assistant|executive|managing|economist|economists|director|editor|professor|analyst|strategist|"
+    r"manager|officer|researcher|fellow|partner|ceo|cfo|cto|and|&|of)[\s,]*)+", re.IGNORECASE)
 
 
 def _without_job_title(author: str) -> str:

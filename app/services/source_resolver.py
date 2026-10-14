@@ -1734,7 +1734,7 @@ class SourceResolver:
                         result=observed,
                         candidate_key=location_hash,
                         location_url=(landing.get("source_url") or location_url) if landing else location_url,
-                        opened_page_url=landing.get("source_url") if landing else None,
+                        opened_page_url=(landing or page_only or {}).get("source_url"),
                         acquisition_outcome=acquisition_outcome,
                         validation_reason=str(location_attempt.get("reason") or "")
                         or None,
@@ -5458,11 +5458,13 @@ class SourceResolver:
 
     @staticmethod
     def _landing_metadata_observation(response) -> dict:
-        """The fetched page's bibliographic fields, kept without its address."""
+        """The fetched page's bibliographic fields and its final fetched address,
+        the record's link (owner decision 2026-10-14)."""
         observed = extract_web_source_metadata(response.text, str(response.url))
         fields = {key: observed[key] for key in ("title", "authors", "year", "doi")}
         fields["metadata"] = {key: observed[key] for key in ("container_title", "pages") if observed.get(key)}
-        return {"observed": fields, "content_sha256": hashlib.sha256(response.content).hexdigest()}
+        return {"observed": fields, "content_sha256": hashlib.sha256(response.content).hexdigest(),
+                "source_url": str(response.url)}
 
     @staticmethod
     def _landing_author_conflict(observation, *, expected_doi, expected_title, expected_author,

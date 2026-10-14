@@ -269,3 +269,14 @@ def test_a_stated_page_is_complete_only_without_cut_off_signs_and_at_a_fitting_l
     # A "Continue reading" link in a sidebar of other articles does not cut this one off.
     sidebar = page.replace("</body>", '<aside><a href="/x">Other essay. Continue reading</a></aside></body>')
     assert stated_page_completeness(sidebar, body, "journal_article")["verdict"] == "complete"
+
+
+def test_a_byline_with_positions_and_a_bullet_names_only_the_people():
+    # Desjardins, 2026-10-14: the positions were read as authors.
+    from app.services.web_source_metadata import extract_web_source_metadata
+    html = ('<html><head><title>A study of trade</title><script type="application/ld+json">'
+            '{"@context":"https://schema.org","@type":"Article","headline":"A study of trade",'
+            '"author":{"@type":"Person","name":"Ada Example, Vice-President and Chief Economist  \u2022  '
+            'Ben Sample, Senior Economist "}}</script></head><body><h1>A study of trade</h1>'
+            '<p>Some article text.</p></body></html>')
+    assert extract_web_source_metadata(html, "https://example.org/a")["authors"] == ["Ada Example", "Ben Sample"]
