@@ -11,7 +11,7 @@ import pytest
 
 from app.services import paper_workflow
 from app.services.evidence_report import _withhold_mismatched_evidence
-from app.services.report_layers import scope_mark_qualifies
+from app.services.report_layers import topical_mismatch
 
 CLAIM = "Canadian telecommunications policy favours incumbents."
 EXCERPT = "This article examines United States platform markets and their regulation."
@@ -80,58 +80,26 @@ class TestWithholdingTheDisplay:
         assert _withhold_mismatched_evidence(member, {"student_text": CLAIM}) is member
 
 
-class TestSharedPredicate:
-    """The workflow must never skip work the report would not have marked."""
-
-    def test_a_qualifying_judgment_is_recognised(self):
-        assert scope_mark_qualifies(_scope(), "partial_text")
+class TestTheMarkDecidesTheWithholding:
+    """The report's mark alone decides; the run no longer has a rule of its own
+    (owner decision 2026-10-15)."""
 
     @pytest.mark.parametrize("override", [
         {"relevance": "generally_relevant"}, {"attention": False},
         {"confidence": "medium"}, {"stated_scope_conflict": "absent"},
     ])
-    def test_a_non_qualifying_judgment_is_not(self, override):
-        assert not scope_mark_qualifies(_scope(**override), "partial_text")
-
-    def test_unsupported_coverage_never_qualifies(self):
-        assert not scope_mark_qualifies(_scope(), "metadata_only")
+    def test_a_non_qualifying_judgment_keeps_the_evidence(self, override):
+        member = _member(scope=_scope(**override))
+        assert not topical_mismatch(member, {"student_text": CLAIM})
+        assert _withhold_mismatched_evidence(member, {"student_text": CLAIM})["best_evidence"] is not None
 
     def test_a_different_subject_needs_whole_document_support(self):
         ground = _scope(discrepancy="different_subject", topic_relation="disjoint",
                         broad_subject_relation="incompatible",
                         plausible_connection="absent", stated_scope_conflict="absent")
-        assert not scope_mark_qualifies({**ground, "claim_terms_present": 10,
-                                         "claim_terms_total": 12}, "partial_text")
-        assert scope_mark_qualifies({**ground, "claim_terms_present": 0,
-                                     "claim_terms_total": 12}, "partial_text")
-
-
-class TestWorkflowShortCircuit:
-    def _artifact(self, status, scope, coverage="partial_text"):
-        from app.services.verification_evidence import SourceScopeAssessmentEvidence
-        record = SourceScopeAssessmentEvidence(
-            status=status, coverage=coverage, excerpt=EXCERPT,
-            excerpt_sha256="x" * 64,
-            assessment={"status": "complete", "scope_assessment": scope},
-            claim_terms_present=0, claim_terms_total=12)
-        return type("A", (), {"source_scope_assessment": record})()
-
-    def test_an_established_mismatch_stops_the_evidence_work(self):
-        assert paper_workflow._scope_mismatch_established(
-            self._artifact("complete", _scope()))
-
-    def test_an_ordinary_judgment_does_not(self):
-        assert not paper_workflow._scope_mismatch_established(
-            self._artifact("complete", _scope(relevance="generally_relevant",
-                                              attention=False)))
-
-    def test_an_unrun_comparison_does_not(self):
-        assert not paper_workflow._scope_mismatch_established(
-            self._artifact("not_run", _scope()))
-
-    def test_a_missing_record_does_not(self):
-        assert not paper_workflow._scope_mismatch_established(
-            type("A", (), {"source_scope_assessment": None})())
+        common = {"student_text": CLAIM}
+        assert not topical_mismatch(_member(scope={**ground, "claim_terms_present": 10, "claim_terms_total": 12}), common)
+        assert topical_mismatch(_member(scope={**ground, "claim_terms_present": 0, "claim_terms_total": 12}), common)
 
 
 class TestOwnerDecision20261014:
@@ -140,18 +108,51 @@ class TestOwnerDecision20261014:
     (owner decisions 2026-10-14 and 2026-09-30; Harlow citation 7)."""
 
     def test_a_fully_retrieved_text_is_never_a_mismatch(self):
-        assert not scope_mark_qualifies(_scope(scope_coverage="full_text"), "full_text")
         member = _member(coverage_level="full_text", scope=_scope(scope_coverage="full_text"))
+        assert not topical_mismatch(member, {"student_text": CLAIM})
         assert _withhold_mismatched_evidence(member, {"student_text": CLAIM})["best_evidence"] is not None
 
     def test_limited_text_can_still_be_a_mismatch(self):
-        assert scope_mark_qualifies(_scope(), "partial_text")
         item = _withhold_mismatched_evidence(_member(coverage_level="partial_text"), {"student_text": CLAIM})
         assert item["best_evidence"] is None
 
-    def test_three_sources_skip_no_evidence_work(self):
-        assert scope_mark_qualifies(_scope(), "partial_text", sources=2)
-        assert not scope_mark_qualifies(_scope(), "partial_text", sources=3)
+    def test_three_sources_keep_their_evidence(self):
         member = _member(coverage_level="partial_text")
+        assert topical_mismatch(member, {"student_text": CLAIM, "members": [member, {}]})
         three = {"student_text": CLAIM, "members": [member, {}, {}]}
         assert _withhold_mismatched_evidence(member, three)["best_evidence"] is not None
+
+
+def test_the_run_gathers_evidence_even_for_a_topical_mismatch(monkeypatch):
+    # Owner decision 2026-10-15: the run never skips evidence work on a topical
+    # comparison; only the report decides the mark and withholds the evidence.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from app.services import cross_language_evidence, evidence_sentence_selection, judgment_reserve
+    from app.services.verification_evidence import SourceScopeAssessmentEvidence
+    evidence = MagicMock(cross_language={})
+    evidence.model_copy.return_value = evidence
+    mismatch = SourceScopeAssessmentEvidence(
+        status="complete", coverage="partial_text", excerpt=EXCERPT, excerpt_sha256="x" * 64,
+        assessment={"status": "complete", "scope_assessment": _scope()},
+        claim_terms_present=0, claim_terms_total=12)
+    def scoped(found, *a, **k):
+        found.source_scope_assessment = mismatch
+        return found
+    called = []
+    same = lambda found, *a, **k: found
+    for name in ("build_passage_evidence", "attach_verification_candidates", "attach_citation_use_routes",
+                 "attach_source_blind_interpretations", "attach_evidence_obligations",
+                 "apply_passage_relevance_gate", "attach_facet_evidence_foundation"):
+        monkeypatch.setattr(paper_workflow, name, (lambda *a, **k: evidence) if name == "build_passage_evidence" else same)
+    monkeypatch.setattr(paper_workflow, "_attach_source_scope", scoped)
+    monkeypatch.setattr(paper_workflow, "attach_candidate_passage_retrieval",
+                        lambda source, found, **k: called.append("retrieval") or found)
+    monkeypatch.setattr(evidence_sentence_selection, "attach_sentence_evidence",
+                        lambda found: called.append("selection") or found)
+    monkeypatch.setattr(cross_language_evidence, "claim_inputs", lambda *a, **k: (None, []))
+    monkeypatch.setattr(judgment_reserve, "reserve_enabled", lambda: False)
+    source = SimpleNamespace(identity_verdict="verified")
+    claim = SimpleNamespace(text=CLAIM, reference_ids=["r1"])
+    paper_workflow._shadow_artifact(source, claim, True, active_reference_id="r1", cited_author_label="Ames")
+    assert called == ["retrieval", "selection"]

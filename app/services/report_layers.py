@@ -129,24 +129,6 @@ def _reference_identified(member: dict) -> bool:
                 and identity.get('title_and_author_agree'))
 
 
-def scope_mark_qualifies(scope: dict, coverage: str, *, sources: int = 1) -> bool:
-    """Would this scope judgment carry a mark, on grounds alone?
-
-    Shared with the verification workflow, which uses it to stop spending on
-    evidence for a source it has already judged topically mismatched. It is
-    deliberately the same ground and threshold logic the report applies, so
-    nothing is skipped that the reader would then see presented as normal.
-    It omits the hash binding, which exists to prove the displayed text was
-    the text compared and cannot be checked before the report is built.
-    """
-    if coverage not in _SCOPE_COMPARABLE_COVERAGE or sources >= BROAD_CITATION_SOURCES:
-        return False
-    return bool(scope.get('relevance') == 'apparent_mismatch'
-                and scope.get('attention') is True
-                and scope.get('confidence') == 'high'
-                and _qualifying_scope_ground(scope))
-
-
 # A fully retrieved text is judged, never marked a topical mismatch; the
 # mark is for abstracts and limited text (owner decision 2026-10-14).
 _SCOPE_COMPARABLE_COVERAGE = {'abstract_only', 'partial_text'}

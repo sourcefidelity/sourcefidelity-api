@@ -1666,26 +1666,22 @@ def _shadow_artifact(
         evidence.source_identity.limitations.append(identity_reason[:1000])
     evidence = attach_verification_candidates(evidence)
     evidence = attach_citation_use_routes(evidence)
-    # Judged before the evidence work, not after it. A source whose own
-    # subject excludes the statement cannot supply evidence for it, so
-    # selecting and ranking passages from it spends two model calls to
-    # produce material the report then withholds. Retrieval itself cannot
-    # be avoided: this judgment reads the document.
+    # The topical comparison the report's mark is made from. The evidence
+    # work below always runs: only the report decides the mark and withholds
+    # the evidence (owner decision 2026-10-15; the run's own skip rule
+    # checked less than the report and left citations with neither).
     if llm_enabled:
         evidence = _attach_source_scope(evidence, claim, scope_excerpt,
                                         source_title=source_title, source=source)
-    topically_mismatched = _scope_mismatch_established(
-        evidence, sources=len(set(getattr(claim, "reference_ids", None) or [])))
-    if llm_enabled and not topically_mismatched:
+    if llm_enabled:
         evidence = attach_source_blind_interpretations(
             evidence,
             response_provider=_student_interpretation_response,
         )
     evidence = attach_evidence_obligations(evidence)
-    if not topically_mismatched:
-        evidence = attach_candidate_passage_retrieval(source, evidence,
-                                                      translated_queries=translated_queries)
-    if llm_enabled and not topically_mismatched:
+    evidence = attach_candidate_passage_retrieval(source, evidence,
+                                                  translated_queries=translated_queries)
+    if llm_enabled:
         evidence = apply_passage_relevance_gate(evidence, source_title=source_title)
         if (
             settings.EVIDENCE_RETRIEVAL_SEMANTIC_BACKEND == "deberta_nli"
@@ -1704,7 +1700,7 @@ def _shadow_artifact(
             evidence = evidence.model_copy(update={
                 "joint_evidence_selection": select_joint_evidence(evidence, source_title=source_title),
             })
-    if (settings.CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED and not topically_mismatched
+    if (settings.CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED
             and (evidence.cross_language or {}).get("differs")):
         # A source in another writing system (cross-language-whole-source-v1,
         # owner decision 2026-10-13): the selector and the Judgment foundation
@@ -1712,19 +1708,19 @@ def _shadow_artifact(
         # miss a passage worded differently.
         from app.services.cross_language_whole_source import attach_whole_source
         evidence = attach_whole_source(source, evidence)
-    if llm_enabled and not topically_mismatched:
+    if llm_enabled:
         # The citation's one evidence list (owner decision 2026-09-28): GLM picks
         # the numbered source sentences; without it the gate's display is used.
         from app.services.evidence_sentence_selection import attach_sentence_evidence
         evidence = attach_sentence_evidence(evidence)
     evidence = attach_facet_evidence_foundation(evidence)
-    if (llm_enabled and not topically_mismatched
+    if (llm_enabled
             and settings.PAPER_EXPERIMENTAL_RELATIONSHIP_JUDGMENTS_ENABLED
             and source.identity_verdict != 'possible_match'):
         evidence = apply_facet_evidence_judgment(evidence)
         evidence = apply_decisive_label_critic(evidence)
     from app.services.judgment_reserve import build_judgment_reserve, reserve_enabled
-    if reserve_enabled() and not topically_mismatched:
+    if reserve_enabled():
         # Wider-search sentences for the Judgment layout, built while the
         # source is still available; never part of the Evidence Package.
         evidence._judgment_reserve = build_judgment_reserve(source, evidence)
@@ -1733,20 +1729,6 @@ def _shadow_artifact(
 
 # Headroom kept between the composed scope text and the input budget.
 _SCOPE_COMPOSITION_MARGIN = 250
-
-
-def _scope_mismatch_established(evidence, *, sources: int = 1) -> bool:
-    """Has the scope comparison already ruled this source out for this claim?"""
-    from app.services.report_layers import scope_mark_qualifies
-    record = getattr(evidence, "source_scope_assessment", None)
-    if record is None or record.status != "complete":
-        return False
-    scope = dict((record.assessment or {}).get("scope_assessment") or {})
-    if not scope:
-        return False
-    scope.setdefault("claim_terms_present", record.claim_terms_present)
-    scope.setdefault("claim_terms_total", record.claim_terms_total)
-    return scope_mark_qualifies(scope, record.coverage, sources=sources)
 
 
 def _attach_source_scope(evidence, claim, excerpt: str, *, source_title: str, source=None):
