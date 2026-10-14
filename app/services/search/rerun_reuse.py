@@ -91,6 +91,8 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if native_script_route_due(item, reference):
         return False
     discovery = item.get("reference_discovery") or {}
+    if _lantern_route_due(discovery, reference):
+        return False
     if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
             and (reference.get("container_title") or "").strip()
             and discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
@@ -134,6 +136,18 @@ def native_script_route_due(item: dict, reference) -> bool:
     route = (discovery.get("native_script_route")
              or (item.get("reference_discovery_trace") or {}).get("native_script_route") or {})
     return not (route.get("policy_version") in NATIVE_SCRIPT_ROUTE_POLICIES and route.get("status") == "completed")
+
+
+def _lantern_route_due(discovery: dict, reference: dict | None) -> bool:
+    """A Media History Digital Library link whose earlier result predates the
+    route that reads its pages (`lantern-pages-v1`, 2026-10-14): searched again
+    once, so the route runs (the Jean Harlow paper's ten Lantern references
+    were all reused from runs before it)."""
+    from app.services.retrieval.lantern import lantern_target
+    if not isinstance(reference, dict) or not lantern_target(reference.get("url")):
+        return False
+    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
+    return not any(a.get("provider") == "student_url_lantern" for a in attempts)
 
 
 def _no_provider_at_fault(discovery: dict) -> bool:

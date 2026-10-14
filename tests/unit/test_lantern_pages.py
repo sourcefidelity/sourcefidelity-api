@@ -96,3 +96,52 @@ def test_lantern_ocr_text_gets_ocr_tolerant_quotation_matching():
     # A scan's own text layer without a bound derivation stays strict, as before.
     assert not _ocr_tolerant(SimpleNamespace(text_quality="scan_ocr", derivation_method=None, provenance="web_fetch"))
     assert not _ocr_tolerant(SimpleNamespace(text_quality="digital", derivation_method=None, provenance="lantern"))
+
+
+def test_an_earlier_result_without_the_lantern_route_is_searched_again():
+    from app.services.search.rerun_reuse import _reusable
+    reference = {"reference_id": "ref-1", "url": "https://lantern.mediahist.org/catalog/fanmag22unse_0333",
+                 "raw_ref": "Talbott, T. (1930). Meet the new blonde. Fanmag, 26-27.", "source_kind": "magazine_article"}
+    completed = {"outcome": "unlocated_after_search", "created_at": "t0",
+                 "attempts": [{"route_category": "student_url", "provider": "student_url_html", "outcome": "candidate_found"}]}
+    item = {"status": "unavailable", "reason_code": "full_text_unavailable", "reference_discovery": completed}
+    assert not _reusable(item, reference)
+    with_route = {**completed, "attempts": [*completed["attempts"],
+                                            {"route_category": "student_url", "provider": "student_url_lantern",
+                                             "outcome": "no_match"}]}
+    assert _reusable({**item, "reference_discovery": with_route}, reference)
+    # Other links are unaffected.
+    assert _reusable(item, {**reference, "url": "https://example.org/page"})
+
+
+def test_a_link_to_the_second_page_of_a_spread_with_a_damaged_headline():
+    pages = {10: "40", 11: "41", 12: "42"}
+    ocr = {10: "Scenes from life during the tr nside the studio.",
+           11: "J ressed in Di nity and ]S[ot Much Else. Fans demand to know.",
+           12: "Another article entirely."}
+
+    def get(url):
+        if url.endswith(".json") and "/catalog/" in url:
+            return _response(url, payload={"data": {"attributes": {"title": {"attributes": {"value": "Fanmag"}},
+                                                                   "dateStart": {"attributes": {"value": "1933"}}}}})
+        if url.endswith("_page_numbers.json"):
+            return _response(url, payload={"pages": [{"leafNum": k, "pageNumber": v} for k, v in pages.items()]})
+        leaf = int(url.rsplit("_", 1)[1])
+        return _response(url, text=f'<div class="card card-body ">{ocr.get(leaf, "")}</div>')
+    article = read_article("https://lantern.mediahist.org/catalog/vol_0011", title="Dressed in Dignity and Not Much Else",
+                           raw_ref="X. (1933). Dressed in dignity and not much else. Fanmag, 40-41.", get=get, get_archive=get)
+    assert article.leaves == [10, 11] and article.complete
+    # Without cited pages only the page carrying the title is read, not the next article.
+    alone = read_article("https://lantern.mediahist.org/catalog/vol_0011", title="Dressed in Dignity and Not Much Else",
+                         raw_ref="X. (1933). Dressed in dignity and not much else. Fanmag.", get=get, get_archive=get)
+    assert alone.leaves == [11] and not alone.complete and alone.notes == ["no_cited_pages"]
+
+
+def test_a_title_not_found_is_an_answered_check(monkeypatch):
+    from app.services.source_resolver import SourceResolver, _student_link_disposition
+    monkeypatch.setattr("app.services.retrieval.provider_gate.paced_get",
+                        lambda provider, interval, url, **kwargs: _fake_get(url))
+    missing = SourceResolver.__new__(SourceResolver)._try_lantern(
+        f"https://lantern.mediahist.org/catalog/{VOLUME}_0333", title="A story never printed here", author="X.",
+        year="1930", container_title="Fanmag", raw_ref="X. (1930). A story never printed here. Fanmag, 26-27.")
+    assert not missing.success and _student_link_disposition(missing) == ("no_match", "link_page_title_differs")

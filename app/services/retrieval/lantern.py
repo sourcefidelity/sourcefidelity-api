@@ -145,24 +145,29 @@ def read_article(url: str, *, title: str | None, raw_ref: str | None, get, get_a
         page_map = _page_map(get_archive, volume)
     except Exception:  # noqa: BLE001 - without the map only the linked leaf and its neighbours are tried
         page_map = {}
-    candidates: list[int] = []
-    if pages and page_map:
-        candidates = [leaf for leaf, printed in sorted(page_map.items()) if printed == str(pages[0])]
-    candidates = [linked_leaf] + [leaf for leaf in candidates if leaf != linked_leaf]
-    if not page_map:
-        candidates += [linked_leaf + offset for offset in (1, 2, -1)]
-    first_leaf, first_text = None, ""
-    for leaf in candidates[:MAX_CANDIDATE_LEAVES]:
-        if leaf < 1:
-            continue
-        text = _page_text(get, volume, leaf)
-        if title_in_text(title, text):
-            first_leaf, first_text = leaf, text
-            break
+    cache: dict[int, str] = {}
+
+    def text_of(leaf: int) -> str:
+        if leaf not in cache:
+            cache[leaf] = _page_text(get, volume, leaf) if leaf >= 1 else ""
+        return cache[leaf]
+
+    start, end = pages if pages else (None, None)
+    first_leaf = _first_leaf_on_linked_spread(title, linked_leaf, start, page_map, text_of)
+    if first_leaf is None:
+        # Other issues bound in the volume: the strict single-page match.
+        candidates = [leaf for leaf, printed in sorted(page_map.items())
+                      if start is not None and printed == str(start) and leaf not in {linked_leaf, linked_leaf - 1}]
+        if not page_map:
+            candidates = [linked_leaf + 1, linked_leaf + 2]
+        first_leaf = next((leaf for leaf in candidates[:MAX_CANDIDATE_LEAVES]
+                           if leaf >= 1 and title_in_text(title, text_of(leaf))), None)
     if first_leaf is None:
         return None
-    start, end = pages if pages else (None, None)
+    first_text = text_of(first_leaf)
     leaves, notes, complete = [first_leaf], [], True
+    # No cited pages: only the page carrying the title, not known complete (the
+    # next page of Hampton's spread is another article).
     if start is not None and end is not None and end > start:
         if end - start + 1 > MAX_CONTIGUOUS_PAGES:
             wanted = [start + 1, end]
@@ -180,7 +185,7 @@ def read_article(url: str, *, title: str | None, raw_ref: str | None, get, get_a
     elif start is None:
         complete = False
         notes.append("no_cited_pages")
-    texts = [first_text] + [_page_text(get, volume, leaf) for leaf in leaves[1:]]
+    texts = [first_text] + [text_of(leaf) for leaf in leaves[1:]]
     if any(not text for text in texts):
         complete = False
         notes.append("page_text_missing")
@@ -188,6 +193,49 @@ def read_article(url: str, *, title: str | None, raw_ref: str | None, get, get_a
         volume=volume, magazine=magazine, volume_dates=dates, leaves=leaves,
         printed_pages=[page_map.get(leaf, "") for leaf in leaves], text="\n\n".join(texts),
         complete=complete, first_leaf_url=f"{LANTERN}/catalog/{volume}_{first_leaf:04d}", notes=notes)
+
+
+def title_on_spread(title: str | None, left: str, right: str) -> bool:
+    """At least 80% of the title's words (three or more) anywhere on a two-page
+    spread. Headlines often run across both pages of a magazine spread, and OCR
+    reads columns out of order; used only for the leaf the student linked."""
+    wanted = [word for word in _words(title) if len(word) > 1]
+    if len(" ".join(wanted)) < 8:
+        return False
+    tokens = set(_words(left)) | set(_words(right))
+    matched = sum(1 for word in wanted if _scanned_word_present(word, tokens))
+    return matched >= 3 and matched >= 0.8 * len(wanted)
+
+
+def _scanned_word_present(word: str, tokens: set[str]) -> bool:
+    """A title word on a scanned page: exact; fused into a longer word
+    ("HappyGive!", four letters or more); or a damaged reading ("ressed" for
+    "dressed", "nity" for "dignity", five letters or more, 70% alike)."""
+    if word in tokens:
+        return True
+    if len(word) >= 4 and any(word in token for token in tokens if len(token) > len(word)):
+        return True
+    if len(word) >= 5:
+        from difflib import SequenceMatcher
+        return any(SequenceMatcher(None, word, token).ratio() >= 0.7
+                   for token in tokens if len(token) >= 3 and abs(len(token) - len(word)) <= 4)
+    return False
+
+
+def _first_leaf_on_linked_spread(title, linked_leaf: int, start: int | None, page_map: dict[int, str],
+                                 text_of) -> int | None:
+    """The article's first leaf when the student's link points into it: the
+    linked leaf or the one before it (a link to an article's second page),
+    printed with the cited first page when both are known, whose two-page
+    spread carries the title."""
+    for first in (linked_leaf, linked_leaf - 1):
+        if first < 1:
+            continue
+        if start is not None and page_map and page_map.get(first) != str(start):
+            continue
+        if title_on_spread(title, text_of(first), text_of(first + 1)):
+            return first
+    return None
 
 
 def _leaf_for_page(page_map: dict[int, str], first_leaf: int, page: int, start: int) -> int | None:

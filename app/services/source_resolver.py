@@ -4025,9 +4025,13 @@ class SourceResolver:
             return RetrievalResult(source_name="lantern", success=False,
                                    error=f"lantern_read_failed:{safe_exception_code(e)}")
         if article is None:
+            # An answered check that did not identify the work, in the existing
+            # vocabulary, so the reference's search can still complete.
             return RetrievalResult(source_name="lantern", success=False,
                                    error="Cited title not found on the linked volume's candidate pages",
-                                   metadata={"lantern": {"policy": pages.POLICY}})
+                                   metadata={"lantern": {"policy": pages.POLICY},
+                                             "web_fetch_diagnostic": WebFetchDiagnostic(
+                                                 reason="page_title_mismatch_unconfirmed").model_dump()})
         content = article.text.encode("utf-8")
         digest = hashlib.sha256(content).hexdigest()
         surname = re.split(r"[,\s]+", str(author or "").strip())[0] if author else ""
