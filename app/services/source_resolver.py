@@ -56,7 +56,7 @@ def _timed_retrieval(operation):
         return result
     return measured
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
-from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed, cross_script_observed
+from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed, cross_script_observed, observed_outcome
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
 
 from app.log_safety import private_value_id, safe_exception_code
@@ -197,6 +197,12 @@ _ANSWERED_LINK_REASONS = {
     'source_kind_unconfirmed': 'link_source_type_unconfirmed',
     'bibliographic_fields_conflict': 'link_details_conflict',
     'bibliographic_identity_unconfirmed': 'link_identity_unconfirmed',
+    # A dead link is an answered check, not a network failure, so the search
+    # completes and a re-run does not repeat it (2026-10-14).
+    'link_not_found': 'link_not_found',
+    # The PDF route was answered with a web page; the web route records its own
+    # check of that page, so this attempt is answered too (2026-10-14).
+    'link_not_pdf': 'link_not_pdf',
 }
 _ANSWERED_DOI_ERRORS = {
     'DOI resolver HTML title does not match cited source': 'doi_page_title_differs',
@@ -804,6 +810,12 @@ def _mdpi_file_server_locations(location, exc: BaseException, doi: str | None) -
         )
         for url in mdpi_file_server_urls(doi)
     ]
+
+
+def _link_gone(url: str) -> bool:
+    """The link checker found the page or file missing or removed (its own
+    `not_found`/`removed` outcomes); this record does not classify responses."""
+    return observed_outcome(url) in {"not_found", "removed"}
 
 
 def _location_exception_disposition(exc: Exception) -> tuple[str, str]:
@@ -3179,6 +3191,17 @@ class SourceResolver:
                 else:
                     url_failure_reason = result.error or "URL download failed"
             else:
+                # A Media History Digital Library page link: read the cited
+                # article's scanned pages (lantern-pages-v1, 2026-10-14).
+                from app.services.retrieval.lantern import lantern_target
+                if lantern_target(student_url):
+                    lantern = self._try_lantern(student_url, title=title, author=author, year=year,
+                                                container_title=container_title, raw_ref=raw_ref)
+                    self._record_discovery_attempt(category="student_url", provider="student_url_lantern",
+                                                   result=lantern, required=False)
+                    if lantern.success:
+                        self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
+                        return lantern
                 # Most cited URLs are web pages. Fetch HTML first so news,
                 # government, blog and reference content does not pay for a
                 # failed PDF-only request before reaching its real route.
@@ -3981,6 +4004,74 @@ class SourceResolver:
         return keys
 
     @_timed_retrieval
+    def _try_lantern(self, url: str, *, title, author, year, container_title, raw_ref) -> RetrievalResult:
+        """The cited magazine article's OCR pages from a Lantern link (`lantern-pages-v1`).
+
+        Confirmed when the cited title opens one of the candidate pages, the
+        magazine is the cited container and the cited year falls within the
+        bound volume's dates; the author counts only when named in the text.
+        """
+        from app.services.retrieval import lantern as pages
+        from app.services.retrieval import provider_gate
+
+        def get(address):
+            return provider_gate.paced_get("lantern", 0.5, address, timeout=20, follow_redirects=True)
+
+        def get_archive(address):
+            return provider_gate.paced_get("internet_archive", 0.5, address, timeout=30, follow_redirects=True)
+        try:
+            article = pages.read_article(url, title=title, raw_ref=raw_ref, get=get, get_archive=get_archive)
+        except Exception as e:  # noqa: BLE001 - a failed read falls back to the ordinary web fetch
+            return RetrievalResult(source_name="lantern", success=False,
+                                   error=f"lantern_read_failed:{safe_exception_code(e)}")
+        if article is None:
+            return RetrievalResult(source_name="lantern", success=False,
+                                   error="Cited title not found on the linked volume's candidate pages",
+                                   metadata={"lantern": {"policy": pages.POLICY}})
+        content = article.text.encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        surname = re.split(r"[,\s]+", str(author or "").strip())[0] if author else ""
+        authors = [author] if surname and len(surname) > 1 and re.search(
+            rf"\b{re.escape(surname)}\b", article.text, re.IGNORECASE) else []
+        year_ok = pages.year_in_dates(year, article.volume_dates)
+        magazine_ok = (pages.magazine_matches(container_title, article.magazine)
+                       or pages.magazine_matches(article.magazine, raw_ref or ""))
+        confirmed = bool(year_ok and magazine_ok)
+        record = {"policy": pages.POLICY, "volume": article.volume, "magazine": article.magazine,
+                  "volume_dates": article.volume_dates, "leaves": article.leaves,
+                  "printed_pages": article.printed_pages, "notes": article.notes}
+        coverage = {"verdict": "complete" if article.complete else "not_assessed",
+                    "reason": "cited_pages_read" if article.complete else (article.notes or ["incomplete"])[0],
+                    "policy": pages.POLICY}
+        result = RetrievalResult(
+            source_name="lantern", success=confirmed, title=title, authors=authors,
+            year=year if year_ok else None,
+            representation=SourceRepresentation(
+                kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain", content=content,
+                source_url=article.first_leaf_url, original_kind=RepresentationKind.HTML, charset="utf-8",
+                completeness=coverage["verdict"], metadata={"web_completeness": coverage}),
+            abstract=article.text, full_text_url=article.first_leaf_url,
+            metadata={"lantern": record, "web_completeness": coverage,
+                      "web_identity": {"title": title, "authors": authors, "year": year if year_ok else None,
+                                       "doi": None},
+                      "requested_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+                      "representation_kind": RepresentationKind.PLAIN_TEXT.value, "text_quality": "scan_ocr"},
+        )
+        _identity, comparisons, _ = _web_identity_comparison(result, title=title, author=author, year=year)
+        result.metadata["identity_comparisons"] = [c.model_dump(mode="json") for c in comparisons]
+        if confirmed:
+            result.metadata.update(identity_confidence="high", work_identity_basis=pages.POLICY,
+                                   identity_reason="Cited title on the scanned page; magazine and year match the volume",
+                                   accepted_representation_sha256=hashlib.sha256(result.full_text).hexdigest(),
+                                   web_fetch_diagnostic=WebFetchDiagnostic(
+                                       reason="bibliographic_identity_confirmed",
+                                       observed_content_sha256=digest).model_dump())
+        else:
+            result.error = "Scanned page found, but the magazine or year does not match the reference"
+            result.metadata.update(identity_confidence="medium", web_fetch_diagnostic=WebFetchDiagnostic(
+                reason="bibliographic_identity_unconfirmed", observed_content_sha256=digest).model_dump())
+        return result
+
     def _try_student_url(
         self,
         url: str,
@@ -4008,10 +4099,19 @@ class SourceResolver:
                 private_value_id("url", url),
                 type(e).__name__,
             )
+            not_pdf = isinstance(e, ValueError) and str(e).startswith("Not a PDF")
             return RetrievalResult(
                 source_name="student_url",
                 success=False,
-                error=f"Student URL download failed ({type(e).__name__})",
+                # "not a PDF" sends the link on to the web route (resolve()); the
+                # bare exception name hid it, so a PDF link answering with a web
+                # page was never checked as one (2026-10-14).
+                error=("Student URL is not a PDF" if not_pdf
+                       else f"Student URL download failed ({type(e).__name__})"),
+                metadata=({'web_fetch_diagnostic': WebFetchDiagnostic(reason='link_not_found').model_dump()}
+                          if _link_gone(url)
+                          else {'web_fetch_diagnostic': WebFetchDiagnostic(reason='link_not_pdf').model_dump()}
+                          if isinstance(e, ValueError) and str(e).startswith("Not a PDF") else {}),
             )
 
         result = RetrievalResult(
@@ -5544,6 +5644,7 @@ class SourceResolver:
                 metadata={'candidate_budget_skipped': isinstance(e, CandidateBudgetExceeded),
                     'web_fetch_diagnostic': WebFetchDiagnostic(reason=(
                     'candidate_budget_exhausted' if isinstance(e, CandidateBudgetExceeded)
+                    else 'link_not_found' if _link_gone(url)
                     else 'access_restricted' if _location_exception_disposition(e)[0] == 'access_restricted'
                     else 'transport_failure' if _location_exception_disposition(e)[0] == 'transport_failure'
                     else 'fetch_unavailable')).model_dump()},

@@ -186,6 +186,17 @@ def link_not_visited(url, reason):
             row.not_checked_reason = reason
 
 
+def observed_outcome(url) -> str | None:
+    """The link checker's classified outcome of its latest request for this
+    submitted link in the current reference (`not_found`, `removed`,
+    `timeout`, ...), or None when it has not been requested. Other components
+    read this instead of classifying responses themselves (2026-10-14)."""
+    for row in ACTIVE_LINKS.get() or []:
+        if row.request_sha256 == binding(str(url)) and row.requests:
+            return row.requests[-1].outcome
+    return None
+
+
 def safe_origin(value):
     """Retain origin only: no userinfo, path, query, fragment or private address."""
     try:

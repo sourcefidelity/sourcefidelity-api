@@ -1899,7 +1899,7 @@ def build_passage_evidence(
         page_locator=claim.page_locator,
         top_k=bounded_top_k,
         allow_ocr_token_sequence=bool(
-            source.text_quality == "scan_ocr" and source.derivation_method
+            _ocr_tolerant(source)
         ),
     )
     if translated_queries and len(candidates) < bounded_top_k:
@@ -2711,6 +2711,14 @@ def _source_matches_artifact(
         and source.derivation_method == identity.derivation_method
         and source.derivation_manifest_sha256 == identity.derivation_manifest_sha256
     )
+
+
+def _ocr_tolerant(source: AuthorizedRepresentation) -> bool:
+    """Scanned text where OCR slips must not read as misquotes: a locally OCR'd
+    upload, or the OCR pages of a Media History Digital Library article
+    (`lantern-pages-v1`, 2026-10-14)."""
+    return bool(source.text_quality == "scan_ocr"
+                and (source.derivation_method or source.provenance == "lantern"))
 
 
 def _validate_derivative_provenance(source: AuthorizedRepresentation) -> None:
@@ -5370,7 +5378,7 @@ def _academic_practice_checks(
     missing = 0
     missing_editorial = 0
     allow_ocr_token_sequence = bool(
-        source.text_quality == "scan_ocr" and source.derivation_method
+        _ocr_tolerant(source)
     )
     for target in targets:
         found = _quotation_location(
