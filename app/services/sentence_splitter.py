@@ -76,6 +76,11 @@ def split_sentences(text: str) -> list[str]:
     protected = re.sub(
         r'([?!])(?=(?![ \t\n]*\n[ \t]*\n)[ \t\n]+\(as cited in [^()\n]{1,120},\s*(?:18|19|20)\d{2}[a-z]?\)\.)',
         lambda m: '\x03' if m[1] == '?' else '\x04', protected, flags=re.I)
+    # A quotation's own citation after its closing mark ends that sentence:
+    # “…?” (Author, 1930, p. 4). (owner review 2026-10-14, Harlow citation 5).
+    protected = re.sub(
+        r'([.?!])(?=[”"’][ \t]+\([^()\n]{1,120}(?:1[6-9]|20)\d{2}[^()\n]*\)[.!?])',
+        lambda m: {'?': '\x03', '!': '\x04', '.': '\x00'}[m[1]], protected)
 
     # Protect "et al." — it's followed by a parenthetical, not a sentence end
     protected = re.sub(r"(et al)\.(?=\s*\()", lambda m: m.group(1) + "\x00", protected, flags=re.IGNORECASE)

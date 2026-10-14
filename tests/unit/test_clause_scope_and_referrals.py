@@ -1,3 +1,4 @@
+import pytest
 """Owner decisions 2026-10-07 from the review of the owner's article: each source
 is judged on its own clause; "see" citations are not judged; a narrower hanging
 indent is stated as narrower, not missing."""
@@ -197,3 +198,16 @@ def test_a_sentence_whose_sources_share_wording_stays_one_citation():
     for m in claim.citation_markers:
         m.marker_type = "parenthetical"
     assert len(citation_clause_segments(claim, ["a", "b", "d"])) == 3
+
+
+@pytest.mark.parametrize(("reason", "note"), [
+    ("antecedent_unresolved", "Not judged: it could not be determined what this statement refers to."),
+    ("wider_search_unavailable", "Not judged: the judge found no evidence in the sentences it read, and no "
+                                 "further sentences from the source were available to check."),
+])
+def test_a_not_judged_result_says_why_in_the_owners_words(reason, note):
+    # Owner wording 2026-10-14 (Harlow review).
+    from html import unescape
+    from app.services.judgment_report import judgment_result
+    result = judgment_result({"display_state": "not_judged", "reason_code": reason}, {}, None)
+    assert note in unescape(result["html"])

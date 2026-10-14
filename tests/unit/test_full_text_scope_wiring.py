@@ -65,7 +65,7 @@ class TestWorkflowAttachment:
         evidence.model_copy = Mock(side_effect=lambda update: update)
         return evidence
 
-    def test_full_text_coverage_is_assessed(self, monkeypatch):
+    def test_limited_text_coverage_is_assessed(self, monkeypatch):
         called = {}
 
         def fake(claim, text, *, source_title, coverage):
@@ -74,7 +74,7 @@ class TestWorkflowAttachment:
 
         monkeypatch.setattr(paper_workflow, "assess_retrieved_text_scope", fake)
         result = paper_workflow._attach_source_scope(
-            self._evidence("full_text"), _claim(), OPENING, source_title="Platforms")
+            self._evidence("partial_text"), _claim(), OPENING, source_title="Platforms")
 
         record = result["source_scope_assessment"]
         assert isinstance(record, SourceScopeAssessmentEvidence)
@@ -82,7 +82,16 @@ class TestWorkflowAttachment:
         # passages from the same document.
         assert record.excerpt.startswith(OPENING)
         assert record.excerpt_sha256 == hashlib.sha256(OPENING.encode()).hexdigest()
-        assert called["coverage"] == "full_text"
+        assert called["coverage"] == "partial_text"
+
+    def test_fully_retrieved_text_is_not_compared(self, monkeypatch):
+        # Owner decision 2026-10-14: a fully retrieved text is judged, never
+        # marked a topical mismatch, so no comparison is spent on it.
+        monkeypatch.setattr(paper_workflow, "assess_retrieved_text_scope",
+                            Mock(side_effect=AssertionError("must not run")))
+        evidence = self._evidence("full_text")
+        assert paper_workflow._attach_source_scope(
+            evidence, _claim(), OPENING, source_title="") is evidence
 
     def test_coverage_enum_is_read_by_value_not_name(self, monkeypatch):
         seen = {}
@@ -103,7 +112,7 @@ class TestWorkflowAttachment:
     def test_missing_excerpt_leaves_no_comparison(self, monkeypatch):
         monkeypatch.setattr(paper_workflow, "assess_retrieved_text_scope",
                             Mock(side_effect=AssertionError("must not run")))
-        evidence = self._evidence("full_text")
+        evidence = self._evidence("partial_text")
         assert paper_workflow._attach_source_scope(
             evidence, Mock(), "", source_title="") is evidence
 
@@ -121,7 +130,7 @@ class TestProjectionReachesTheGate:
             "subject_comparison": "US platforms against Canadian telecom",
             "rationale": "The source states a United States scope.",
             "abstract_span": text[:24], "claim_span": claim[:14],
-            "scope_policy_version": "fulltext-topic-v1", "scope_coverage": "full_text",
+            "scope_policy_version": "fulltext-topic-v1", "scope_coverage": "partial_text",
             "abstract_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "claim_sha256": hashlib.sha256(claim.encode()).hexdigest(),
         }
@@ -129,7 +138,7 @@ class TestProjectionReachesTheGate:
     def test_projected_member_marks_the_mismatch(self):
         scope = self._scope(OPENING, CLAIM_TEXT)
         member = {
-            "coverage_level": "full_text",
+            "coverage_level": "partial_text",
             "reference_identity": {"status": "bibliographic_conflict",
                                    "title_and_author_agree": True},
             "scope_source": {"text": OPENING},
@@ -179,7 +188,7 @@ class TestChainFromArtifactToMark:
         artifact = _artifact()
         artifact = artifact.model_copy(update={
             "coverage": artifact.coverage.model_copy(
-                update={"level": CoverageLevel("full_text")})})
+                update={"level": CoverageLevel("partial_text")})})
 
         scope = {
             "status": "complete", "relevance": "apparent_mismatch", "attention": True,
@@ -190,7 +199,7 @@ class TestChainFromArtifactToMark:
             "subject_comparison": "US platforms against Canadian telecom",
             "rationale": "The source states a United States scope.",
             "abstract_span": excerpt[:24], "claim_span": claim_text[:14],
-            "scope_policy_version": "fulltext-topic-v1", "scope_coverage": "full_text",
+            "scope_policy_version": "fulltext-topic-v1", "scope_coverage": "partial_text",
             "abstract_sha256": hashlib.sha256(excerpt.encode()).hexdigest(),
             "claim_sha256": hashlib.sha256(claim_text.encode()).hexdigest(),
         }
@@ -215,7 +224,7 @@ class TestChainFromArtifactToMark:
 
         record = payload["source_scope_assessment"]
         assert record["excerpt"].startswith(OPENING)
-        assert record["coverage"] == "full_text"
+        assert record["coverage"] == "partial_text"
         assert record["assessment"]["scope_assessment"]["relevance"] == "apparent_mismatch"
 
     def test_payload_projects_into_a_member_the_gate_marks(self, monkeypatch):

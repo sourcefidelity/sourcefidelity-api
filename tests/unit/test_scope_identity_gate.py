@@ -89,11 +89,11 @@ SOURCE = "This article examines United States platform markets and their regulat
 
 
 class TestRetrievedDocumentScope:
-    def test_full_text_mismatch_is_now_marked(self):
-        """Khan: the check used to be skipped entirely once text was retrieved."""
+    def test_a_fully_retrieved_text_is_never_marked(self):
+        """Owner decision 2026-10-14 (Harlow citation 7): full text is judged instead."""
         member = _scope_member("full_text", SOURCE, CLAIM,
                                version="fulltext-topic-v1", scope_coverage="full_text")
-        assert topical_mismatch(member, {"student_text": CLAIM})
+        assert not topical_mismatch(member, {"student_text": CLAIM})
 
     def test_partial_text_is_also_comparable(self):
         member = _scope_member("partial_text", SOURCE, CLAIM,

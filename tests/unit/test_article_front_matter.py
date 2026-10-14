@@ -72,7 +72,7 @@ def test_a_dummy_it_opening_needs_no_antecedent():
 
 
 def test_propositions_sharing_words_are_underlined_once(monkeypatch):
-    # The owner's article, 2026-10-08: the smaller keeps the shared words.
+    # The owner's article, 2026-10-08: the shared words lead into the proposition after them (2026-10-14).
     from app.services import judgment_layer
     calls = []
     monkeypatch.setattr(judgment_layer, "claim_span_rectangles",
@@ -87,6 +87,27 @@ def test_propositions_sharing_words_are_underlined_once(monkeypatch):
     outer = {"group": "d", "ranges": [(0, 200)]}
     judgment_layer._separate_contained([inner, outer], {}, {})
     assert outer["display_ranges"] == [(60, 200)]   # containing: bolded on its added words (2026-09-29)
+
+
+def test_a_shared_lead_in_takes_the_style_of_the_proposition_after_it(monkeypatch):
+    # Owner review 2026-10-14 (Harlow citation 3): the lead-in all three
+    # clauses share leads into the first clause, not the shortest one.
+    from app.services import judgment_layer
+    drawn = {}
+    monkeypatch.setattr(judgment_layer, "claim_span_rectangles",
+                        lambda citation, ranges, words: ([{"ranges": ranges}], "exact"))
+    first = {"group": "a", "ranges": [(0, 10), (12, 30)]}
+    second = {"group": "b", "ranges": [(0, 10), (32, 36)]}
+    third = {"group": "c", "ranges": [(0, 10), (38, 60)]}
+    judgment_layer._separate_contained([first, second, third], {}, {})
+    for mark in (first, second, third):
+        drawn[mark["group"]] = mark.get("rects", [{"ranges": mark["ranges"]}])[0]["ranges"]
+    assert drawn == {"a": [(0, 10), (12, 30)], "b": [(32, 36)], "c": [(38, 60)]}
+    # A shared ending goes with the proposition just before it.
+    early = {"group": "d", "ranges": [(0, 20), (50, 60)]}
+    late = {"group": "e", "ranges": [(30, 40), (50, 60)]}
+    judgment_layer._separate_contained([early, late], {}, {})
+    assert early["rects"][0]["ranges"] == [(0, 20)] and late.get("rects") is None
 
 
 def test_the_no_passage_line_is_tagged_for_the_judgment_window():

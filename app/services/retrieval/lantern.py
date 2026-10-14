@@ -11,7 +11,9 @@ which is printed page 26 of an earlier issue in the same volume). This route:
    file of that volume (`<volume>_page_numbers.json`);
 3. among the leaves printed with the cited first page (one per bound issue),
    plus the linked leaf, takes the one whose OCR text carries the cited title;
-4. reads the OCR text of the cited pages from Lantern.
+4. reads the OCR text of the cited pages from Lantern, one page per form
+   feed, each labelled with its printed number where the page shows it
+   (`page_labels`, owner decision 2026-10-14).
 
 A range longer than `MAX_CONTIGUOUS_PAGES` is read as its first two pages and
 its last page (an article continued at the back of the issue) and is not
@@ -25,6 +27,9 @@ import re
 from dataclasses import dataclass, field
 
 POLICY = "lantern-pages-v1"
+# Pages separated by form feeds with printed page numbers (owner decision
+# 2026-10-14); a Lantern text stored before is read again once (rerun_reuse).
+PAGES_VERSION = "lantern-page-labels-v1"
 LANTERN = "https://lantern.mediahist.org"
 ARCHIVE = "https://archive.org"
 MAX_CONTIGUOUS_PAGES = 8
@@ -32,6 +37,8 @@ MAX_CANDIDATE_LEAVES = 8
 _LINK = re.compile(r"^https?://lantern\.mediahist\.org/catalog/([A-Za-z0-9._-]+?)_(\d{1,5})/?(?:[?#].*)?$")
 _OCR = re.compile(r'(?s)<div class="card card-body ">(.*?)</div>')
 _PAGES = re.compile(r"(?:pp?\.\s*)?\b(\d{1,4})\s*[-–—]\s*(\d{1,4})\b|(?:\bpp?\.\s*)(\d{1,4})\b")
+# A single page after the magazine, before the link or the end: "Movie Classic, 41."
+_BARE_PAGE = re.compile(r",\s*(\d{1,4})\.?\s*(?:https?://\S*\s*)?$")
 
 
 @dataclass
@@ -46,6 +53,18 @@ class LanternArticle:
     first_leaf_url: str
     title_found: bool = True
     notes: list[str] = field(default_factory=list)
+
+
+def page_labels(article: LanternArticle) -> list[str | None]:
+    """Each page's printed number, from the archive's page-number file, kept
+    only where the page itself prints it on a line of its own at its top or
+    bottom (owner decision 2026-10-14); pages are separated by form feeds."""
+    labels = []
+    for printed, text in zip(article.printed_pages, article.text.split("\f")):
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        edges = lines[:3] + lines[-3:]
+        labels.append(printed if printed and printed.isdigit() and printed in edges else None)
+    return labels
 
 
 def lantern_target(url: str | None) -> tuple[str, int] | None:
@@ -64,6 +83,9 @@ def cited_pages(raw_ref: str | None) -> tuple[int, int] | None:
                 found = (start, end)
         elif match.group(3):
             found = (int(match.group(3)),) * 2
+    bare = None if found else _BARE_PAGE.search(str(raw_ref or "").strip())
+    if bare and not re.fullmatch(r"1[6-9]\d\d|20\d\d", bare.group(1)):
+        found = (int(bare.group(1)),) * 2
     return found
 
 
@@ -191,7 +213,7 @@ def read_article(url: str, *, title: str | None, raw_ref: str | None, get, get_a
         notes.append("page_text_missing")
     return LanternArticle(
         volume=volume, magazine=magazine, volume_dates=dates, leaves=leaves,
-        printed_pages=[page_map.get(leaf, "") for leaf in leaves], text="\n\n".join(texts),
+        printed_pages=[page_map.get(leaf, "") for leaf in leaves], text="\f".join(texts),
         complete=complete, first_leaf_url=f"{LANTERN}/catalog/{volume}_{first_leaf:04d}", notes=notes)
 
 

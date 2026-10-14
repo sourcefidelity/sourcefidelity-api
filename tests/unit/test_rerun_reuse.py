@@ -133,7 +133,8 @@ def test_a_redownload_identical_to_the_verified_copy_keeps_its_identity(monkeypa
     from app.services.file_safety import SafetyVerdict
     from app.services.retrieval.base import RepresentationKind, RetrievalResult, SourceRepresentation
     from app.services.source_type import SourceKindAssessment
-    doc = fitz.open(); doc.new_page().insert_text((72, 72), "Harbour cranes in river ports. Ames 2020."); content = doc.tobytes()
+    doc = fitz.open(); doc.new_page().insert_text((72, 72), "Harbour cranes in river ports. 2020."); content = doc.tobytes()
+    # No author on the page: a title page naming title and author is the work on its own (2026-10-14).
     resolver = object.__new__(module.SourceResolver)
     monkeypatch.setattr(resolver, "_durable_repository_active", lambda: True)
     monkeypatch.setattr(resolver, "_retain_provisional_candidate", lambda *a, **k: None)
@@ -197,3 +198,13 @@ def test_a_run_excluded_from_reuse_contributes_no_results(monkeypatch):
         assert rerun_reuse.prior_results_index(session, current)
         monkeypatch.setattr(rerun_reuse.settings, "SEARCH_REUSE_EXCLUDED_JOBS", str(earlier.id))
         assert rerun_reuse.prior_results_index(session, current) == {}
+
+
+def test_lantern_pages_stored_before_page_numbers_are_read_again_once():
+    # Owner decision 2026-10-14: Lantern pages now carry printed page numbers,
+    # so an earlier stored Lantern text is read again once (free route).
+    from app.services.retrieval.lantern import PAGES_VERSION
+    stored = {"status": "durable_authorized", "representation_id": "r", "source_name": "lantern"}
+    assert not _reusable(stored)
+    assert _reusable({**stored, "lantern_pages": PAGES_VERSION})
+    assert _reusable({"status": "durable_authorized", "representation_id": "r", "source_name": "crossref"})

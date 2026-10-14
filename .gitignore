@@ -306,3 +306,5 @@ url_web_results.json
 sources/
 private_guiding_contracts/
 private_guiding_tools/
+.scratch/
+CONTEXT.md

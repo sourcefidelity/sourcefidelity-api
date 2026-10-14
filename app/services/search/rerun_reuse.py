@@ -88,6 +88,10 @@ def downloadable(item: dict) -> bool:
 def _reusable(item: dict, reference: dict | None = None) -> bool:
     if _student_link_routes_due(item, reference):
         return False
+    from app.services.retrieval.lantern import PAGES_VERSION
+    if item.get("source_name") == "lantern" and item.get("lantern_pages") != PAGES_VERSION:
+        # Stored before Lantern pages carried printed page numbers: read again once.
+        return False
     if item.get("status") == "transient_authorized" or downloadable(item):
         return downloadable(item)
     if item.get("status") == "durable_authorized":

@@ -160,8 +160,9 @@ def _statement_text(claim) -> str:
 def heading_citation(citation: dict) -> bool:
     """A heading naming a work with its citation ("Classical Hollywood: The Day
     the Earth Stood Still (Wise, 1951)"): short, title-cased, holding the
-    citation and with no sentence punctuation at its end."""
-    text = " ".join(str(citation.get("student_text") or "").split())
+    citation and with no sentence punctuation at its end. A clause cut at its
+    citation is judged by its whole sentence (owner review 2026-10-14)."""
+    text = " ".join(str((citation.get("clause_of") or citation).get("student_text") or "").split())
     marker = " ".join(str(citation.get("citation_marker") or "").split())
     # The citation may also open the heading: "Killer's Kiss (1955): Classical
     # Hollywood Film Analysis" (paper 6, 2026-10-04).
@@ -409,7 +410,8 @@ def build_evidence_report_view(
             )
             item = _withhold_unidentified_abstract(item, linked_page=_abstract_from_submitted_link(
                 member, reference_id, aggregate.get("submitted_link_observations")))
-            item = _withhold_mismatched_evidence(item, {"student_text": claim.text})
+            item = _withhold_mismatched_evidence(item, {"student_text": claim.text,
+                                                        "members": group.get("members") or []})
             # One flag, not a gradient: where the judgment stopped short
             # of a mark, the comparison and the reason go in the evidence
             # window instead of beside the citation.
@@ -2326,7 +2328,8 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     for entry in catalog:
         panel_templates += _render_reference_window_template(
             entry, reference_practice, citations, citation_format=citation_format,
-            patchwriting=patchwriting.get(('reference', entry.get('reference_id'))), paper_key=paper_key)
+            patchwriting=patchwriting.get(('reference', entry.get('reference_id'))), paper_key=paper_key,
+            uncited_reference_ids=view.get('uncited_reference_ids'))
     paper_pages, placed_indexes = _render_continuous_paper(
         view["paper_surface"], citations, reference_practice,
         numbers=numbers, catalog=catalog, passages=passages,
@@ -5167,13 +5170,26 @@ def _render_continuous_paper(
                     f'<rect class="citation-format-mark" style="fill:#ff9a38;fill-opacity:.3;stroke:none" '
                     f'x="{target["x0"]:.3f}" y="{target["y0"]:.3f}" '
                     f'width="{target["x1"]-target["x0"]:.3f}" height="{target["y1"]-target["y0"]:.3f}" /></a>')
+        from app.services.report_layers import locator_attention, locator_rectangles, member_marks
+        located_locators, locator_overlays = set(), []
         for target in targets:
             member_index = target['member_index']
             member = citation['members'][member_index]
             label = str((member.get('source') or {}).get('raw_reference') or 'Source')
-            from app.services.report_layers import locator_attention, member_marks
             issue = member_marks(member, citation, target, (surface.get('selectable_words') or {}).get(target['page_index'], []))
-            academic = bool(member.get('secondary_citation')) or locator_attention(member)
+            academic = bool(member.get('secondary_citation'))
+            if locator_attention(member) and member_index not in located_locators:
+                # Only the locator's words are yellow for a locator issue, never
+                # the year (owner review 2026-10-14).
+                located_locators.add(member_index)
+                for rect in locator_rectangles(citation, surface.get('selectable_words') or {}):
+                    locator_overlays.append((rect['page_index'],
+                        f'<a href="#evidence-panel" class="citation-overlay member-target locator-target" '
+                        f'role="button" tabindex="-1" data-member-index="{member_index}" '
+                        f'data-anchor-id="{escape(anchor_id, quote=True)}" data-panel-template="citation-panel-{index}">'
+                        f'<rect class="source-highlight academic-highlight" style="fill:#ffe45c;fill-opacity:.4;stroke:none" '
+                        f'x="{rect["x0"]:.3f}" y="{rect["y0"]:.3f}" width="{rect["x1"]-rect["x0"]:.3f}" '
+                        f'height="{rect["y1"]-rect["y0"]:.3f}" rx="1" /></a>'))
             overlays_by_page.setdefault(target['page_index'], []).append(
                 f'<a href="#evidence-panel" class="citation-overlay member-target {target["tone"]}" '
                 f'role="button" tabindex="0" aria-pressed="false" '
@@ -5186,6 +5202,8 @@ def _render_continuous_paper(
                 f'x="{target["x0"]:.3f}" y="{target["y0"]:.3f}" '
                 f'width="{target["x1"]-target["x0"]:.3f}" height="{target["y1"]-target["y0"]:.3f}" rx="1" />{issue}</a>'
             )
+        for page_index, overlay in locator_overlays:
+            overlays_by_page.setdefault(page_index, []).append(overlay)
 
     indexed_findings = list(enumerate(reference_practice or [], 1))
     # Broad topical hit targets sit behind exact formatting/academic targets.
@@ -5665,7 +5683,8 @@ def attach_propositions(citations: list[dict], layer: dict) -> None:
                     at = display.find(student[a:b])
                     if at >= 0:
                         local.append((at, at + b - a))
-            propositions.append({'group': group, 'letter': chr(ord('A') + position), 'local_ranges': local})
+            # Lowercase, attached to the citation number (owner decision 2026-10-14).
+            propositions.append({'group': group, 'letter': chr(ord('a') + position), 'local_ranges': local})
         citation['propositions'] = propositions
 
 
@@ -6109,7 +6128,8 @@ def _passage_window_templates(passages: list[dict], citations: list[dict], numbe
 
 
 def _citation_reference_headings(templates: str, citations: list[dict], numbers: dict[str, int]) -> str:
-    """"Citation N – Reference N" (owner request 2026-10-02): each linked
+    """"Citation N – Reference N" (owner request 2026-10-02), "Citation 3a –
+    Reference N" for a proposition (owner decision 2026-10-14): each linked
     reference opens its Reference window, in the reference-heading colour."""
     from app.services.report_references import reference_template_id
 
@@ -6121,8 +6141,10 @@ def _citation_reference_headings(templates: str, citations: list[dict], numbers:
             return match.group(0)
         links = ', '.join(f'<button type="button" class="reference-heading-link" '
                           f'data-go-to="{reference_template_id(n)}">Reference {n}</button>' for n in linked)
-        return f'{match.group(1)} – {links}{match.group(3)}'
-    return re.sub(r'(<template id="citation-panel-(\d+)"><h2>.*?)(<span data-proposition-suffix>)',
+        # The proposition letter stays with the citation number: "Citation 3a –
+        # Reference 18" (owner decision 2026-10-14).
+        return f'{match.group(1)}{match.group(3)} – {links}'
+    return re.sub(r'(<template id="citation-panel-(\d+)"><h2>.*?)(<span data-proposition-suffix></span>)',
                   heading, templates)
 
 
@@ -6180,13 +6202,15 @@ def _submitted_link_unretrieved_reason(member: dict, findings: list[dict] | None
 
 
 def withdraw_unverified_possible_matches(view: dict, citations: list[dict], unverified_ids: set) -> dict:
-    """A possible-match copy of a work the searches could not locate is not its
-    text (paper 8, 2026-10-02): the member shows no text and the retrieval
-    counts move it to unretrieved. Shared by the window and the PDF export."""
+    """A possible-match copy is not the work's text: first for works the
+    searches could not locate (paper 8, 2026-10-02), then for every possible
+    match (owner decision 2026-10-14; 4 of 8 reviewed were another work). The
+    member shows no text and the retrieval counts move it to unretrieved.
+    Shared by the window and the PDF export."""
     withdrawn: dict[str, str] = {}
     for citation in citations:
         for member in citation.get('members', []):
-            if member.get('reference_id') in unverified_ids and member.get('identity_status') == 'possible_match':
+            if member.get('identity_status') == 'possible_match':
                 withdrawn.setdefault(member.get('reference_id'), str(member.get('coverage_level') or ''))
                 member.update(coverage_level='unavailable', best_evidence=None, additional_evidence=[],
                               evidence_sentences=[], evidence_extracts=[], availability='',
@@ -6204,7 +6228,8 @@ def withdraw_unverified_possible_matches(view: dict, citations: list[dict], unve
 
 def _render_reference_window_template(entry: dict, findings: list[dict], citations: list[dict],
                                       *, citation_format: str = '', patchwriting: list[dict] | None = None,
-                                      paper_key: str = '') -> str:
+                                      paper_key: str = '',
+                                      uncited_reference_ids: list[str] | None = None) -> str:
     """One window per reference: the entry, its availability, its citations
     and every located reference-list finding on it, grouped by category.
 
@@ -6244,11 +6269,16 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
     if cited:
         parts.append('<p class="reference-citations">Cited in ' + ' '.join(
             f'<button type="button" data-go-to="citation-panel-{i}">Citation {i}</button>' for i in cited) + '</p>')
-    elif not _media_named_in_paper(source, paper_key):
+    elif uncited_reference_ids is None and not _media_named_in_paper(source, paper_key):
         parts.append('<p class="muted">No in-text citation in this report is linked to this reference.</p>')
+    academic = render_patchwriting(patchwriting, as_items=True) if patchwriting else ''
+    if entry.get('reference_id') in (uncited_reference_ids or []):
+        # The summary's finding, in its window (owner decision and wording 2026-10-14).
+        academic += ('<li class="finding-item finding-uncited-reference">'
+                     'This reference is not cited in the paper.</li>')
     grouped = _grouped_findings([(findings[j - 1], j) for j in entry.get('finding_indexes') or []],
                                 citation_format=citation_format,
-                                extra={'academic': render_patchwriting(patchwriting, as_items=True)} if patchwriting else None)
+                                extra={'academic': academic} if academic else None)
     if member and 'issue-heading unverified' in _member_coverage_heading(member):
         # The heading already says "Cannot be verified"; the finding keeps
         # only its explanation (owner decision 2026-09-30).
@@ -6568,7 +6598,7 @@ def _reference_authors(member: dict) -> str:
     author = str((member.get('source') or {}).get('author') or '').strip()
     # Name parts between commas, without the initials ("Bordwell, D" too).
     names = [part.strip() for part in re.split(r',\s*', author.replace('&', ','))
-             if part.strip() and not re.fullmatch(r"(?:[A-Z]\.?\s*-?\s*)+", part.strip())]
+             if part.strip() and not re.fullmatch(r"(?:[A-Z]\.\s*-?\s*)+|[A-Z]{1,3}", part.strip())]
     if not names:
         return author.rstrip('.')
     return names[0] if len(names) == 1 else ' & '.join(names) if len(names) == 2 else f'{names[0]} et al.'

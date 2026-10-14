@@ -217,5 +217,10 @@ def test_a_possible_match_copy_of_an_unverifiable_reference_is_not_its_text():
     out = withdraw_unverified_possible_matches(view, [{'members': [member]}], {'r1'})
     assert member['coverage_level'] == 'unavailable' and member['best_evidence'] is None
     assert out['overview']['abstract_or_limited_sources'] == 0 and out['overview']['unavailable_sources'] == 7
-    kept = {'reference_id': 'r2', 'identity_status': 'possible_match', 'coverage_level': 'partial'}
-    assert withdraw_unverified_possible_matches(view, [{'members': [kept]}], {'r1'}) is view and kept['coverage_level'] == 'partial'
+    # Every possible-match copy is withdrawn, whatever its reference's search found
+    # (owner decision 2026-10-14: 4 of 8 reviewed were another work).
+    other = {'reference_id': 'r2', 'identity_status': 'possible_match', 'coverage_level': 'partial'}
+    withdraw_unverified_possible_matches(view, [{'members': [other]}], {'r1'})
+    assert other['coverage_level'] == 'unavailable' and other['identity_status'] == 'withdrawn_possible_match'
+    verified = {'reference_id': 'r3', 'identity_status': 'verified', 'coverage_level': 'full_text'}
+    assert withdraw_unverified_possible_matches(view, [{'members': [verified]}], set()) is view

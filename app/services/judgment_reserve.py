@@ -64,6 +64,9 @@ def build_judgment_reserve(source, artifact) -> dict | None:
             return None
         used = {sel.candidate_id: {p.passage_id for p in sel.passages} for sel in retrieval.selections}
         known_text = {" ".join(s.text.split()) for s in original.source_sentences}
+        whole = _read_in_full(source, artifact)
+        if whole and len(whole) == len(original.candidate_bundles):
+            return _whole_source_marker(whole)
         # The same ranking, skipping every passage the first selection used.
         wide = attach_candidate_passage_retrieval(source, artifact, excluded_passage_ids_by_candidate=used)
         # The reserve is the next retrieved passages: a whole-source plan
@@ -81,7 +84,7 @@ def build_judgment_reserve(source, artifact) -> dict | None:
             any_new = any_new or bool(fresh)
             bundles.append(bundle.model_copy(update={"evidence_sentence_ids": fresh}))
         if not any_new:
-            return None
+            return _whole_source_marker(whole) if whole else None
         kept_ids = {sid for b in bundles for sid in [*b.evidence_sentence_ids, *b.source_discourse_sentence_ids]}
         reserve = foundation.model_copy(update={
             "candidate_bundles": bundles,
@@ -91,6 +94,7 @@ def build_judgment_reserve(source, artifact) -> dict | None:
         return {
             "reserve_version": RESERVE_VERSION,
             "retention": settings.JUDGMENT_RESERVE_RETENTION,
+            "whole_source_read": whole,
             "foundation": reserve.model_dump(mode="json"),
             "passages": [{"passage_id": p.passage_id, "page_index": p.page_index, "page_label": p.page_label,
                           "character_start": p.character_start}
@@ -99,6 +103,26 @@ def build_judgment_reserve(source, artifact) -> dict | None:
     except Exception as exc:        # optional record: degrade, never fail the run
         logger.warning("Judgment reserve not built (type=%s)", type(exc).__name__)
         return None
+
+
+def _read_in_full(source, artifact) -> list[str]:
+    """Candidates whose judge was given every sentence of the source: the
+    retrieved passages hold all of its body text and the candidate's
+    foundation holds all of their sentences (owner decision 2026-10-14)."""
+    from app.services.cross_language_whole_source import build_plan, whole_source_passages
+    plan = build_plan(artifact, whole_source_passages(source))
+    if not plan.entries or any(not entry.retrieved for entry in plan.entries):
+        return []
+    foundation = artifact.facet_evidence_foundation
+    every = {sentence.sentence_id for sentence in foundation.source_sentences}
+    return [bundle.candidate_id for bundle in foundation.candidate_bundles
+            if every and every <= set(bundle.evidence_sentence_ids)]
+
+
+def _whole_source_marker(candidates: list[str]) -> dict:
+    """No new sentences exist; the judge already read the whole source."""
+    return {"reserve_version": RESERVE_VERSION, "retention": settings.JUDGMENT_RESERVE_RETENTION,
+            "whole_source_read": list(candidates), "foundation": None, "passages": []}
 
 
 def store_reserve(session, record, reserve: dict) -> None:
@@ -136,6 +160,13 @@ def make_wider_search(session, verification_report_id, run):
 
     def wider(context, item, routes, _run, cache, call):
         if reserve is None:
+            return None
+        if item.bundle.candidate_id in (reserve.get("whole_source_read") or []):
+            # The judge already read every sentence of the source: no wider
+            # search is left, so "no evidence" stands (owner decision 2026-10-14).
+            return {"display_state": "insufficient", "reason_code": "whole_source_read",
+                    "record": {"status": "whole_source_read"}, "spend_usd": 0.0}
+        if not reserve.get("foundation"):
             return None
         foundation = FacetEvidenceFoundation.model_validate(reserve["foundation"])
         wide_context = SimpleNamespace(**{**vars(context), "facet_evidence_foundation": foundation,

@@ -3,7 +3,7 @@
 // results and fills each citation window: the label's judgment part and state,
 // the note above the collapsed evidence, and any sentence the judge relied on
 // that the evidence list does not already hold. A citation with several
-// propositions has one window per proposition (Citation N - A, B, ...); the
+// propositions has one window per proposition (Citation Na, Nb, ...); the
 // window shows only that proposition's results.
 (() => {
   const dataEl = document.getElementById('judgment-data');

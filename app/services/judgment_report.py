@@ -43,6 +43,12 @@ UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported
 EXAMPLE_OF_RESEARCH_NOTE = ("Judged as an example of the research the statement describes; the statement's "
                             "overall picture of the research is the writer's own.")
 REFERRAL_NOTE = "Not judged: a \u201csee\u201d citation points to further reading rather than supporting a statement."
+# Owner wording 2026-10-14 (Harlow review): the reason a Not Judged result is not judged.
+NOT_JUDGED_NOTES = {
+    "antecedent_unresolved": "Not judged: it could not be determined what this statement refers to.",
+    "wider_search_unavailable": ("Not judged: the judge found no evidence in the sentences it read, and no "
+                                 "further sentences from the source were available to check."),
+}
 # Owner-approved wording (2026-10-12) for a citation that is only a quotation; since
 # 2026-10-13 it replaces the window heading (report_judgment.js), not a note.
 QUOTATION_ONLY_NOTE = "Not Judged - Quotation only"
@@ -269,6 +275,8 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
     if state == "not_judged" and reason == "referral_citation":
         # Owner-approved wording (2026-10-07).
         parts.append(f'<p class="jw-coaching">{escape(REFERRAL_NOTE)}</p>')
+    elif state == "not_judged" and reason in NOT_JUDGED_NOTES:
+        parts.append(f'<p class="jw-coaching">{escape(NOT_JUDGED_NOTES[reason])}</p>')
     if reason in _RETRY_REASONS:
         parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')
     parts.append("</section>")

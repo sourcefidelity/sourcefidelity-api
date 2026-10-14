@@ -57,7 +57,7 @@
   // Open a window that has no mark on the paper (an unplaced citation or an
   // unlocated reference): the window still opens; nothing scrolls.
   // A citation with several judged propositions has one window per
-  // proposition (owner request 2026-09-28): "Citation N - A", its wording in bold.
+  // proposition (owner request 2026-09-28): "Citation 3a" (owner decision 2026-10-14), its wording in bold.
   function showProposition(proposition) {
     const texts = [...panel.querySelectorAll('.selected-citation[data-proposition]')];
     const suffix = panel.querySelector('[data-proposition-suffix]');
@@ -65,7 +65,7 @@
     const chosen = texts.find(el => el.dataset.proposition === proposition) || texts[0];
     texts.forEach(el => { el.hidden = el !== chosen; });
     panel.dataset.proposition = chosen.dataset.proposition;
-    if (suffix) suffix.textContent = ' - ' + chosen.dataset.propositionLetter;
+    if (suffix) suffix.textContent = chosen.dataset.propositionLetter;
     // Quotation and locator checks show only for a part that quotes one of
     // their terms (owner request 2026-10-14); a heading left empty hides too.
     const fold = value => String(value || '').toLowerCase().replace(/[‘’“”"']/g, '').replace(/\s+/g, ' ').trim();

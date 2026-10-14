@@ -1725,6 +1725,13 @@ def authorize_representation(
                 "OCR derivative immutable parent is unavailable or inconsistent"
             )
     page_labels = derivative_evidence.get("page_labels")
+    printed = validation_evidence.get("printed_page_labels") or {}
+    if (not derivative_evidence and record.representation_kind == "plain_text"
+            and printed.get("content_sha256") == digest and isinstance(printed.get("labels"), list)
+            and len(printed["labels"]) == content.count(b"\f") + 1):
+        # A scanned magazine's printed page numbers, bound to this exact text
+        # (lantern-pages-v1, owner decision 2026-10-14).
+        page_labels = printed["labels"]
     repairs = None
     from app.config import settings as _settings
     if record.representation_kind == "pdf" and _settings.SOURCE_TEXT_QUALITY_CHECK_ENABLED:
@@ -2728,7 +2735,11 @@ def _validate_derivative_provenance(source: AuthorizedRepresentation) -> None:
         source.derivation_manifest_sha256,
         source.page_labels,
     )
-    if not any(value is not None for value in values):
+    if not any(value is not None for value in values[:3]):
+        # Printed page labels alone (a scanned magazine's page numbers, owner
+        # decision 2026-10-14) belong to plain text, one label per page.
+        if values[3] is not None and source.representation_kind != "plain_text":
+            raise EvidenceAuthorizationError("Page labels without a derivative belong to plain text only")
         return
     if any(value is None for value in values):
         raise EvidenceAuthorizationError(
@@ -3614,7 +3625,7 @@ def _extract_pages(
                 _SourcePage(
                     index=(
                         index
-                        if len(raw_pages) > 1 or source.derivation_method
+                        if len(raw_pages) > 1 or source.derivation_method or supplied_labels is not None
                         else None
                     ),
                     label=label,
@@ -5502,6 +5513,14 @@ def _academic_practice_checks(
             for page_index in matched_pages
             if page_index is not None
         )
+        # A matched span with no page, or on a page with no number, cannot be
+        # compared with the locator: not assessed, never "outside" (owner
+        # review 2026-10-14; webpages and unpaginated texts).
+        unpaginated = any(
+            page_index is None
+            for match in target_matches
+            for page_index, _start, _end in match.fragments
+        ) or any(not printed.get(page_index) for page_index in matched_pages)
         if derivative_label_missing:
             locator = AcademicPracticeCheckEvidence(
                 status="not_assessable",
@@ -5510,6 +5529,13 @@ def _academic_practice_checks(
                 limitations=[
                     "The OCR derivative did not preserve a reliable printed-page label for every matched span."
                 ],
+            )
+        elif unpaginated:
+            locator = AcademicPracticeCheckEvidence(
+                status="not_assessable",
+                outcome="page_label_unavailable",
+                evidence_passage_ids=evidence_ids,
+                limitations=["The matched source text carries no page number to compare with the locator."],
             )
         else:
             consistent = bool(matched_pages) and all(

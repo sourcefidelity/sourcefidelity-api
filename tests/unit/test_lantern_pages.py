@@ -42,6 +42,11 @@ def test_links_pages_and_titles_are_read_tolerantly():
     assert lantern_target("https://archive.org/details/screenland22unse") is None
     assert cited_pages("Talbott, T. (1930). Meet the new blonde. Screenland, 26-27.") == (26, 27)
     assert cited_pages("Whitchel, J. A. (1932). The girl. Silver Screen, 22-50.") == (22, 50)
+    # A single page after the magazine needs no "p." (owner review 2026-10-14, Harlow reference 7).
+    assert cited_pages("Rowe, K. (1932). Strikes. Movie Classic, 41. https://lantern.mediahist.org/catalog/x_0041") == (41, 41)
+    assert cited_pages("Rowe, K. (1932). Strikes. Movie Classic, 41.") == (41, 41)
+    assert cited_pages("Rowe, K. (1932). Strikes. Photoplay. https://lantern.mediahist.org/catalog/x_0041") is None
+    assert cited_pages("Rowe, K. (1932). Strikes. Photoplay, 1932.") is None
     # A display headline the OCR broke ("th s TARS") still matches; an unrelated page does not.
     assert title_in_text("The Girl Who Changed the Stars", "envious blanched The Girl Who Changed th s TARS Tossed into the Stream")
     assert not title_in_text("The Girl Who Changed the Stars", "Golf widows of the hills meet the wives")
@@ -82,6 +87,11 @@ def test_the_resolver_confirms_on_title_magazine_and_year(monkeypatch):
     assert found.success and found.metadata["identity_confidence"] == "high"
     assert found.metadata["text_quality"] == "scan_ocr" and found.representation.completeness == "complete"
     assert found.authors == []   # the byline is not in the scanned text
+    # Printed page numbers travel with the exact text they label (2026-10-14).
+    import hashlib
+    labels = found.metadata["printed_page_labels"]
+    assert labels["content_sha256"] == hashlib.sha256(found.representation.content).hexdigest()
+    assert len(labels["labels"]) == found.representation.content.count(b"\f") + 1 == 2
     wrong_year = resolver._try_lantern(url, title="Meet the new blonde", author="Talbott, T.", year="1950",
                                        container_title="Fanmag", raw_ref=ref)
     assert not wrong_year.success and wrong_year.metadata["identity_confidence"] == "medium"
@@ -144,3 +154,35 @@ def test_a_title_not_found_is_an_answered_check(monkeypatch):
         f"https://lantern.mediahist.org/catalog/{VOLUME}_0333", title="A story never printed here", author="X.",
         year="1930", container_title="Fanmag", raw_ref="X. (1930). A story never printed here. Fanmag, 26-27.")
     assert not missing.success and _student_link_disposition(missing) == ("no_match", "link_page_title_differs")
+
+
+def test_pages_carry_the_printed_number_only_where_the_scan_shows_it():
+    # Owner decision 2026-10-14: the archive's page numbers label the pages,
+    # each confirmed by the page number printed on that page; pages are
+    # separated by a form feed so a locator can be checked.
+    from app.services.retrieval.lantern import page_labels
+    ocr = {10: "40\nDRESSED in dignity and not much else, she said.", 11: "The rest of the story.\n:o"}
+    def get(url):
+        if url.endswith(".json") and "/catalog/" in url:
+            return _response(url, payload={"data": {"attributes": {"title": {"attributes": {"value": "Fanmag"}},
+                                                                   "dateStart": {"attributes": {"value": "1933"}}}}})
+        if url.endswith("_page_numbers.json"):
+            return _response(url, payload={"pages": [{"leafNum": 10, "pageNumber": "40"},
+                                                     {"leafNum": 11, "pageNumber": "41"}]})
+        leaf = int(url.rsplit("_", 1)[1])
+        return _response(url, text=f'<div class="card card-body ">{ocr.get(leaf, "")}</div>')
+    article = read_article("https://lantern.mediahist.org/catalog/vol_0010", title="Dressed in Dignity and Not Much Else",
+                           raw_ref="X. (1933). Dressed in dignity and not much else. Fanmag, 40-41.", get=get, get_archive=get)
+    assert article.text.count("\f") == 1 and "\n\n" not in article.text
+    assert page_labels(article) == ["40", None]
+
+
+def test_a_cached_lantern_copy_without_page_numbers_is_read_again():
+    # Owner decision 2026-10-14: the local copy is skipped once, so the Lantern
+    # route stores the pages with their printed numbers.
+    from types import SimpleNamespace
+    from app.services.source_resolver import _stale_lantern_copy
+    assert _stale_lantern_copy(SimpleNamespace(provenance="lantern", validation_evidence={}))
+    labelled = {"printed_page_labels": {"labels": ["26", None]}}
+    assert not _stale_lantern_copy(SimpleNamespace(provenance="lantern", validation_evidence=labelled))
+    assert not _stale_lantern_copy(SimpleNamespace(provenance="crossref", validation_evidence={}))

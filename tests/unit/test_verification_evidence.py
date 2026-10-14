@@ -2081,6 +2081,50 @@ def test_quotation_locator_reports_match_on_different_page(session: Session) -> 
     assert artifact.locator_check.outcome == "located_span_outside_supplied_locator"
 
 
+def test_a_source_without_page_numbers_cannot_place_a_quotation_outside_its_locator(
+    session: Session,
+) -> None:
+    # Owner review 2026-10-14 (Harlow citations 1, 2 and 8): a webpage or an
+    # unpaginated text has no page to compare, so the locator is not assessed.
+    storage = MemoryStorage()
+    content = b"An unpaginated page. The exact quoted evidence appears on this page."
+    record = _admit(session, storage, content, kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain")
+    source = authorize_representation(
+        session, storage, representation_id=record.id, scope_type="personal_owner", scope_id="owner-1")
+    artifact = build_passage_evidence(
+        source,
+        claim=_claim('"The exact quoted evidence appears on this page."', claim_type="quotation",
+                     page_locator="27"),
+    )
+    assert artifact.quotation_check.outcome == "all_spans_literal_match"
+    assert artifact.locator_check.status == "not_assessable"
+    assert artifact.locator_check.outcome == "page_label_unavailable"
+
+
+def test_printed_page_labels_of_a_scanned_magazine_check_the_locator() -> None:
+    # Owner decision 2026-10-14 (Lantern pages): the printed numbers label the
+    # pages of the text, so the locator is checked against them.
+    from dataclasses import replace as _replace
+    content = b"26\nOpening page of the story.\fThe exact quoted evidence appears on this page.\n27"
+    now = datetime.now(timezone.utc)
+    source = AuthorizedRepresentation(
+        representation_id="lantern-rep", canonical_work_id="w", content_object_id="o",
+        content_sha256=hashlib.sha256(content).hexdigest(), content=content, representation_kind="plain_text",
+        media_type="text/plain", provenance="public_web", scope_type="personal_owner", scope_id="owner-1",
+        identity_verdict="verified", identity_confidence=0.9, completeness_verdict="complete",
+        text_quality="scan_ocr", edition_or_version=None, created_at=now, admitted_at=now,
+        page_labels=("26", "27"))
+    quote = '"The exact quoted evidence appears on this page."'
+    inside = build_passage_evidence(source, claim=_claim(quote, claim_type="quotation", page_locator="27"))
+    assert inside.locator_check.outcome == "located_span_matches_supplied_locator"
+    outside = build_passage_evidence(source, claim=_claim(quote, claim_type="quotation", page_locator="26"))
+    assert outside.locator_check.outcome == "located_span_outside_supplied_locator"
+    single = _replace(source, content=content.split(b"\f")[1],
+                      content_sha256=hashlib.sha256(content.split(b"\f")[1]).hexdigest(), page_labels=("27",))
+    alone = build_passage_evidence(single, claim=_claim(quote, claim_type="quotation", page_locator="27"))
+    assert alone.locator_check.outcome == "located_span_matches_supplied_locator"
+
+
 def test_author_accepted_manuscript_does_not_claim_publisher_page_match(
     session: Session,
 ) -> None:

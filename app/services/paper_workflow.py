@@ -419,6 +419,9 @@ def retrieve_paper_sources(
             # link that yielded no text again once (rerun_reuse).
             from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
             result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
+        if getattr(result, "source_name", None) == "lantern":
+            from app.services.retrieval.lantern import PAGES_VERSION
+            result_record["lantern_pages"] = PAGES_VERSION
         if exc is not None:
             result_record.update(
                 status="unavailable",
@@ -528,7 +531,9 @@ def retrieve_paper_sources(
         # either way. Bound to the validated bytes, not just to the flag.
         corroborated_landing = bool(
             confidence == 'medium'
-            and metadata.get('identity_corroborated_by_landing_page')
+            and (metadata.get('identity_corroborated_by_landing_page')
+                 # Its own title page names the cited title and first author (2026-10-14).
+                 or metadata.get('identity_corroborated_by_title_page'))
             and metadata.get('accepted_representation_sha256')
             == hashlib.sha256(representation.content).hexdigest()
         )
@@ -1669,7 +1674,8 @@ def _shadow_artifact(
     if llm_enabled:
         evidence = _attach_source_scope(evidence, claim, scope_excerpt,
                                         source_title=source_title, source=source)
-    topically_mismatched = _scope_mismatch_established(evidence)
+    topically_mismatched = _scope_mismatch_established(
+        evidence, sources=len(set(getattr(claim, "reference_ids", None) or [])))
     if llm_enabled and not topically_mismatched:
         evidence = attach_source_blind_interpretations(
             evidence,
@@ -1729,7 +1735,7 @@ def _shadow_artifact(
 _SCOPE_COMPOSITION_MARGIN = 250
 
 
-def _scope_mismatch_established(evidence) -> bool:
+def _scope_mismatch_established(evidence, *, sources: int = 1) -> bool:
     """Has the scope comparison already ruled this source out for this claim?"""
     from app.services.report_layers import scope_mark_qualifies
     record = getattr(evidence, "source_scope_assessment", None)
@@ -1740,7 +1746,7 @@ def _scope_mismatch_established(evidence) -> bool:
         return False
     scope.setdefault("claim_terms_present", record.claim_terms_present)
     scope.setdefault("claim_terms_total", record.claim_terms_total)
-    return scope_mark_qualifies(scope, record.coverage)
+    return scope_mark_qualifies(scope, record.coverage, sources=sources)
 
 
 def _attach_source_scope(evidence, claim, excerpt: str, *, source_title: str, source=None):
@@ -1754,7 +1760,9 @@ def _attach_source_scope(evidence, claim, excerpt: str, *, source_title: str, so
     # not its value. Read the value so the comparison means what it says.
     level = getattr(evidence.coverage, "level", None)
     coverage = str(getattr(level, "value", level) or "")
-    if coverage not in {"full_text", "partial_text"} or not excerpt:
+    # Fully retrieved text is never marked a topical mismatch (owner decision
+    # 2026-10-14), so only limited text is compared.
+    if coverage != "partial_text" or not excerpt:
         return evidence
     # The opening states the work's own scope; the passages show what it
     # actually discusses. Composed into one block so the existing binding,

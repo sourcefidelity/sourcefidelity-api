@@ -1,5 +1,6 @@
 """Fail-closed presentation of retained, source-bound findings. No assessment."""
 import hashlib
+import re
 
 
 def partial_relevance(member: dict) -> bool:
@@ -128,7 +129,7 @@ def _reference_identified(member: dict) -> bool:
                 and identity.get('title_and_author_agree'))
 
 
-def scope_mark_qualifies(scope: dict, coverage: str) -> bool:
+def scope_mark_qualifies(scope: dict, coverage: str, *, sources: int = 1) -> bool:
     """Would this scope judgment carry a mark, on grounds alone?
 
     Shared with the verification workflow, which uses it to stop spending on
@@ -138,7 +139,7 @@ def scope_mark_qualifies(scope: dict, coverage: str) -> bool:
     It omits the hash binding, which exists to prove the displayed text was
     the text compared and cannot be checked before the report is built.
     """
-    if coverage not in _SCOPE_COMPARABLE_COVERAGE:
+    if coverage not in _SCOPE_COMPARABLE_COVERAGE or sources >= BROAD_CITATION_SOURCES:
         return False
     return bool(scope.get('relevance') == 'apparent_mismatch'
                 and scope.get('attention') is True
@@ -146,7 +147,9 @@ def scope_mark_qualifies(scope: dict, coverage: str) -> bool:
                 and _qualifying_scope_ground(scope))
 
 
-_SCOPE_COMPARABLE_COVERAGE = {'abstract_only', 'full_text', 'partial_text'}
+# A fully retrieved text is judged, never marked a topical mismatch; the
+# mark is for abstracts and limited text (owner decision 2026-10-14).
+_SCOPE_COMPARABLE_COVERAGE = {'abstract_only', 'partial_text'}
 
 
 def _scope_source_text(member: dict) -> tuple[str, bool]:
@@ -244,6 +247,26 @@ def locator_attention(member: dict) -> bool:
     return bool(member.get('coverage_level') in {'full_text', 'abstract_only', 'partial_text'}
                 and member.get('show_locator_check') and locator.get('attention')
                 and locator.get('status') in {'complete', 'incomplete'})
+
+
+def locator_rectangles(citation: dict, words_by_page: dict) -> list[dict]:
+    """The locator's own words in the citation ("p. 27"), never the year
+    (owner review 2026-10-14); none when they cannot be placed exactly."""
+    from app.services.judgment_layer import claim_span_rectangles
+    text = str(citation.get('student_text') or '')
+    marker = str(citation.get('citation_marker') or '')
+    locator = str(citation.get('page_locator') or '').strip()
+    start = citation.get('paper_character_start')
+    at = text.rfind(marker) if marker else -1
+    if not locator or at < 0 or not isinstance(start, int):
+        return []
+    found = list(re.finditer(r'(?:\b(?:pp?|para|paras|ch|sec)\.\s*)?' + re.escape(locator) + r'(?![\w])',
+                             marker))
+    if len(found) != 1:
+        return []
+    begin = start + at + found[0].start()
+    rects, placement = claim_span_rectangles(citation, [(begin, begin + len(found[0].group(0)))], words_by_page)
+    return rects if placement == 'exact' else []
 
 
 def member_layers(member: dict, citation: dict) -> set[str]:

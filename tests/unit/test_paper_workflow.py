@@ -355,8 +355,10 @@ def test_possible_match_paper_pipeline_cleans_source_and_preserves_label(monkeyp
         aggregate = session.scalar(select(Report))
         view = aggregate.report_json['evidence_report']
         html = render_evidence_report_html(view, csp_nonce='test-provisional-nonce')
-        assert 'Possible source match' in html
-        assert 'The publication year differs from the reference.' in html
+        # A possible-match copy shows no text (owner decision 2026-10-14).
+        assert 'Possible source match' not in html
+        assert 'The publication year differs from the reference.' not in html
+        assert 'No Text Retrieved' in html
         for citation in view['citations']:
             for member in citation['members']:
                 assert member['identity_status'] == 'possible_match'

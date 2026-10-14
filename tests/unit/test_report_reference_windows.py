@@ -97,6 +97,18 @@ def test_uncited_unlocated_reference_has_a_window_but_no_paper_target():
     assert not soup.select('[data-panel-template="reference-entry-panel-2"]')
 
 
+def test_an_uncited_reference_window_shows_the_academic_practice_item():
+    # Owner decision 2026-10-14 (Harlow reference 1): the window carries the
+    # summary's Academic Practice finding, not a note.
+    win = window(report(uncited_reference_ids=[rid(2)]), 'reference-entry-panel-2')
+    section = win.select_one('section.reference-finding[data-category="academic"]')
+    assert section and 'This reference is not cited in the paper.' in section.get_text()
+    assert 'No in-text citation in this report is linked to this reference.' not in win.get_text()
+    # A reference the summary counts as cited (a heading's) shows neither.
+    win = window(report(uncited_reference_ids=[]), 'reference-entry-panel-2')
+    assert 'not cited' not in win.get_text() and 'No in-text citation' not in win.get_text()
+
+
 def test_entry_spanning_two_pages_gets_targets_on_both_but_one_badge_and_anchor():
     locations = {rid(1): {'rectangles': [entry_box(0, 700), entry_box(1, 72)], 'links': []}}
     soup = report(paper_surface={**SURFACE, 'reference_locations': locations})

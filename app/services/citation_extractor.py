@@ -430,6 +430,18 @@ def _reference_author_count(ref: ParsedReference) -> int:
     return max(1, len(_reference_lead_surnames(ref)))
 
 
+# A person's initials: with full stops, or at most three bare capitals ("D").
+_INITIALS = re.compile(r"(?:[A-Z]\.\s*-?\s*)+|[A-Z]{1,3}")
+
+
+def _organisation_list(ref: ParsedReference) -> bool:
+    """Group authors separated by commas or "&", with no person's initials
+    ("Library of Congress, MBRS, & Moving Image Section"): their count is not
+    read, so "et al." is not called a difference (owner review 2026-10-14)."""
+    parts = [part.strip() for part in re.split(r",|&", ref.author or "") if part.strip()]
+    return len(parts) >= 2 and not any(_INITIALS.fullmatch(part) for part in parts)
+
+
 def spelling_distance(a: str, b: str) -> int:
     """Optimal-string-alignment distance: insertions, deletions, substitutions, adjacent swaps."""
     rows = [list(range(len(b) + 1))]
@@ -596,11 +608,13 @@ def _find_citations_in_paragraph(
             if year and not year_candidates and len(name_candidates) == 1:
                 candidates = name_candidates
                 link_differences.append(f"year:{name_candidates[0].year or 'n.d.'}")
-                if et_al and _reference_author_count(name_candidates[0]) < 3:
+                if (et_al and _reference_author_count(name_candidates[0]) < 3
+                        and not _organisation_list(name_candidates[0])):
                     link_differences.append(f"author_count:{_count_word(_reference_author_count(name_candidates[0]))}")
             elif year_candidates and len(year_candidates) == 1 and et_al:
                 candidates = year_candidates
-                link_differences.append(f"author_count:{_count_word(_reference_author_count(year_candidates[0]))}")
+                if not _organisation_list(year_candidates[0]):
+                    link_differences.append(f"author_count:{_count_word(_reference_author_count(year_candidates[0]))}")
             elif year_candidates and len(year_candidates) == 1:
                 lead = _reference_lead_surnames(year_candidates[0])
                 candidates = year_candidates

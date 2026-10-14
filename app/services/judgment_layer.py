@@ -169,6 +169,13 @@ def build_judgment_layer(session: Session, view: dict, words_by_page: dict, *,
             # Every stored record was out of scope or missing: the citation is
             # still underlined, as not judged (the citation-span line is hidden).
             marks.append(static)
+        if any(m.get("ranges") for m in marks[before:]):
+            # A source not judged draws no line of its own under judged
+            # propositions; its result stays in their window (owner review
+            # 2026-10-14: one underline per word).
+            for mark in marks[before:]:
+                if mark["candidate"] == WHOLE_CITATION:
+                    mark.update(rects=[], placement="none")
         _separate_contained(marks[before:], citation, words_by_page)
     marks.sort(key=lambda m: (m["order"], m["citation"] or 0))
     return {"marks": marks}
@@ -180,8 +187,10 @@ def _separate_contained(marks: list[dict], citation: dict, words_by_page: dict) 
     underlined and bolded only where it adds words, so the two do not overlap
     (owner review 2026-09-29); what the judge read is unchanged. Two
     propositions that share only some words ("studied the cranes that …" in
-    both) are separated the same way: the smaller keeps the
-    shared words (owner review 2026-10-08: one underline per word)."""
+    both) are separated the same way, one underline per word (owner review
+    2026-10-08): shared words lead into the proposition whose own words come
+    first after them, and a shared ending stays with the one just before it
+    (owner review 2026-10-14, replacing "the smaller keeps the shared words")."""
     def positions(ranges):
         return {p for a, b in ranges for p in range(a, b)}
 
@@ -195,6 +204,16 @@ def _separate_contained(marks: list[dict], citation: dict, words_by_page: dict) 
         return [(a, b) for a, b in shown if b - a > 1]
 
     groups = {m["group"]: positions(m["ranges"]) for m in marks if m.get("ranges")}
+
+    def keeper(position, sharing):
+        """The proposition whose own words come first after a shared word, or,
+        for a shared ending, the one whose own words end just before it."""
+        alone = {g: groups[g] - set().union(*(groups[o] for o in sharing if o != g)) for g in sharing}
+        after = {g: min((p for p in alone[g] if p > position), default=None) for g in sharing}
+        if any(value is not None for value in after.values()):
+            return min((g for g in sharing if after[g] is not None), key=lambda g: (after[g], g))
+        return max(sharing, key=lambda g: (max((p for p in alone[g] if p < position), default=-1), g))
+
     for mark in marks:
         own = positions(mark.get("ranges") or [])
         contained, shared = set(), set()
@@ -203,8 +222,13 @@ def _separate_contained(marks: list[dict], citation: dict, words_by_page: dict) 
                 continue
             if other < own:
                 contained |= other            # a proposition inside this one
-            elif len(other) < len(own):
-                shared |= other & own         # a smaller one sharing some words
+        partial = [g for g, other in groups.items() if g != mark["group"] and other & own
+                   and not other < own and not own < other]
+        if partial:
+            for position in own - contained:
+                sharing = [g for g in [mark["group"], *partial] if position in groups[g]]
+                if len(sharing) > 1 and keeper(position, sharing) != mark["group"]:
+                    shared.add(position)
         if not contained and not shared:
             continue
         underlined = spans(own - contained - shared)

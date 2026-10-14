@@ -91,6 +91,16 @@ def test_a_heading_naming_a_work_is_not_a_citation():
                              'citation_marker': "Killer's Kiss (1955)"})
 
 
+def test_a_clause_cut_at_its_citation_is_not_a_heading():
+    # Owner review 2026-10-14 (Harlow): a sentence cut at its one citation
+    # keeps the title-cased words before the marker, which alone read as a heading.
+    from app.services.evidence_report import heading_citation
+    sentence = 'In Wife vs. Secretary (Brown, 1936), she played a secretary suspected of an affair.'
+    clause = {'student_text': 'In Wife vs. Secretary (Brown, 1936)', 'citation_marker': '(Brown, 1936)',
+              'clause_of': {'student_text': sentence, 'paper_character_start': 0}}
+    assert not heading_citation(clause)
+
+
 def test_a_confirmed_cited_web_page_is_whole_when_not_cut_off():
     # Paper 5 reference 13 (a 569-word event page) read as limited text, 2026-10-03.
     from app.services.web_completeness import confirmed_page_completeness

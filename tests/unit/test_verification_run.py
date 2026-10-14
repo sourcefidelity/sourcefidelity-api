@@ -446,3 +446,26 @@ def test_cleanup_worker_has_schedule_and_recovers_expired_run(database, monkeypa
     with database() as session:
         assert session.get(VerificationRunRecord, run_id).status == "abandoned_cleaned"
     assert storage.objects == {}
+
+
+def test_a_transient_lantern_text_keeps_its_printed_page_numbers(database):
+    # Owner decision 2026-10-14: a temporary copy of Lantern pages keeps the
+    # printed page numbers bound to its exact text.
+    import hashlib
+    content = b"50\nThe first page.\fThe second page.\n51"
+    labels = {"policy": "lantern-pages-v1", "labels": ["50", "51"],
+              "content_sha256": hashlib.sha256(content).hexdigest()}
+    storage = MemoryStorage()
+    with database() as session:
+        representation = SourceRepresentation(kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain",
+                                              content=content, metadata={"printed_page_labels": labels})
+        run = begin_verification_run(session, storage, _request(representation=representation,
+                                                                acquisition_route="lantern"))
+        source = load_verification_run_source(session, storage, run.id, scope_type="personal_owner",
+                                              scope_id="owner-1")
+        assert source.page_labels == ("50", "51")
+        other = SourceRepresentation(kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain",
+                                     content=b"Other text.", metadata={"printed_page_labels": labels})
+        run = begin_verification_run(session, storage, _request(representation=other))
+        assert load_verification_run_source(session, storage, run.id, scope_type="personal_owner",
+                                            scope_id="owner-1").page_labels is None

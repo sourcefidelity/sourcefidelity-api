@@ -731,6 +731,14 @@ LANDING_ABSTRACT_ONLY_ERROR = "landing page holds an abstract and back matter on
 # page naming the work also keeps its abstract); an earlier
 # result without text, or with a search-found page's text, is searched again once.
 STUDENT_LINK_ROUTES_VERSION = "student-link-routes-v5"
+
+
+def _stale_lantern_copy(record) -> bool:
+    """A stored Lantern text from before its pages carried printed page
+    numbers: skipped by the local copy, so the Lantern route reads it again
+    with them (owner decision 2026-10-14)."""
+    return (getattr(record, "provenance", None) == "lantern"
+            and not (getattr(record, "validation_evidence", None) or {}).get("printed_page_labels"))
 # Result metadata a displaced page carried that would authorize its text.
 _ACQUISITION_ONLY_METADATA = frozenset({
     "durable_admission", "repository_representation_id", "publisher_preview",
@@ -1060,6 +1068,52 @@ def _distinctive_title_tokens(title: str | None) -> set[str]:
 _OPENING_TITLE_PAGES = 3
 _OPENING_TITLE_WINDOW_WORDS = 300
 _OPENING_TITLE_MIN_OVERLAP = 0.6
+
+
+_TITLE_PAGE_FUNCTION_WORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "its", "their", "our", "an", "of", "in", "on", "to", "a",
+    "as", "at", "by", "or", "how", "what", "why", "are", "is"})
+
+
+def title_page_names_work(opening: str, title: str | None, author: str | None) -> bool:
+    """Does a copy's opening name the cited title and its first author?
+
+    The title counts when, within the opening's first 300 words, it appears
+    with its spacing removed (a title read from a paper loses spaces:
+    "IdentitiesthroughGame-Making") or all its distinctive words stand close
+    together (a student's slightly different wording). The first author's
+    surname must also appear: a title phrase alone matched a stranger's
+    working paper, and the cited author alone a different chapter (owner
+    decision 2026-10-14, after the review of 8 possible matches).
+    """
+    def words(value):
+        return re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", str(value or "")).casefold())
+
+    head = words(opening)[:_OPENING_TITLE_WINDOW_WORDS]
+    title_words = words(title)
+    if not head or not title_words:
+        return False
+    squashed = "".join(title_words)
+    tokens = {word for word in title_words if len(word) >= 3 and word not in _TITLE_PAGE_FUNCTION_WORDS}
+    title_found = len(squashed) >= 12 and squashed in "".join(head)
+    if not title_found and tokens:
+        span = 2 * len(tokens) + 4
+        title_found = any(tokens <= set(head[index:index + span]) for index in range(len(head)))
+    surname = words(re.split(r"[,&(]", str(author or ""))[0])
+    return bool(title_found and surname and all(part in head for part in surname))
+
+
+def _title_page_confirms(content: bytes, title: str | None, author: str | None) -> bool:
+    """`title_page_names_work` on a PDF's opening pages; never raises."""
+    try:
+        import fitz
+
+        with fitz.open(stream=content, filetype="pdf") as document:
+            opening = " ".join(document[index].get_text()
+                               for index in range(min(_OPENING_TITLE_PAGES, len(document))))
+    except Exception:
+        return False
+    return title_page_names_work(opening, title, author)
 
 
 def _opening_pages_present_title(content: bytes, expected_title: str | None) -> bool:
@@ -3875,7 +3929,7 @@ class SourceResolver:
                         if (record.canonical_work.year != year or
                                 _normalize_cache_author(record.canonical_work.author) != _normalize_cache_author(author)):
                             record = None
-                if record is None:
+                if record is None or _stale_lantern_copy(record):
                     return RetrievalResult(source_name="local_cache", success=False)
                 try:
                     data = self._backend.download(record.content_object.storage_key)
@@ -4101,6 +4155,7 @@ class SourceResolver:
         magazine_ok = (pages.magazine_matches(container_title, article.magazine)
                        or pages.magazine_matches(article.magazine, raw_ref or ""))
         confirmed = bool(year_ok and magazine_ok)
+        labels = pages.page_labels(article)
         record = {"policy": pages.POLICY, "volume": article.volume, "magazine": article.magazine,
                   "volume_dates": article.volume_dates, "leaves": article.leaves,
                   "printed_pages": article.printed_pages, "notes": article.notes}
@@ -4113,9 +4168,13 @@ class SourceResolver:
             representation=SourceRepresentation(
                 kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain", content=content,
                 source_url=article.first_leaf_url, original_kind=RepresentationKind.HTML, charset="utf-8",
-                completeness=coverage["verdict"], metadata={"web_completeness": coverage}),
+                completeness=coverage["verdict"], metadata={
+                    "web_completeness": coverage,
+                    "printed_page_labels": {"policy": pages.POLICY, "labels": labels, "content_sha256": digest}}),
             abstract=article.text, full_text_url=article.first_leaf_url,
             metadata={"lantern": record, "web_completeness": coverage,
+                      # The printed page numbers, bound to this exact text (owner decision 2026-10-14).
+                      "printed_page_labels": {"policy": pages.POLICY, "labels": labels, "content_sha256": digest},
                       "web_identity": {"title": title, "authors": authors, "year": year if year_ok else None,
                                        "doi": None},
                       "requested_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
@@ -4816,6 +4875,22 @@ class SourceResolver:
                 f"{identity_reason}; corroborated by the landing page that names "
                 "this work and advertises this file as its full text"
             )
+        # The copy's own title page names the cited title and first author
+        # (owner decision 2026-10-14): the cited work, not a possible match.
+        title_page = (
+            not corroborated
+            and not metadata.get("author_conflict")
+            and identity_confidence == "medium"
+            and kind is RepresentationKind.PDF
+            and kind_verdict != "incompatible"
+            and text_quality in {"digital", "born_digital", "scan_ocr"}
+            and bool(safety_report and safety_report.verdict is SafetyVerdict.CLEAN)
+            and _title_page_confirms(content, expected_title, expected_author)
+        )
+        if title_page:
+            corroborated = True
+            metadata["identity_corroborated_by_title_page"] = True
+            identity_reason = f"{identity_reason}; its title page names the cited title and first author"
         if identity_confidence != "high" and not corroborated:
             self._retain_provisional_candidate(result, confidence=identity_confidence,
                 reason=identity_reason, completeness=completeness,
@@ -7346,6 +7421,15 @@ class SourceResolver:
                     result.metadata["content_identity_confidence"] = content_identity
                     text_quality = "digital"
                 result.metadata = result.metadata or {}
+                if (identity_confidence == "medium" and representation_kind is RepresentationKind.PDF
+                        and not result.metadata.get("author_conflict")
+                        and getattr(validation, "source_kind_verdict", "unknown") != "incompatible"
+                        and _title_page_confirms(result.full_text, ref_title or result.title, ref_author)):
+                    # Its own title page names the cited title and first author
+                    # (owner decision 2026-10-14): the cited work.
+                    identity_confidence = "high"
+                    identity_reason = f"{identity_reason}; its title page names the cited title and first author"
+                    result.metadata["identity_corroborated_by_title_page"] = True
                 result.metadata["identity_confidence"] = identity_confidence
                 result.metadata["identity_reason"] = identity_reason
                 result.metadata["representation_kind"] = representation_kind.value
@@ -7663,6 +7747,8 @@ class SourceResolver:
                     # The canonical work keeps the cited fields as its lookup
                     # key; reuse compares only what the source itself showed.
                     validation_evidence["observed_identity"] = observed_identity
+                if result.metadata.get("printed_page_labels"):
+                    validation_evidence["printed_page_labels"] = result.metadata["printed_page_labels"]
                 ocr_evidence = result.metadata.get("ocr_derivative")
                 if ocr_evidence and result.parent_representation is not None:
                     validation_evidence["ocr_derivative"] = ocr_evidence

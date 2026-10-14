@@ -72,9 +72,22 @@ def test_reserve_holds_only_sentences_the_first_selection_did_not_use():
     json.dumps(reserve)       # storable as JSON
 
 
-def test_reserve_is_absent_for_a_short_source_or_a_non_full_text():
+def test_a_short_source_read_in_full_needs_no_wider_search():
+    # Owner decision 2026-10-14 (Harlow): a source the judge read in full has
+    # no wider search left, so its "no evidence" stands.
     source, artifact = _long_source_artifact(paragraphs=2)
-    assert reserve_module.build_judgment_reserve(source, artifact) is None
+    reserve = reserve_module.build_judgment_reserve(source, artifact)
+    candidates = {b.candidate_id for b in artifact.facet_evidence_foundation.candidate_bundles}
+    assert reserve["foundation"] is None and set(reserve["whole_source_read"]) == candidates
+    json.dumps(reserve)
+
+
+def test_a_long_source_is_not_read_in_full():
+    source, artifact = _long_source_artifact()
+    assert not reserve_module.build_judgment_reserve(source, artifact).get("whole_source_read")
+
+
+def test_reserve_is_absent_for_a_non_full_text():
     source, artifact = _long_source_artifact()
     partial = artifact.model_copy(update={"coverage": artifact.coverage.model_copy(update={"level": "partial_text"})})
     assert reserve_module.build_judgment_reserve(source, partial) is None
@@ -161,3 +174,18 @@ def test_no_reserve_means_no_wider_search(db):
     run = SimpleNamespace(scope_type="personal_owner", scope_id="owner-1", policy_hash="p")
     wider = reserve_module.make_wider_search(session, uuid.uuid4(), run)
     assert wider(None, None, ROUTES, run, None, None) is None
+
+
+def test_no_evidence_in_a_source_read_in_full_stands_without_a_call(db, monkeypatch):
+    monkeypatch.setattr(settings, "JUDGMENT_MAX_INPUT_TOKENS", 100_000)
+    session, record = db
+    source, artifact = _long_source_artifact(paragraphs=2)
+    reserve_module.store_reserve(session, record, reserve_module.build_judgment_reserve(source, artifact))
+    session.commit()
+    prepared = prepare_candidate_prompts(artifact, max_input_tokens=100_000)
+    item = next(i for i in prepared.items if not isinstance(i, CandidateFacetFinding))
+    run = SimpleNamespace(scope_type="personal_owner", scope_id="owner-1", policy_hash="p")
+    wider = reserve_module.make_wider_search(session, record.id, run)
+    outcome = wider(artifact, item, ROUTES, run, None, lambda *a, **k: pytest.fail("no call"))
+    assert (outcome["display_state"], outcome["reason_code"]) == ("insufficient", "whole_source_read")
+    assert outcome["spend_usd"] == 0
