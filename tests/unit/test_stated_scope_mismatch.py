@@ -192,6 +192,24 @@ def test_an_unidentified_reference_shows_no_abstract():
     assert kept['best_evidence'] is not None
 
 
+def test_an_abstract_read_from_the_students_own_link_is_shown():
+    # Regulation references 8 and 13: the abstract is the page the student's
+    # link returned (same bytes as the link checker's response), so it is not
+    # a merged record's summary.
+    from app.services.evidence_report import _abstract_from_submitted_link, _withhold_unidentified_abstract
+    member = {'abstract_evidence': {'provenance': {'basis': 'linked_abstract_page', 'page_content_sha256': 'a' * 64}}}
+    observations = [{'reference_id': 'ref-8', 'requests': [{'response_sha256': 'a' * 64}]}]
+    assert _abstract_from_submitted_link(member, 'ref-8', observations)
+    assert not _abstract_from_submitted_link(member, 'ref-9', observations)
+    other_page = [{'reference_id': 'ref-8', 'requests': [{'response_sha256': 'b' * 64}]}]
+    assert not _abstract_from_submitted_link(member, 'ref-8', other_page)
+    merged = {'abstract_evidence': {'provenance': {'basis': 'canonical_work_graph', 'page_content_sha256': 'a' * 64}}}
+    assert not _abstract_from_submitted_link(merged, 'ref-8', observations)
+    item = {'coverage_level': 'abstract_only', 'best_evidence': {'text': '摘要'},
+            'reference_identity': {'status': 'possible_match'}}
+    assert _withhold_unidentified_abstract(item, linked_page=True)['best_evidence'] is not None
+
+
 @pytest.mark.parametrize('raw,container,pages', [
     ('Belton, J. (2013). The Studio System. In J. Belton (Ed.), '
      'American cinema/American culture (pp. 64-86). New York: McGraw Hill.',

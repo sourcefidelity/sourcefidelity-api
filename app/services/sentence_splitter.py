@@ -24,8 +24,28 @@ _ABBREVIATIONS = re.compile(
     re.IGNORECASE,
 )
 
-# Sentence-ending pattern: . ! ? (optionally followed by closing quote/paren)
-_SENTENCE_END = re.compile(r"([.!?]+[\"'\u201d\u2019\)]*)(?:\s+|(?<=\)\.)(?=[A-Z]))")
+# Sentence-ending pattern: . ! ? (optionally followed by closing quote/paren).
+# A closing double quotation mark directly followed by a capital also ends a
+# sentence: students drop the space ("individual.\u201dDifferent", 2026-10-14).
+_SENTENCE_END = re.compile(r"([.!?]+[\"'\u201d\u2019\)]*)(?:\s+|(?<=\)\.)(?=[A-Z])|(?<=[\u201d\"])(?=[A-Z]))")
+
+# Han, kana and Hangul sentences end at \u3002\uff01\uff1f, a closing quotation mark or
+# bracket staying with its sentence; any spacing after it (none, a space or a
+# line break) belongs to neither sentence. The one rule every splitter uses:
+# group 1 ends the sentence, the match's end starts the next (2026-10-14).
+CJK_SENTENCE_END = re.compile(r"([\u3002\uff01\uff1f]+[\u201d\u2019\u300d\u300f\uff09\"')]*)(\s*)")
+
+
+def split_cjk(text: str) -> list[str]:
+    """A text cut at Han, kana and Hangul sentence ends (stripped pieces)."""
+    pieces, start = [], 0
+    for match in CJK_SENTENCE_END.finditer(text):
+        if match.end(1) >= len(text.rstrip()):
+            break
+        pieces.append(text[start:match.end(1)].strip())
+        start = match.end()
+    pieces.append(text[start:].strip())
+    return [piece for piece in pieces if piece]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -88,7 +108,7 @@ def split_sentences(text: str) -> list[str]:
         chunk = chunk.replace('\x03', '?').replace('\x04', '!')
         chunk = chunk.strip()
         if chunk:
-            sentences.append(chunk)
+            sentences.extend(split_cjk(chunk))
 
     return sentences
 

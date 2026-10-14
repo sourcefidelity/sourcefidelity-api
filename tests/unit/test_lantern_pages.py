@@ -98,20 +98,19 @@ def test_lantern_ocr_text_gets_ocr_tolerant_quotation_matching():
     assert not _ocr_tolerant(SimpleNamespace(text_quality="digital", derivation_method=None, provenance="lantern"))
 
 
-def test_an_earlier_result_without_the_lantern_route_is_searched_again():
+def test_an_earlier_result_without_text_under_older_link_handling_is_searched_again():
     from app.services.search.rerun_reuse import _reusable
+    from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
     reference = {"reference_id": "ref-1", "url": "https://lantern.mediahist.org/catalog/fanmag22unse_0333",
                  "raw_ref": "Talbott, T. (1930). Meet the new blonde. Fanmag, 26-27.", "source_kind": "magazine_article"}
     completed = {"outcome": "unlocated_after_search", "created_at": "t0",
                  "attempts": [{"route_category": "student_url", "provider": "student_url_html", "outcome": "candidate_found"}]}
     item = {"status": "unavailable", "reason_code": "full_text_unavailable", "reference_discovery": completed}
     assert not _reusable(item, reference)
-    with_route = {**completed, "attempts": [*completed["attempts"],
-                                            {"route_category": "student_url", "provider": "student_url_lantern",
-                                             "outcome": "no_match"}]}
-    assert _reusable({**item, "reference_discovery": with_route}, reference)
-    # Other links are unaffected.
-    assert _reusable(item, {**reference, "url": "https://example.org/page"})
+    assert _reusable({**item, "student_link_routes": STUDENT_LINK_ROUTES_VERSION}, reference)
+    # A reference without a student link is unaffected.
+    assert _reusable(item, {**reference, "url": ""})
+
 
 
 def test_a_link_to_the_second_page_of_a_spread_with_a_damaged_headline():

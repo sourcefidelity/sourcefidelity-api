@@ -284,6 +284,14 @@ _AUTHOR_LABEL_WORDS = frozenset({"author", "authors", "note", "notes", "loading"
                                  "by", "unknown", "details", "more", "information", "info"})
 
 
+# The same interface labels in Chinese ("作者简介", about the author, read as
+# a byline on a database record page, 2026-10-14).
+_CJK_AUTHOR_LABELS = frozenset({"作者", "作者简介", "作者介绍", "作者信息", "作者单位", "作者姓名", "责任者",
+                                "著者", "编者", "作者简历"})
+
+
 def _label_only_author(value: str) -> bool:
+    if re.sub(r"[\s:：·•,，、]+", "", value) in _CJK_AUTHOR_LABELS:
+        return True
     words = re.findall(r"[a-z]+", value.casefold())
     return bool(words) and all(word in _AUTHOR_LABEL_WORDS for word in words)

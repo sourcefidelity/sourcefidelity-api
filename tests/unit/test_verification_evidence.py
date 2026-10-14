@@ -2463,3 +2463,21 @@ def test_multi_reference_title_block_keeps_its_dedicated_channel_and_method():
     # which the report validator requires for the title-block exemption.
     assert candidate.method == "document_level_member_evidence"
     assert "candidate_document_metadata" in channels
+
+
+def test_a_quoted_term_on_the_cited_page_is_located_there_not_earlier(session: Session) -> None:
+    # Demir & Sepli, p. 140 (2026-10-14): "tariff" also occurs on an earlier page.
+    storage = MemoryStorage()
+    content = _pdf(
+        "A tariff schedule was published by the ministry in the first chapter of the report.",
+        "Protectionism can be implied through tariffs and non-tariff barriers such as quotas.",
+    )
+    record = _admit(session, storage, content)
+    source = authorize_representation(session, storage, representation_id=record.id,
+                                      scope_type="personal_owner", scope_id="owner-1")
+    artifact = build_passage_evidence(
+        source,
+        claim=_claim('protectionism can be manifested through "tariff" and "non-tariff barriers"',
+                     claim_type="quotation", page_locator="2"),
+    )
+    assert artifact.locator_check.outcome == "located_span_matches_supplied_locator"

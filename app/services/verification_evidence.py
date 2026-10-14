@@ -5380,9 +5380,14 @@ def _academic_practice_checks(
     allow_ocr_token_sequence = bool(
         _ocr_tolerant(source)
     )
+    # A quoted term found on the cited pages is located there before anywhere
+    # else: a common word ("tariff") also occurs on earlier pages, and taking
+    # its first occurrence put a correctly cited quote outside its locator
+    # (Demir & Sepli, p. 140, 2026-10-14).
+    search_pages = _cited_pages_first(pages, claim.page_locator, source)
     for target in targets:
         found = _quotation_location(
-            pages,
+            search_pages,
             target,
             allow_ocr_token_sequence=allow_ocr_token_sequence,
         )
@@ -5491,14 +5496,9 @@ def _academic_practice_checks(
             for page_index, _start, _end in match.fragments
             if page_index is not None
         }
-        page_labels = {
-            page.index: {
-                int(value) for value in re.findall(r"\d+", page.label or "")
-            }
-            for page in pages
-        }
+        printed = {page.index: _printed_page_numbers(page, source) for page in pages}
         derivative_label_missing = bool(source.derivation_method) and any(
-            not page_labels.get(page_index)
+            not printed.get(page_index)
             for page_index in matched_pages
             if page_index is not None
         )
@@ -5513,11 +5513,7 @@ def _academic_practice_checks(
             )
         else:
             consistent = bool(matched_pages) and all(
-                (
-                    page_labels.get(page_index)
-                    or ({page_index + 1} if not source.derivation_method else set())
-                )
-                & locator_pages
+                (printed.get(page_index) or set()) & locator_pages
                 for page_index in matched_pages
                 if page_index is not None
             )
@@ -5910,6 +5906,25 @@ def _lexical_score(claim_tokens: list[str], claim_text: str, passage: str) -> fl
     )
     length_penalty = min(1.0, math.sqrt(len(claim_tokens) / max(len(passage_tokens), 1)))
     return (0.72 * coverage + 0.20 * bigram + 0.08 * length_penalty)
+
+
+def _cited_pages_first(pages: list, locator: str | None, source) -> list:
+    """The source's pages with those matching the supplied locator first, by
+    the same page-label rule the locator check applies; order otherwise kept."""
+    wanted = _page_locator_values(locator) if locator else set()
+    if not wanted:
+        return pages
+    cited = [page for page in pages if _printed_page_numbers(page, source) & wanted]
+    return cited + [page for page in pages if page not in cited]
+
+
+def _printed_page_numbers(page, source) -> set[int]:
+    """The page numbers a source page stands for: its printed label, else its
+    position (never for an OCR derivative, whose positions are not pages)."""
+    labels = {int(value) for value in re.findall(r"\d+", page.label or "")}
+    if labels or source.derivation_method or page.index is None:
+        return labels
+    return {page.index + 1}
 
 
 def _page_locator_values(locator: str) -> set[int]:

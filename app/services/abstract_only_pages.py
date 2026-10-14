@@ -271,6 +271,31 @@ def short_page_words(result: RetrievalResult | None, cited_kind: str | None) -> 
     return words if words < min(STATED_PAGE_MIN_WORDS, low) else None
 
 
+# Prose a third-party page may hold beyond the publisher's abstract and still
+# yield to it: its abstract restated with metadata, keywords or listings.
+PUBLISHER_ABSTRACT_EXTRA_PROSE_WORDS = 150
+
+
+def publisher_abstract_covers_page(result: RetrievalResult | None, landing: RetrievalResult | None) -> int | None:
+    """The prose words of an incomplete web page that adds little to the
+    abstract the publisher's own page gave (owner decision 2026-10-14), or
+    None when the page stands: no publisher abstract, a complete page, a PDF,
+    or prose beyond the abstract plus PUBLISHER_ABSTRACT_EXTRA_PROSE_WORDS."""
+    if landing is None or not landing.abstract:
+        return None
+    if ((landing.metadata or {}).get("abstract_provenance") or {}).get("basis") != "publisher_landing_page":
+        return None
+    representation = getattr(result, "representation", None)
+    if representation is None or not representation.content:
+        return None
+    if str(representation.completeness or "").casefold() == "complete":
+        return None
+    if RepresentationKind.HTML not in (representation.kind, representation.original_kind):
+        return None
+    prose = body_prose_words(representation.content.decode("utf-8", "replace"))
+    return prose if prose <= _words(landing.abstract) + PUBLISHER_ABSTRACT_EXTRA_PROSE_WORDS else None
+
+
 def _doi_key(value) -> str:
     return re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", str(value or "").strip(),
                   flags=re.IGNORECASE).casefold()
@@ -294,3 +319,63 @@ def doi_confirmed_abstract(holder: RetrievalResult | None, doi: str | None) -> d
     if not provider or provider not in confirmed:
         return None
     return {"provider": provider, "doi": doi, "doi_confirmed_by": confirmed}
+
+
+# ---- linked Chinese-language abstract pages (cjk-abstract-page-v1) ----------
+#
+# Owner decision 2026-10-14 (the Regulation paper's references 8 and 13): a
+# page the student linked for a Chinese-language work, matched to the work but
+# holding an abstract rather than the work (a CNKI abstract page, a database
+# record page), gives its abstract as abstract-only evidence. The abstract is
+# found deterministically: text after an abstract label (摘要, 内容摘要,
+# 内容提要) up to the next field label, else the one page element whose class or
+# id names a summary or abstract. Nothing is kept below MIN_CJK_ABSTRACT_CHARS
+# Han characters.
+
+CJK_ABSTRACT_POLICY = "cjk-abstract-page-v1"
+LINKED_ABSTRACT_BASIS = "linked_abstract_page"
+MIN_CJK_ABSTRACT_CHARS = 40
+MAX_CJK_ABSTRACT_CHARS = 3_000
+_HAN = re.compile(r"[一-鿿]")
+_CJK_LABELLED = re.compile(
+    r"(?:内容摘要|内容提要|摘\s*要)\s*[:：]\s*(?P<text>.+?)\s*"
+    r"(?=关键词|关键字|关\s*键\s*词|基金|分类号|中图分类|DOI|专辑|专题|文献来源|作者单位|$)", re.DOTALL)
+_SUMMARY_ELEMENT = re.compile(
+    r"<(?P<tag>div|p|section|span|dd)\b[^>]*\b(?:class|id)=[\"'][^\"']*(?:summary|abstract)[^\"']*[\"'][^>]*>"
+    r"(?P<inner>.*?)</(?P=tag)>", re.IGNORECASE | re.DOTALL)
+
+
+def _visible(html: str) -> str:
+    from html import unescape
+    text = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", html or "")
+    return " ".join(unescape(re.sub(r"<[^>]+>", " ", text)).split())
+
+
+def cjk_page_abstract(html: str) -> dict | None:
+    """The abstract of a Chinese-language abstract page, or None."""
+    candidates = [match.group("text") for match in _CJK_LABELLED.finditer(_visible(html))]
+    if not any(len(_HAN.findall(value)) >= MIN_CJK_ABSTRACT_CHARS for value in candidates):
+        candidates = [_visible(match.group("inner")) for match in _SUMMARY_ELEMENT.finditer(html or "")]
+    candidates = [value.strip() for value in candidates if len(_HAN.findall(value)) >= MIN_CJK_ABSTRACT_CHARS]
+    if not candidates:
+        return None
+    abstract = max(candidates, key=lambda value: len(_HAN.findall(value)))[:MAX_CJK_ABSTRACT_CHARS]
+    return {"abstract": abstract, "abstract_sha256": hashlib.sha256(abstract.encode("utf-8")).hexdigest(),
+            "abstract_characters": len(abstract)}
+
+
+def is_mainly_abstract(page_text: str, abstract: str) -> bool:
+    """The page's readable text is little more than its abstract: at most three
+    times its Han characters plus 400 (navigation, title, metadata). Empty page
+    text (nothing readable) counts as mainly abstract."""
+    page = len(_HAN.findall(page_text or ""))
+    return page <= 3 * len(_HAN.findall(abstract or "")) + 400
+
+
+def cjk_abstract_provenance(observation: dict, *, provider: str, content_sha256: str | None,
+                            doi: str | None) -> dict:
+    """Bounded, content-bound provenance; no address is kept."""
+    return {"policy": CJK_ABSTRACT_POLICY, "basis": LINKED_ABSTRACT_BASIS, "provider": str(provider or "")[:80],
+            "doi": doi or None, "page_content_sha256": content_sha256,
+            "abstract_sha256": observation["abstract_sha256"],
+            "abstract_characters": observation["abstract_characters"]}

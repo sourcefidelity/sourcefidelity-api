@@ -103,7 +103,7 @@ def inspect(location, expected):
                          for c in candidate.comparisons)
                      and scope(expected.title, fields["title"]) == "outside_bound")
         confirmed = (not expected.reference_parse_review and candidate.plausible_identity_match
-            and not candidate.has_material_conflict and not candidate.has_unresolved_supplied_identity_fields
+            and not candidate.has_material_conflict and not candidate.has_unresolved_supplied_identifying_fields
             and candidate.agreement_count >= 2)
         observation = dict(observed=fields, content_sha256=hashlib.sha256(response.content).hexdigest(),
             source_url=str(response.url), identity_evidence_kind=(

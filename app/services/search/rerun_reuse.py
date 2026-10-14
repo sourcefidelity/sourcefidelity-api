@@ -43,10 +43,13 @@ def _norm(value) -> str:
 
 
 def reference_signature(reference, *, identity_only: bool) -> tuple:
-    """Unchanged reference text and parse, and the same cited/identity-only mode."""
+    """Unchanged reference text and parse, and the same cited/identity-only mode.
+    The parsed link is part of the parse: a repaired address (a query split by
+    a space, 2026-10-14) is a link the earlier search never followed."""
     get = (lambda name: reference.get(name)) if isinstance(reference, dict) else (lambda name: getattr(reference, name, None))
     return (_norm(get("raw_ref")), _norm(get("source_kind")), _norm(get("title")), _norm(get("author")),
-            _norm(get("year")), _norm(get("container_title")), _norm(get("doi")), bool(identity_only))
+            _norm(get("year")), _norm(get("container_title")), _norm(get("doi")), bool(identity_only),
+            _norm(get("url")))
 
 
 def _required_searches_completed(item: dict, reference: dict | None) -> bool:
@@ -83,6 +86,8 @@ def downloadable(item: dict) -> bool:
 
 
 def _reusable(item: dict, reference: dict | None = None) -> bool:
+    if _student_link_routes_due(item, reference):
+        return False
     if item.get("status") == "transient_authorized" or downloadable(item):
         return downloadable(item)
     if item.get("status") == "durable_authorized":
@@ -91,8 +96,6 @@ def _reusable(item: dict, reference: dict | None = None) -> bool:
     if native_script_route_due(item, reference):
         return False
     discovery = item.get("reference_discovery") or {}
-    if _lantern_route_due(discovery, reference):
-        return False
     if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
             and (reference.get("container_title") or "").strip()
             and discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
@@ -138,16 +141,28 @@ def native_script_route_due(item: dict, reference) -> bool:
     return not (route.get("policy_version") in NATIVE_SCRIPT_ROUTE_POLICIES and route.get("status") == "completed")
 
 
-def _lantern_route_due(discovery: dict, reference: dict | None) -> bool:
-    """A Media History Digital Library link whose earlier result predates the
-    route that reads its pages (`lantern-pages-v1`, 2026-10-14): searched again
-    once, so the route runs (the Jean Harlow paper's ten Lantern references
-    were all reused from runs before it)."""
-    from app.services.retrieval.lantern import lantern_target
-    if not isinstance(reference, dict) or not lantern_target(reference.get("url")):
+def _student_link_routes_due(item: dict, reference: dict | None) -> bool:
+    """A reference with a student link whose earlier result was searched under
+    older student-link handling, and holds no text or holds a search-found
+    page's text: searched again once, so newer link routes run (the Jean
+    Harlow paper's Lantern links, the Regulation paper's Chinese abstract
+    pages and Kinzius et al.'s DOI page, 2026-10-14). A stored copy, or text
+    the student's own link gave, is reused as before."""
+    from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
+    if not isinstance(reference, dict) or not (reference.get("url") or reference.get("doi")):
         return False
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    return not any(a.get("provider") == "student_url_lantern" for a in attempts)
+    if item.get("student_link_routes") == STUDENT_LINK_ROUTES_VERSION:
+        return False
+    if item.get("status") == "durable_authorized":
+        return False
+    if item.get("status") == "transient_authorized":
+        return item.get("source_name") not in _STUDENT_LINK_SOURCES
+    return True
+
+
+# Routes that read the student's own link (its page, its file, its DOI, its
+# Media History Digital Library pages).
+_STUDENT_LINK_SOURCES = frozenset({"student_url", "web_fetch", "lantern", "doi_resolver"})
 
 
 def _no_provider_at_fault(discovery: dict) -> bool:
@@ -241,7 +256,7 @@ def parsed_signature(signature: tuple) -> tuple:
 
 def _identifying(signature: tuple) -> bool:
     """A parse with a DOI, or a title with an author and year, names one work."""
-    _, _, title, author, year, _, doi, _ = signature
+    _, _, title, author, year, _, doi = signature[:7]
     return bool(doi) or bool(title and author and year)
 
 

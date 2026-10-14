@@ -46,9 +46,11 @@ SYSTEM_PROMPT = (
     'Return JSON only: {"translations": [{"id": string, "translation": string}]}, one item per supplied id.'
 )
 
-# Sentence ends: Han/kana full stops (with closing quotes or brackets), or a
+# Sentence ends: the shared Han/kana/Hangul rule (sentence_splitter), or a
 # Latin-style end mark followed by space. Splitting is lossless.
-_UNIT_END = re.compile(r"[。！？]+[」』”’\"'）)]*\s*|[.!?]+[”’\"'）)\]]*\s+")
+from app.services.sentence_splitter import CJK_SENTENCE_END as _CJK_END
+
+_UNIT_END = re.compile(_CJK_END.pattern + r"|[.!?]+[”’\"'）)\]]*\s+")
 
 
 def reading_text(text) -> str:

@@ -472,7 +472,7 @@ class ReferenceDiscoveryCandidate(BaseModel):
                     or not self.location_sha256
                     or self.has_material_conflict
                     or not (self.authoritative_identifier_match or self.agreement_count >= 2)
-                    or self.has_unresolved_supplied_identity_fields):
+                    or self.has_unresolved_supplied_identifying_fields):
                 raise ValueError("Landing-page identity lacks independently bound bibliographic agreement")
         return self
 
@@ -482,15 +482,31 @@ class ReferenceDiscoveryCandidate(BaseModel):
 
         Keep its original hash and unknown comparison for audit; it supplies
         neither an agreement nor a conflict. Other missing fields stay closed.
+        Findings that accuse a reference (a missing required DOI) use this
+        strict form.
         """
+        return self.unresolved_supplied(frozenset())
+
+    @property
+    def has_unresolved_supplied_identifying_fields(self) -> bool:
+        """As above, except that a journal, volume, issue or page range the
+        page does not show neither confirms nor blocks identity; a shown one
+        that conflicts still does. The identity rule for acquired pages
+        (owner direction 2026-10-14: one rule for DOI and web pages)."""
+        return self.unresolved_supplied(DESCRIPTIVE_IDENTITY_FIELDS)
+
+    def unresolved_supplied(self, unshown_allowed: frozenset[str], ignored: frozenset[str] = frozenset()) -> bool:
+        """A supplied field, other than `ignored`, is neither agreeing nor (for
+        `unshown_allowed`) simply not shown on the page."""
         return any(
-            c.expected_sha256
+            c.expected_sha256 and c.field_name not in ignored
             and c.outcome not in {"agreement", "minor_difference"}
             and not (
                 c.field_name == "year"
                 and c.expected_sha256 == _value_hash("n.d.")
                 and c.outcome == "unknown"
             )
+            and not (c.field_name in unshown_allowed and c.outcome == "unknown" and not c.observed_sha256)
             for c in self.comparisons
         )
 
@@ -787,8 +803,12 @@ def build_reference_discovery_candidate(
     location_rank: int | None = None,
     origin_providers: list[str] | None = None,
     disposition_reason_code: str | None = None,
+    opened_page_url: str | None = None,
 ) -> ReferenceDiscoveryCandidate:
-    """Normalize one resolver candidate into inspectable field comparisons."""
+    """Normalize one resolver candidate into inspectable field comparisons.
+
+    `opened_page_url` is the final address of a page the application fetched
+    and read itself, never a search provider's result list."""
     if (result.metadata or {}).get("candidate_budget_skipped"):
         seed = f"{attempt_id}\x1f{provider}\x1f{candidate_key or ''}"
         return ReferenceDiscoveryCandidate(
@@ -1148,8 +1168,12 @@ def build_reference_discovery_candidate(
         ),
         title_absence_reason=_title_absence_reason(result, acquisition_outcome),
         # A web-search result's address is never kept (provider terms,
-        # ARCHITECTURE retention rule), even for a page the application opened.
-        page_url=(location_url if location_url and location_url.lower().startswith(("http://", "https://"))
+        # ARCHITECTURE retention rule). The address of a page the application
+        # opened and read is the page's own and is kept (owner decision
+        # 2026-10-14), so a located record found through search has its link.
+        page_url=(opened_page_url if opened_page_url and opened_page_url.lower().startswith(("http://", "https://"))
+                  and len(opened_page_url) <= 2000 else
+                  location_url if location_url and location_url.lower().startswith(("http://", "https://"))
                   and acquisition_outcome not in {"metadata_only", "not_attempted", "transport_failure",
                                                   "access_restricted", "unavailable", "unknown"}
                   and not ({provider, discovery_provider or "", *(origin_providers or [])} & _SEARCH_RESULT_PROVIDERS)
@@ -1350,6 +1374,11 @@ def _normalize_doi(value: str) -> str:
 def _year(value: str) -> str:
     match = re.search(r"(?:19|20)\d{2}", value)
     return match.group() if match else ""
+
+
+# Fields that describe where a work appears rather than which work it is: a
+# page that does not show them is not held against the work (2026-10-14).
+DESCRIPTIVE_IDENTITY_FIELDS = frozenset({"container_title", "volume", "issue", "pages"})
 
 
 def _value_hash(value: str) -> str:

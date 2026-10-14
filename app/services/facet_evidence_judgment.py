@@ -1185,16 +1185,19 @@ def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
     spans = []
     start = 0
     text = passage.text
-    # Han, kana and Hangul sentences end at 。！？ with no following space; the
-    # closing quotation mark stays with its sentence (cross-language-evidence-v1).
-    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}"
-                          r"|(?<=[。！？])(?![”’」』）\s]|$)|(?<=[。！？][”’」』）])(?!$)")
+    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
+    # Han, kana and Hangul sentence ends follow the shared rule, whatever spacing
+    # follows them (a government page's line breaks had joined whole articles
+    # into one "sentence", 2026-10-14; cross-language-evidence-v1).
+    from app.services.sentence_splitter import CJK_SENTENCE_END
+    cjk_cuts = [(m.end(1), m.end(), "boundary") for m in CJK_SENTENCE_END.finditer(text)
+                if m.end(1) < len(text.rstrip())]
     # A front-matter label line ("A B S T R A C T") ends what came before it and
     # is no sentence; the title, author and affiliation lines before an
     # abstract label are metadata, not evidence (the owner's article, 2026-10-07).
     labels = list(_FRONT_MATTER_LABEL.finditer(text))
     abstract_at = next((m.start() for m in labels if _ABSTRACT_LABEL.fullmatch(m.group(1))), None)
-    cuts = sorted([(m.start(), m.end(), "boundary") for m in boundary.finditer(text)]
+    cuts = sorted([(m.start(), m.end(), "boundary") for m in boundary.finditer(text)] + cjk_cuts
                   + [(m.start(), m.end(), "label") for m in labels])
     for cut_start, cut_end, kind in cuts:
         if cut_start < start:

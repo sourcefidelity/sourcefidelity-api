@@ -113,6 +113,7 @@ from app.services.identity_pdf import bounded_pdf_inspection
 from app.services.search.candidate_ranking import identity_candidate_ranking
 from app.services.pure_scan_ocr import prepare_pure_scan_ocr
 from app.services.reference_discovery import (
+    DESCRIPTIVE_IDENTITY_FIELDS,
     INCOMPLETE_METADATA_SEARCH_REASONS,
     CandidateAcquisitionOutcome,
     ExpectedBibliographicFields,
@@ -438,6 +439,25 @@ def _web_link_differences(comparisons, result, *, title, author, year, doi):
             and expected.get(c.field_name) and observed.get(c.field_name)]
 
 
+_CORE_IDENTITY_FIELDS = frozenset({'title', 'author', 'year', 'doi', 'isbn'})
+
+
+def identity_confirms_work(identity, *, kind_checked: bool = False) -> bool:
+    """The one page-identity rule for web pages and DOI/landing pages (owner
+    direction 2026-10-14): a plausible match with no material conflict, every
+    identifying detail the reference supplies (title, author, year, DOI, ISBN,
+    publisher, type) seen and agreeing, and at least two core details agreeing
+    or the identifier matching. A journal, volume, issue or page range the page
+    does not show neither confirms nor blocks (Springer's page shows no volume
+    or issue; the DOI route had rejected it while the web route accepted it)."""
+    agreeing = sum(c.outcome in {'agreement', 'minor_difference'} for c in identity.comparisons
+                   if c.field_name in _CORE_IDENTITY_FIELDS)
+    return bool(identity.plausible_identity_match and not identity.has_material_conflict
+                and not identity.unresolved_supplied(
+                    DESCRIPTIVE_IDENTITY_FIELDS, frozenset({'source_kind'}) if kind_checked else frozenset())
+                and (identity.authoritative_identifier_match or agreeing >= 2))
+
+
 def _web_identity_comparison(result, *, title=None, author=None, year=None, doi=None):
     """Shared existing identity standard for readable and metadata-only pages."""
     identity = build_reference_discovery_candidate(
@@ -445,10 +465,7 @@ def _web_identity_comparison(result, *, title=None, author=None, year=None, doi=
         expected=ExpectedBibliographicFields(title=title or '', authors=[author] if author else [],
             year=year or '', doi=doi or ''), result=result)
     comparisons = [c for c in identity.comparisons if c.field_name in {'title', 'author', 'year', 'doi'}]
-    confirmed = bool(identity.plausible_identity_match and not identity.has_material_conflict
-        and all(c.outcome in {'agreement', 'minor_difference'} for c in comparisons)
-        and (len(comparisons) >= 2 or identity.authoritative_identifier_match))
-    return identity, comparisons, confirmed
+    return identity, comparisons, identity_confirms_work(identity, kind_checked=True)
 
 
 def _cited_title_on_front_pages(content: bytes, title: str | None, pages: int = 3) -> bool:
@@ -705,6 +722,15 @@ REPUBLISHED_WORK_EVIDENCE = "page bibliography confirms the cited work"
 # A landing page holding only an abstract and back matter
 # (landing-abstract-back-matter-v1): its abstract is kept, not its page text.
 LANDING_ABSTRACT_ONLY_ERROR = "landing page holds an abstract and back matter only"
+# The student-link handling a result was searched under. Bumped when a change
+# can find text or an abstract a link gave nothing for before (v2, 2026-10-14:
+# Media History Digital Library pages, dead-link answers, linked Chinese
+# abstract pages; v3, the same day: such abstracts by the cross-language
+# naming standard, the one page-identity rule for DOI pages; v4, Chinese
+# author-field labels are not names; v5, the model's same-work answer for a
+# page naming the work also keeps its abstract); an earlier
+# result without text, or with a search-found page's text, is searched again once.
+STUDENT_LINK_ROUTES_VERSION = "student-link-routes-v5"
 # Result metadata a displaced page carried that would authorize its text.
 _ACQUISITION_ONLY_METADATA = frozenset({
     "durable_admission", "repository_representation_id", "publisher_preview",
@@ -712,11 +738,40 @@ _ACQUISITION_ONLY_METADATA = frozenset({
 })
 
 
+def _attach_linked_abstract(result: RetrievalResult, response, doi: str | None) -> bool:
+    """A page naming the cited work that is a Chinese-language abstract page
+    (cjk-abstract-page-v1): the result keeps only its abstract, as abstract-only
+    evidence. Page text a web result carries in its abstract field is not an
+    abstract; one with recorded provenance is kept. A page holding much more
+    text than its abstract (a full article opening with 摘要) is left as it is.
+    Returns whether the result now holds the page's abstract."""
+    from app.services.abstract_only_pages import (
+        cjk_abstract_provenance, cjk_page_abstract, is_mainly_abstract)
+    if result.abstract and (result.metadata or {}).get("abstract_provenance"):
+        return False
+    observation = cjk_page_abstract(getattr(response, "text", "") or "")
+    page_text = (result.full_text or b"").decode("utf-8", "replace") if isinstance(result.full_text, bytes) else ""
+    if observation is None or not is_mainly_abstract(page_text, observation["abstract"]):
+        return False
+    result.representation = None
+    result.full_text = None
+    result.abstract = observation["abstract"]
+    result.metadata = {key: value for key, value in (result.metadata or {}).items()
+                       if key not in {"accepted_representation_sha256", "web_completeness"}}
+    result.metadata["abstract_provenance"] = cjk_abstract_provenance(
+        observation, provider=result.source_name,
+        content_sha256=hashlib.sha256(getattr(response, "content", b"") or b"").hexdigest(),
+        doi=doi or result.doi)
+    return True
+
+
 def _landing_abstract_holder(result: RetrievalResult | None) -> RetrievalResult | None:
     """An abstract-only result for an abstract kept from a landing page."""
+    from app.services.abstract_only_pages import LINKED_ABSTRACT_BASIS
     metadata = (result.metadata or {}) if result is not None else {}
     if (result is None or not result.abstract or result.full_text
-            or (metadata.get("abstract_provenance") or {}).get("basis") != "publisher_landing_page"):
+            or (metadata.get("abstract_provenance") or {}).get("basis")
+            not in {"publisher_landing_page", LINKED_ABSTRACT_BASIS}):
         return None
     return RetrievalResult(source_name=result.source_name, success=True, metadata=dict(metadata),
                            abstract=result.abstract, doi=result.doi, title=result.title,
@@ -1679,6 +1734,7 @@ class SourceResolver:
                         result=observed,
                         candidate_key=location_hash,
                         location_url=(landing.get("source_url") or location_url) if landing else location_url,
+                        opened_page_url=landing.get("source_url") if landing else None,
                         acquisition_outcome=acquisition_outcome,
                         validation_reason=str(location_attempt.get("reason") or "")
                         or None,
@@ -3137,6 +3193,12 @@ class SourceResolver:
                 f"isbn={isbn}, title={title}"
             )
 
+        # An abstract kept from a publisher landing page that held only an
+        # abstract and back matter (landing-abstract-back-matter-v1), or from
+        # a linked Chinese-language abstract page (cjk-abstract-page-v1); used
+        # only when no other abstract is found.
+        landing_abstract_result: RetrievalResult | None = None
+
         # 2. Try student URL — PDF first, then web-page text for HTML sources.
         capabilities = getattr(self, "_acquisition_capabilities", None)
         if student_url and capabilities is not None and 'student_url' not in capabilities:
@@ -3188,6 +3250,7 @@ class SourceResolver:
                         self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                         return web_result
                     url_failure_reason = web_result.error or "web fetch failed"
+                    landing_abstract_result = landing_abstract_result or _landing_abstract_holder(web_result)
                 else:
                     url_failure_reason = result.error or "URL download failed"
             else:
@@ -3235,6 +3298,7 @@ class SourceResolver:
                     url_failure_reason = result.error or "PDF validation failed"
                 else:
                     url_failure_reason = web_result.error or "web fetch failed"
+                    landing_abstract_result = landing_abstract_result or _landing_abstract_holder(web_result)
                     archived = self._try_archived_copy(student_url, web_result, title, expected_kind,
                                                        author, year, doi)
                     if archived is not None:
@@ -3246,10 +3310,6 @@ class SourceResolver:
         #      access the paper through the university's library proxy. This
         #      is the key to high full-text retrieval rates for paywalled content
         #      — the proxy handles subscription authentication.
-        # An abstract kept from a publisher landing page that held only an
-        # abstract and back matter (landing-abstract-back-matter-v1); used
-        # only when no other abstract is found.
-        landing_abstract_result: RetrievalResult | None = None
         if (
             doi
             and settings.DOI_RESOLVER_URL
@@ -3264,7 +3324,7 @@ class SourceResolver:
                 result=result,
                 required=True,
             )
-            landing_abstract_result = _landing_abstract_holder(result)
+            landing_abstract_result = _landing_abstract_holder(result) or landing_abstract_result
             if result.success:
                 if result.full_text:
                     self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
@@ -3437,7 +3497,7 @@ class SourceResolver:
                 )
                 self._record_canonical_location_outcomes(merged_result)
                 preferred = self._abstract_instead_of_short_page(
-                    merged_result, merged_result, enriched_doi, expected_kind)
+                    merged_result, merged_result, enriched_doi, expected_kind, landing=landing_abstract_result)
                 if preferred is not None:
                     best_abstract_result = preferred
                 elif merged_result.full_text:
@@ -3492,7 +3552,7 @@ class SourceResolver:
                     provider="public_doi", result=direct, required=False)
                 landing_abstract_result = landing_abstract_result or _landing_abstract_holder(direct)
                 preferred = self._abstract_instead_of_short_page(
-                    direct, best_abstract_result, enriched_doi, expected_kind)
+                    direct, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
                 if preferred is not None:
                     best_abstract_result = preferred
                 elif direct.success and direct.full_text:
@@ -3511,7 +3571,7 @@ class SourceResolver:
                     self._record_discovery_attempt(category="student_url",
                         provider=MDPI_FILE_SERVER_ROUTE, result=mdpi, required=False)
                     preferred = self._abstract_instead_of_short_page(
-                        mdpi, best_abstract_result, enriched_doi, expected_kind)
+                        mdpi, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
                     if preferred is not None:
                         best_abstract_result = preferred
                     elif mdpi.success and mdpi.full_text:
@@ -3539,7 +3599,7 @@ class SourceResolver:
                 if result.metadata and result.metadata.get("retrieval_trace"):
                     web_retrieval_trace.extend(result.metadata["retrieval_trace"])
                 preferred = self._abstract_instead_of_short_page(
-                    result, best_abstract_result, enriched_doi, expected_kind)
+                    result, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
                 if preferred is not None:
                     best_abstract_result = preferred
                     continue
@@ -5440,7 +5500,8 @@ class SourceResolver:
                 "landing_content_sha256": (observation or {}).get("content_sha256")}
 
     @staticmethod
-    def _landing_metadata_identity(response, *, expected_doi, expected_title, expected_author, expected_year):
+    def _landing_metadata_identity(response, *, expected_doi, expected_title, expected_author, expected_year,
+                                   kind_checked: bool = False):
         """Identity-only evidence from the fetched page, never its search snippet.
 
         A metadata page is not an acquired full-text representation. Preserve
@@ -5465,15 +5526,9 @@ class SourceResolver:
             expected=expected,
             result=RetrievalResult(source_name="independent_landing_metadata", success=True, **fields),
         )
-        confirmed = (
-            not expected.reference_parse_review
-            and candidate.plausible_identity_match and not candidate.has_material_conflict
-            and not candidate.has_unresolved_supplied_identity_fields
-            and (candidate.authoritative_identifier_match or sum(
-                c.outcome in {'agreement', 'minor_difference'} for c in candidate.comparisons
-                if c.field_name in {'title', 'author', 'year', 'doi', 'isbn'}
-            ) >= 2)
-        )
+        # The shared page-identity rule; a reference held for parse review
+        # cannot confirm anything.
+        confirmed = not expected.reference_parse_review and identity_confirms_work(candidate, kind_checked=kind_checked)
         if not confirmed:
             return None
         validated_response_identity(str(response.url), hashlib.sha256(response.content).hexdigest(),
@@ -5876,6 +5931,11 @@ class SourceResolver:
                 differences=_web_link_differences(comparisons, result, title=title,
                     author=expected_author, year=expected_year, doi=expected_doi))
             result.metadata['identity_comparisons'] = [c.model_dump(mode='json') for c in comparisons]
+            if not identity.has_material_conflict and (
+                    confirmed or romanised_page == "agreement" or cross_script_same_work):
+                # A Chinese-language page that names the cited work by the
+                # cross-language identity standard and is an abstract page.
+                _attach_linked_abstract(result, resp, expected_doi)
             # No representation, accepted hash, success, or admission grant.
             return result
 
@@ -5921,6 +5981,9 @@ class SourceResolver:
                     named.metadata["cross_script_judgment"] = judge_cross_script_identity(
                         {'title': title, 'author': expected_author, 'year': expected_year},
                         {'titles': page_titles, 'date': observed.get('year'), 'text': page_text})
+                judged = named.metadata.get("cross_script_judgment") or {}
+                if cross_script_same_work or romanised_page == "agreement" or judged.get("same_work") == "yes":
+                    _attach_linked_abstract(named, resp, expected_doi)
                 return named
             _identity, _comparisons, names_work = _web_identity_comparison(
                 named, title=title, author=expected_author, year=expected_year, doi=expected_doi)
@@ -5928,6 +5991,7 @@ class SourceResolver:
                 named.error = "Page names the cited work; its text is not the cited work's text"
                 named.metadata = {"web_identity": observed, "work_identity_basis": "page-citation-metadata-v1",
                                   **diagnostic('source_kind_unconfirmed')}
+                _attach_linked_abstract(named, resp, expected_doi)
                 return named
             return RetrievalResult(
                 source_name="web_fetch",
@@ -6074,6 +6138,16 @@ class SourceResolver:
             # in the trace and continue the existing permitted discovery chain.
             result.success = False
             result.error = "Observed webpage bibliographic identity remains unconfirmed"
+            # Its abstract may still serve when the page names the work by the
+            # cross-language identity standard (cjk-abstract-page-v1).
+            judged = result.metadata.get("cross_script_judgment") or {}
+            if not identity.has_material_conflict and (
+                    romanised_page == "agreement" or cross_script_same_work or judged.get("same_work") == "yes"):
+                _attach_linked_abstract(result, resp, expected_doi)
+        elif confirmed and not identity.has_material_conflict:
+            # A confirmed Chinese-language abstract page gives its abstract, not
+            # its navigation and metadata as limited text (cjk-abstract-page-v1).
+            _attach_linked_abstract(result, resp, expected_doi)
         return result
 
     def _validated_doi_resolver_pdf(
@@ -6300,9 +6374,10 @@ class SourceResolver:
         # were the original false-acceptance path.
         content_type = resp.headers.get("content-type", "").lower()
         if "text/html" in content_type:
+            # The DOI route tests the page's work type itself below.
             public_identity = (self._landing_metadata_identity(resp,
                 expected_doi=doi, expected_title=title, expected_author=expected_author,
-                expected_year=expected_year) if public else None)
+                expected_year=expected_year, kind_checked=True) if public else None)
             discovered = discover_scholarly_locations(
                 resp.text,
                 final_url,
@@ -6936,7 +7011,8 @@ class SourceResolver:
 
     def _abstract_instead_of_short_page(self, acquired: RetrievalResult | None,
                                         holder: RetrievalResult | None, doi: str | None,
-                                        expected_kind: SourceKindAssessment) -> RetrievalResult | None:
+                                        expected_kind: SourceKindAssessment, *,
+                                        landing: RetrievalResult | None = None) -> RetrievalResult | None:
         """The DOI's adapter abstract in place of a page too short to be the work.
 
         doi-abstract-over-short-page-v1 (owner decision 2026-10-13): when an
@@ -6947,15 +7023,23 @@ class SourceResolver:
         acquired result stands.
         """
         from app.services.abstract_only_pages import (
-            DOI_ABSTRACT_POLICY, doi_confirmed_abstract, short_page_words)
+            DOI_ABSTRACT_POLICY, doi_confirmed_abstract, publisher_abstract_covers_page, short_page_words)
         if acquired is None or not acquired.success:
             return None
         words = short_page_words(acquired, expected_kind.kind)
-        if words is None:
-            return None
-        basis = doi_confirmed_abstract(holder, doi)
+        reason = "acquired_page_too_short_for_a_whole_work"
+        basis = doi_confirmed_abstract(holder, doi) if words is not None else None
         if basis is None:
-            return None
+            # The publisher's own page, confirmed through the DOI, gave the
+            # abstract: another site's incomplete page whose prose adds little
+            # to it yields too (owner decision 2026-10-14, Kinzius et al.'s
+            # aggregator page over Springer's abstract).
+            words = publisher_abstract_covers_page(acquired, landing)
+            if words is None:
+                return None
+            holder, reason = landing, "publisher_abstract_covers_third_party_page"
+            basis = {"provider": landing.source_name, "doi": doi,
+                     "publisher_abstract": dict((landing.metadata or {}).get("abstract_provenance") or {})}
         _, discovery = self._discovery_artifacts()
         if discovery is not None and discovery.get("outcome") not in _CONFIRMED_DISCOVERY_OUTCOMES:
             return None
@@ -6974,9 +7058,10 @@ class SourceResolver:
                     if key not in _ACQUISITION_ONLY_METADATA}
         metadata["abstract_provenance"] = {
             "policy": DOI_ABSTRACT_POLICY,
-            "basis": "doi_confirmed_adapter_record",
+            "basis": ("publisher_landing_page" if reason == "publisher_abstract_covers_third_party_page"
+                      else "doi_confirmed_adapter_record"),
             **basis,
-            "reason": "acquired_page_too_short_for_a_whole_work",
+            "reason": reason,
             "displaced_page": displaced,
         }
         return RetrievalResult(

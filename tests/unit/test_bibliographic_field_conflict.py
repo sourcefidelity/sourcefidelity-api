@@ -255,3 +255,18 @@ def test_a_structured_volume_from_a_provider_record_never_fails_the_run():
     outcomes = {c.field_name: c.outcome for c in candidate.comparisons}
     assert outcomes["volume"] == "unknown"      # not a volume: treated as missing
     assert outcomes["issue"] == "agreement"     # a whole number is read as text
+
+
+def test_a_search_found_page_the_application_opened_keeps_its_own_address():
+    # Owner decision 2026-10-14: the search result is not kept, but the
+    # address of the page the application fetched and read is.
+    from app.services.reference_discovery import (
+        ExpectedBibliographicFields, build_reference_discovery_candidate)
+    from app.services.retrieval.base import RetrievalResult
+    common = dict(attempt_id='a-0', provider='web_search', discovery_provider='brave',
+                  expected=ExpectedBibliographicFields(title='A work', year='2020'),
+                  result=RetrievalResult(source_name='web_search', success=True, title='A work'),
+                  location_url='https://example.org/found', acquisition_outcome='unavailable')
+    assert build_reference_discovery_candidate(**common).page_url is None
+    opened = build_reference_discovery_candidate(**common, opened_page_url='https://example.org/work/1')
+    assert opened.page_url == 'https://example.org/work/1'

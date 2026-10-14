@@ -407,7 +407,8 @@ def build_evidence_report_view(
             item["reference_identity"] = _identity_view(
                 discovery_by_reference.get(reference_id)
             )
-            item = _withhold_unidentified_abstract(item)
+            item = _withhold_unidentified_abstract(item, linked_page=_abstract_from_submitted_link(
+                member, reference_id, aggregate.get("submitted_link_observations")))
             item = _withhold_mismatched_evidence(item, {"student_text": claim.text})
             # One flag, not a gradient: where the judgment stopped short
             # of a mark, the comparison and the reason go in the evidence
@@ -2363,13 +2364,6 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
         f'<a href="{escape(str(export_action.get("report_href") or "#"), quote=True)}">Interactive Report</a>'
         if export_mode == "released_print" else ''
     )
-    # Owner-approved label (2026-10-13); only on the live page while the
-    # submitted file is kept (recheck-copy-v1), never in a download.
-    check_again = view.get("check_again_action") or {}
-    if check_again.get("enabled") and check_again.get("href") and export_mode == "interactive":
-        print_links += (f'<form class="check-again" method="post" action="{escape(str(check_again["href"]), quote=True)}">'
-                        '<button type="submit">Check Again</button>'
-                        '<span class="upload-status" aria-live="polite"></span></form>')
     # Select text is the one paper tool: copying a passage. Comment, highlight
     # and pen tools were removed (owner decision 2026-09-25).
     paper_tools = ('<span class="group" aria-label="Paper tools">'
@@ -2382,7 +2376,7 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
 :root{{--ink:#18212b;--muted:#5b6672;--line:#d8dee6;--blue:#2563a7;--teal:#168c8c;--no-connection:#8c6b4f;--blue-bg:#eef6ff;--source-bg:#f7f4ea;--amber:#d95f02;--amber-bg:#fff6e8;--gray:#b8c0c8;--violet:#7651a8;--paper:#fff;--page:#f3f5f7}}
 *{{box-sizing:border-box}} [hidden]{{display:none!important}} body{{margin:0;background:var(--page);color:var(--ink);font:16px/1.5 system-ui,-apple-system,sans-serif}}
     header,main,footer{{width:100%;max-width:none}} header{{padding:1.5rem clamp(.75rem,2vw,1.5rem) 1rem}} h1{{margin:0 0 .25rem;font-size:1.8rem}} h2{{font-size:1.2rem}} .sub{{color:var(--muted)}}
-.report-actions{{display:flex;gap:.35rem;justify-content:flex-end;flex-wrap:wrap}} .report-actions a{{border:1px solid var(--line);background:#fff;border-radius:5px;padding:.45rem .65rem;color:inherit;text-decoration:none}} .report-actions .check-again{{display:flex;gap:.35rem;align-items:center;margin:0}} .report-actions .check-again button{{border:1px solid var(--line);background:#fff;border-radius:5px;padding:.45rem .65rem;font:inherit;color:inherit;cursor:pointer;white-space:nowrap}} .report-actions a[aria-current="page"]{{background:var(--blue);color:#fff;border-color:var(--blue)}}
+.report-actions{{display:flex;gap:.35rem;justify-content:flex-end;flex-wrap:wrap}} .report-actions a{{border:1px solid var(--line);background:#fff;border-radius:5px;padding:.45rem .65rem;color:inherit;text-decoration:none}} .report-actions a[aria-current="page"]{{background:var(--blue);color:#fff;border-color:var(--blue)}}
 .summary{{margin:1rem 0;background:#fff;border:1px solid var(--line);border-radius:8px;padding:1rem}} .summary-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem}} .summary-column{{border-left:3px solid var(--blue);padding:0 .85rem}} .summary-column h2{{margin-top:0}} .summary-column li{{margin:.6rem 0}} .empty-pattern{{color:var(--muted)}}
 .technical-details{{margin:1rem 0;background:#fff;border:1px solid var(--line);border-radius:7px;padding:.2rem .9rem}}.tech-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:.5rem 1.25rem;padding:.2rem 0 1rem}}.tech-grid section.wide{{grid-column:1/-1;overflow-x:auto}}.tech-grid h2{{font-size:1rem;margin:.6rem 0 .3rem}}.tech-table{{border-collapse:collapse;font-size:.86rem;width:100%}}.tech-table th,.tech-table td{{text-align:left;padding:.2rem .5rem .2rem 0;border-bottom:1px solid var(--line);white-space:nowrap}}.tech-table th{{color:var(--muted);font-weight:600}}@media print{{.technical-details{{display:none}}}} .read-guide{{margin:1rem 0;background:#fff;border:1px solid var(--line);border-radius:7px;padding:.2rem .9rem}} .guide-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;padding:.7rem 0 1rem}} .guide-grid p{{margin:.25rem 0}}
     .layout{{--paper-share:68%;width:auto;display:grid;grid-template-columns:minmax(20rem,var(--paper-share)) minmax(20.75rem,1fr);grid-template-rows:auto minmax(0,1fr);height:100dvh;overflow:clip;margin:0 clamp(.75rem,2vw,1.5rem);background:var(--page);border:1px solid var(--line);border-radius:8px}} .paper,.panel{{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:1rem;min-width:0}} .panel>h2:first-child{{margin-top:0}} .source-group>h3{{font-size:.95rem;margin:.7rem 0 .2rem;border-bottom:2px solid var(--gray);padding-bottom:.2rem}} .source-group.full_text>h3{{border-color:var(--blue)}} .source-group.partial_text>h3,.source-group.abstract_only>h3{{border-color:var(--teal)}} .panel{{overflow:auto;overflow-wrap:anywhere}} .splitter{{cursor:col-resize;touch-action:none;display:flex;align-items:center;justify-content:center}} .splitter::before{{content:"";width:3px;height:4rem;border-radius:2px;background:#aeb8c4}} .splitter:focus{{outline:2px solid var(--blue);outline-offset:-2px}} .paper-pages{{display:grid;gap:1.5rem}} .paper-page{{margin:0}} .paper-page figcaption{{color:var(--muted);font-size:.85rem;margin-bottom:.3rem}} .page-surface{{display:block;width:100%;height:auto;background:#fff;box-shadow:0 2px 12px #0002}}
@@ -2459,7 +2453,7 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
     rendered = rendered.replace('<span>Light-grey underline:', '<span data-key="reference"><i class="submitted-link-key"></i>purple diamond: link issue</span><span>Light-grey underline:')
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.unverified-highlight,.reference-practice-overlay .reference-formatting-hit.unverified-highlight{fill:#f28b82;fill-opacity:.42;stroke:none}.reference-practice-overlay .reference-formatting-hit.reference-difference-highlight{fill:transparent;stroke:#0a7cff;stroke-width:1.8;stroke-dasharray:none;pointer-events:all}.issue-heading.unverified{text-decoration-color:#c5221f;background:rgba(242,139,130,.42)}.issue-heading.evidence{text-decoration-color:#2f62a8}.unverified-key,.difference-key{display:inline-block;width:1.3rem;height:.75rem}.unverified-key{background:#f28b826b}.difference-key{border:2px solid #0a7cff}.reference-finding .finding-item+.finding-item{margin-top:.6rem}</style>', 1)
     rendered = rendered.replace('</style>', '.citation-overlay.member-target .source-highlight.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}.submitted-link-hit{fill:transparent;pointer-events:all}.submitted-link-key{width:.85rem;height:.85rem;transform:rotate(45deg);background:#7651a8}.focus-relevance .topical-reference-hit{display:block}</style>', 1)
-    rendered = rendered.replace('</style>', '/* One connected workspace: a single control bar over the paper and the evidence window. */.workspace-bar{grid-column:1/-1;grid-row:1;display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.3rem .6rem;background:#fff;border-bottom:1px solid var(--line);min-width:0}.workspace-bar .toolbar{position:static;margin:0;padding:0;background:transparent;border:0;box-shadow:none;height:auto;flex-wrap:nowrap;overflow-x:auto;gap:.25rem;min-width:0}.evidence-controls{margin-left:auto}.evidence-controls>*{flex:none;white-space:nowrap}.evidence-controls .group{display:inline-flex;gap:.3rem}.toolbar button,.toolbar label{padding:.35rem .45rem}.toolbar button:disabled{opacity:.45;cursor:default}.layout>.paper{grid-row:2;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0;border:0;border-radius:0;background:transparent}.layout .paper-viewport{flex:1;min-height:0;overflow:auto;padding:.75rem}/* Skipped content-visibility pages report their last-rendered width; a flexible track stops it holding the column open. */.paper-pages{grid-template-columns:minmax(0,1fr)}.paper>.report-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}.side-pane{grid-row:2;min-height:0;min-width:0;display:grid;grid-template-columns:.75rem minmax(0,1fr);background:#fff;border-left:1px solid var(--line);transition:transform .22s ease}.side-pane .splitter{height:auto;position:static;background:var(--page)}.side-pane .evidence-column{min-height:0;min-width:0;display:flex;flex-direction:column}.side-pane .panel{flex:1;min-height:0;max-height:none;position:static;margin:0;border:0;border-radius:0}.layout.panel-sliding .side-pane{transform:translateX(100%)}.layout.panel-collapsed{grid-template-columns:minmax(0,1fr)}.layout.panel-collapsed .side-pane{display:none}@media(prefers-reduced-motion:reduce){.side-pane{transition:none}}.page-container{content-visibility:auto}.text-selection-off .page-container,.text-selection-off .page-container *{user-select:none!important;-webkit-user-select:none!important}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:auto auto auto;height:auto;overflow:visible}.workspace-bar{flex-wrap:wrap}.layout>.paper{grid-row:auto}.layout .paper-viewport{max-height:calc(100dvh - 3rem)}.side-pane{grid-row:auto;grid-template-columns:1fr;border-left:0;border-top:1px solid var(--line)}.side-pane .splitter{display:none}.side-pane .panel{max-height:none}}@media print{.workspace-bar,.side-pane{display:none}.layout{display:block;height:auto;overflow:visible;border:0;margin:0}.layout .paper-viewport{max-height:none;overflow:visible;padding:0}.page-container{content-visibility:visible}}/* Margin numbers and whole-entry reference targets. */.paper-badge{cursor:pointer}.paper-badge .badge-bg{fill:#fff;stroke:#7b8794;stroke-width:.6;vector-effect:non-scaling-stroke}.paper-badge .badge-number{font:600 7px system-ui,-apple-system,sans-serif;fill:#34404c;pointer-events:none}.paper-badge:hover .badge-bg,.paper-badge.selected .badge-bg{fill:#dcecff;stroke:var(--blue)}body.layout-paper .paper-badge{display:none}.style-guidance-links{margin-top:.8rem;font-size:.85rem;color:var(--muted)}.finding-list{margin:.3rem 0 0;padding-left:1.2rem}.finding-list>li{margin:.25rem 0}.finding-list>li>p{margin:0}body.layout-judgment .citation-overlay,body.layout-judgment .reference-practice-overlay,body.layout-judgment .reference-entry-overlay,body.layout-judgment .paper-badge{display:none}@media print{.paper-badge{display:none}}.reference-entry-overlay{cursor:pointer}.reference-entry-hit{fill:transparent;stroke:none;pointer-events:all}.reference-entry-overlay:hover .reference-entry-hit{fill:#b9dcff;fill-opacity:.12}.reference-entry-overlay.selected .reference-entry-hit{fill:#b9dcff;fill-opacity:.22}.reference-entry-overlay:focus{outline:none}.reference-entry-overlay:focus .reference-entry-hit{stroke:var(--blue);stroke-width:1;vector-effect:non-scaling-stroke}.badge-key{display:inline-flex;align-items:center;justify-content:center;min-width:1.05rem;height:.85rem;padding:0 .2rem;border:1px solid #7b8794;background:#fff;font-size:.62rem;font-style:normal;font-weight:600;color:#34404c}.citation-badge-key{border-radius:.45rem}.reference-badge-key{border-radius:2px}/* Linked summary instances and the Reference window. */.summary-instance{color:var(--blue)}.reference-availability{font-size:.95rem;margin:.6rem 0 .3rem}.reference-citations button{border:1px solid var(--line);background:#fff;border-radius:4px;padding:.1rem .45rem;margin:.1rem .15rem;font:inherit;font-size:.86rem;cursor:pointer}.reference-finding{border-top:1px solid var(--line);margin-top:.75rem;padding-top:.25rem}' + '</style>', 1)
+    rendered = rendered.replace('</style>', '/* One connected workspace: a single control bar over the paper and the evidence window. */.workspace-bar{grid-column:1/-1;grid-row:1;display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.3rem .6rem;background:#fff;border-bottom:1px solid var(--line);min-width:0}.workspace-bar .toolbar{position:static;margin:0;padding:0;background:transparent;border:0;box-shadow:none;height:auto;flex-wrap:nowrap;overflow-x:auto;gap:.25rem;min-width:0}.evidence-controls{margin-left:auto}.evidence-controls>*{flex:none;white-space:nowrap}.evidence-controls .group{display:inline-flex;gap:.3rem}.toolbar button,.toolbar label{padding:.35rem .45rem}.toolbar button:disabled{opacity:.45;cursor:default}.layout>.paper{grid-row:2;min-height:0;min-width:0;display:flex;flex-direction:column;padding:0;border:0;border-radius:0;background:transparent}.layout .paper-viewport{flex:1;min-height:0;overflow:auto;padding:.75rem}/* Skipped content-visibility pages report their last-rendered width; a flexible track stops it holding the column open. */.paper-pages{grid-template-columns:minmax(0,1fr)}.paper>.report-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}.side-pane{grid-row:2;min-height:0;min-width:0;display:grid;grid-template-columns:.75rem minmax(0,1fr);background:#fff;border-left:1px solid var(--line);transition:transform .22s ease}.side-pane .splitter{height:auto;position:static;background:var(--page)}.side-pane .evidence-column{min-height:0;min-width:0;display:flex;flex-direction:column}.side-pane .panel{flex:1;min-height:0;max-height:none;position:static;margin:0;border:0;border-radius:0}.layout.panel-sliding .side-pane{transform:translateX(100%)}.layout.panel-collapsed{grid-template-columns:minmax(0,1fr)}.layout.panel-collapsed .side-pane{display:none}@media(prefers-reduced-motion:reduce){.side-pane{transition:none}}.page-container{content-visibility:auto}.text-selection-off .page-container,.text-selection-off .page-container *{user-select:none!important;-webkit-user-select:none!important}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:auto auto auto;height:auto;overflow:visible}.workspace-bar{flex-wrap:wrap}.layout>.paper{grid-row:auto}.layout .paper-viewport{max-height:calc(100dvh - 3rem)}.side-pane{grid-row:auto;grid-template-columns:1fr;border-left:0;border-top:1px solid var(--line)}.side-pane .splitter{display:none}.side-pane .panel{max-height:none}}@media print{.workspace-bar,.side-pane{display:none}.layout{display:block;height:auto;overflow:visible;border:0;margin:0}.layout .paper-viewport{max-height:none;overflow:visible;padding:0}.page-container{content-visibility:visible}}/* Margin numbers and whole-entry reference targets. */.paper-badge{cursor:pointer}.paper-badge .badge-bg{fill:#fff;stroke:#7b8794;stroke-width:.6;vector-effect:non-scaling-stroke}.paper-badge .badge-number{font:600 7px system-ui,-apple-system,sans-serif;fill:#34404c;pointer-events:none}.paper-badge:hover .badge-bg,.paper-badge.selected .badge-bg{fill:#dcecff;stroke:var(--blue)}body.layout-paper .paper-badge{display:none}.style-guidance-links{margin-top:.8rem;font-size:.85rem;color:var(--muted)}.finding-list{margin:.3rem 0 0;padding-left:1.2rem}.finding-list>li{margin:.25rem 0}.finding-list>li>p{margin:0} .finding-list>li>p.full-reference{margin:.45rem 0 0}body.layout-judgment .citation-overlay,body.layout-judgment .reference-practice-overlay,body.layout-judgment .reference-entry-overlay,body.layout-judgment .paper-badge{display:none}@media print{.paper-badge{display:none}}.reference-entry-overlay{cursor:pointer}.reference-entry-hit{fill:transparent;stroke:none;pointer-events:all}.reference-entry-overlay:hover .reference-entry-hit{fill:#b9dcff;fill-opacity:.12}.reference-entry-overlay.selected .reference-entry-hit{fill:#b9dcff;fill-opacity:.22}.reference-entry-overlay:focus{outline:none}.reference-entry-overlay:focus .reference-entry-hit{stroke:var(--blue);stroke-width:1;vector-effect:non-scaling-stroke}.badge-key{display:inline-flex;align-items:center;justify-content:center;min-width:1.05rem;height:.85rem;padding:0 .2rem;border:1px solid #7b8794;background:#fff;font-size:.62rem;font-style:normal;font-weight:600;color:#34404c}.citation-badge-key{border-radius:.45rem}.reference-badge-key{border-radius:2px}/* Linked summary instances and the Reference window. */.summary-instance{color:var(--blue)}.reference-availability{font-size:.95rem;margin:.6rem 0 .3rem}.reference-citations button{border:1px solid var(--line);background:#fff;border-radius:4px;padding:.1rem .45rem;margin:.1rem .15rem;font:inherit;font-size:.86rem;cursor:pointer}.reference-finding{border-top:1px solid var(--line);margin-top:.75rem;padding-top:.25rem}' + '</style>', 1)
     return _bind_inline_styles(rendered, nonce)
 
 
@@ -3005,6 +2999,15 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     findings[:]=[f for f in findings if f.get('finding_type') not in {'submitted_link_issue', 'reference_author_conflict'}]
     findings.extend(without_repeated_identifier_conflicts(
         reference_link_findings(result.get('submitted_link_observations'), sources), findings))
+    # A citation window also states its reference's dead link, with the
+    # reference window's own sentence, so a reader sees why no text was
+    # retrieved (owner request 2026-10-14).
+    dead_links = {}
+    for finding in findings:
+        if finding.get('finding_type') == 'submitted_link_issue' and finding.get('link_outcome') == 'missing_page':
+            dead_links.setdefault(finding.get('reference_id'), []).append(finding['finding'])
+    for member in members:
+        member['_submitted_link_issues'] = list(dict.fromkeys(dead_links.get(member.get('reference_id')) or []))
     existing = {f.get('reference_id') for f in findings if f.get('finding_type') == 'duplicate_citation_key'}
     for member in members:
         for finding in member.get('reference_findings') or []:
@@ -4709,15 +4712,32 @@ _IDENTIFIED_FOR_SOURCE_EVIDENCE = frozenset({
 })
 
 
-def _withhold_unidentified_abstract(item: dict) -> dict:
+def _abstract_from_submitted_link(member: dict, reference_id: str, observations) -> bool:
+    """The abstract was read from the very page the student's own link
+    returned: its page hash equals a response the link checker recorded for
+    this reference (Regulation references 8 and 13, 2026-10-14)."""
+    from app.services.abstract_only_pages import LINKED_ABSTRACT_BASIS
+    provenance = (member.get("abstract_evidence") or {}).get("provenance") or {}
+    page = provenance.get("page_content_sha256")
+    if provenance.get("basis") != LINKED_ABSTRACT_BASIS or not page:
+        return False
+    return any(
+        request.get("response_sha256") == page
+        for row in observations or [] if isinstance(row, dict) and row.get("reference_id") == reference_id
+        for request in row.get("requests") or [] if isinstance(request, dict))
+
+
+def _withhold_unidentified_abstract(item: dict, *, linked_page: bool = False) -> dict:
     """Show no abstract when the cited work was never identified.
 
     The abstract belongs to whichever record the search merged, which is only
     the cited work when identity was established. Withholding it is the
     difference between "we could not confirm this source" and presenting a
-    stranger's summary as the student's source.
+    stranger's summary as the student's source. An abstract read from the
+    page the student's own link returned is that page's, not a merged
+    record's, and is shown like text read from the same link.
     """
-    if item.get("coverage_level") != "abstract_only":
+    if item.get("coverage_level") != "abstract_only" or linked_page:
         return item
     if (item.get("reference_identity") or {}).get("status") in _IDENTIFIED_FOR_SOURCE_EVIDENCE:
         return item
@@ -6308,16 +6328,25 @@ def _render_member(member: dict, *, grouped: bool = False, patchwriting: list[di
     # Checks that found nothing stay plain; each Academic Practice issue is a
     # bullet under its heading (owner request 2026-10-03).
     plain_rows, academic_items = "", []
+    # A quotation or locator check belongs to the parts of a split statement
+    # that quote something: the window hides it for a judged part whose wording
+    # carries none of the quoted terms (owner request 2026-10-14).
+    targets = [str(t) for t in member.get("quotation_targets") or [] if str(t).strip()]
+    quoted = (f' data-quote-targets="{escape(json.dumps(targets, ensure_ascii=False), quote=True)}"'
+              if targets else '')
     for label, check, _identity_item in check_items:
-        row = (f'<p class="check-line">{escape(_panel_statement(_check_sentence(label, check)))}</p>'
-               + (render_quotation_comparisons(check, str(member.get("_citation_text") or ""))
-                  if label == "Quotation" else ""))
+        row = (render_quotation_comparisons(check, str(member.get("_citation_text") or ""))
+               if label == "Quotation" else "")
+        sentence = escape(_panel_statement(_check_sentence(label, check)))
         if check.get('attention'):
-            academic_items.append(f'<li class="finding-item">{row}</li>')
+            academic_items.append(f'<li class="finding-item"{quoted}><p class="check-line">{sentence}</p>{row}</li>')
         else:
-            plain_rows += row
+            line = f'<p class="check-line">{sentence}</p>{row}'
+            plain_rows += f'<div{quoted}>{line}</div>' if quoted else line
     academic_items += [f'<li class="finding-item"><p class="check-line">{escape(line)}</p></li>'
                        for line in member.get("_reference_mismatch") or []]
+    academic_items += [f'<li class="finding-item"><p class="check-line">{escape(line)}</p></li>'
+                       for line in member.get("_submitted_link_issues") or []]
     secondary = secondary_citation_line(member.get("secondary_citation"))
     if secondary:
         academic_items.append(f'<li class="finding-item"><p class="check-line">{escape(secondary)}</p></li>')
@@ -6849,6 +6878,10 @@ def _link_reference_text(text: str, *, suppressed_dois: frozenset[str] = frozens
         else:
             href = label
         chunks.append(escape(text[cursor:match.start()]))
+        # "Press.https://..." with no space would wrap as one word, breaking
+        # the publisher's name early (Regulation reference 8, 2026-10-14).
+        if match.start() and not text[match.start() - 1].isspace():
+            chunks.append("<wbr>")
         chunks.append(
             f'<a class="reference-url" href="{escape(href, quote=True)}" '
             f'target="_blank" rel="noopener noreferrer">{escape(label)}</a>'

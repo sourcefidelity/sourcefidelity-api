@@ -414,6 +414,11 @@ def retrieve_paper_sources(
     def record_acquisition(plan: dict, result, exc) -> None:
         """Admit one acquired source and checkpoint it, on the job's thread."""
         reference, result_record = plan["reference"], plan["record"]
+        if getattr(reference, "url", None) or getattr(reference, "doi", None):
+            # Which student-link handling ran: a later version searches a
+            # link that yielded no text again once (rerun_reuse).
+            from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
+            result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
         if exc is not None:
             result_record.update(
                 status="unavailable",

@@ -39,6 +39,14 @@ def repair_reference_urls(
         end = match.end()
         pieces = [match.group()]
         annotated = False
+        # A query whose address ends at "?" or "&" and goes on after a space or
+        # up to two line breaks ("initDatabaseDetail?" then "siteId=14&…" in
+        # the next Word paragraph, the Regulation paper, 2026-10-14) is one
+        # address: none ends there.
+        same_line = re.match(r"(?:[ \t]+|[ \t]*(?:\r?\n[ \t]*){1,2})([\w.-]+=[^\s]*)", layout_text[end:])
+        if pieces[-1].endswith(("?", "&")) and same_line and _TOKEN.fullmatch(same_line[1]):
+            pieces.append(same_line[1])
+            end += same_line.end()
         for _ in range(7):
             next_line = re.match(r"[ \t]*\r?\n[ \t]*([^\r\n]+)", layout_text[end:])
             if not next_line:

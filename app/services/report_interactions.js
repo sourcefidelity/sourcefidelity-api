@@ -66,6 +66,22 @@
     texts.forEach(el => { el.hidden = el !== chosen; });
     panel.dataset.proposition = chosen.dataset.proposition;
     if (suffix) suffix.textContent = ' - ' + chosen.dataset.propositionLetter;
+    // Quotation and locator checks show only for a part that quotes one of
+    // their terms (owner request 2026-10-14); a heading left empty hides too.
+    const fold = value => String(value || '').toLowerCase().replace(/[‘’“”"']/g, '').replace(/\s+/g, ' ').trim();
+    const wording = fold(chosen.textContent);
+    panel.querySelectorAll('[data-quote-targets]').forEach(el => {
+      let terms = [];
+      try { terms = JSON.parse(el.dataset.quoteTargets); } catch (error) { terms = []; }
+      el.hidden = texts.length > 1 && terms.length > 0 && !terms.some(term => wording.includes(fold(term)));
+    });
+    panel.querySelectorAll('.finding-list').forEach(list => {
+      const items = [...list.children];
+      const empty = items.length > 0 && items.every(item => item.hidden);
+      list.hidden = empty;
+      const heading = list.previousElementSibling;
+      if (heading && heading.querySelector('.issue-heading')) heading.hidden = empty;
+    });
     return chosen.dataset.proposition;
   }
   function propositionsIn(template) {
@@ -348,21 +364,6 @@
       else if(response.status===409){message.textContent='The report is already being updated.';button.disabled=false;}
       else{message.textContent='';button.disabled=false;}}
     catch(error){message.textContent='';button.disabled=false;}
-    form.removeAttribute('aria-busy');
-  });
-  document.addEventListener('submit', async event => {
-    const form=event.target;if(!form.classList.contains('check-again'))return;event.preventDefault();
-    const message=form.querySelector('.upload-status'),button=form.querySelector('button');
-    // Owner-approved wording (2026-10-13).
-    const failed='The paper could not be checked again.';
-    button.disabled=true;form.setAttribute('aria-busy','true');message.textContent='Checking again…';
-    try{const response=await fetch(form.action,{method:'POST',credentials:'same-origin'}),data=await response.json().catch(()=>({}));
-      if(response.ok&&data.reused&&data.report_id){window.location.assign('/report/'+encodeURIComponent(data.report_id)+window.location.search);return;}
-      if(response.ok&&data.status_url&&data.attempt_id){awaitSuccessor(data.status_url,message,String(data.attempt_id),failed);return;}
-      if(response.status===410){form.remove();return;}   // no longer kept, or marks released
-      if(response.status===409){message.textContent='The report is already being updated.';button.disabled=false;}
-      else{message.textContent=failed;button.disabled=false;}}
-    catch(error){message.textContent=failed;button.disabled=false;}
     form.removeAttribute('aria-busy');
   });
   // view-state:start

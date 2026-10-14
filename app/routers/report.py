@@ -155,7 +155,6 @@ def get_report(
     view = enable_authenticated_paper_actions(
         view, report_id=report_id,
         search_again_enabled=not _report_marks_released(session, report_id, principal))
-    view["check_again_action"] = _check_again_action(session, report_id, principal)
     with fitz.open(stream=paper_content, filetype="pdf") as document:
         view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
         view["paper_surface"]["selectable_words"] = {
@@ -422,19 +421,6 @@ def _report_job(session: Session, report_id: str, principal) -> Job | None:
             or job.scope_id != principal.scope_id):
         return None
     return job
-
-
-def _check_again_action(session: Session, report_id: str, principal) -> dict | None:
-    """The "Check Again" control while the submitted file is still kept (recheck-copy-v1)."""
-    from app.services.recheck_copy import available, lineage
-    if PAPER_CHECK_CAPABILITY not in principal.capabilities or not isinstance(session, Session):
-        return None
-    job = _report_job(session, report_id, principal)
-    if job is None or _report_marks_released(session, report_id, principal):
-        return None
-    if not any(available(item) for item in lineage(session, job)):
-        return None
-    return {"enabled": True, "href": f"/report/{quote(str(report_id), safe='')}/check-again"}
 
 
 @router.post("/{report_id}/check-again")
