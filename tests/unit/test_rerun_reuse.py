@@ -2,11 +2,17 @@
 import pytest
 from types import SimpleNamespace
 
-from app.services.search.rerun_reuse import _reusable, reference_signature, reused_result
+from app.services.search.rerun_reuse import reference_signature, reused_result
+from app.services.source_reuse import earlier_result, refuse
 
 REF = {"reference_id": "ref-1", "raw_ref": "Smith, J. (2020). A study. Example Books.", "source_kind": "monograph",
        "title": "A study", "author": "Smith, J.", "year": "2020", "container_title": "", "doi": ""}
 
+
+
+def _reusable(item, reference=None):
+    """The earlier-result decision, through source_reuse's public interface."""
+    return earlier_result(item, reference).reusable
 
 def test_only_complete_results_are_reusable():
     discovery = {"outcome": "unlocated_after_search", "created_at": "2026-10-01T00:00:00Z"}
@@ -34,7 +40,7 @@ def test_a_changed_parse_or_mode_is_not_reused_and_a_match_is_rekeyed():
 
 
 def test_an_optional_route_failure_does_not_force_a_search_when_required_searches_completed(monkeypatch):
-    import app.services.search.rerun_reuse as reuse
+    import app.services.source_reuse as reuse
     item = {"status": "unavailable", "reason_code": "source_not_found",
             "reference_discovery": {"outcome": "search_incomplete"}}
     monkeypatch.setattr(reuse, "_required_searches_completed", lambda item, reference: reference is not None)
@@ -79,7 +85,7 @@ def test_reused_link_checks_are_bound_to_the_new_reference():
 
 def test_a_verified_open_access_copy_is_downloaded_again_instead_of_searched():
     # paper-search-reuse-v4, owner decision 2026-10-07.
-    from app.services.search.rerun_reuse import public_copy
+    from app.services.source_reuse import public_copy
     access = {"version": "verified-public-source-access-v1", "href": "https://repository.example/ames.pdf",
               "content_sha256": "a" * 64}
     item = {"status": "transient_authorized", "source_name": "openalex", "public_source_access": access}
@@ -112,7 +118,7 @@ def test_a_downloaded_copy_must_be_the_file_the_earlier_run_verified(monkeypatch
 
 def test_a_copy_whose_admission_lapsed_mid_run_is_downloaded_again():
     # The long article, 2026-10-08: texts verified, then lost when a 58-minute run outlived their lease.
-    from app.services.search.rerun_reuse import downloadable
+    from app.services.source_reuse import downloadable
     access = {"version": "verified-public-source-access-v1", "href": "https://repository.example/ames.pdf",
               "content_sha256": "a" * 64}
     lapsed = {"status": "unavailable", "reason_code": "transient_verification_run_unavailable",
@@ -203,7 +209,7 @@ def test_a_run_excluded_from_reuse_contributes_no_results(monkeypatch):
 def test_lantern_pages_stored_before_page_numbers_are_read_again_once():
     # Owner decision 2026-10-14: Lantern pages now carry printed page numbers,
     # so an earlier stored Lantern text is read again once (free route).
-    from app.services.retrieval.lantern import PAGES_VERSION
+    from app.services.source_reuse import LANTERN_PAGES_VERSION as PAGES_VERSION
     stored = {"status": "durable_authorized", "representation_id": "r", "source_name": "lantern"}
     assert not _reusable(stored)
     assert _reusable({**stored, "lantern_pages": PAGES_VERSION})

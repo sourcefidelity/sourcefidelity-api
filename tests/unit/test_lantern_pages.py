@@ -109,8 +109,8 @@ def test_lantern_ocr_text_gets_ocr_tolerant_quotation_matching():
 
 
 def test_an_earlier_result_without_text_under_older_link_handling_is_searched_again():
-    from app.services.search.rerun_reuse import _reusable
-    from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
+    from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION, earlier_result
+    _reusable = lambda item, reference=None: earlier_result(item, reference).reusable
     reference = {"reference_id": "ref-1", "url": "https://lantern.mediahist.org/catalog/fanmag22unse_0333",
                  "raw_ref": "Talbott, T. (1930). Meet the new blonde. Fanmag, 26-27.", "source_kind": "magazine_article"}
     completed = {"outcome": "unlocated_after_search", "created_at": "t0",
@@ -181,7 +181,7 @@ def test_a_cached_lantern_copy_without_page_numbers_is_read_again():
     # Owner decision 2026-10-14: the local copy is skipped once, so the Lantern
     # route stores the pages with their printed numbers.
     from types import SimpleNamespace
-    from app.services.source_resolver import _stale_lantern_copy
+    from app.services.source_reuse import lantern_copy_stale as _stale_lantern_copy
     assert _stale_lantern_copy(SimpleNamespace(provenance="lantern", validation_evidence={}))
     labelled = {"printed_page_labels": {"labels": ["26", None]}}
     assert not _stale_lantern_copy(SimpleNamespace(provenance="lantern", validation_evidence=labelled))

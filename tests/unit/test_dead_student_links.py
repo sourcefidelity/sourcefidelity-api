@@ -1,6 +1,6 @@
 """A student's link that answers 404 or 410 is a dead link, not a network failure (2026-10-14)."""
 from app.services.retrieval.base import RetrievalResult
-from app.services.search.rerun_reuse import _network_failed
+from app.services.source_reuse import _network_failed
 from app.services.source_resolver import _link_gone, _student_link_disposition
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
 

@@ -31,11 +31,15 @@ import copy
 from datetime import datetime, timedelta, timezone
 
 from app.config import settings
+# The reuse rules (source_reuse, 2026-10-15); these names stay importable here.
+from app.services.source_reuse import (  # noqa: F401
+    _network_failed, _required_searches_completed, downloadable, earlier_result,
+    native_script_route_due, public_copy,
+)
 
 POLICY = "paper-search-reuse-v5"
-_REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
-_INCOMPLETE_REASONS = frozenset({"full_text_search_incomplete", "transient_verification_run_unavailable",
-                                 "transient_source_admission_failed", "durable_representation_not_authorized"})
+
+
 
 
 def _norm(value) -> str:
@@ -50,162 +54,6 @@ def reference_signature(reference, *, identity_only: bool) -> tuple:
     return (_norm(get("raw_ref")), _norm(get("source_kind")), _norm(get("title")), _norm(get("author")),
             _norm(get("year")), _norm(get("container_title")), _norm(get("doi")), bool(identity_only),
             _norm(get("url")))
-
-
-def _required_searches_completed(item: dict, reference: dict | None) -> bool:
-    """reference-verification found every required search complete."""
-    if not reference:
-        return False
-    from app.services.reference_verification import COMPLETED_WITHOUT_MATCH_REASONS, assess_reference_verification
-    from app.services.schemas import ParsedReference
-    try:
-        parsed = ParsedReference.model_validate(reference)
-    except Exception:
-        return False
-    verdict = assess_reference_verification(parsed, item.get("reference_discovery"))
-    return verdict.get("reason_code") in COMPLETED_WITHOUT_MATCH_REASONS
-
-
-def public_copy(item: dict) -> dict | None:
-    """The earlier run's verified open-access address and file hash, if kept."""
-    access = item.get("public_source_access") or {}
-    href, digest = str(access.get("href") or ""), str(access.get("content_sha256") or "")
-    if (access.get("version") == "verified-public-source-access-v1" and href.startswith("https://")
-            and len(digest) == 64 and item.get("source_name")):
-        return {"href": href, "content_sha256": digest, "provider": str(item["source_name"])}
-    return None
-
-
-def downloadable(item: dict) -> bool:
-    """A verified open-access copy can be downloaded again: a transient text,
-    or one whose admission lapsed during a long run after it was verified
-    (`transient_verification_run_unavailable`, the long article, 2026-10-08)."""
-    return public_copy(item) is not None and (
-        item.get("status") == "transient_authorized"
-        or item.get("reason_code") == "transient_verification_run_unavailable")
-
-
-def _reusable(item: dict, reference: dict | None = None) -> bool:
-    if _student_link_routes_due(item, reference):
-        return False
-    from app.services.retrieval.lantern import PAGES_VERSION
-    if item.get("source_name") == "lantern" and item.get("lantern_pages") != PAGES_VERSION:
-        # Stored before Lantern pages carried printed page numbers: read again once.
-        return False
-    if item.get("status") == "transient_authorized" or downloadable(item):
-        return downloadable(item)
-    if item.get("status") == "durable_authorized":
-        # The text itself is stored; how the search ended does not matter.
-        return bool(item.get("representation_id"))
-    if native_script_route_due(item, reference):
-        return False
-    discovery = item.get("reference_discovery") or {}
-    if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
-            and (reference.get("container_title") or "").strip()
-            and discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
-            and not discovery.get("container_identity")):
-        # An unconfirmed chapter whose book was never identified is searched
-        # again, so a corrected book lookup reaches it (Gershon, 2026-10-04).
-        return False
-    if item.get("status") == "link_check_only":
-        # An uncited web page's own search (webpage-verification-v1): reused
-        # once its web providers answered (paper 10's Statista, 2026-10-04).
-        return bool(item.get("web_page_check")) and _web_search_answered(discovery)
-    if item.get("status") not in _REUSABLE_STATUSES or item.get("reason_code") in _INCOMPLETE_REASONS:
-        return False
-    if item.get("full_text_search_incomplete_providers"):
-        return False
-    if item.get("retryable_provider_dependencies"):
-        # An optional provider left a retry, but every search the reference's
-        # kind requires finished (paper 10: OpenAlex re-searched each run, 2026-10-04).
-        return _required_searches_completed(item, reference)
-    if _network_failed(discovery):
-        return False
-    if discovery.get("outcome") == "search_incomplete":
-        return _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
-    return bool(discovery)
-
-
-def native_script_route_due(item: dict, reference) -> bool:
-    """A likely other-language work whose earlier result has no completed
-    search in its own script, and was not confirmed, is searched again
-    (native-script-route-v1): reusing it would keep the reference neutral
-    forever, or reuse a search that never looked where the work is."""
-    if not isinstance(reference, dict):
-        return False
-    from app.services.other_language import other_language_signals
-    if not other_language_signals(reference):
-        return False
-    discovery = item.get("reference_discovery") or {}
-    if discovery.get("outcome") in {"confirmed", "confirmed_with_minor_differences"}:
-        return False
-    from app.services.reference_verification import NATIVE_SCRIPT_ROUTE_POLICIES
-    route = (discovery.get("native_script_route")
-             or (item.get("reference_discovery_trace") or {}).get("native_script_route") or {})
-    return not (route.get("policy_version") in NATIVE_SCRIPT_ROUTE_POLICIES and route.get("status") == "completed")
-
-
-def _student_link_routes_due(item: dict, reference: dict | None) -> bool:
-    """A reference with a student link whose earlier result was searched under
-    older student-link handling, and holds no text or holds a search-found
-    page's text: searched again once, so newer link routes run (the Jean
-    Harlow paper's Lantern links, the Regulation paper's Chinese abstract
-    pages and Kinzius et al.'s DOI page, 2026-10-14). A stored copy, or text
-    the student's own link gave, is reused as before."""
-    from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
-    if not isinstance(reference, dict) or not (reference.get("url") or reference.get("doi")):
-        return False
-    if item.get("student_link_routes") == STUDENT_LINK_ROUTES_VERSION:
-        return False
-    if item.get("status") == "durable_authorized":
-        return False
-    if item.get("status") == "transient_authorized":
-        return item.get("source_name") not in _STUDENT_LINK_SOURCES
-    return True
-
-
-# Routes that read the student's own link (its page, its file, its DOI, its
-# Media History Digital Library pages).
-_STUDENT_LINK_SOURCES = frozenset({"student_url", "web_fetch", "lantern", "doi_resolver"})
-
-
-def _no_provider_at_fault(discovery: dict) -> bool:
-    """Incomplete only for reasons a repeat would meet again: every required
-    provider answered, and the gaps are filtered index records, unresolved
-    web-search leads or pages that did not confirm the work (owner decision
-    2026-10-07; Franchise 2's 8 such references were searched again each run).
-    A provider whose failure holds the search incomplete still forces a new
-    search; so does a reference whose parse was incomplete."""
-    from app.services.paper_workflow import _blocking_providers_from_record
-    if (discovery.get("expected") or {}).get("reference_parse_review"):
-        return False
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    if not any(a.get("route_category") == "bounded_web" for a in attempts):
-        return False
-    return not _blocking_providers_from_record(discovery)
-
-
-def _web_search_answered(discovery: dict) -> bool:
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    web = [a for a in attempts if a.get("route_category") == "bounded_web"]
-    return bool(web) and all(a.get("outcome") in {"candidate_found", "no_match"} for a in web)
-
-
-def _network_failed(discovery: dict) -> bool:
-    """The earlier run could not reach the student's link, or most indexes:
-    a network failure, not a finished search (2026-10-02)."""
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    # A failed student link matters only when nothing else confirmed the work:
-    # a confirmed reference is not searched again for it (paper 4 re-run,
-    # 2026-10-02: 15 confirmed references re-searched, USD 0.35).
-    if (discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
-            and any(a.get("route_category") == "student_url" and a.get("outcome") == "operational_failure"
-                    for a in attempts)):
-        return True
-    adapters = [a for a in attempts if a.get("route_category") == "academic_adapter"
-                and a.get("outcome") != "unavailable"]
-    failed = sum(1 for a in adapters if a.get("outcome") == "operational_failure")
-    return bool(adapters) and failed * 2 >= len(adapters)
 
 
 def excluded_job_ids() -> frozenset[str]:
@@ -243,9 +91,15 @@ def prior_results_index(session, job) -> dict:
         references = {ref.get("reference_id"): ref for ref in (earlier.extraction_payload or {}).get("references") or []}
         for item in earlier.source_results or []:
             reference = references.get(item.get("reference_id"))
-            if reference is None or not _reusable(item, reference):
+            if reference is None:
                 continue
             key = reference_signature(reference, identity_only=bool(item.get("identity_only_policy")))
+            decision = earlier_result(item, reference)
+            if not decision.reusable:
+                # Why the most recent earlier result was not reused (provenance).
+                index.setdefault(("refused",) + key, decision.reason)
+                index.setdefault(("refused",) + parsed_signature(key), decision.reason)
+                continue
             index.setdefault(key, (str(earlier.id), item))
             index.setdefault(parsed_signature(key), (str(earlier.id), item))
     return index
@@ -294,3 +148,12 @@ def reused_result(index: dict, reference, *, identity_only: bool) -> dict | None
     record["search_reuse"] = {"policy_version": POLICY, "from_job_id": prior_job_id,
                               "searched_at": (record.get("reference_discovery") or {}).get("created_at")}
     return record
+
+
+def reuse_refusal(index: dict, reference, *, identity_only: bool) -> str | None:
+    """Why the most recent earlier result for this reference was not reused, if one was refused."""
+    signature = reference_signature(reference, identity_only=identity_only)
+    found = index.get(("refused",) + signature)
+    if found is None and _identifying(signature):
+        found = index.get(("refused",) + parsed_signature(signature))
+    return found

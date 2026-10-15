@@ -337,7 +337,7 @@ def retrieve_paper_sources(
     # An unchanged reference already searched by an earlier run of this paper
     # reuses that result instead of paying again (paper-search-reuse-v1). A
     # targeted refresh never reuses: it exists to search again.
-    from app.services.search.rerun_reuse import prior_results_index, reused_result
+    from app.services.search.rerun_reuse import prior_results_index, reuse_refusal, reused_result
     rerun_index = {} if targeted_refresh else prior_results_index(session, job)
 
     def checkpoint(result_record: dict) -> None:
@@ -417,11 +417,11 @@ def retrieve_paper_sources(
         if getattr(reference, "url", None) or getattr(reference, "doi", None):
             # Which student-link handling ran: a later version searches a
             # link that yielded no text again once (rerun_reuse).
-            from app.services.source_resolver import STUDENT_LINK_ROUTES_VERSION
+            from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION
             result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
         if getattr(result, "source_name", None) == "lantern":
-            from app.services.retrieval.lantern import PAGES_VERSION
-            result_record["lantern_pages"] = PAGES_VERSION
+            from app.services.source_reuse import LANTERN_PAGES_VERSION
+            result_record["lantern_pages"] = LANTERN_PAGES_VERSION
         if exc is not None:
             result_record.update(
                 status="unavailable",
@@ -549,15 +549,14 @@ def retrieve_paper_sources(
         if getattr(representation, "kind", None) == RepresentationKind.PLAIN_TEXT:
             # Every route ends here, reuse included (2026-10-13): an index record
             # is not the work, and a page of notes or listings is never whole.
-            from app.services.abstract_only_pages import mostly_notes_or_listings
-            from app.services.source_validator import _detect_nonwork_listing
-            text = representation.content.decode("utf-8", "replace")
-            if _detect_nonwork_listing(" ".join(text.split()), getattr(reference, "title", None)):
+            from app.services.source_reuse import stored_text_today
+            decision, completeness = stored_text_today(
+                representation.content.decode("utf-8", "replace"),
+                title=getattr(reference, "title", None), completeness=completeness)
+            if not decision.reusable:
                 result_record.update(status="unavailable", reason_code="representation_is_a_listing")
                 checkpoint(result_record)
                 return
-            if str(completeness).casefold() == "complete" and mostly_notes_or_listings(text):
-                completeness = "not_assessed"
         try:
             run = begin_verification_run(
                 session,
@@ -639,27 +638,32 @@ def retrieve_paper_sources(
         if identity_only:
             result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
         reused = reused_result(rerun_index, reference, identity_only=identity_only)
+        refusal = None if reused is not None else reuse_refusal(rerun_index, reference, identity_only=identity_only)
         if reused is not None and reused.get("status") == "durable_authorized":
             try:
                 authorize_representation(session, backend, representation_id=reused["representation_id"],
                                          scope_type=job.scope_type, scope_id=job.scope_id)
             except Exception:
-                reused = None   # the stored source is no longer usable here: search again
+                reused, refusal = None, "stored_copy_unusable"   # search again
         if (reused is not None and not identity_only
                 and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
             # A source uploaded since the earlier run is in the library now:
             # resolve the reference, which finds it before any search (2026-10-07).
             stored = getattr(active_resolver, "stored_copy_available", None)
             if stored is not None and stored(reference):
-                reused = None
+                reused, refusal = None, "library_copy_available"
         public = None
         if reused is not None and downloadable(reused):
             public = public_copy(reused)
             if not (public and refetch and not identity_only):
                 public = reused = None
+                refusal = "public_copy_not_downloaded"
         if reused is not None and public is None:
             checkpoint(reused)
             continue
+        if refusal:
+            # Why an earlier result was not reused (provenance, 2026-10-15).
+            result_record["reuse_refusal"] = refusal
         plan = {"reference": reference, "record": result_record, "identity_only": identity_only,
                 "reused": reused, "public": public}
         if workers == 1:

@@ -547,7 +547,7 @@ def test_a_supplied_link_that_loads_but_cannot_be_read_leaves_a_book_section_not
 
 
 def test_neutral_completed_searches_are_still_reused_on_a_rerun():
-    from app.services.search.rerun_reuse import _required_searches_completed
+    from app.services.source_reuse import _required_searches_completed
     reference = {'reference_id': 'ref-0001-000000000001', 'title': ROMANISED, 'source_kind': 'journal_article',
                  'raw_ref': f'Pan, Y. (2016). {ROMANISED}. Example Law Review, 3(11), 6-9.'}
     assert _required_searches_completed({'reference_discovery': searched(other_ref())}, reference)

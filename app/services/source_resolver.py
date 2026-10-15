@@ -730,15 +730,15 @@ LANDING_ABSTRACT_ONLY_ERROR = "landing page holds an abstract and back matter on
 # author-field labels are not names; v5, the model's same-work answer for a
 # page naming the work also keeps its abstract); an earlier
 # result without text, or with a search-found page's text, is searched again once.
-STUDENT_LINK_ROUTES_VERSION = "student-link-routes-v5"
+from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION  # noqa: E402,F401 (source_reuse.ROUTE_VERSIONS)
 
-
-def _stale_lantern_copy(record) -> bool:
-    """A stored Lantern text from before its pages carried printed page
-    numbers: skipped by the local copy, so the Lantern route reads it again
-    with them (owner decision 2026-10-14)."""
-    return (getattr(record, "provenance", None) == "lantern"
-            and not (getattr(record, "validation_evidence", None) or {}).get("printed_page_labels"))
+# Reasons the source library's copy was not used, as the local copy has always reported them.
+_STORED_COPY_ERRORS = {
+    "limited_preview_not_revalidated": "Limited preview binding could not be revalidated",
+    "edition_candidate_not_pdf": None,
+    "edition_candidate_not_revalidated": "Edition-qualified library candidate could not be revalidated",
+    "stored_text_is_a_listing": "Stored copy is a listing, not the cited work",
+}
 # Result metadata a displaced page carried that would authorize its text.
 _ACQUISITION_ONLY_METADATA = frozenset({
     "durable_admission", "repository_representation_id", "publisher_preview",
@@ -3929,8 +3929,12 @@ class SourceResolver:
                         if (record.canonical_work.year != year or
                                 _normalize_cache_author(record.canonical_work.author) != _normalize_cache_author(author)):
                             record = None
-                if record is None or _stale_lantern_copy(record):
+                from app.services.source_reuse import lantern_copy_stale, stored_copy
+                if record is None:
                     return RetrievalResult(source_name="local_cache", success=False)
+                if lantern_copy_stale(record):
+                    return RetrievalResult(source_name="local_cache", success=False,
+                                           metadata={"reuse_refusal": "lantern_pages_changed"})
                 try:
                     data = self._backend.download(record.content_object.storage_key)
                 except FileNotFoundError:
@@ -3944,42 +3948,28 @@ class SourceResolver:
                         error="Accepted source object unavailable",
                     )
                 kind = RepresentationKind(record.representation_kind)
-                if record.completeness_verdict == 'incomplete':
-                    from app.services.publisher_preview import valid_preview_receipt
-                    if (not author or not year or record.canonical_work.year != year
-                            or _normalize_cache_author(record.canonical_work.author) != _normalize_cache_author(author)
-                            or not valid_preview_receipt((record.validation_evidence or {}).get('publisher_preview'),
-                                hashlib.sha256(data).hexdigest(), record.source_url)):
-                        return RetrievalResult(source_name='local_cache', success=False,
-                            error='Limited preview binding could not be revalidated')
-                if edition_title_fallback:
-                    if kind != RepresentationKind.PDF:
-                        return RetrievalResult(source_name="local_cache", success=False)
+
+                def edition_check():
                     validation = validate_retrieved_pdf(data, expected_title=title,
                         expected_author=author, expected_year=year, document_kind="book",
                         expected_source_kind=expected_source_kind.kind,
                         expected_source_kind_confidence=expected_source_kind.confidence,
                         expected_source_kind_evidence=expected_source_kind.evidence)
-                    if (validation.identity_confidence == "rejected" or validation.completeness == "incomplete"
-                            or not _accepted_copy_has_edition_label(data, title)):
-                        return RetrievalResult(source_name="local_cache", success=False,
-                            error="Edition-qualified library candidate could not be revalidated")
+                    return not (validation.identity_confidence == "rejected"
+                                or validation.completeness == "incomplete"
+                                or not _accepted_copy_has_edition_label(data, title))
+                decision, completeness = stored_copy(
+                    record, data, kind=kind, title=title, author=author, year=year,
+                    normalize_author=_normalize_cache_author,
+                    edition_check=edition_check if edition_title_fallback else None)
+                if not decision.reusable:
+                    return RetrievalResult(source_name="local_cache", success=False,
+                                           error=_STORED_COPY_ERRORS.get(decision.reason),
+                                           metadata={"reuse_refusal": decision.reason})
                 original_kind = (
                     RepresentationKind(record.original_kind)
                     if record.original_kind else None
                 )
-                completeness = record.completeness_verdict
-                if kind == RepresentationKind.PLAIN_TEXT:
-                    # Copies admitted before 2026-10-13 are read again: an
-                    # index record is not the work, and a page of notes or
-                    # listings is never its whole text.
-                    from app.services.abstract_only_pages import mostly_notes_or_listings
-                    stored_text = data.decode("utf-8", "replace")
-                    if _detect_nonwork_listing(" ".join(stored_text.split()), title):
-                        return RetrievalResult(source_name="local_cache", success=False,
-                                               error="Stored copy is a listing, not the cited work")
-                    if completeness == "complete" and mostly_notes_or_listings(stored_text):
-                        completeness = "not_assessed"
                 observed_fields = None
                 if getattr(record, "admitted_by", None) == "retrieval_pipeline":
                     # The canonical work holds the citation's own fields, so

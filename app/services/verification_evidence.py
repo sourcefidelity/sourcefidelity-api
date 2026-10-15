@@ -1754,13 +1754,11 @@ def authorize_representation(
         # Copies stored before 2026-10-13 are read again wherever they are
         # used: an index record is not the work, and a page of notes or
         # listings is never its whole text.
-        from app.services.abstract_only_pages import mostly_notes_or_listings
-        from app.services.source_validator import _detect_nonwork_listing
-        text = content.decode("utf-8", "replace")
-        if _detect_nonwork_listing(" ".join(text.split())):
+        from app.services.source_reuse import stored_text_today
+        decision, completeness_verdict = stored_text_today(
+            content.decode("utf-8", "replace"), title=None, completeness=completeness_verdict)
+        if not decision.reusable:
             raise SourceTextUnusable("Representation is a listing, not the cited work")
-        if str(completeness_verdict or "").casefold() == "complete" and mostly_notes_or_listings(text):
-            completeness_verdict = "not_assessed"
     return AuthorizedRepresentation(
         representation_id=str(record.id),
         canonical_work_id=str(record.canonical_work_id),

@@ -27,9 +27,6 @@ import re
 from dataclasses import dataclass, field
 
 POLICY = "lantern-pages-v1"
-# Pages separated by form feeds with printed page numbers (owner decision
-# 2026-10-14); a Lantern text stored before is read again once (rerun_reuse).
-PAGES_VERSION = "lantern-page-labels-v1"
 LANTERN = "https://lantern.mediahist.org"
 ARCHIVE = "https://archive.org"
 MAX_CONTIGUOUS_PAGES = 8

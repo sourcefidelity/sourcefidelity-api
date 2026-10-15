@@ -424,7 +424,8 @@ def test_native_route_searches_do_not_complete_the_ordinary_required_routes():
 
 
 def test_a_rerun_searches_again_until_the_native_route_completed():
-    from app.services.search.rerun_reuse import POLICY, native_script_route_due
+    from app.services.search.rerun_reuse import POLICY
+    from app.services.source_reuse import native_script_route_due
     ref = {'title': ROMANISED, 'raw_ref': ENTRY, 'source_kind': 'journal_article'}
     assert POLICY == 'paper-search-reuse-v5'
     assert native_script_route_due({'reference_discovery': _verified_discovery()}, ref)
