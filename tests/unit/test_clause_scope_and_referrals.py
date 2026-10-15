@@ -1,8 +1,9 @@
-import pytest
 """Owner decisions 2026-10-07 from the review of the owner's article: each source
 is judged on its own clause; "see" citations are not judged; a narrower hanging
 indent is stated as narrower, not missing."""
 from types import SimpleNamespace
+
+import pytest
 
 from app.services.candidate_relationship_judgment import _member_clause_spans
 from app.services.judgment_input import judgment_eligibility, referral_citation

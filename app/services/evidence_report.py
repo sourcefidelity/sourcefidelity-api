@@ -30,6 +30,7 @@ from app.services.report_paper_artifact import (
     load_authorized_report_paper_artifact,
     paper_surface_descriptor,
 )
+from app.services.citation_projection import heading_citation, project_citations, uncited_reference_ids
 from app.services.paper_extraction import (
     PaperExtractionArtifact,
     unresolved_marker_report_groups,
@@ -157,23 +158,6 @@ def _statement_text(claim) -> str:
     return claim.text[source_heading_statement_start(claim.text, claim.citation_marker):] or claim.text
 
 
-def heading_citation(citation: dict) -> bool:
-    """A heading naming a work with its citation ("Classical Hollywood: The Day
-    the Earth Stood Still (Wise, 1951)"): short, title-cased, holding the
-    citation and with no sentence punctuation at its end. A clause cut at its
-    citation is judged by its whole sentence (owner review 2026-10-14)."""
-    text = " ".join(str((citation.get("clause_of") or citation).get("student_text") or "").split())
-    marker = " ".join(str(citation.get("citation_marker") or "").split())
-    # The citation may also open the heading: "Killer's Kiss (1955): Classical
-    # Hollywood Film Analysis" (paper 6, 2026-10-04).
-    if not marker or marker not in text or re.search(r"[.!?;][\"”’')]*$", text):
-        return False
-    lead = text.replace(marker, " ", 1).strip(" :–-")
-    words = re.findall(r"[A-Za-z][\w'’\-]*", lead)
-    if not 1 <= len(words) <= 15 or re.search(r"[.!?;][\"”’')]*$", lead):
-        return False
-    long_words = [word for word in words if len(word) >= 4]
-    return bool(long_words) and sum(word[0].isupper() for word in long_words) >= 0.75 * len(long_words)
 
 
 def _hanging_indent_narrow(differences: list[dict]) -> bool:
@@ -332,6 +316,7 @@ def build_evidence_report_view(
         if discovery is not original_discoveries[reference_id]
     ]
 
+    projected_groups = []
     for group in aggregate.get("citation_groups", []):
         claim_id = group.get("claim_id")
         claim = claims.get(claim_id)
@@ -437,96 +422,10 @@ def build_evidence_report_view(
                 citation_has_attention = True
             members.append(item)
 
-        from app.services.candidate_relationship_judgment import citation_clause_segments
-        whole = {"student_text": claim.text, "citation_marker": claim.citation_marker}
-        segments = (None if claim.citation_marker_type == "source_heading" or heading_citation(whole)
-                    else citation_clause_segments(claim, [m.get("reference_id") for m in group.get("members", [])]))
-        if not segments:
-            citations.append(_citation_entry(
-                extraction, paper_surface, claim, members, citation_has_attention,
-                claim.passage_start, claim.passage_end, claim.text,
-                _normalize_display_text(_statement_text(claim))))
-            continue
-        # One sentence, several sources' own clauses: each clause and its
-        # marker is its own citation, shown with ellipses where the sentence
-        # goes on (owner decision 2026-10-07). The highlight is narrowed to the
-        # clause when the page is drawn.
-        whole_location = _paper_location(paper_surface, passage_start=claim.passage_start,
-                                         passage_end=claim.passage_end)
-        for local_start, local_end, reference_ids, opens, closes in segments:
-            part = [m for m in members if m.get("reference_id") in reference_ids]
-            text = claim.text[local_start:local_end]
-            display = ("" if opens else "…") + _normalize_display_text(text) + ("" if closes else "…")
-            entry = _citation_entry(
-                extraction, paper_surface, claim, part,
-                any(f["level"] == "attention" for m in part for f in m.get("reference_findings") or [])
-                or any((m.get(k) or {}).get("attention") for m in part for k in ("quotation_check", "locator_check")),
-                claim.passage_start + local_start, claim.passage_start + local_end, text, display)
-            entry["paper_location"] = deepcopy(whole_location)
-            entry["clause_of"] = {"student_text": claim.text, "paper_character_start": claim.passage_start}
-            citations.append(entry)
+        projected_groups.append((claim, group, members, citation_has_attention))
 
-    for marker in unresolved_marker_report_groups(extraction.citation_marker_census):
-        missing_members = _missing_reference_members(extraction, marker["passage_start"], marker["passage_end"])
-        marker_members = [
-            _unresolved_marker_member(
-                references[reference_id],
-                marker["reason_codes"],
-                reference_layout.get(reference_id),
-            )
-            for reference_id in marker["reference_ids"]
-            if reference_id in references
-        ]
-        citations.append(
-            {
-                "claim_id": marker["group_id"],
-                "paper_character_start": marker["passage_start"],
-                "paper_character_end": marker["passage_end"],
-                "student_text": marker["text"],
-                "display_student_text": _normalize_display_text(marker["text"]),
-                "citation_marker": marker["citation_marker"],
-                "claim_type": "not_assessed",
-                "page_locator": "",
-                "tone": "attention" if missing_members else "not_assessed",
-                "display_coverage": "none",
-                "paper_location": _paper_location(
-                    paper_surface,
-                    passage_start=marker["passage_start"],
-                    passage_end=marker["passage_end"],
-                ),
-                "members": marker_members,
-                "marker_only": not marker["recovered_sentence"],
-                "missing_reference_members": missing_members,
-                "reference_mismatch_members": _reference_mismatch_members(
-                    extraction, marker["passage_start"], marker["passage_end"]),
-                "reference_mismatch_details": _reference_mismatch_details(
-                    extraction, marker["passage_start"], marker["passage_end"]),
-                "boundary_reason": (
-                    "No reference-list entry was found for " + "; ".join(missing_members) + "."
-                    if missing_members else
-                    "The sentence cites more than one source, but the app could not determine safely which parts belong to each source. Compare the listed sources manually."
-                    if marker["recovered_sentence"] and marker_members
-                    else _reason_label(marker["reason_codes"][0])
-                ),
-            }
-        )
-
-    citations.sort(
-        key=lambda item: (
-            item["paper_character_start"],
-            item["paper_character_end"],
-            item["claim_id"],
-        )
-    )
-    # A heading that names a work with its citation states nothing to check
-    # (owner request 2026-10-03): it is not a citation, but its reference
-    # still counts as cited.
-    heading_reference_ids = sorted({member.get("reference_id") for citation in citations
-                                    if heading_citation(citation)
-                                    for member in citation.get("members") or [] if member.get("reference_id")})
-    citations[:] = [citation for citation in citations if not heading_citation(citation)]
-    for citation_number, citation in enumerate(citations, 1):
-        citation["citation_number"] = citation_number
+    citations, heading_reference_ids = project_citations(
+        extraction, paper_surface, projected_groups, references, reference_layout)
 
     consistency = aggregate.get("reference_consistency") or {}
     duplicate_attention_ids = {
@@ -3054,15 +2953,10 @@ def project_reference_flags(view: dict, document, paper_hash: str) -> dict:
     result['reference_numbers'] = reference_numbers(result)
     # References no citation links to, except a film or programme the paper
     # names by its title (owner decisions 2026-09-30).
-    from app.services.report_references import reference_catalog
     words = (result.get('paper_surface') or {}).get('selectable_words')
     paper_key = (_paper_key(result['paper_surface']) if words
                  else _fold_for_titles(' '.join(page.get_text() for page in document)))
-    headed = set(result.get('heading_reference_ids') or [])
-    result['uncited_reference_ids'] = [
-        entry['reference_id'] for entry in reference_catalog(result, result['reference_numbers'])
-        if not entry.get('citation_numbers') and entry['reference_id'] not in headed
-        and not _media_named_in_paper(entry.get('source') or {}, paper_key)]
+    result['uncited_reference_ids'] = uncited_reference_ids(result, result['reference_numbers'], paper_key)
     result.pop('role_summaries', None)   # the former per-audience summaries
     summary = result['summary'] = _build_report_summary(
         citations=result.get('citations') or [], overview=result.get('overview') or {},
