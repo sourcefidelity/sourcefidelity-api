@@ -12,6 +12,7 @@ from app.services import judgment_runs as runs
 def result_items(session, run, principal, *, after: int = 0, limit: int = 50) -> list[dict]:
     from app.models.report import VerificationReportRecord
     from app.services.judgment_report import display_state, judgment_result
+    from app.services.judgment_reasons import quotation_only
     from app.services.judgment_reserve import load_reserve
     items: list[dict] = []
     if run is None:
@@ -45,7 +46,8 @@ def result_items(session, run, principal, *, after: int = 0, limit: int = 50) ->
             "labels": (row.panel or {}).get("labels") or {},
             "formal_status": (row.panel or {}).get("formal_status"),
             "wider_search": row.wider_search,
-            "label": result["label"], "window_html": result["html"], "evidence": result["evidence"]})
+            "label": result["label"], "window_html": result["html"], "evidence": result["evidence"],
+            "quotation_only": quotation_only(row.reason_code)})
     return items
 
 

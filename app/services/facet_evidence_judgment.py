@@ -63,6 +63,19 @@ FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v7"
 MAX_EVIDENCE_SENTENCES_PER_CANDIDATE = 128
 MIN_EVIDENCE_SENTENCES_PER_CANDIDATE = 24
 _PROMPT_OVER_BUDGET = "The fixed facet prompt exceeded its configured budget."
+_SENTENCES_UNAVAILABLE = "Candidate or authorized evidence sentences were unavailable."
+_ANTECEDENT_NOT_UNIQUE = "Local document evidence did not resolve the candidate antecedent uniquely."
+_ANTECEDENT_NOT_EXACT = "The recorded local antecedent resolution lacked exact evidence."
+_ANTECEDENT_CONTEXT_MISSING = "Required bounded antecedent context was unavailable."
+# The Judgment reason each message that stops a claim before the judge means
+# (judgment_reasons, 2026-10-15); the run reads this, never the wording.
+PRE_CALL_REASONS = {
+    _PROMPT_OVER_BUDGET: "prompt_over_budget",
+    _SENTENCES_UNAVAILABLE: "evidence_unavailable",
+    _ANTECEDENT_NOT_UNIQUE: "antecedent_unresolved",
+    _ANTECEDENT_NOT_EXACT: "antecedent_unresolved",
+    _ANTECEDENT_CONTEXT_MISSING: "antecedent_unresolved",
+}
 MAX_FOUNDATION_SOURCE_SENTENCES = 1024
 
 _SYSTEM_PROMPT = """Map fixed student facet IDs to fixed source-sentence IDs.
@@ -608,7 +621,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Candidate or authorized evidence sentences were unavailable.",
+                    _SENTENCES_UNAVAILABLE,
                     context_resolution=(
                         "unresolved"
                         if candidate is not None and candidate.requires_antecedent_context
@@ -626,7 +639,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Local document evidence did not resolve the candidate antecedent uniquely.",
+                    _ANTECEDENT_NOT_UNIQUE,
                     context_resolution=local_context_status,
                 )
             )
@@ -639,7 +652,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "The recorded local antecedent resolution lacked exact evidence.",
+                    _ANTECEDENT_NOT_EXACT,
                     context_resolution="unresolved",
                 )
             )
@@ -652,7 +665,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Required bounded antecedent context was unavailable.",
+                    _ANTECEDENT_CONTEXT_MISSING,
                     context_resolution="unresolved",
                 )
             )

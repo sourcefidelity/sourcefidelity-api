@@ -42,13 +42,9 @@ UNDECIDED_WORDING_NOTE = "The model cannot decide if this statement is supported
 # Owner-approved wording (2026-10-09), shown on a judged statement describing a body of research.
 EXAMPLE_OF_RESEARCH_NOTE = ("Judged as an example of the research the statement describes; the statement's "
                             "overall picture of the research is the writer's own.")
-REFERRAL_NOTE = "Not judged: a \u201csee\u201d citation points to further reading rather than supporting a statement."
-# Owner wording 2026-10-14 (Harlow review): the reason a Not Judged result is not judged.
-NOT_JUDGED_NOTES = {
-    "antecedent_unresolved": "Not judged: it could not be determined what this statement refers to.",
-    "wider_search_unavailable": ("Not judged: the judge found no evidence in the sentences it read, and no "
-                                 "further sentences from the source were available to check."),
-}
+# The reason table (judgment_reasons, 2026-10-15); these names stay importable here.
+from app.services.judgment_reasons import NOT_JUDGED_NOTES, REFERRAL_NOTE  # noqa: E402,F401
+from app.services import judgment_reasons as reasons  # noqa: E402
 # Owner-approved wording (2026-10-12) for a citation that is only a quotation; since
 # 2026-10-13 it replaces the window heading (report_judgment.js), not a note.
 QUOTATION_ONLY_NOTE = "Not Judged - Quotation only"
@@ -58,11 +54,10 @@ def display_state(state: str | None, reason: str | None) -> str:
     """The shown state: an undecided judge is its own result (owner decision 2026-09-29)."""
     # The same results after a wider evidence search carry a "wider_search_"
     # prefix (paper 4 citation 8 showed Not Judged; 2026-10-02).
-    if state == "not_judged" and str(reason or "").removeprefix("wider_search_") in {"judge_undecided", "samples_split"}:
+    if state == "not_judged" and reasons.undecided(reason):
         return "undecided"
     return state if state in LABELS else "not_judged"
 JUDGED = frozenset({"supported", "qualified", "contradicts", "insufficient"})
-_RETRY_REASONS = frozenset({"judge_failed", "wider_search_judge_failed", "judge_unavailable"})
 # The judge names sentences by prompt alias (s1, s2, ...).
 _SENTENCE_ALIAS = re.compile(r"\bs(\d{1,3})\b")
 _REF = "\x00{}\x00"
@@ -265,19 +260,17 @@ def judgment_result(row: dict, payload: dict, reserve: dict | None, *, fake_pane
         # Answers with no shared result show their note about the statement and the
         # source (2026-10-03), else the fixed note; otherwise the statement was unresolved.
         coaching = row.get("coaching") or {}
-        if str(reason or "").removeprefix("wider_search_") != "samples_split":
+        if not reasons.samples_split(reason):
             note = UNDECIDED_WORDING_NOTE
         elif coaching.get("status") == "model" and coaching.get("version") == SPLIT_NOTE_VERSION and coaching.get("note"):
             note = coaching["note"]
         else:
             note = UNDECIDED_NOTE
         parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
-    if state == "not_judged" and reason == "referral_citation":
-        # Owner-approved wording (2026-10-07).
-        parts.append(f'<p class="jw-coaching">{escape(REFERRAL_NOTE)}</p>')
-    elif state == "not_judged" and reason in NOT_JUDGED_NOTES:
-        parts.append(f'<p class="jw-coaching">{escape(NOT_JUDGED_NOTES[reason])}</p>')
-    if reason in _RETRY_REASONS:
+    note = reasons.fixed_note(reason) if state == "not_judged" else None
+    if note:
+        parts.append(f'<p class="jw-coaching">{escape(note)}</p>')
+    if reasons.retryable(reason):
         parts.append('<p><button type="button" class="jw-retry" data-judgment-retry>Try Again</button></p>')
     parts.append("</section>")
     return {"state": state, "label": LABELS[state], "html": "".join(p for p in parts if p), "evidence": evidence}

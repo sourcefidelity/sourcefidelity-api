@@ -118,7 +118,7 @@
       const kind = label.querySelector('.evidence-kind');
       if (kind) {
         kind.dataset.kindText ??= kind.textContent;
-        const quotationOnly = state === 'not_judged' && items.length && items.every(i => i.reason_code === 'quotation_only');
+        const quotationOnly = state === 'not_judged' && items.length && items.every(i => i.quotation_only);
         kind.textContent = quotationOnly ? 'Quotation only' : kind.dataset.kindText;
       }
     }

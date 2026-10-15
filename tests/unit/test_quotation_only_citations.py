@@ -118,4 +118,7 @@ def test_the_heading_reads_the_owners_wording():
     result = judgment_result({"display_state": "not_judged", "reason_code": "quotation_only"}, {}, None)
     assert result["label"] == "Not Judged" and "Quotation only" not in result["html"]
     script = (Path(__file__).resolve().parents[2] / "app/services/report_judgment.js").read_text()
-    assert "i.reason_code === 'quotation_only'" in script and "'Quotation only'" in script
+    # The server marks the item from the reason table; the page only reads the mark (2026-10-15).
+    from app.services.judgment_reasons import quotation_only
+    assert quotation_only("quotation_only") and not quotation_only("referral_citation")
+    assert "i.quotation_only" in script and "'Quotation only'" in script and "'quotation_only'" not in script

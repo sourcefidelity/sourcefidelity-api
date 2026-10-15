@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.services import judgment_reasons
 from app.config import settings
 from app.models.job import Job
 from app.models.judgment import (
@@ -39,7 +40,6 @@ from app.services.judgment_coaching import COACHED_STATES, coach
 from app.services.judgment_report import candidate_text
 from app.services.judgment_panel import PANEL_VERSION, ArmResult, CandidatePanelResult, judge_candidate
 
-UNDECIDED_REASONS = frozenset({"judge_undecided", "judges_undecided"})
 from app.services.llm_service import chat_completion_json
 
 logger = logging.getLogger(__name__)
@@ -49,11 +49,6 @@ WHOLE_CITATION = "__citation__"
 NO_NOTICE = "none"
 _FAILURES_BEFORE_STOPPING = 3
 ACTIVE = frozenset({"queued", "running"})
-_PRE_CALL_REASONS = (
-    ("antecedent", "antecedent_unresolved"),
-    ("exceeded its configured budget", "prompt_over_budget"),
-    ("sentences were unavailable", "evidence_unavailable"),
-)
 
 
 
@@ -109,10 +104,12 @@ def eligible_members(view: dict) -> list[tuple[int | None, str]]:
 
 
 def _pre_call_reason(finding: CandidateFacetFinding) -> str:
-    text = " ".join(finding.limitations or [])
-    for needle, reason in _PRE_CALL_REASONS:
-        if needle in text:
-            return reason
+    """The reason the claim's preparation recorded, by its exact message
+    (facet_evidence_judgment.PRE_CALL_REASONS), never by searching the text."""
+    from app.services.facet_evidence_judgment import PRE_CALL_REASONS
+    for limitation in finding.limitations or []:
+        if limitation in PRE_CALL_REASONS:
+            return PRE_CALL_REASONS[limitation]
     return "not_assessed_before_judging"
 
 
@@ -331,13 +328,13 @@ def execute_run(
                     result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]
             coaching = None
             note_state = result.display_state
-            if (result.display_state == "not_judged" and result.reason_code in UNDECIDED_REASONS
+            if (result.display_state == "not_judged" and judgment_reasons.uncertain_judge(result.reason_code)
                     and any(a.finding is not None and a.finding.status == "uncertain"
                             for a in result.arms if a.status == "valid" and a.in_majority)):
                 # A judge left part of the statement uncertain: the note says why
                 # (owner decision 2026-09-30). An unresolved statement keeps its fixed note.
                 note_state = "undecided"
-            elif result.display_state == "not_judged" and result.reason_code.removeprefix("wider_search_") == "samples_split":
+            elif result.display_state == "not_judged" and judgment_reasons.samples_split(result.reason_code):
                 # Answers with no shared result: the note explains the statement and
                 # the source, never the answers (owner decision 2026-10-03).
                 note_state = "split"

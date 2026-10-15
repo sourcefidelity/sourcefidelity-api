@@ -189,7 +189,8 @@ def make_wider_search(session, verification_report_id, run):
         if result.display_state == "insufficient":
             state, reason = "insufficient", "agreed_no_evidence_after_wider_search"
         elif result.display_state == "not_judged":
-            state, reason = "not_judged", f"wider_search_{result.reason_code}"
+            from app.services.judgment_reasons import after_wider_search
+            state, reason = "not_judged", after_wider_search(result.reason_code)
         else:
             state, reason = result.display_state, "found_in_wider_search"
         return {"display_state": state, "reason_code": reason, "record": record, "spend_usd": result.spend_usd}
