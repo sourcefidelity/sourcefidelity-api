@@ -204,9 +204,11 @@ class TestChainFromArtifactToMark:
             "claim_sha256": hashlib.sha256(claim_text.encode()).hexdigest(),
         }
         def fake(c, t, *, source_title, coverage):
-            # Bind to the text actually sent, as the real call does.
-            bound = {**scope, "abstract_span": t[:24],
-                     "abstract_sha256": hashlib.sha256(t.encode()).hexdigest()}
+            # Bind to the text actually sent, whitespace collapsed, as the real call does.
+            from app.services.passage_relevance import scope_bound_text
+            sent = scope_bound_text(t)
+            bound = {**scope, "abstract_span": sent[:24],
+                     "abstract_sha256": hashlib.sha256(sent.encode()).hexdigest()}
             return {"status": "complete", "scope_assessment": bound,
                     "abstract_sha256": bound["abstract_sha256"],
                     "claim_sha256": bound["claim_sha256"]}

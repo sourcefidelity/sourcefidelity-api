@@ -146,7 +146,10 @@ def _scope_source_text(member: dict) -> tuple[str, bool]:
         evidence = member.get('best_evidence') or {}
         return str(evidence.get('text') or ''), not evidence.get('excerpt_truncated')
     scope_source = member.get('scope_source') or {}
-    return str(scope_source.get('text') or ''), bool(scope_source.get('text'))
+    # The assessment was bound to the excerpt with its whitespace collapsed.
+    from app.services.passage_relevance import scope_bound_text
+    text = scope_bound_text(scope_source.get('text'))
+    return text, bool(text)
 
 
 BROAD_CITATION_SOURCES = 3

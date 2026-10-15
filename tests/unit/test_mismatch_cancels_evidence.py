@@ -156,3 +156,13 @@ def test_the_run_gathers_evidence_even_for_a_topical_mismatch(monkeypatch):
     claim = SimpleNamespace(text=CLAIM, reference_ids=["r1"])
     paper_workflow._shadow_artifact(source, claim, True, active_reference_id="r1", cited_author_label="Ames")
     assert called == ["retrieval", "selection"]
+
+
+def test_a_limited_text_excerpt_with_line_breaks_keeps_its_mark():
+    # 2026-10-15: the assessment binds to the excerpt with its whitespace
+    # collapsed, so the report must compare the same form (944 of 1,030 stored
+    # retrieved-text assessments failed the binding; reference 13, two papers).
+    stored = "This article examines United States\n\nplatform markets  and their regulation."
+    scope = _scope()
+    member = _member(coverage_level="partial_text", scope_source={"text": stored}, scope=scope)
+    assert topical_mismatch(member, {"student_text": CLAIM})

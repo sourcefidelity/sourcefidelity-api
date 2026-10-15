@@ -1023,6 +1023,13 @@ def _complete_abstract_excerpt(text: str, excerpt: str) -> bool:
     ))
 
 
+def scope_bound_text(value) -> str:
+    """The form of a text a scope assessment is bound to: whitespace collapsed.
+    The report compares the same form (2026-10-15: line breaks in stored
+    excerpts had failed 944 of 1,030 retrieved-text bindings)."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def _assess_scope(
     claim,
     abstract_text: str,
@@ -1040,7 +1047,7 @@ def _assess_scope(
     own subject or stated scope exclude what the citation attributes to it —
     does not change with the route that produced the text.
     """
-    text = re.sub(r"\s+", " ", str(abstract_text or "")).strip()
+    text = scope_bound_text(abstract_text)
     if not text:
         return {"status": "not_assessed", "outcome": "abstract_unavailable"}
     masked_claim = redact_direct_identifiers(claim.text)
