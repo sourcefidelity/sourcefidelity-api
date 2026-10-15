@@ -1274,7 +1274,10 @@ _TITLE_NOISE_TOKENS = frozenset({
 })
 
 
-def _distinctive_title_tokens(title: str) -> set[str]:
+def _short_title_tokens(title: str) -> set[str]:
+    """Words that make a cited title long enough to match by containment
+    alone (`_landing_title_confirms`). It once shared the name of
+    `_distinctive_title_tokens` and silently replaced it (2026-10-15)."""
     return {token for token in re.split(r"[^A-Za-z0-9]+", title.lower())
             if len(token) >= 3 and token not in _TITLE_NOISE_TOKENS}
 
@@ -1365,7 +1368,7 @@ def _landing_title_confirms(cited_title: str, page_titles: list[str]) -> bool:
     from app.services.pdf_verifier import _aligned_title_containment, _normalize
     if not _html_title_matches(cited_title, page_titles):
         return False
-    if len(_distinctive_title_tokens(cited_title)) >= 4:
+    if len(_short_title_tokens(cited_title)) >= 4:
         return True
     cited = _normalize(cited_title)
     return any(_aligned_title_containment(cited, _normalize(page_title))
