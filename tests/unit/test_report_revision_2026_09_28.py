@@ -130,11 +130,12 @@ def test_decoding_never_produces_a_non_doi():
 
 
 def test_the_proposition_letter_follows_the_citation_number_before_its_references():
-    # Owner decision 2026-10-14 (Harlow): "Citation 3a – Reference 18, Reference 25".
-    from app.services.evidence_report import _citation_reference_headings
-    templates = '<template id="citation-panel-1"><h2>Citation 1<span data-proposition-suffix></span></h2></template>'
-    citations = [{"members": [{"reference_id": "r18"}, {"reference_id": "r25"}]}]
-    html = _citation_reference_headings(templates, citations, {"r18": 18, "r25": 25})
-    heading = html.split("<h2>")[1].split("</h2>")[0]
+    # Owner decision 2026-10-14 (Harlow): "Citation 3a – Reference 18, Reference 25";
+    # built once with the template (2026-10-15).
+    from app.services.evidence_report import citation_heading
+    citation = {"members": [{"reference_id": "r25"}, {"reference_id": "r18"}]}
+    heading = citation_heading("Citation 1", citation, {"r18": 18, "r25": 25})
     assert heading.startswith("Citation 1<span data-proposition-suffix></span> – ")
     assert heading.index("Reference 18") < heading.index("Reference 25")
+    assert citation_heading("Citation 2", {"members": [{"reference_id": "other"}]}, {"r18": 18}) == (
+        "Citation 2<span data-proposition-suffix></span>")

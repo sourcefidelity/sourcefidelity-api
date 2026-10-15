@@ -162,3 +162,15 @@ def test_a_located_book_record_takes_its_publisher_from_the_edition_details():
     assert record["publisher"] == "Greenwood" and record["year"] == "1994" and record["authors"] == ["Mary River"]
     discovery["candidates"][0]["observed"]["publisher"] = "Plains Press"
     assert _candidate_record(discovery, "c1")["publisher"] == "Plains Press"
+
+
+def test_a_grouped_finding_is_built_without_its_heading_or_reference_copy():
+    # 2026-10-15: built on its own, not rendered as a window and stripped.
+    from app.services.evidence_report import _finding_body, _render_reference_panel_template
+    finding = {"finding_type": "reference_order", "finding": "References are not in alphabetical order.",
+               "source": {"raw_reference": "Ames, A. (2020). Ports.", "author": "Ames, A.", "year": "2020",
+                          "title": "Ports"}}
+    window = _render_reference_panel_template(finding, 1)
+    assert "<h2>" in window and "own-reference" in window
+    body = _finding_body(finding, 1)
+    assert body == "<p>References are not in alphabetical order.</p>"

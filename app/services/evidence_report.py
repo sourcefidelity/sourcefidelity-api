@@ -2196,8 +2196,10 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     passages = [p for p in view.get('patchwriting_passages') or []
                 if isinstance(p, dict) and isinstance(p.get('number'), int)]
     patchwriting = _patchwriting_by_window(passages, citations)
+    from app.services.report_references import reference_catalog, reference_list_finding, reference_numbers
+    numbers = reference_numbers(view)
     for index, item in enumerate(citations, 1):
-        template = _render_panel_template(item, index, patchwriting=patchwriting)
+        template = _render_panel_template(item, index, patchwriting=patchwriting, numbers=numbers)
         overlapping = [(f, j) for j, f in enumerate(reference_practice, 1) if _formatting_overlaps(item, f)]
         # Owner wording 2026-09-30 for a parenthetical after the final punctuation.
         placement = ({'formatting': '<p class="reference-issue">This parenthetical citation is placed after '
@@ -2208,8 +2210,6 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
         related += guidance_links(_citation_guidance_kinds(item) + [f.get('finding_type') for f, _ in overlapping],
                                   citation_format)
         panel_templates += template.replace('</template>', related + '</template>')
-    from app.services.report_references import reference_catalog, reference_list_finding, reference_numbers
-    numbers = reference_numbers(view)
     catalog = reference_catalog({**view, 'citations': citations}, numbers)
     for index, item in enumerate(reference_practice, 1):
         if reference_list_finding(item) and item.get('reference_id') in numbers:
@@ -2221,7 +2221,6 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
                 f'<button type="button" data-panel-template="citation-panel-{i}">Citation {i}</button>' for i in related)
             template = template.replace('</template>',links+'</template>')
         panel_templates += template
-    panel_templates = _citation_reference_headings(panel_templates, citations, numbers)
     panel_templates += _passage_window_templates(passages, citations, numbers)
     paper_key = _paper_key(view.get('paper_surface') or {})
     for entry in catalog:
@@ -5490,7 +5489,21 @@ def _member_coverage_heading(item: dict, citation: dict | None = None) -> str:
     return heading
 
 
-def _render_panel_template(citation: dict, index: int, *, patchwriting: dict | None = None) -> str:
+def citation_heading(number_html: str, citation: dict, numbers: dict | None) -> str:
+    """A citation window's heading: its number, the slot the page fills with
+    the proposition letter ("Citation 3a", owner decision 2026-10-14), and its
+    references ("Citation N – Reference N", owner request 2026-10-02), each
+    opening its Reference window in the reference-heading colour."""
+    from app.services.report_references import reference_template_id
+    linked = sorted({numbers[m.get('reference_id')] for m in citation.get('members') or []
+                     if m.get('reference_id') in (numbers or {})})
+    links = ', '.join(f'<button type="button" class="reference-heading-link" '
+                      f'data-go-to="{reference_template_id(n)}">Reference {n}</button>' for n in linked)
+    return f'{number_html}<span data-proposition-suffix></span>' + (f' – {links}' if linked else '')
+
+
+def _render_panel_template(citation: dict, index: int, *, patchwriting: dict | None = None,
+                           numbers: dict | None = None) -> str:
     upload = citation.get("upload_action") or {}
 
     members = ''.join(
@@ -5525,7 +5538,7 @@ def _render_panel_template(citation: dict, index: int, *, patchwriting: dict | N
     heading = (f'<a href="#citation-location-{index}">Citation {index}</a>'
                if (citation.get('paper_location') or {}).get('rectangles') else f'Citation {index}')
     return (
-        f'<template id="citation-panel-{index}"><h2>{heading}<span data-proposition-suffix></span></h2>'
+        f'<template id="citation-panel-{index}"><h2>{citation_heading(heading, citation, numbers)}</h2>'
         f'{_render_citation_texts(citation)}'
         f'{navigation}'
         + f'{practice}{members}</template>'
@@ -5699,21 +5712,13 @@ def _category_heading(category: str, tag: str = 'h2') -> str:
     return f'<{tag}><strong class="issue-heading {category}">{label}</strong></{tag}>'
 
 
-_LEADING_HEADING = re.compile(
-    r'^\s*(?:<h[23][^>]*>.*?</h[23]>|<p><strong[^>]*>[^<]*</strong></p>)', re.S)
-
-
 def _finding_body(finding: dict, index: int, *, combined: bool = False) -> str:
     """One finding's content without its heading or its own copy of the reference.
 
     Findings are grouped under one heading per category (owner decision
     2026-09-24), so the per-finding heading is dropped here.
     """
-    inner = _render_reference_panel_template(finding, index, combined=combined)
-    inner = inner.split('>', 1)[1].rsplit('</template>', 1)[0]
-    inner = _LEADING_HEADING.sub('', inner, count=1)
-    inner = re.sub(r'<h3 class="own-reference-heading">Submitted Reference</h3>', '', inner)
-    inner = re.sub(r'<p class="full-reference own-reference">.*?</p>', '', inner, flags=re.S)
+    inner = _render_reference_panel_content(_worded_finding(finding), index, combined=combined, body_only=True)
     if finding.get('finding_type') == 'source_topical_mismatch':
         inner = '<p><mark class="issue-heading topical">Possible topical mismatch.</mark></p>' + inner
     return inner.replace('<h2', '<h3').replace('</h2>', '</h3>')
@@ -5839,13 +5844,19 @@ def _citation_guidance_kinds(citation: dict) -> list[str]:
     return kinds
 
 
-def _render_reference_panel_template(finding: dict, index: int, *, combined: bool = False) -> str:
+def _worded_finding(finding: dict) -> dict:
+    """A title-italics finding states what is wrong with the title."""
     kind = finding.get('finding_type')
     original = str(finding.get('finding') or '')
     if kind in {'reference_title_style','body_title_style'} and original.startswith(('Italicize','Use regular')):
         subject = 'The reference title' if kind == 'reference_title_style' else 'The title in the paper'
         finding = {**finding, 'finding':subject + (' lacks required italics.' if original.startswith('Italicize') else ' is incorrectly italicized.')}
-    content = _render_reference_panel_content(finding, index, combined=combined)
+    return finding
+
+
+def _render_reference_panel_template(finding: dict, index: int, *, combined: bool = False) -> str:
+    kind = finding.get('finding_type')
+    content = _render_reference_panel_content(_worded_finding(finding), index, combined=combined)
     if kind in SUBMITTED_LINK_FINDINGS | {'source_topical_mismatch'}:
         return content
     category = finding_category(kind)
@@ -5854,7 +5865,16 @@ def _render_reference_panel_template(finding: dict, index: int, *, combined: boo
     return re.sub(r'<h2>.*?</h2>', _category_heading(category), content, count=1)
 
 
-def _render_reference_panel_content(finding: dict, index: int, *, combined: bool = False) -> str:
+def _render_reference_panel_content(finding: dict, index: int, *, combined: bool = False,
+                                    body_only: bool = False) -> str:
+    """A reference finding's window; with `body_only`, its content alone, without
+    the window frame, its heading or the reference's own copy (a finding grouped
+    under one category heading, 2026-10-15)."""
+    def frame(heading: str, body: str) -> str:
+        return body if body_only else f'<template id="reference-panel-{index}">{heading}{body}</template>'
+
+    def own(html: str) -> str:
+        return '' if body_only else html
     finding = {**finding, 'finding': _panel_statement(finding.get('finding') or '')}
     if finding.get('finding_type') in {'potentially_fabricated_reference', 'reference_identifier_conflict',
                                        'unverified_reference'}:
@@ -5863,22 +5883,19 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         # identifier shown to reach a different work is not offered as a route
         # to the cited one. These records stay audit-only.
         source = {**finding['source'], 'reference_findings': [finding]}
-        reference = '' if combined else f'<p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'
+        reference = '' if combined else own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>')
         heading = '<p><strong>Citation and Reference Formatting</strong></p>' if combined else '<h2>Reference Information</h2>'
         if finding.get('finding_type') in SUBMITTED_LINK_FINDINGS:
             heading = '<h2>Submitted-Link Issue</h2>'
         records = credibility_records_html(finding)
         if finding.get('finding_type') == 'reference_identifier_conflict':
             # The identified record completes "The submitted DOI identifies:".
-            return (f'<template id="reference-panel-{index}">{heading}<p>{credibility_finding_html(finding)}</p>'
-                    + records + reference + '</template>')
-        return (f'<template id="reference-panel-{index}">{heading}<p>{credibility_finding_html(finding)}</p>'
-                + reference + records + '</template>')
+            return frame(heading, f'<p>{credibility_finding_html(finding)}</p>' + records + reference)
+        return frame(heading, f'<p>{credibility_finding_html(finding)}</p>' + reference + records)
     if finding.get('finding_type') == 'duplicate_reference_entry':
         rows = ''.join(f'<p class="full-reference">{_render_formatted_reference(peer, peer.get("raw_reference", ""))}</p>'
                        for peer in finding.get('related_references') or [])
-        return (f'<template id="reference-panel-{index}"><h2>Academic Practice</h2>'
-                f'<p>{escape(finding["finding"])}</p>{rows}</template>')
+        return frame('<h2>Academic Practice</h2>', f'<p>{escape(finding["finding"])}</p>{rows}')
     if finding.get('finding_type') == 'required_quotation_locator_missing':
         finding['finding'] = ('This passage lacks a page number or other numbered location.'
                               if finding.get('citation_style') == 'mla' else
@@ -5886,49 +5903,42 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
     source = finding["source"]
     if combined:
         # The citation panel already supplies the student text and source.
-        return (f'<template id="reference-panel-{index}"><p><strong>Citation and Reference Formatting</strong></p>'
-                f'<p class="reference-issue">{escape(finding["finding"])}</p></template>')
+        return frame('<p><strong>Citation and Reference Formatting</strong></p>',
+                     f'<p class="reference-issue">{escape(finding["finding"])}</p>')
     if finding.get('finding_type') == 'source_topical_mismatch':
-        return (f'<template id="reference-panel-{index}"><h2>Abstract Retrieved – <mark class="issue-heading topical">Possible Topical Mismatch</mark></h2>'
-                f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
-                f'<p>{escape(finding["finding"])}</p><h3>Selected Citation</h3>'
+        return frame('<h2>Abstract Retrieved – <mark class="issue-heading topical">Possible Topical Mismatch</mark></h2>',
+                own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>')
+                + f'<p>{escape(finding["finding"])}</p><h3>Selected Citation</h3>'
                 f'<blockquote>{escape(finding["citation_text"])}</blockquote><h3>Abstract</h3>'
-                f'<blockquote>{translated_text_html(finding["abstract_text"], finding.get("evidence_translations"))}</blockquote></template>')
+                f'<blockquote>{translated_text_html(finding["abstract_text"], finding.get("evidence_translations"))}</blockquote>')
     if finding.get('finding_type') == 'submitted_link_issue':
-        return (f'<template id="reference-panel-{index}"><h2>Submitted-Link Issue</h2>'
-                f'<p>{escape(finding["finding"])}</p><p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'
-                + '</template>')
+        return frame('<h2>Submitted-Link Issue</h2>', f'<p>{escape(finding["finding"])}</p>'
+                     + own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, source.get("raw_reference", ""))}</p>'))
     if finding.get('finding_type') == 'required_quotation_locator_missing':
         mla = finding.get('citation_style') == 'mla'
         heading = 'Passage location missing' if mla else 'Quotation location missing'
-        return (f'<template id="reference-panel-{index}"><h2>{heading}</h2>'
-                f'<p>{escape(finding["finding"])}</p><blockquote>{escape(finding["quote_text"])}</blockquote>'
-                f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
-                '</template>')
+        return frame(f'<h2>{heading}</h2>', f'<p>{escape(finding["finding"])}</p><blockquote>{escape(finding["quote_text"])}</blockquote>'
+                     + own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'))
     if finding.get('finding_type') in {'reference_title_style', 'reference_order', 'body_title_style'}:
         heading = ('Body title formatting' if finding['finding_type']=='body_title_style' else
                    'Reference title formatting' if finding['finding_type']=='reference_title_style' else 'Reference order')
-        return (f'<template id="reference-panel-{index}"><h2>{heading}</h2>'
-                f'<p>{escape(finding["finding"])}</p>'
-                f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'
-                '</template>')
+        return frame(f'<h2>{heading}</h2>', f'<p>{escape(finding["finding"])}</p>'
+                     + own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, source["raw_reference"])}</p>'))
     if finding.get('finding_type') == 'assessment_link_missing':
-        return (f'<template id="reference-panel-{index}"><h2>Assessment-Required Link Missing</h2>'
-                f'<p>{escape(finding["finding"])}</p><p>This is an assessment requirement, not a universal citation-style rule. '
-                'A DOI, ordinary URL, or library permalink satisfies the presence check; public full-text access is not required.</p>'
-                f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
+        return frame('<h2>Assessment-Required Link Missing</h2>',
+                     f'<p>{escape(finding["finding"])}</p><p>This is an assessment requirement, not a universal citation-style rule. '
+                     'A DOI, ordinary URL, or library permalink satisfies the presence check; public full-text access is not required.</p>'
+                     + own(f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p>'))
     if finding.get('finding_type') == 'required_author_missing':
-        return (f'<template id="reference-panel-{index}"><h2>Required Author Missing</h2>'
-                f'<p>{escape(finding["finding"])}</p>'
-                '<p>The author is verified from bibliographic registration metadata, not citation evidence.</p>'
-                f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
+        return frame('<h2>Required Author Missing</h2>', f'<p>{escape(finding["finding"])}</p>'
+                     '<p>The author is verified from bibliographic registration metadata, not citation evidence.</p>'
+                     + own(f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p>'))
     if finding.get('finding_type') == 'required_doi_missing':
         from urllib.parse import quote
         doi = str(finding['verified_doi'])
-        return (f'<template id="reference-panel-{index}"><h2>Required DOI Missing</h2>'
-                f'<p>{escape(finding["finding"])}</p>'
-                f'<p>Verified DOI: <a href="https://doi.org/{escape(quote(doi, safe="/"), quote=True)}" target="_blank" rel="noopener noreferrer">{escape(doi)}</a></p>'
-                f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p></template>')
+        return frame('<h2>Required DOI Missing</h2>', f'<p>{escape(finding["finding"])}</p>'
+                     f'<p>Verified DOI: <a href="https://doi.org/{escape(quote(doi, safe="/"), quote=True)}" target="_blank" rel="noopener noreferrer">{escape(doi)}</a></p>'
+                     + own(f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p>'))
     fallback = ". ".join(
         value for value in (source["author"], source["year"], source["title"]) if value
     ) or source["raw_reference"]
@@ -5946,29 +5956,24 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         # The finding names the issue and the located record follows in full;
         # the field list, located value and provider line were removed
         # (owner decision 2026-09-30).
-        return (
-            f'<template id="reference-panel-{index}"><h2>Reference Information</h2>'
+        return frame('<h2>Reference Information</h2>', (
             f'<p>{escape(finding["finding"])}</p>'
             + (f'<p><strong>In your reference:</strong> {escape(str(difference.get("submitted_value") or "Not retained"))}</p>'
-               if difference else '') +
-            '<h3 class="own-reference-heading">Submitted Reference</h3>'
-            f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>'
-            '<h3>Located Record</h3>'
+               if difference else '')
+            + own('<h3 class="own-reference-heading">Submitted Reference</h3>'
+                  f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>')
+            + '<h3>Located Record</h3>'
             f'<p class="full-reference">{escape(located_text or "No displayable located-record fields were retained.")}'
             + (f' <a class="reference-url" href="{escape(located["page_url"], quote=True)}" target="_blank" '
                f'rel="noopener noreferrer">{escape(located["page_url"])}</a>'
                if _safe_reference_href(str(located.get("page_url") or "")) else '')
-            + '</p></template>'
-        )
+            + '</p>'))
     related = "".join(
         f'<p class="full-reference">{_render_formatted_reference(peer, peer["raw_reference"])}</p>'
         for peer in finding.get("related_references") or []
     )
-    return (
-        f'<template id="reference-panel-{index}"><h2>Reference Practice</h2>'
-        f'<p>{escape(finding["finding"])}</p>'
-        + (related or f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>') + '</template>'
-    )
+    return frame('<h2>Reference Practice</h2>', f'<p>{escape(finding["finding"])}</p>'
+                 + (related or own(f'<p class="full-reference own-reference">{_render_formatted_reference(source, fallback)}</p>')))
 
 
 def _media_named_in_paper(source: dict, paper_key: str) -> bool:
@@ -6019,27 +6024,6 @@ def _passage_window_templates(passages: list[dict], citations: list[dict], numbe
                          '<strong class="issue-heading academic">Academic Practice</strong>'
                          f' – {links}</h2><ul class="finding-list">{render_patchwriting([w["item"] for w in rows], as_items=True, show_reference=True)}</ul></template>')
     return ''.join(templates)
-
-
-def _citation_reference_headings(templates: str, citations: list[dict], numbers: dict[str, int]) -> str:
-    """"Citation N – Reference N" (owner request 2026-10-02), "Citation 3a –
-    Reference N" for a proposition (owner decision 2026-10-14): each linked
-    reference opens its Reference window, in the reference-heading colour."""
-    from app.services.report_references import reference_template_id
-
-    def heading(match):
-        citation = citations[int(match.group(2)) - 1] if 0 < int(match.group(2)) <= len(citations) else {}
-        linked = sorted({numbers[m.get('reference_id')] for m in citation.get('members') or []
-                         if m.get('reference_id') in numbers})
-        if not linked:
-            return match.group(0)
-        links = ', '.join(f'<button type="button" class="reference-heading-link" '
-                          f'data-go-to="{reference_template_id(n)}">Reference {n}</button>' for n in linked)
-        # The proposition letter stays with the citation number: "Citation 3a –
-        # Reference 18" (owner decision 2026-10-14).
-        return f'{match.group(1)}{match.group(3)} – {links}'
-    return re.sub(r'(<template id="citation-panel-(\d+)"><h2>.*?)(<span data-proposition-suffix></span>)',
-                  heading, templates)
 
 
 def _submitted_link_refused(member: dict) -> bool:
