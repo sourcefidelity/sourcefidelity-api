@@ -93,10 +93,19 @@ def find_reusable_report(
                                 .order_by(Report.report_version.desc(), Report.created_at.desc()).limit(1))
         if report is None or (report.report_json or {}).get(FINGERPRINT_KEY) != fingerprint:
             continue
+        if _model_calls_failed(report):
+            continue
         if not _paper_copy_available(session, job, current):
             continue
         return job, report
     return None
+
+
+def _model_calls_failed(report: Report) -> bool:
+    """A run some of whose model calls went unanswered (a provider outage) is
+    not this submission's result: it is checked again (2026-10-15)."""
+    metrics = ((report.report_json or {}).get("evidence_report") or {}).get("processing_metrics") or {}
+    return int(metrics.get("missing_usage_calls") or 0) > 0
 
 
 def _paper_copy_available(session: Session, job: Job, current: datetime) -> bool:

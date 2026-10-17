@@ -15,7 +15,8 @@ Scope = Literal['outside_bound', 'material', 'unknown', 'resolved_different', 'c
 
 
 def text_key(text):
-    text = re.sub(r'<[^>]*>', ' ', text or '')
+    from app.services.lookalike_letters import fold_lookalikes
+    text = fold_lookalikes(re.sub(r'<[^>]*>', ' ', text or ''))
     return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', text).casefold()).strip()
 
 

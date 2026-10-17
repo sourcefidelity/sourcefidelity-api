@@ -301,6 +301,12 @@ def identity_observed(url, content_sha256, reason, fields=(), *, differences=())
                'bibliographic_identity_unconfirmed': 'unconfirmed'}.get(reason)
     if not outcome:
         return
+    from app.services.web_source_metadata import is_video_host
+    if is_video_host(url) and outcome == 'bibliographic_conflict':
+        # A video page's title, upload date and uploader are the uploader's,
+        # not the work's: the link is checked only for whether it opens
+        # (owner decision 2026-10-16).
+        return
     for row in ACTIVE_LINKS.get() or []:
         if row.request_sha256 != binding(str(url)):
             continue
@@ -392,6 +398,9 @@ def validated_response_identity(url, content_sha256, reason, fields=()):
                'medium': 'unconfirmed', 'low': 'unconfirmed'}.get(reason)
     if not url or not outcome:
         return []
+    from app.services.web_source_metadata import is_video_host
+    if is_video_host(url) and outcome == 'bibliographic_conflict':
+        outcome, fields = 'unconfirmed', []
     records = []
     for row in ACTIVE_LINKS.get() or []:
         for request in row.requests:

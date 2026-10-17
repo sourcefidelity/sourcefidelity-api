@@ -62,6 +62,9 @@ def prioritize_svg_highlights(markup):
             classes = set(element.get('class', '').split())
             priority = (3 if classes & {'academic-highlight', 'unverified-highlight', 'quote-difference-mark', 'mark-practice'} else
                         2 if classes & {'reference-formatting-hit', 'indicator-reference'} else
+                        # An uncited reference's whole-entry yellow sits under the
+                        # entry's own finding marks (2026-10-16).
+                        1.8 if 'uncited-highlight' in classes else
                         1.5 if 'mark-relevance' in classes else
                         1 if classes & {'source-highlight', 'selection-bg'} else 0)
             if priority:

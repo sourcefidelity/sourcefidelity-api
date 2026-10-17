@@ -417,3 +417,24 @@ def test_an_author_note_credits_a_manuscript_without_a_byline(heading):
 
 def test_a_surname_far_below_the_title_without_an_author_note_gets_no_credit():
     assert check(manuscript_with_author_note("Further reading")).identity_confidence != "high"
+
+
+def test_a_cited_surname_inside_a_hyphenated_byline_name_is_not_credited():
+    front = ("An Introduction to the Larkmere-Vance Conjecture\nO. Quillby\n"
+             "Notes for a lecture course on curves.")
+    credited, *_ = validator._author_observation(front, None, "Introduction", "Vance, R.",
+                                                 validator._normalize_identity_text(front))
+    assert not credited
+    whole, *_ = validator._author_observation(front.replace("O. Quillby", "R. Larkmere-Vance"),
+                                              None, "Introduction", "Larkmere-Vance, R.", "")
+    assert whole
+
+
+def test_a_one_word_title_inside_a_longer_title_is_not_prominent():
+    spans = [{'text': 'An Introduction to the Larkmere-Vance Conjecture',
+              'bbox': (50, 40, 500, 60), 'size': 18.0},
+             {'text': 'Notes for a lecture course on curves. ' * 5,
+              'bbox': (50, 400, 500, 420), 'size': 10.0}]
+    assert not validator._title_in_layout_spans(spans, 800.0, "Introduction")
+    alone = [{**spans[0], 'text': 'Introduction'}, spans[1]]
+    assert validator._title_in_layout_spans(alone, 800.0, "Introduction")

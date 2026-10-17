@@ -186,3 +186,77 @@ def test_a_cached_lantern_copy_without_page_numbers_is_read_again():
     labelled = {"printed_page_labels": {"labels": ["26", None]}}
     assert not _stale_lantern_copy(SimpleNamespace(provenance="lantern", validation_evidence=labelled))
     assert not _stale_lantern_copy(SimpleNamespace(provenance="crossref", validation_evidence={}))
+
+
+def test_an_article_continued_at_the_back_of_the_issue_is_read_from_its_first_page():
+    from app.services.retrieval.lantern import cited_page_ranges
+    assert cited_page_ranges("Q. (1947, March). Ask the editor. Fanmag, 50–51, 90–92.") == [(50, 51), (90, 92)]
+    assert cited_page_ranges("Q. (1945). A title. Fanmag, 49(10), 30–31, 74–75.") == [(30, 31), (74, 75)]
+    assert cited_page_ranges("Rowe, K. (1932). Strikes. Movie Classic, 41.") == [(41, 41)]
+    assert cited_page_ranges("Rowe, K. (1932). Strikes. Photoplay, 1932.") == []
+    pages = {20: "50", 21: "51", 30: "90", 31: "91", 32: "92"}
+    ocr = {20: "Ask the Editor. By Orla Quill. The studio answers.", 21: "More answers.",
+           30: "Ask the Editor (Continued from page 51)", 31: "and so on", 32: "the end"}
+
+    def get(url):
+        if url.endswith(".json") and "/catalog/" in url:
+            return _response(url, payload={"data": {"attributes": {"title": {"attributes": {"value": "Fanmag"}},
+                                                                   "dateStart": {"attributes": {"value": "1947"}}}}})
+        if url.endswith("_page_numbers.json"):
+            return _response(url, payload={"pages": [{"leafNum": k, "pageNumber": v} for k, v in pages.items()]})
+        leaf = int(url.rsplit("_", 1)[1])
+        return _response(url, text=f'<div class="card card-body ">{ocr.get(leaf, "")}</div>')
+    article = read_article("https://lantern.mediahist.org/catalog/vol_0030", title="Ask the editor",
+                           raw_ref="Quill, O. (1947, March). Ask the editor. Fanmag, 50–51, 90–92.",
+                           get=get, get_archive=get)
+    assert article.leaves == [20, 21, 30, 31, 32] and article.complete
+    assert article.printed_pages == ["50", "51", "90", "91", "92"]
+
+
+def test_the_issue_nearest_after_the_linked_page_is_tried_first():
+    # Ten bound issues each print a page 30; the linked contents page is in the ninth.
+    pages = {leaf: "30" for leaf in range(10, 110, 10)}
+    ocr = {90: "How the Star Has Changed! The studio speaks."}
+
+    def get(url):
+        if url.endswith(".json") and "/catalog/" in url:
+            return _response(url, payload={"data": {"attributes": {"title": {"attributes": {"value": "Fanmag"}},
+                                                                   "dateStart": {"attributes": {"value": "1945"}}}}})
+        if url.endswith("_page_numbers.json"):
+            return _response(url, payload={"pages": [{"leafNum": k, "pageNumber": v} for k, v in pages.items()]})
+        leaf = int(url.rsplit("_", 1)[1])
+        return _response(url, text=f'<div class="card card-body ">{ocr.get(leaf, "")}</div>')
+    article = read_article("https://lantern.mediahist.org/catalog/vol_0085", title="How the star has changed",
+                           raw_ref="Q. (1945, August). How the star has changed. Fanmag, 30.", get=get, get_archive=get)
+    assert article is not None and article.leaves == [90]
+
+
+def test_a_searched_article_is_read_from_the_first_page_after_its_contents_line():
+    from app.services.retrieval.lantern import article_first_leaf
+    pages = {876: "4", 902: "30", 903: "31", 1002: "30"}
+
+    def get_archive(url):
+        return _response(url, payload={"pages": [{"leafNum": k, "pageNumber": v} for k, v in pages.items()]})
+    assert article_first_leaf("vol", 876, 30, get_archive) == 902
+    assert article_first_leaf("vol", 902, 30, get_archive) == 902
+    assert article_first_leaf("vol", 876, None, get_archive) == 876
+    # Beyond one issue's span the found page itself is read.
+    assert article_first_leaf("vol", 700, 30, get_archive) == 700
+
+
+def test_a_headline_counts_in_order_and_little_words_do_not():
+    from app.services.retrieval.lantern import searched_article_on_spread, title_in_order
+    assert title_in_order("Doin' the Shorty-George!", "SHORTY. GEORGE! Fred Astaire and his partner")
+    scattered = ("the stars of the week " + "filler words about the studio " * 4
+                 + "a girl from Ohio " + "more filler about pictures " * 4 + "who changed her name")
+    assert not title_in_order("The Girl Who Changed the Stars", scattered)
+    assert not title_in_order("Exciting woman", "an exciting week for a woman")
+    # A graphic headline OCR cannot read: the cited author's byline confirms a searched page.
+    assert searched_article_on_spread("Exciting woman", "Vidor", "Days to remember from an ace director",
+                                      "CHARLES VIDOR As told to a writer")
+    assert not searched_article_on_spread("Exciting woman", "Vidor", "Days to remember", "As told to a writer")
+
+
+def test_a_year_with_an_apa_letter_falls_within_the_volume_dates():
+    from app.services.retrieval.lantern import year_in_dates
+    assert year_in_dates("1946b", "Photoplay (Jul-Dec 1946)") and not year_in_dates("1947a", "Jul-Dec 1946")

@@ -381,6 +381,14 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
     expected = discovery.get('expected') or {}
     kind = normalize_source_kind(expected.get('source_kind') or getattr(reference, 'source_kind', None))
     result['source_kind'] = kind
+    archive_page = discovery.get('periodical_archive_match') or {}
+    if archive_page.get('page_id'):
+        # A digitised magazine page shows the article (media-history-archive-v1):
+        # shown as a possible match and never flagged (2026-10-16).
+        result.update(status='possible_match', reason_code='periodical_archive_page_located',
+                      archive_page={k: archive_page.get(k) for k in
+                                    ('page_id', 'publication', 'volume_dates', 'read_url', 'excerpt')})
+        return result
     if not web_rule and not is_bibliographically_searchable(kind):
         result['reason_code'] = 'not_held_by_academic_indexes'
         return result

@@ -458,7 +458,9 @@ def test_a_book_keeps_its_publisher():
     ([], 'Neumeyer', 'unresolved'),
     # A second name or a contributor clause does not show a single author.
     (['John Belton and Jane Doe.'], 'Belton', 'unresolved'),
-    (['John Belton ; with a foreword by X.'], 'Belton', 'unresolved'),
+    # Added material by another person is not co-authorship (2026-10-16).
+    (['John Belton ; with a foreword by X.'], 'Belton', 'single_authored'),
+    (['John Belton ; with contributions by X and Y.'], 'Belton', 'unresolved'),
     (['Someone Else.'], 'Belton', 'unresolved'),
 ])
 def test_the_title_page_statement_decides_single_authorship(statements, surname, expected):
@@ -515,6 +517,9 @@ def test_the_container_is_a_monograph_only_on_a_single_author_statement(monkeypa
 
     resolver = sr.SourceResolver.__new__(sr.SourceResolver)
     resolver._retrieval_sources = [Catalogue()]
+    # No national catalogue answers here (they are tested separately).
+    monkeypatch.setattr('app.services.retrieval.title_page_catalogues.catalogue_statements',
+                        lambda title, surname, get: None)
     monkeypatch.setattr(resolver, 'resolve_reference', lambda probe, identity_only: RetrievalResult(
         source_name='bibliography_identity', success=False,
         metadata={'reference_discovery': {'outcome': outcome}}), raising=False)
@@ -539,8 +544,37 @@ def test_the_containing_book_is_looked_up_whenever_the_part_is_unconfirmed(outco
     resolver = sr.SourceResolver.__new__(sr.SourceResolver)
     resolver._identify_container_work = lambda reference: {'status': 'identified'}
     discovery = {'outcome': outcome}
-    resolver._attach_container_identity(parsed(BELTON, 'Belton, J'), discovery)
-    assert ('container_identity' in discovery) is looked_up
+    resolver._container_responsibility = lambda title, author: {'classification': 'unresolved'}
+    _trace, attached = resolver._attach_container_identity(parsed(BELTON, 'Belton, J'), {}, discovery)
+    # A confirmed chapter gets only the title-page check, never a book search.
+    assert (attached.get('container_identity', {}).get('status') == 'identified') is looked_up
+
+
+def test_once_the_book_is_identified_a_part_title_namesake_no_longer_decides_the_part():
+    from app.services import source_resolver as sr
+    from app.services.reference_discovery import (BibliographicFieldComparison,
+                                                  ExpectedBibliographicFields, ReferenceDiscoveryCandidate)
+    resolver = sr.SourceResolver.__new__(sr.SourceResolver)
+    resolver._identify_container_work = lambda reference: {'status': 'identified', 'title': 'Bright lights'}
+    resolver._discovery_artifacts = lambda: ({'trace': 'again'}, {'outcome': 'possible_match'})
+
+    def compare(field, outcome):
+        return BibliographicFieldComparison(field_name=field, outcome=outcome, reason_code=f'{field}_{outcome}')
+    namesake = ReferenceDiscoveryCandidate(
+        candidate_id='candidate-1', attempt_id='attempt-1', provider='web_search', plausible_identity_match=True,
+        comparisons=[compare('title', 'agreement'), compare('author', 'material_conflict')])
+    expected = ExpectedBibliographicFields(title='Postwar changes', authors=['Quillby, O.'],
+                                           container_title='Bright lights', source_kind='book_section')
+    token = sr._ACTIVE_DISCOVERY_TRACE.set({'expected': expected, 'candidates': [namesake]})
+    try:
+        trace, discovery = resolver._attach_container_identity(
+            parsed(BELTON, 'Belton, J'), {'trace': 'first'}, {'outcome': 'bibliographic_conflict'})
+    finally:
+        sr._ACTIVE_DISCOVERY_TRACE.reset(token)
+    assert not namesake.is_credible and namesake.disposition_reason_code == 'part_title_namesake'
+    assert trace == {'trace': 'again'}
+    assert discovery == {'outcome': 'possible_match', 'container_identity': {'status': 'identified',
+                                                                          'title': 'Bright lights'}}
 
 
 
@@ -605,3 +639,129 @@ def test_a_repeated_publisher_and_a_web_reference_without_a_title_are_reported()
                               raw_ref="Lee, K. (2020). A chapter. In A. Editor (Ed.), Example Press handbook. Example Press.")
     found = {f["reference_id"]: f["finding"] for f in reference_element_findings([blom, site, titled, chapter], "apa")}
     assert found == {"r1": PUBLISHER_REPEATED_TEXT, "r2": TITLE_MISSING_TEXT}
+
+
+def test_a_chapter_of_an_identified_single_authored_book_is_reported_as_such_not_as_missing_editors():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import chapter_form_findings
+    raw = 'Quillby, O. (2004). Glamour. In Bright lights (pp. 1-20). Harbour Press.'
+    ref = SimpleNamespace(raw_ref=raw, source_kind='book_section', needs_review=False,
+                          reference_id='ref-1', author='Quillby, O.')
+    monograph = {'ref-1': {'is_monograph': True, 'title': 'Bright Lights', 'authors': ['O. Quillby']}}
+    findings = chapter_form_findings([ref], 'apa', monograph)
+    assert [f['finding_type'] for f in findings] == ['contribution_author_is_volume_editor']
+    assert findings[0]['finding'] == ('The located work Bright Lights is a single-authored book, not an '
+                                      'edited collection, so this reference cites a part of it as though '
+                                      'it were a chapter in an edited volume.')
+    edited = {'ref-1': {'is_monograph': False, 'title': 'Bright Lights'}}
+    assert [f['finding_type'] for f in chapter_form_findings([ref], 'apa', edited)] == ['chapter_editors_missing']
+
+
+def test_a_chapter_uses_the_library_copy_of_its_book_only_with_the_same_author_and_year():
+    from app.services import source_resolver as sr
+    from app.services.retrieval.base import RetrievalResult
+    from app.services.source_type import SourceKindAssessment
+    resolver = sr.SourceResolver.__new__(sr.SourceResolver)
+    looked_up = []
+
+    def cache(doi, isbn, title, **kwargs):
+        looked_up.append(title)
+        return RetrievalResult(source_name='local_cache', success=True, title='Bright lights: Stars and society',
+                               authors=['Quillby, O'], year='2004')
+    resolver._check_local_cache = cache
+    chapter = SourceKindAssessment('book_section', 'high', ('fixture',))
+    found = resolver._check_local_cache_for_book('Bright lights: Stars and society (2nd ed.)', chapter,
+                                                 author='Quillby, O.', year='2004')
+    assert found.success and found.metadata['held_as_book_of_cited_part']
+    assert looked_up == ['Bright lights: Stars and society']
+    other = resolver._check_local_cache_for_book('Bright lights: Stars and society', chapter,
+                                                 author='Marsh, T.', year='2004')
+    assert not other.success and other.metadata['reuse_refusal'] == 'book_copy_author_or_year_differs'
+    assert resolver._check_local_cache_for_book('Bright lights', SourceKindAssessment('monograph', 'high', ('x',)),
+                                                author='Quillby, O.', year='2004') is None
+
+
+def test_added_material_by_another_person_leaves_a_book_single_authored():
+    from app.services.retrieval.open_library import classify_responsibility
+    assert classify_responsibility(["by Orla Quillby.", "Orla Quillby ; with a supplementary chapter and "
+                                    "bibliography by Tam Marsh."], "Quillby") == "single_authored"
+    assert classify_responsibility(["Orla Quillby and Tam Marsh."], "Quillby") == "unresolved"
+    assert classify_responsibility(["Orla Quillby ; with a new introduction by Tam Marsh", "edited by Orla Quillby"],
+                                   "Quillby") == "edited"
+
+
+def test_an_open_library_main_title_without_its_subtitle_is_the_cited_book(monkeypatch):
+    from types import SimpleNamespace
+    from app.services.retrieval import open_library as ol
+    from app.services.retrieval.base import RetrievalResult
+    retriever = ol.OpenLibraryRetriever.__new__(ol.OpenLibraryRetriever)
+    found = RetrievalResult(source_name="open_library", success=True, title="The Star System",
+                            authors=["Orla Quillby"], metadata={"open_library_key": "/works/OL1W"})
+    retriever.search_by_title_author = lambda title, author: found
+    monkeypatch.setattr(ol.provider_gate, "paced_get", lambda *a, **k: (_ for _ in ()).throw(ol.httpx.HTTPError("x")))
+    retriever.provider_metrics = {"calls": 0}
+    retriever.policy = SimpleNamespace(min_interval_seconds=0, timeout_seconds=1)
+    assert retriever.statements_of_responsibility("The Star System: Production of Identities", "Quillby, O.")[
+        "reason"] == "editions_unavailable"
+    assert retriever.statements_of_responsibility("The Star Witness", "Quillby, O.")["reason"] == "title_differs"
+
+
+def test_chapter_findings_mark_the_part_they_concern_not_the_whole_entry():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import chapter_form_findings
+    raw = 'Quillby, O. (2004). Glamour. In Bright lights. Harbour Press.'
+    ref = SimpleNamespace(raw_ref=raw, source_kind='book_section', needs_review=False, reference_id='ref-1',
+                          author='Quillby, O.', title='Glamour', container_title='Bright lights')
+    edited = {f['finding_type']: f for f in chapter_form_findings([ref], 'apa', {})}
+    assert edited['chapter_editors_missing']['locate_value'] == 'In Bright lights'
+    assert edited['chapter_pages_missing']['locate_value'] == 'In Bright lights'
+    single = chapter_form_findings([ref], 'apa', {'ref-1': {'is_monograph': True, 'title': 'Bright Lights'}})
+    assert [f['locate_value'] for f in single if f['finding_type'] == 'contribution_author_is_volume_editor'] == ['Glamour']
+
+
+def test_a_reference_without_a_journal_or_publisher_marks_its_title():
+    from app.services.reference_formatting import reference_entry_findings
+    from app.services.schemas import ParsedReference
+    raw = "Quillby, O. (2021). The lantern era of the coastal press."
+    ref = ParsedReference(reference_id="r", raw_ref=raw, author="Quillby, O.", year="2021",
+                          title="The lantern era of the coastal press", source_kind="unknown")
+    found = [f for f in reference_entry_findings({"r": ref}) if f["finding_type"] == "reference_publication_missing"]
+    assert [f["locate_value"] for f in found] == ["The lantern era of the coastal press"]
+
+
+def test_a_national_library_title_page_decides_when_open_library_has_none():
+    from types import SimpleNamespace
+    from app.services import source_resolver as sr
+    from app.services.retrieval import title_page_catalogues as catalogues
+
+    def marc(*records):
+        return "".join(f'<datafield tag="245"><subfield code="a">{a}</subfield><subfield code="c">{c}</subfield></datafield>'
+                       for a, c in records)
+    assert catalogues.statements_from_marcxml(
+        marc(("The star system :", "Orla Quillby."), ("Invasion of the star system", "Other Name.")),
+        "The Star System: Production of Identities") == ["Orla Quillby."]
+    calls = []
+
+    def get(provider, url, params):
+        calls.append(provider)
+        body = "" if provider == "library_of_congress" else marc(("The star system :", "Orla Quillby."))
+        return SimpleNamespace(status_code=200, text=body)
+    assert catalogues.catalogue_statements("The Star System: Production of Identities", "Quillby", get) == (
+        "national_library_of_scotland", ["Orla Quillby."])
+    assert calls == ["library_of_congress", "national_library_of_scotland"]
+
+    resolver = sr.SourceResolver.__new__(sr.SourceResolver)
+    resolver._retrieval_sources = [SimpleNamespace(statements_of_responsibility=lambda t, a: {
+        "classification": "unresolved", "work_key": "/works/OL1W", "statements": []})]
+    held = {"value": ("library_of_congress", ["edited by Orla Quillby."])}
+    original = catalogues.catalogue_statements
+    catalogues.catalogue_statements = lambda title, surname, get: held["value"]
+    try:
+        assert resolver._container_responsibility("The Star System", "Quillby, O.")["classification"] == "edited"
+        held["value"] = ("library_of_congress", ["Orla Quillby."])
+        found = resolver._container_responsibility("The Star System", "Quillby, O.")
+        assert found["classification"] == "single_authored" and found["provider"] == "library_of_congress"
+        held["value"] = None
+        assert resolver._container_responsibility("The Star System", "Quillby, O.")["classification"] == "unresolved"
+    finally:
+        catalogues.catalogue_statements = original

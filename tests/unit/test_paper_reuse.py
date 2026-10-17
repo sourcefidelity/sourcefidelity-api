@@ -119,3 +119,45 @@ def test_a_run_excluded_from_reuse_checks_it_again(session, monkeypatch):
     job, _ = _job(session)
     monkeypatch.setattr(paper_reuse.settings, "SEARCH_REUSE_EXCLUDED_JOBS", f" other , {str(job.id).upper()}")
     assert _find(session) is None
+
+
+def test_a_run_whose_model_calls_failed_checks_it_again(session):
+    # 2026-10-15: three papers checked during a model provider outage (8 calls
+    # unanswered each) came back unchanged from Check Again.
+    job, report = _job(session)
+    report.report_json = {**report.report_json,
+                          "evidence_report": {"processing_metrics": {"llm_calls": 13, "missing_usage_calls": 8}}}
+    session.commit()
+    assert _find(session) is None
+    report.report_json = {**report.report_json,
+                          "evidence_report": {"processing_metrics": {"llm_calls": 13, "missing_usage_calls": 0}}}
+    session.commit()
+    assert _find(session) == (job, report)
+
+
+def test_an_earlier_result_that_todays_search_rules_would_change_is_searched_again_once():
+    from app.services.source_reuse import SEARCH_RULES_VERSION, earlier_result
+    item = {"status": "unavailable", "reason_code": "source_not_found",
+            "reference_discovery": {"outcome": "unlocated_after_search", "attempts": [{"provider": "crossref"}]}}
+    magazine = {"reference_id": "r", "source_kind": "journal_article", "container_title": "Fanmag",
+                "year": "1946b", "title": "A title"}
+    assert earlier_result(item, magazine).reason == "search_rules_changed"
+    assert earlier_result({**item, "search_rules": SEARCH_RULES_VERSION}, magazine).reusable
+    lookalike = {**magazine, "container_title": "", "title": "The cult оf love"}
+    assert earlier_result(item, lookalike).reason == "search_rules_changed"
+    plain = {**magazine, "container_title": "", "source_kind": "monograph"}
+    assert earlier_result(item, plain).reusable
+
+
+def test_a_stored_chapter_whose_book_authorship_is_unread_is_checked_again_once():
+    from app.services.source_reuse import SEARCH_RULES_VERSION, earlier_result
+    chapter = {"reference_id": "r", "source_kind": "book_section", "container_title": "Bright lights",
+               "year": "2004", "title": "Introduction"}
+    stored = {"status": "durable_authorized", "representation_id": "rep",
+              "reference_discovery": {"outcome": "insufficient_metadata",
+                                      "container_identity": {"responsibility": {"classification": "unresolved"}}}}
+    assert earlier_result(stored, chapter).reason == "search_rules_changed"
+    assert earlier_result({**stored, "search_rules": SEARCH_RULES_VERSION}, chapter).reusable
+    # A stored journal article is not searched again for the magazine rule.
+    article = {**chapter, "source_kind": "journal_article", "container_title": "Fanmag"}
+    assert earlier_result({**stored, "reference_discovery": {}}, article).reusable

@@ -86,3 +86,22 @@ def test_pdf_diamond_link_does_not_replace_original_url_target():
         assert any(l.get('uri')=='https://example.org/book' for l in links)
         center=fitz.Point(rect.x1+7,(rect.y0+rect.y1)/2)
         assert any(l['kind']==fitz.LINK_GOTO and l['from'].contains(center) for l in links)
+
+
+def test_an_uncited_reference_is_marked_yellow_over_its_whole_entry():
+    r={'page_index':0,'x0':50,'y0':50,'x1':250,'y1':65}
+    surface={'page_dimensions':[{'page_index':0,'width':600,'height':800}],'page_href_template':'p-{page_index}',
+             'reference_locations':{'r':{'index':0,'rectangles':[r]}}}
+    catalog=[{'reference_id':'r','number':1,'template_id':'reference-entry-panel-1',
+              'location':surface['reference_locations']['r']}]
+    html,_=_render_continuous_paper(surface,[],[],numbers={'r':1},catalog=catalog,uncited_reference_ids=['r'])
+    mark=BeautifulSoup(html,'html.parser').select_one('rect.uncited-highlight')
+    assert mark is not None and mark['width']=='200.000'
+    assert mark.find_parent('a')['data-panel-template']=='reference-entry-panel-1'
+    cited,_=_render_continuous_paper(surface,[],[],numbers={'r':1},catalog=catalog,uncited_reference_ids=[])
+    assert 'uncited-highlight' not in cited
+    from app.services.highlight_priority import prioritize_svg_highlights
+    both = prioritize_svg_highlights('<rect class="uncited-highlight" x="0" y="0" width="100" height="10"/>'
+                                     '<rect class="reference-formatting-hit" x="40" y="0" width="20" height="10"/>')
+    # The finding's own orange mark stays whole over the yellow.
+    assert 'class="reference-formatting-hit" x="40" y="0" width="20" height="10"' in both

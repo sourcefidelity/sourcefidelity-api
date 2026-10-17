@@ -224,3 +224,16 @@ def test_a_possible_match_copy_of_an_unverifiable_reference_is_not_its_text():
     assert other['coverage_level'] == 'unavailable' and other['identity_status'] == 'withdrawn_possible_match'
     verified = {'reference_id': 'r3', 'identity_status': 'verified', 'coverage_level': 'full_text'}
     assert withdraw_unverified_possible_matches(view, [{'members': [verified]}], set()) is view
+
+
+def test_monographs_cited_as_edited_collections_are_one_formatting_summary_line():
+    from app.services.evidence_report import broad_reference_summary
+    findings = [{'finding_type': 'contribution_author_is_volume_editor', 'reference_id': r, 'rectangles': [{}]}
+                for r in ('a', 'b')]
+    summary = broad_reference_summary({}, findings, {'a': 2, 'b': 4})
+    line, = summary['reference_formatting']
+    assert line['lead'] == '2 references format monographs as edited collections'
+    assert [i['number'] for i in line['instances']] == [2, 4]
+    assert not summary.get('academic_practice')
+    one = broad_reference_summary({}, findings[:1], {'a': 2})['reference_formatting'][0]
+    assert one['lead'] == '1 reference formats a monograph as an edited collection'

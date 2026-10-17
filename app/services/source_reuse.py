@@ -58,8 +58,16 @@ ROUTE_VERSIONS = {
         "lantern-page-labels-v1",
         "a stored Lantern text without printed page numbers is read again once, from an "
         "earlier result or the source library"),
+    # 2026-10-16 (Rita Hayworth review): the magazine archive search, the
+    # chapter-title namesake rule and look-alike letter folding.
+    "search_rules": RouteVersion(
+        "search-rules-v4",
+        "an earlier result without text for a dated periodical article, a chapter whose search "
+        "ended in a record conflict or whose book's authorship was unresolved, or a title with "
+        "look-alike letters is searched again once"),
 }
 STUDENT_LINK_ROUTES_VERSION = ROUTE_VERSIONS["student_link_routes"].version
+SEARCH_RULES_VERSION = ROUTE_VERSIONS["search_rules"].version
 LANTERN_PAGES_VERSION = ROUTE_VERSIONS["lantern_pages"].version
 
 _REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
@@ -150,6 +158,10 @@ def earlier_result(item: dict, reference: dict | None = None) -> Reuse:
         return refuse("student_link_routes_changed")
     if item.get("source_name") == "lantern" and item.get("lantern_pages") != LANTERN_PAGES_VERSION:
         return refuse("lantern_pages_changed")
+    if search_rules_due(item, reference):
+        # Before the stored-text exits: a stored copy is found again at once,
+        # and its book's authorship is what changed (2026-10-16).
+        return refuse("search_rules_changed")
     if item.get("status") == "transient_authorized" or downloadable(item):
         return REUSE if downloadable(item) else refuse("transient_text_not_kept")
     if item.get("status") == "durable_authorized":
@@ -185,6 +197,33 @@ def earlier_result(item: dict, reference: dict | None = None) -> Reuse:
         return (REUSE if _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
                 else refuse("search_incomplete"))
     return REUSE if discovery else refuse("no_search_record")
+
+
+def search_rules_due(item: dict, reference) -> bool:
+    """An earlier result without text that today's search rules would change
+    (`search_rules` above): searched again once, then reused as before."""
+    if not isinstance(reference, dict) or item.get("search_rules") == SEARCH_RULES_VERSION:
+        return False
+    import re
+    from app.services.lookalike_letters import fold_lookalikes
+    discovery = item.get("reference_discovery") or {}
+    periodical = (reference.get("source_kind") in {"journal_article", "news_article", "unknown"}
+                  and (reference.get("container_title") or "").strip()
+                  and re.match(r"^\d{4}", str(reference.get("year") or "")))
+    container = discovery.get("container_identity") or {}
+    chapter = (reference.get("source_kind") == "book_section"
+               and (reference.get("container_title") or "").strip())
+    namesake = (chapter
+                and (not container  # a confirmed chapter whose book was never checked
+                     or discovery.get("outcome") == "bibliographic_conflict"
+                     # The book's authorship was unread: Open Library's main title
+                     # and added-material statements are now read.
+                     or (container and (container.get("responsibility") or {}).get("classification") == "unresolved")))
+    lookalike = fold_lookalikes(reference.get("title") or "") != (reference.get("title") or "")
+    # A reference that already has its text needs only its book's authorship
+    # checked; the search rules for finding a text do not apply to it.
+    has_text = item.get("status") in {"durable_authorized", "transient_authorized"} or downloadable(item)
+    return bool(namesake or (not has_text and (periodical or lookalike)))
 
 
 def native_script_route_due(item: dict, reference) -> bool:

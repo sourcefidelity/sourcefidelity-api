@@ -1001,6 +1001,7 @@ def test_metadata_only_identity_survives_checkpoint_reload_and_report(monkeypatc
 
     monkeypatch.setattr("socket.socket.connect", forbidden)
     monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr("app.tasks.judgment.dispatch_report_judgment", lambda _run_id: None)
     monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _: (SafetyVerdict.CLEAN, "OK"))
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
     Base.metadata.create_all(engine)

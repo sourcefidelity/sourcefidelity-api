@@ -196,6 +196,17 @@ _BOOK_REVIEW_RE = re.compile(
 # with no issue at all ("System, 93, 1-11"), which is ordinary APA and was
 # previously unclassifiable. The second shape requires the range: a bare
 # "volume, number" pair is not evidence of an article.
+# A magazine article dated to the month or day and cited without a volume:
+# "(1947, March). Ask the boss. Photoplay, 50-51, 90-92." (2026-10-16). The
+# month-level date is what separates it from a book's trailing imprint.
+DATED_PERIODICAL_RE = re.compile(
+    r"\((?:18|19|20)\d{2}[a-z]?,\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Spring|Summer|Autumn|Fall|Winter)"
+    r"[a-z]*\.?(?:\s+\d{1,2})?\)\.\s+.+?[.?!]\s+"
+    r"(?P<container>[^\W\d_][^.!?\n,]{1,80}?),\s*(?:pp?\.\s*)?"
+    r"(?P<pages>\d{1,4}(?:\s*[-\u2013\u2014]\s*\d{1,4})?(?:\s*,\s*\d{1,4}(?:\s*[-\u2013\u2014]\s*\d{1,4})?)*)"
+    r"\s*\.?\s*$",
+    re.IGNORECASE,
+)
 _JOURNAL_STRUCTURE_RE = re.compile(
     r"(?:\b(?:journal|quarterly|review)\b.{0,100})?"
     # A magazine cites discontinuous pages as "pp. 34-36, 91-93". Without these
@@ -281,7 +292,9 @@ _BOOK_EDITION_RE = re.compile(r"\(\s*\d+(?:st|nd|rd|th)\s+ed\.?(?:ition)?\s*\)",
 _BOOK_SECTION_RE = re.compile(
     r"\bIn\s+.{1,160}\((?:Ed|Eds)\.?\)"
     # Editors omitted: "Chapter. In Book title (pp. 75-116)." (2026-09-29).
-    r"|\.\s+In\s+[^()]{3,300}?\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)"
+    # A chapter title may end in "?" or "!" (2026-10-16, "Why Rita Hayworth? In ...").
+    r"|[.?!]\s+In\s+[^()]{3,300}?(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?"
+    r"\(\s*pp?\.\s*\d{1,6}\s*[-–—]\s*\d{1,6}\s*\)"
     # Editors after the book title: "Chapter. In Book title (A. Name & B. Name,
     # Eds.)." A common student variant (paper 5, Bordwell, 2026-10-01).
     r"|\.\s+In\s+[^()]{3,300}?\([^()]{2,160}?,\s*Eds?\.\s*\)",
@@ -430,7 +443,12 @@ def classify_reference_source_kind(
         return _assessment("software", "high" if _SOFTWARE_RE.search(combined) else "medium", "software marker or repository host")
     if _PODCAST_RE.search(combined):
         return _assessment("podcast_episode", "high", "explicit podcast marker")
-    if _VIDEO_RE.search(combined) or any(host in normalized_url for host in ("youtube.com/", "youtu.be/", "vimeo.com/")):
+    # A film or programme cited by its own credits ("(Director)", "[TV Movie]")
+    # is traditional media whatever site the link points to; only an explicit
+    # "[Video]" makes the upload itself the work (owner decision 2026-10-16).
+    credited_media = is_traditional_media(raw) and not re.search(r"\[(?:video|webinar)\]", raw, re.I)
+    if not credited_media and (_VIDEO_RE.search(combined)
+                               or any(host in normalized_url for host in ("youtube.com/", "youtu.be/", "vimeo.com/"))):
         return _assessment("video", "high", "explicit video marker or dedicated video host")
     if _SOCIAL_RE.search(combined):
         return _assessment("social_media_post", "high", "explicit social-media marker or host")
@@ -452,6 +470,9 @@ def classify_reference_source_kind(
     if (_JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_VOLUME_ISSUE_RE.search(raw)
             or _MARKED_JOURNAL_STRUCTURE_RE.search(raw) or _JOURNAL_ISSUE_ONLY_RE.search(raw)):
         return _assessment("journal_article", "high", "journal volume/issue/page structure")
+    if DATED_PERIODICAL_RE.search(raw):
+        # The kind an explicit "[Magazine article]" marker gives, not a journal.
+        return _assessment("news_article", "medium", "magazine date and page list")
     if re.search(r"\bISBN(?:-1[03])?\b", raw, re.I) or _BOOK_EDITION_RE.search(raw):
         return _assessment("monograph", "high", "ISBN or edition marker")
     raw_without_url = re.sub(r"https?://\S+|www\.\S+", " ", raw, flags=re.I).strip()

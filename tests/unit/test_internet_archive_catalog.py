@@ -175,3 +175,25 @@ class TestWiredAsAGapFiller:
         from app.services.reference_formatting import book_publication_year_discrepancy
         source = inspect.getsource(book_publication_year_discrepancy)
         assert "provider!='google_books'" in source or "provider != 'google_books'" in source
+
+
+def test_an_empty_archive_answer_is_a_completed_optional_search_not_a_failure(monkeypatch):
+    from app.services.reference_discovery import ExpectedBibliographicFields
+    from app.services.retrieval.google_books import BookMetadataSearch
+    from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
+    monkeypatch.setattr(InternetArchiveCatalogRetriever, "search_metadata_result",
+                        lambda self, **kwargs: BookMetadataSearch('title:("Lanterns")', "no_results_low_coverage"))
+    expected = ExpectedBibliographicFields(title="Lanterns", authors=["Quillby, O."], source_kind="monograph")
+    trace = {'reference_id': 'fixture', 'expected': expected, 'required': {'academic_adapter'},
+             'queries': [], 'attempts': [], 'candidates': [], 'limitations': [],
+             'search_policy_version': 'api-first-search-v2'}
+    token = _ACTIVE_DISCOVERY_TRACE.set(trace)
+    try:
+        SourceResolver._corroborate_book_from_archive(SourceResolver.__new__(SourceResolver), expected)
+    finally:
+        _ACTIVE_DISCOVERY_TRACE.reset(token)
+    attempt, = trace['attempts']
+    query, = trace['queries']
+    assert attempt.outcome == 'no_match' and not attempt.required
+    # Its silence is weak evidence: the query says so, and no review counts it.
+    assert query.execution_outcome == 'no_results' and query.reason_code == 'low_coverage_catalogue'

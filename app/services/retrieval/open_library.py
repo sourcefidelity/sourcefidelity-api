@@ -171,7 +171,16 @@ class OpenLibraryRetriever(RetrievalSource):
         key = str((found.metadata or {}).get("open_library_key") or "")
         if not found.success or not re.fullmatch(r"/works/OL\d+W", key):
             return {"classification": "unresolved", "reason": "work_not_found"}
-        if not _title_words(found.title or "")[:len(_title_words(title))] == _title_words(title):
+        found_words, cited_words = _title_words(found.title or ""), _title_words(title)
+        # Open Library keeps main titles without subtitles ("The Star System"
+        # for "The Star System: Hollywood's Production of Popular
+        # Identities"); the cited main title counts (2026-10-16).
+        main_words = _title_words(re.split(r"\s*[:—–]\s*|\s+-\s+", title, maxsplit=1)[0])
+        # A cited title written without its colon ("Being Rita Hayworth labor,
+        # identity, ...") starts with the main title.
+        if not (found_words[:len(cited_words)] == cited_words
+                or (len(found_words) >= 2 and found_words == main_words)
+                or (len(found_words) >= 3 and cited_words[:len(found_words)] == found_words)):
             return {"classification": "unresolved", "reason": "title_differs"}
         if not any(surname.casefold() in name.casefold() for name in found.authors):
             return {"classification": "unresolved", "reason": "author_differs"}
@@ -204,6 +213,11 @@ _EDITORIAL = re.compile(r"\b(?:edited|editors?|eds?|compiled|compiler|herausgege
 _SEVERAL_NAMES = re.compile(r"\b(?:and|with)\b|[&;,]", re.IGNORECASE)
 
 
+_ADDED_MATERIAL = re.compile(
+    r"\s*;\s*with\s+(?:a\s+|an\s+)?(?:new\s+)?(?:supplementary\s+chapter|introduction|foreword|preface|afterword"
+    r"|epilogue|bibliography|notes)\b[^;]*$", re.IGNORECASE)
+
+
 def _title_words(value: str) -> list[str]:
     return re.findall(r"\w+", value.casefold())
 
@@ -219,6 +233,9 @@ def classify_responsibility(statements: list[str], surname: str) -> str:
     if any(_EDITORIAL.search(value) for value in statements):
         return "edited"
     key = surname.strip().casefold()
+    # Added material by someone else does not make a co-author: "Richard Dyer ;
+    # with a supplementary chapter and bibliography by Paul McDonald" (2026-10-16).
+    statements = [_ADDED_MATERIAL.sub("", value) for value in statements]
     if key and statements and all(
             key in value.casefold() and not _SEVERAL_NAMES.search(value.strip(" .")) for value in statements):
         return "single_authored"

@@ -685,6 +685,8 @@ def reference_entry_findings(references: dict[str, ParsedReference],
         if not re.search(r'\w', tail) and not (ref.url or ref.doi) and ref.raw_ref.index(title) > 0:
             findings.append(dict(finding_type='reference_publication_missing', reference_id=reference_id,
                 finding=PUBLICATION_MISSING_TEXT, rule_id='apa7_publication_details_present_v1',
+                # The title the details should follow is marked (owner request 2026-10-16).
+                locate_value=title,
                 rule_source=APA_TITLE_RULE_SOURCE,
                 field_difference={'field_name': 'entry', 'submitted_value': ref.raw_ref},
                 rectangles=[], localization_status='not_assessed'))
@@ -900,15 +902,19 @@ CHAPTER_EDITORS_MISSING_TEXT = 'This reference cites a chapter in the form used 
 CHAPTER_PAGES_MISSING_TEXT = 'This reference cites a chapter but gives no page range for it.'
 
 
-def chapter_form_findings(references, citation_format: str) -> list[dict]:
+def chapter_form_findings(references, citation_format: str,
+                          container_records: dict | None = None) -> list[dict]:
     """APA chapter references that omit the book's editors or the chapter's page range.
 
     Only references parsed as book sections in the "In <book>" form are
     assessed; the finding states what the reference lacks, without advice.
+    When the book was identified as single-authored there are no editors to
+    name, so the finding says that instead (owner decision 2026-10-16).
     """
     if citation_format != 'apa':
         return []
     findings = []
+    records = container_records or {}
     for reference in references:
         raw = getattr(reference, 'raw_ref', '') or ''
         # The checks read the entry itself, so a reference held for review
@@ -923,8 +929,15 @@ def chapter_form_findings(references, citation_format: str) -> list[dict]:
                 ('chapter_pages_missing', CHAPTER_PAGES_MISSING_TEXT, _CHAPTER_PAGES_RE.search(raw))):
             if present:
                 continue
+            record = records.get(getattr(reference, 'reference_id', '')) or {}
+            if finding_type == 'chapter_editors_missing' and record.get('is_monograph'):
+                findings.append(_monograph_part_finding(reference, record, ''))
+                continue
             findings.append(dict(
                 finding_type=finding_type, reference_id=reference.reference_id, finding=text,
+                # Marked where the missing element belongs, not the whole entry
+                # (owner request 2026-10-16).
+                **({'locate_value': place} if (place := _in_book_text(reference)) else {}),
                 rule_id='apa7_chapter_reference_elements_v1', rule_source=APA_CONTRIBUTION_RULE_SOURCE,
                 field_difference={'field_name': 'editors' if finding_type == 'chapter_editors_missing' else 'pages',
                                   'submitted_value': ''},
@@ -1014,21 +1027,40 @@ def contribution_editor_findings(references, container_records: dict | None = No
         record = records.get(getattr(reference, 'reference_id', '')) or {}
         if not record.get('is_monograph'):
             continue  # unidentified, or a genuine edited collection
-        located = str(record.get('title') or '').strip()
-        findings.append(dict(
-            finding_type='contribution_author_is_volume_editor',
-            reference_id=reference.reference_id,
-            finding=(
-                f'The located work{" " + located if located else ""} is a single-authored '
-                'book, not an edited collection, so this reference cites a part of it as '
-                'though it were a chapter in an edited volume.'),  # no advice (owner decision 2026-10-01)
-            rule_id='apa7_contribution_author_is_editor_v1',
-            rule_source=APA_CONTRIBUTION_RULE_SOURCE,
-            located_record={**{k: record.get(k) for k in ('title', 'authors', 'provider')},
-                            'source_kind': record.get('located_source_kind') or record.get('source_kind')},
-            field_difference={'field_name': 'editor', 'submitted_value': editor},
-            rectangles=[], localization_status='not_assessed'))
+        findings.append(_monograph_part_finding(reference, record, editor))
     return findings
+
+
+def _in_book_text(reference) -> str:
+    """The entry's own "In <book>" text, where a chapter's editors and pages go."""
+    raw = getattr(reference, 'raw_ref', '') or ''
+    container = (getattr(reference, 'container_title', '') or '').strip()
+    if container and f'In {container}' in raw:
+        return f'In {container}'
+    return container if container and container in raw else ''
+
+
+def _monograph_part_finding(reference, record: dict, editor: str) -> dict:
+    """A part of an identified single-authored book cited as an edited-volume chapter."""
+    located = str(record.get('title') or '').strip()
+    title = (getattr(reference, 'title', '') or '').strip()
+    raw = getattr(reference, 'raw_ref', '') or ''
+    return dict(
+        # Only the part's title is marked: the rest of the entry is not wrong
+        # (owner request 2026-10-16).
+        **({'locate_value': title} if title and title in raw else {}),
+        finding_type='contribution_author_is_volume_editor',
+        reference_id=reference.reference_id,
+        finding=(
+            f'The located work{" " + located if located else ""} is a single-authored '
+            'book, not an edited collection, so this reference cites a part of it as '
+            'though it were a chapter in an edited volume.'),  # no advice (owner decision 2026-10-01)
+        rule_id='apa7_contribution_author_is_editor_v1',
+        rule_source=APA_CONTRIBUTION_RULE_SOURCE,
+        located_record={**{k: record.get(k) for k in ('title', 'authors', 'provider')},
+                        'source_kind': record.get('located_source_kind') or record.get('source_kind')},
+        field_difference={'field_name': 'editor', 'submitted_value': editor},
+        rectangles=[], localization_status='not_assessed')
 
 
 # Fields whose disagreement is a citation detail, not an identity question.

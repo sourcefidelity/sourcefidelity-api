@@ -477,3 +477,45 @@ def test_content_identity_rejection_overrides_plausible_search_title():
 
     assert candidate.plausible_identity_match is True
     assert candidate.is_credible is False
+
+
+def test_a_one_word_book_title_supports_a_search_with_its_author_and_publisher():
+    from app.services.reference_discovery import ExpectedBibliographicFields
+    book = ExpectedBibliographicFields(title="Lanterns", authors=["Quillby, O."],
+                                       publisher="Harbour Press", source_kind="monograph")
+    assert book.supports_identity_search()
+    assert not book.model_copy(update={"publisher": ""}).supports_identity_search()
+    assert not book.model_copy(update={"source_kind": "journal_article"}).supports_identity_search()
+
+
+def test_a_part_title_namesake_by_other_authors_outside_the_cited_book_is_another_work():
+    from app.services.reference_discovery import is_part_title_namesake
+    chapter = ExpectedBibliographicFields(title="Postwar changes", authors=["Quillby, O."],
+                                          container_title="Bright lights", source_kind="book_section")
+    namesake = ReferenceDiscoveryCandidate(
+        candidate_id="candidate-1", attempt_id="attempt-academic_adapter",
+        provider="provider-academic_adapter", plausible_identity_match=True,
+        comparisons=[_comparison("title", "agreement"), _comparison("author", "material_conflict"),
+                     _comparison("container_title", "unknown")])
+    assert is_part_title_namesake(chapter, namesake)
+    in_book = namesake.model_copy(update={"comparisons": [
+        *namesake.comparisons[:2], _comparison("container_title", "agreement")]})
+    assert not is_part_title_namesake(chapter, in_book)
+    assert not is_part_title_namesake(chapter.model_copy(update={"source_kind": "monograph"}), namesake)
+    assert not is_part_title_namesake(chapter, namesake.model_copy(update={"authoritative_identifier_match": True}))
+    assert is_part_title_namesake(chapter, namesake.model_copy(update={"validated_identity_content_sha256": "a" * 64}))
+
+
+def test_an_archive_item_page_title_is_the_book_title_with_matching_authors():
+    from app.services.reference_discovery import _web_title_furniture_only
+    page = "Being a star : labor, identity, and fame : Quillby, Orla : Free Download, Borrow, and Streaming : Internet Archive"
+    assert _web_title_furniture_only("Being a star labor, identity, and fame", page, author_match=True)
+    assert not _web_title_furniture_only("Being a star labor, identity, and fame", page, author_match=False)
+    assert not _web_title_furniture_only("Some other book entirely here", page, author_match=True)
+
+
+def test_a_bookseller_format_after_the_title_is_page_furniture():
+    from app.services.reference_discovery import _web_title_furniture_only
+    page = "Lanterns at Sea - A Biography of Orla Quillby - Softcover"
+    assert _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=True)
+    assert not _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=False)

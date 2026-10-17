@@ -15,6 +15,7 @@ from copy import copy as shallow_copy, deepcopy
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+import dataclasses
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -38,7 +39,8 @@ def _timed_retrieval(operation):
         tick = time.perf_counter()
         if expired() and operation.__name__ not in {"_download_and_cache", "_check_local_cache"}:
             result = RetrievalResult(source_name=operation.__name__, success=False,
-                                     error="reference_elapsed_budget_timeout")
+                                     error="reference_elapsed_budget_timeout",
+                                     metadata={"elapsed_budget_exhausted": True})
         else:
             result = operation(*args, **kwargs)
         if isinstance(result, RetrievalResult):
@@ -112,6 +114,7 @@ from app.services.identity_landing import bounded_landing_inspection
 from app.services.identity_pdf import bounded_pdf_inspection
 from app.services.search.candidate_ranking import identity_candidate_ranking
 from app.services.pure_scan_ocr import prepare_pure_scan_ocr
+from app.services.lookalike_letters import fold_lookalikes
 from app.services.reference_discovery import (
     DESCRIPTIVE_IDENTITY_FIELDS,
     INCOMPLETE_METADATA_SEARCH_REASONS,
@@ -124,6 +127,7 @@ from app.services.reference_discovery import (
     build_reference_discovery_candidate,
     required_reference_discovery_routes,
     is_edition_sensitive_reference,
+    is_part_title_namesake,
 )
 from app.services.source_repository import (
     LICENSE_CLASSES,
@@ -163,7 +167,10 @@ def _append_unique_candidate(trace: dict, candidate) -> None:
 
 
 def _search_execution_outcome(result: RetrievalResult) -> str:
-    if (result.metadata or {}).get("candidate_budget_skipped"):
+    # Our own limits (a candidate budget, the reference's elapsed budget) are
+    # never the provider's doing (2026-10-15: an elapsed budget read as a
+    # provider "timeout" named the provider as the cause).
+    if (result.metadata or {}).get("candidate_budget_skipped") or (result.metadata or {}).get("elapsed_budget_exhausted"):
         return "budget_skipped"
     if result.success:
         return "results"
@@ -502,6 +509,9 @@ def _record_link_title_conflict(url, resp, title, page_titles, *, expected_autho
                                                         year=expected_year, doi=expected_doi))
 
 
+# Periodical kinds whose articles the magazine archive can hold; an unknown
+# kind still names a magazine when its container title is one the library holds.
+_PERIODICAL_ARCHIVE_KINDS = frozenset({"journal_article", "news_article", "unknown"})
 _WEB_TITLE_WORD = re.compile(r"[^\W\d_]{2,}")
 # A page served instead of the content (bot check, script shell, access or
 # cookie wall) names no work; its title is never a conflict (IMDb's
@@ -1839,6 +1849,8 @@ class SourceResolver:
                     acquisition_outcome="metadata_only",
                     disposition_reason_code="journal_registration_only",
                 ))
+        elif "archive_page_matches" in (result.metadata or {}):
+            pass  # a located archive page is recorded on the trace, not as a candidate record
         elif "book_metadata_candidates" in (result.metadata or {}):
             for item in result.metadata["book_metadata_candidates"]:
                 candidate_result = RetrievalResult(**item)
@@ -2058,6 +2070,11 @@ class SourceResolver:
                 getattr(reference, "doi", None) or None, getattr(reference, "isbn", None) or None, title or None,
                 author=getattr(reference, "author", None) or None, year=getattr(reference, "year", None) or None,
                 expected_source_kind=expected_kind)
+            if not (found.success and found.full_text):
+                found = self._check_local_cache_for_book(
+                    getattr(reference, "container_title", "") or "", expected_kind,
+                    author=getattr(reference, "author", None) or None,
+                    year=getattr(reference, "year", None) or None) or found
         except Exception:
             return False
         return bool(found.success and found.full_text)
@@ -2149,7 +2166,9 @@ class SourceResolver:
         reference_id = getattr(reference, "reference_id", None) or "unassigned-reference"
         expected = ExpectedBibliographicFields(
             author_normalization_policy_version='author-etal-comparison-v1',
-            title=getattr(reference, "title", None) or "",
+            # The search form: look-alike letters folded (the reference keeps
+            # the student's exact wording).
+            title=fold_lookalikes(getattr(reference, "title", None) or ""),
             reference_parse_review=bool(getattr(reference, 'needs_review', False)),
             container_title=getattr(reference, 'container_title', '') or '',
             publisher=getattr(reference, 'publisher', '') or '',
@@ -2227,10 +2246,12 @@ class SourceResolver:
                 exc.reference_discovery_trace,
                 exc.reference_discovery,
             ) = self._discovery_artifacts()
+            exc.reference_discovery_trace, exc.reference_discovery = self._attach_container_identity(
+                reference, exc.reference_discovery_trace, exc.reference_discovery, identity_only=identity_only)
             self._attach_native_route(exc.reference_discovery_trace, exc.reference_discovery,
                                       (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
+            self._attach_periodical_archive(exc.reference_discovery_trace, exc.reference_discovery)
             if not identity_only and isinstance(exc.reference_discovery, dict):
-                self._attach_container_identity(reference, exc.reference_discovery)
                 mismatch = self._doi_title_mismatch()
                 if mismatch:
                     exc.reference_discovery["doi_title_mismatch"] = mismatch
@@ -2263,15 +2284,16 @@ class SourceResolver:
                     result = native
             result.metadata = result.metadata or {}
             trace_payload, discovery_payload = self._discovery_artifacts()
+            trace_payload, discovery_payload = self._attach_container_identity(
+                reference, trace_payload, discovery_payload, identity_only=identity_only)
             self._attach_native_route(trace_payload, discovery_payload,
                                       (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
+            self._attach_periodical_archive(trace_payload, discovery_payload)
             if not identity_only:
                 self._update_search_memo(result, trace_payload)
             result.metadata["reference_discovery_trace"] = trace_payload
             if discovery_payload is not None:
                 result.metadata["reference_discovery"] = discovery_payload
-                if not identity_only:
-                    self._attach_container_identity(reference, discovery_payload)
                 mismatch = self._doi_title_mismatch()
                 if mismatch:
                     discovery_payload["doi_title_mismatch"] = mismatch
@@ -2609,19 +2631,54 @@ class SourceResolver:
                 }
         return None
 
-    def _attach_container_identity(self, reference, discovery: dict) -> None:
+    def _attach_container_identity(self, reference, trace_payload: dict | None,
+                                   discovery: dict | None, *,
+                                   identity_only: bool = False) -> tuple[dict | None, dict | None]:
         """Identify the containing book whenever the cited part is not confirmed.
 
         The part search can end unconfirmed on either path out of
         `resolve_reference`: raised as unresolved, or returned with an
         unchecked lead (Belton's 2026-09-27 rerun: five Brave leads unchecked,
         so "search incomplete"). The book is identifiable either way.
+
+        Once the book is identified, a record sharing only the chapter's title
+        by other authors is another work, and the part's outcome is derived
+        again without it (`is_part_title_namesake`).
         """
-        if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES:
-            return
+        if not isinstance(discovery, dict):
+            return trace_payload, discovery
+        if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES or identity_only:
+            # The chapter itself is confirmed, or is an uncited entry that gets
+            # only the identity lookup, so its book is not searched; but
+            # whether the book is single-authored still decides how a missing
+            # editor is reported: the free title-page check only (2026-10-16).
+            container = (getattr(reference, "container_title", "") or "").strip()
+            if getattr(reference, "source_kind", "") == "book_section" and container:
+                responsibility = self._container_responsibility(container, getattr(reference, "author", "") or "")
+                discovery["container_identity"] = {
+                    "policy_version": "container-work-identity-v2",
+                    "status": ("part_confirmed" if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES
+                               else "title_page_only"),
+                    "searched_title": container, "title": container,
+                    "is_monograph": responsibility.get("classification") == "single_authored",
+                    "responsibility": responsibility}
+            return trace_payload, discovery
         container_identity = self._identify_container_work(reference)
-        if container_identity:
-            discovery["container_identity"] = container_identity
+        if not container_identity:
+            return trace_payload, discovery
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if container_identity.get("status") == "identified" and trace is not None:
+            namesakes = [candidate for candidate in trace["candidates"]
+                         if is_part_title_namesake(trace["expected"], candidate)]
+            for candidate in namesakes:
+                candidate.plausible_identity_match = False
+                candidate.disposition_reason_code = "part_title_namesake"
+            if namesakes:
+                rederived_trace, rederived = self._discovery_artifacts()
+                if isinstance(rederived, dict):
+                    trace_payload, discovery = rederived_trace, rederived
+        discovery["container_identity"] = container_identity
+        return trace_payload, discovery
 
     def _identify_container_work(self, reference):
         """Identify the book a miscited chapter names, without claiming the part.
@@ -2703,9 +2760,30 @@ class SourceResolver:
             return {"classification": "unresolved", "reason": "catalogue_not_configured" if source is None
                     else "no_cited_author"}
         try:
-            return source.statements_of_responsibility(title, author)
+            found = source.statements_of_responsibility(title, author)
         except Exception as exc:   # an optional check never fails the reference
-            return {"classification": "unresolved", "reason": f"lookup_failed:{type(exc).__name__}"}
+            found = {"classification": "unresolved", "reason": f"lookup_failed:{type(exc).__name__}"}
+        if found.get("classification") != "unresolved":
+            return found
+        # Open Library holds no title-page statement for this book: the
+        # national library catalogues may (title-page-catalogues-v1).
+        from app.services.relevance import extract_surnames
+        from app.services.retrieval import provider_gate
+        from app.services.retrieval import title_page_catalogues as catalogues
+        from app.services.retrieval.open_library import classify_responsibility
+        surnames = extract_surnames(author)
+        if not surnames or expired():
+            return found
+        held = catalogues.catalogue_statements(
+            title, surnames[0],
+            lambda provider, url, params: provider_gate.paced_get(
+                provider, catalogues._PACE_SECONDS, url, params=params, timeout=20, follow_redirects=True))
+        if held is None:
+            return found
+        provider, statements = held
+        return {"classification": classify_responsibility(statements, surnames[0]),
+                "statements": statements[:8], "provider": provider, "policy": catalogues.VERSION,
+                "open_library": {k: found.get(k) for k in ("reason", "work_key") if found.get(k)}}
 
     def _identity_settled(self, graph) -> bool:
         """Is the work confirmed AND already reachable?
@@ -2911,6 +2989,81 @@ class SourceResolver:
             candidate.metadata['transient_details_discarded'] = True
         candidates.append(candidate)
 
+    def _search_periodical_archive(self, *, title, author, year, container_title, raw_ref,
+                                   expected_kind) -> RetrievalResult | None:
+        """Find a cited magazine article in the Media History Digital Library.
+
+        A free search (media-history-archive-v1) before the paid routes. The
+        page it finds is read like a student's own Lantern link
+        (`lantern-pages-v1`): when the cited pages carry the title, that text
+        is the source. A page that only shows the article (a contents line)
+        makes the reference a possible match. An empty or failed search is
+        never evidence that the article does not exist.
+        """
+        if expired():
+            return None
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if (trace is None or expected_kind.kind not in _PERIODICAL_ARCHIVE_KINDS or not (title or "").strip()
+                or not (container_title or "").strip() or not re.match(r"^\d{4}", year or "")):
+            return None
+        capabilities = getattr(self, "_acquisition_capabilities", None)
+        if capabilities is not None and "academic_adapters" not in capabilities:
+            return None
+        from app.services.retrieval import media_history_archive as archive
+        from app.services.relevance import extract_surnames
+        surnames = extract_surnames(author) if author else []
+        pages = re.findall(r"\d+", (trace["expected"].pages or "").strip())
+        search = archive.find_periodical_article(
+            title, container_title, year, surnames[0] if surnames else (author or ""),
+            pages[0] if pages else "")
+        if search.outcome == "declined":
+            return None  # the library holds no such magazine; nothing was asked
+        empty = search.outcome == "no_results_low_coverage"
+        self._record_discovery_attempt(
+            category="academic_adapter", provider=archive.PROVIDER, required=False,
+            result=RetrievalResult(
+                source_name=archive.PROVIDER, success=search.match is not None,
+                error=None if search.match else "no results" if empty else search.outcome,
+                metadata={
+                    "structured_search_attempts": [
+                        {**attempt, **({"reason_code": "low_coverage_catalogue"}
+                                       if attempt["outcome"] == "no_results" else {})}
+                        for attempt in search.attempts[:8]] or [
+                        {"query": "insufficient-metadata", "outcome": search.outcome}],
+                    "archive_page_matches": [],
+                }),
+        )
+        if search.match is None:
+            return None
+        trace["periodical_archive_match"] = {"policy_version": archive.VERSION,
+                                             **dataclasses.asdict(search.match)}
+        from app.services.retrieval import lantern as pages
+        from app.services.retrieval import provider_gate
+        volume, found_leaf = pages.lantern_target(archive.page_link(search.match.page_id)) or (None, None)
+        cited = pages.cited_page_ranges(raw_ref) or ([pages.cited_pages(raw_ref)] if pages.cited_pages(raw_ref) else [])
+        leaf = pages.article_first_leaf(
+            volume, found_leaf, cited[0][0] if cited else None,
+            lambda address: provider_gate.paced_get("internet_archive", 0.5, address, timeout=30,
+                                                    follow_redirects=True)) if volume else None
+        if leaf is None:
+            return None
+        lantern = self._try_lantern(f"{pages.LANTERN}/catalog/{volume}_{leaf:04d}", title=title, author=author,
+                                    year=year, container_title=container_title, raw_ref=raw_ref,
+                                    searched_author=(surnames[0] if surnames else author or "")
+                                    if search.match.author_beside else "")
+        self._record_discovery_attempt(category="academic_adapter", provider="lantern",
+                                       result=lantern, required=False)
+        return lantern if lantern.success else None
+
+    @staticmethod
+    def _attach_periodical_archive(trace_payload: dict | None, discovery_payload: dict | None) -> None:
+        match = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("periodical_archive_match")
+        if not match:
+            return
+        for payload in (trace_payload, discovery_payload):
+            if isinstance(payload, dict):
+                payload["periodical_archive_match"] = deepcopy(match)
+
     def _enrich_journal_registration(self, reference) -> None:
         """Optional bounded metadata escalation, never an exhaustive archive check."""
         if expired():
@@ -3091,14 +3244,19 @@ class SourceResolver:
                 },
             },
         } for book in search.candidates]
+        # An empty answer is a completed search, not a failure; its reason code
+        # keeps the catalogue's weak coverage, and the route stays optional, so
+        # no completion rule or review counts it as absence (2026-10-16).
+        empty = search.outcome == "no_results_low_coverage"
         result = RetrievalResult(
             source_name="internet_archive", success=bool(candidates),
-            error=None if candidates else search.error_code or search.outcome,
+            error=None if candidates else "no results" if empty else search.error_code or search.outcome,
             metadata={
                 "structured_search_attempts": [{
                     "query": search.query or "insufficient-metadata",
-                    "outcome": search.outcome,
-                    "result_count": len(candidates) if search.outcome == "results" else None,
+                    "outcome": "no_results" if empty else search.outcome,
+                    "result_count": 0 if empty else len(candidates) if search.outcome == "results" else None,
+                    **({"reason_code": "low_coverage_catalogue"} if empty else {}),
                 }],
                 "book_metadata_candidates": candidates,
             },
@@ -3192,6 +3350,14 @@ class SourceResolver:
         if result.success and result.full_text:
             link_not_visited(None, 'authorized_reuse')
             return result
+        # 1.1. A chapter held only as its whole book (owner decision 2026-10-16).
+        book = self._check_local_cache_for_book(container_title, expected_kind, author=author, year=year)
+        if book is not None:
+            self._record_discovery_attempt(category="durable_repository", provider="local_cache",
+                                           result=book, required=False)
+            if book.success and book.full_text:
+                link_not_visited(None, 'authorized_reuse')
+                return book
 
         # 1.5. Reuse bounded abstract/miss lookup state. Full text always wins
         # from the durable repository. A changed cited URL, acquisition-policy
@@ -3386,6 +3552,15 @@ class SourceResolver:
                 if result.full_text:
                     self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                 return result
+
+        # 2.6. A cited magazine article in the Media History Digital Library
+        #      (media-history-archive-v1, 2026-10-16): free, before paid search.
+        archived_article = self._search_periodical_archive(
+            title=title, author=author, year=year, container_title=container_title,
+            raw_ref=raw_ref, expected_kind=expected_kind)
+        if archived_article is not None:
+            self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
+            return archived_article
 
         # 3. Merge structured-provider evidence into one canonical work graph,
         #    then acquire from its combined location set. Public-domain sources
@@ -3886,6 +4061,33 @@ class SourceResolver:
 
     # ── Internal helpers ───────────────────────────────────
 
+    def _check_local_cache_for_book(self, container_title, expected_kind, *, author, year):
+        """The library's accepted copy of the book a cited chapter is in.
+
+        Looked up by the book's title without its edition note, and used only
+        when the library record's year and first author's surname are the
+        reference's (owner decision 2026-10-16: Dyer's introduction to
+        *Heavenly bodies*, uploaded but never found by the chapter title).
+        None when the reference is not a chapter or names no book.
+        """
+        if expected_kind.kind != "book_section" or not (container_title or "").strip() or not author or not year:
+            return None
+        from app.services.reference_verification import _EDITION
+        from app.services.relevance import extract_surnames
+        book_title = re.sub(r"\s+", " ", _EDITION.sub(" ", container_title)).strip(" .,")
+        found = self._check_local_cache(
+            None, None, book_title, author=author, year=year,
+            expected_source_kind=SourceKindAssessment("monograph", "medium", ("book of a cited chapter",)))
+        if not found.success:
+            return found
+        cited = [s.casefold() for s in extract_surnames(author)[:1]]
+        held = [s.casefold() for a in (found.authors or [])[:1] for s in extract_surnames(a)[:1]]
+        if not cited or cited != held or str(found.year or "")[:4] != str(year)[:4]:
+            return RetrievalResult(source_name="local_cache", success=False,
+                                   metadata={"reuse_refusal": "book_copy_author_or_year_differs"})
+        found.metadata = {**(found.metadata or {}), "held_as_book_of_cited_part": True}
+        return found
+
     @_timed_retrieval
     def _check_local_cache(
         self,
@@ -4111,7 +4313,8 @@ class SourceResolver:
         return keys
 
     @_timed_retrieval
-    def _try_lantern(self, url: str, *, title, author, year, container_title, raw_ref) -> RetrievalResult:
+    def _try_lantern(self, url: str, *, title, author, year, container_title, raw_ref,
+                     searched_author: str | None = None) -> RetrievalResult:
         """The cited magazine article's OCR pages from a Lantern link (`lantern-pages-v1`).
 
         Confirmed when the cited title opens one of the candidate pages, the
@@ -4127,7 +4330,8 @@ class SourceResolver:
         def get_archive(address):
             return provider_gate.paced_get("internet_archive", 0.5, address, timeout=30, follow_redirects=True)
         try:
-            article = pages.read_article(url, title=title, raw_ref=raw_ref, get=get, get_archive=get_archive)
+            article = pages.read_article(url, title=title, raw_ref=raw_ref, get=get, get_archive=get_archive,
+                                         searched_author=searched_author)
         except Exception as e:  # noqa: BLE001 - a failed read falls back to the ordinary web fetch
             return RetrievalResult(source_name="lantern", success=False,
                                    error=f"lantern_read_failed:{safe_exception_code(e)}")
@@ -6940,7 +7144,8 @@ class SourceResolver:
         for query, lookup in lookups:
             try:
                 result = (RetrievalResult(source_name=source.name, success=False,
-                          error="reference_elapsed_budget_timeout") if expired() else lookup())
+                          error="reference_elapsed_budget_timeout",
+                          metadata={"elapsed_budget_exhausted": True}) if expired() else lookup())
             except Exception as exc:
                 result = RetrievalResult(source_name=source.name, success=False, error=safe_exception_code(exc))
             observation = {"query": query, "outcome": _search_execution_outcome(result)}

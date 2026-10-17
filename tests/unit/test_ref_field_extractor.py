@@ -227,3 +227,51 @@ def test_only_a_bracket_naming_a_translation_tool_is_a_note():
                  'Why we translate [Why We Translate]. Example Press.',
                  'Title [Translated by A. Person]. Example Press.'):
         assert not has_translation_tool_note(kept) and without_translation_tool_notes(kept) == kept
+
+
+def test_a_chapter_with_an_edition_note_before_its_pages_is_a_chapter():
+    # 2026-10-16 (Rita Hayworth reference 3): "(2nd ed.)" between the book
+    # title and the page range made the entry a monograph titled "Introduction".
+    from app.services.source_type import classify_reference_source_kind
+    raw = ("Stone, B. (2004). Introduction. In River towns: Water and society (2nd ed.) (pp. 1-16). "
+           "Harbour Press.")
+    reference = extract_fields_apa(raw)
+    assert reference.container_title == "River towns: Water and society"
+    assert classify_reference_source_kind(raw, title=reference.title).kind == "book_section"
+
+
+def test_a_title_ending_in_an_exclamation_mark_is_not_part_of_the_magazine_name():
+    from app.services.ref_field_extractor import extract_fields_apa
+    parsed = extract_fields_apa("Quillby, O. (1945, August). How the star has changed! Lanternland, 49(10), 30–31, 74–75.")
+    assert parsed.container_title == "Lanternland" and parsed.volume == "49" and parsed.issue == "10"
+
+
+def test_a_dated_magazine_article_without_a_volume_names_its_magazine():
+    from app.services.ref_field_extractor import extract_fields_apa
+    from app.services.source_type import classify_reference_source_kind
+    raw = "Quillby, O. (1947, March). Ask the editor. Lanternland, 50–51, 90–92."
+    parsed = extract_fields_apa(raw)
+    assert parsed.container_title == "Lanternland" and parsed.pages == "50-51, 90-92"
+    assert parsed.publisher == ""
+    assert classify_reference_source_kind(raw, title=parsed.title).kind == "news_article"
+    # A book's year carries no month; its trailing element is not a magazine.
+    assert extract_fields_apa("Quillby, O. (1947). Ask the editor. Harbour Press.").container_title == ""
+
+
+def test_a_chapter_title_ending_in_a_question_mark_is_a_chapter():
+    from app.services.ref_field_extractor import extract_fields_apa
+    from app.services.source_type import classify_reference_source_kind
+    raw = "Quillby, O. (2005b). Why this star? In Being a star: Labor and fame (pp. 1–28). Harbour Press."
+    parsed = extract_fields_apa(raw)
+    assert parsed.title == "Why this star?" and parsed.container_title == "Being a star: Labor and fame"
+    assert parsed.pages == "1-28"
+    assert classify_reference_source_kind(raw, title=parsed.title).kind == "book_section"
+
+
+def test_a_month_dated_magazine_without_an_issue_lists_pages_not_a_volume():
+    from app.services.ref_field_extractor import extract_fields_apa
+    parsed = extract_fields_apa("Quillby, O. (1946b, August). Lanterns. Fanmag, 42, 86–87.")
+    assert parsed.container_title == "Fanmag" and parsed.volume == "" and parsed.pages == "42, 86-87"
+    # A journal year with a volume and pages is unchanged.
+    journal = extract_fields_apa("Quillby, O. (2019). Lanterns. Journal of Light, 42, 86–87.")
+    assert journal.volume == "42" and journal.pages == "86-87"

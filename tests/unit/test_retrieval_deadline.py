@@ -143,3 +143,33 @@ def test_expired_identity_search_is_incomplete_not_fabricated(ticks, monkeypatch
     assert {q["execution_outcome"] for q in trace["queries"]
             if q["query_id"] in query_ids} == {"budget_skipped"}
     assert not assess_reference_credibility(ref, result.metadata["reference_discovery"], trace)["findings"]
+
+
+def test_a_budget_spent_between_lookups_blames_no_provider(ticks):
+    # 2026-10-15: the budget ran out after a source's DOI lookup, and its title
+    # lookup's "reference_elapsed_budget_timeout" was read as a provider timeout,
+    # which named the provider as the cause of the incomplete search.
+    from app.services.paper_workflow import _blocking_providers_from_record
+    from app.services.schemas import ParsedReference
+
+    obj = SourceResolver.__new__(SourceResolver)
+    obj._acquisition_capabilities = None
+    provider = Mock(name="adapter")
+    provider.name = "crossref"
+    provider.capabilities = {"metadata_only_search", "doi", "title_author"}
+
+    def doi_lookup(doi):
+        ticks[0] = 2   # the reference's budget is spent while this call runs
+        return RetrievalResult(source_name="crossref", success=False, error="not found")
+    provider.search_by_doi.side_effect = doi_lookup
+    obj._retrieval_sources = [provider]
+    ref = ParsedReference(reference_id="spent", title="A sufficiently specific work title", doi="10.1234/spent",
+        author="Writer, A.", year="2020", source_kind="journal_article",
+        raw_ref="Writer, A. (2020). A sufficiently specific work title. https://doi.org/10.1234/spent")
+    with clock.deadline_scope(1):
+        result = obj.resolve_reference(ref, identity_only=True)
+    provider.search_by_title_author.assert_not_called()
+    trace = result.metadata["reference_discovery_trace"]
+    outcomes = [q["execution_outcome"] for q in trace["queries"] if q.get("execution_provider") == "crossref"]
+    assert "timeout" not in outcomes and "budget_skipped" in outcomes
+    assert "crossref" not in _blocking_providers_from_record(result.metadata["reference_discovery"])

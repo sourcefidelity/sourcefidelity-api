@@ -566,7 +566,14 @@ def _title_in_layout_spans(spans: list[dict], height: float, title: str,
         # A romanised cited title against a Han-script title zone, read
         # character by character (cross-language-identity-v1).
         return cross_language.romanised_title_in_text(title, prominent)
-    return _normalize_identity_text(title) in _normalize_identity_text(prominent)
+    normalized = _normalize_identity_text(title)
+    if " " not in normalized:
+        # A one-word title ("Introduction") is prominent only as a whole line,
+        # never as a word inside a longer title.
+        return any(_normalize_identity_text(span["text"]) == normalized for span in spans
+                   if float(span["bbox"][1]) <= height * title_zone
+                   or (display_type and float(span.get("size", 0.0)) >= max_size - 0.1))
+    return normalized in _normalize_identity_text(prominent)
 
 
 def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
@@ -904,9 +911,15 @@ def _author_note_lines(front_text: str) -> list[str]:
     return []
 
 
-def _contains_name(normalized_text: str, name: str) -> bool:
-    name = _normalize_identity_text(name)
-    return bool(name) and f" {name} " in f" {normalized_text} "
+def _name_identity_text(value: str) -> str:
+    """Identity text that keeps a hyphenated name one word ("Swinnerton-Dyer")."""
+    return _normalize_identity_text(re.sub(r"(?<=[^\W\d_])[-‐‑](?=[^\W\d_])", "", value))
+
+
+def _contains_name(normalized_text: str, name: str, normalize=_name_identity_text) -> bool:
+    name = normalize(name)
+    text = f" {normalized_text} "
+    return bool(name) and (f" {name} " in text or f" {name.replace(' ', '')} " in text)
 
 
 def _cited_author_segments(expected_author: str | None) -> list[str]:
@@ -1024,7 +1037,7 @@ def _author_observation(front_text: str, metadata_author: str | None,
     zone, title_end = _opening_zone(front_text, expected_title)
     # An author note ("Mini Bio", "About the author") names the writer of a
     # manuscript that has no byline; it counts with the title block.
-    zone_identity = _normalize_identity_text(
+    zone_identity = _name_identity_text(
         _without_affiliation_marks("\n".join([*zone, *_author_note_lines(front_text)])))
     first = _normalize_identity_text(_identity_surname(expected_author))
     personal = _cited_personal_surnames(expected_author)
@@ -1049,7 +1062,7 @@ def _author_observation(front_text: str, metadata_author: str | None,
     full = _normalize_identity_text(expected_author)
     credited = bool(
         (len(first) >= 3 and _contains_name(zone_identity, first))
-        or (len(full) >= 3 and _contains_name(full_text_identity, full))
+        or (len(full) >= 3 and _contains_name(full_text_identity, full, _normalize_identity_text))
     )
     return credited, [expected_author] if credited else [], None, names
 

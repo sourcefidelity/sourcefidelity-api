@@ -108,3 +108,26 @@ def test_abstract_scope_warning_requires_bound_affirmative_evidence(fault):
         'abstract_relevance':relevance},ref,SimpleNamespace(text=statement,reference_ids=['a']))
     assert member_tone(member) == ('attention' if not fault else 'limited_evidence')
     assert member['best_evidence']['display_text'] == text
+
+
+def test_a_record_without_the_journal_is_stated_only_with_a_reportable_difference():
+    from types import SimpleNamespace
+    from app.services.evidence_report import _states_record_lacks_journal
+    year = {'field_name': 'year', 'outcome': 'material_conflict', 'reason_code': 'year_identity_conflict'}
+    agree = {'field_name': 'title', 'outcome': 'agreement'}
+    expected = {'year': '1992', 'container_title': 'Screen Studies Quarterly', 'title': 'Glamour'}
+    bare = {'plausible_identity_match': True, 'observed': {'year': '1993', 'title': 'Glamour'},
+            'comparisons': [agree, year]}
+    article = SimpleNamespace(source_kind='journal_article')
+    # A one-year gap on an article is a registry artefact, not the student's error.
+    one_year = _reference_identity_conflict_view({'expected': expected, 'candidates': [bare]})
+    assert not _states_record_lacks_journal(one_year, article)
+    far = {**bare, 'observed': {'year': '1999', 'title': 'Glamour'}}
+    assert _states_record_lacks_journal(
+        _reference_identity_conflict_view({'expected': expected, 'candidates': [far]}), article)
+    # Another credible record names the cited journal: the absence is that registry's.
+    named = {'plausible_identity_match': True,
+             'observed': {'year': '1999', 'container_title': 'Screen Studies Quarterly'},
+             'comparisons': [agree, {**year}, {'field_name': 'container_title', 'outcome': 'agreement'}]}
+    both = _reference_identity_conflict_view({'expected': expected, 'candidates': [far, named]})
+    assert not _states_record_lacks_journal(both, article)

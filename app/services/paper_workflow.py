@@ -419,6 +419,8 @@ def retrieve_paper_sources(
             # link that yielded no text again once (rerun_reuse).
             from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION
             result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
+        from app.services.source_reuse import SEARCH_RULES_VERSION
+        result_record["search_rules"] = SEARCH_RULES_VERSION
         if getattr(result, "source_name", None) == "lantern":
             from app.services.source_reuse import LANTERN_PAGES_VERSION
             result_record["lantern_pages"] = LANTERN_PAGES_VERSION

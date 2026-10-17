@@ -15,6 +15,16 @@ _ISSUE_LABEL_RE = re.compile(
 )
 
 
+# Video hosts where the uploader writes the page title and the page date is the
+# upload date; neither is the work's title or publication year (2026-10-16).
+_VIDEO_HOSTS = ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")
+
+
+def is_video_host(url: str | None) -> bool:
+    host = (urlsplit(str(url or "")).hostname or "").casefold()
+    return any(host == item or host.endswith("." + item) for item in _VIDEO_HOSTS)
+
+
 def _strip_declared_site_suffix(title: str, declared_names: list[str]) -> str:
     """Remove a trailing site/journal name the page declares about itself.
 
@@ -169,6 +179,8 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
             author_method = "interface_label_rejected"
         if generic_date:
             date, date_method = None, "page_furniture_date_rejected"
+    if is_video_host(page_url):
+        date, date_method = None, "video_upload_date_rejected"
     if archive_item:
         # The item webpage's date is often its upload/scan date, not the
         # publication year of the described book. Require the labelled field.
@@ -183,7 +195,7 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
         if len(set(publication_values)) == 1 and re.fullmatch(r"(?:18|19|20)\d{2}(?:-\d{2}(?:-\d{2})?)?", publication_values[0]):
             date = publication_values[0]
             date_method = "catalog_publication_date"
-    if not date and not archive_item:
+    if not date and not archive_item and not is_video_host(page_url):
         for node in header_nodes:
             value = node.get_text(" ", strip=True)
             value = re.sub(r"^(?:Published|Posted)(?: on)?\s+", "", value, flags=re.I)

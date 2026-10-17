@@ -199,7 +199,28 @@ class ExpectedBibliographicFields(BaseModel):
         significant_title_words = [
             value for value in self.title.split() if len(value.strip(".,:;!?")) >= 3
         ]
-        return len(significant_title_words) >= 2
+        # A one-word book title ("Stars") still names a book once its author
+        # and publisher come with it (2026-10-16).
+        book = (self.source_kind in {"monograph", "edited_collection"}
+                and any(a.strip() for a in self.authors) and self.publisher.strip())
+        return len(significant_title_words) >= (1 if book else 2)
+
+
+def is_part_title_namesake(expected: "ExpectedBibliographicFields", candidate: "ReferenceDiscoveryCandidate") -> bool:
+    """A record sharing only a cited chapter's title, by other authors and not
+    in the cited book, is another work (Hayworth reference 9, 2026-10-16).
+
+    Applied only once the cited book itself is identified, so the record
+    cannot be the book's own listing of the chapter.
+    """
+    # A page read and checked for its title is still another work when its
+    # author conflicts and it is not in the book (Hayworth reference 9).
+    if (expected.source_kind != "book_section" or not expected.container_title.strip()
+            or candidate.authoritative_identifier_match):
+        return False
+    outcomes = {item.field_name: item.outcome for item in candidate.comparisons}
+    return (outcomes.get("title") == "agreement" and outcomes.get("author") == "material_conflict"
+            and outcomes.get("container_title") != "agreement")
 
 
 def is_edition_sensitive_reference(expected: ExpectedBibliographicFields, raw_reference: str = "") -> bool:
@@ -527,7 +548,7 @@ class ReferenceDiscoveryCandidate(BaseModel):
 
     @property
     def is_credible(self) -> bool:
-        if self.acquisition_outcome == "identity_rejected":
+        if self.acquisition_outcome == "identity_rejected" or self.disposition_reason_code == "part_title_namesake":
             return False
         return (
             bool(self.validated_identity_content_sha256)
@@ -1330,12 +1351,33 @@ def _web_title_furniture_only(expected: str, observed: str, *, author_match: boo
         return False
     page = _BRACKET_DESCRIPTOR.sub(" ", observed or "")
     forms = {_normalize_text(page)}
+    archive = _ARCHIVE_ITEM_TITLE.match(page)
+    # Matching authors required: "The studio system : Free Download ..." alone
+    # would make a generic short title a match (measured 2026-10-16).
+    if archive and author_match:
+        # "Title : subtitle : Creator, A : Free Download, Borrow, and
+        # Streaming : Internet Archive" (Hayworth reference 12, 2026-10-16):
+        # the item page's own title; the creator segment counts only with
+        # matching authors.
+        forms.add(_normalize_text(archive.group("item")))
+        if " : " in archive.group("item"):
+            forms.add(_normalize_text(archive.group("item").rsplit(" : ", 1)[0]))
     match = _SITE_SUFFIX.search(page)
     if match and len(match.group(0).split()) <= 6 and (author_match or match.group(0).strip().startswith("|")):
         forms.add(_normalize_text(page[:match.start()]))
+    # A bookseller's format after the title ("... - A Biography of Rita
+    # Hayworth - Softcover", Hayworth reference 6, 2026-10-16).
+    fmt = _BOOK_FORMAT_SUFFIX.search(page)
+    if fmt and author_match:
+        forms.add(_normalize_text(page[:fmt.start()]))
     return cited in forms
 
 
+_BOOK_FORMAT_SUFFIX = re.compile(
+    r"\s*(?:\||-|–|—|:|,)\s*(?:soft\s*cover|hard\s*cover|hardback|paperback|mass market paperback|e-?book"
+    r"|kindle edition)\s*$", re.IGNORECASE)
+_ARCHIVE_ITEM_TITLE = re.compile(r"^(?P<item>.+?)\s*:\s*Free Download, Borrow, and Streaming\s*:\s*Internet Archive\s*$",
+                                 re.IGNORECASE)
 _VOLUME_NOTE = re.compile(r"\(\s*(?:(?:\d+(?:st|nd|rd|th)|rev(?:ised)?\.?|new|updated)\s*ed(?:ition|\.)?"
                           r"|vol(?:ume|\.)?\s*\d+)\s*\)\s*$", re.IGNORECASE)
 
@@ -1347,7 +1389,8 @@ def _without_volume_note(value: str) -> str:
 def _normalize_text(value: str) -> str:
     # Crossref deposits can carry HTML entities: "Media &amp; Policy" left the
     # journal unresolved and held back Chalaby's DOI finding (2026-09-29).
-    normalized = unicodedata.normalize("NFKC", html.unescape(value)).casefold()
+    from app.services.lookalike_letters import fold_lookalikes
+    normalized = unicodedata.normalize("NFKC", fold_lookalikes(html.unescape(value))).casefold()
     normalized = re.sub(r"[^\w]+", " ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()
 

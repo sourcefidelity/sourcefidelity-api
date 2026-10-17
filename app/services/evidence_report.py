@@ -564,12 +564,17 @@ def build_evidence_report_view(
         for reference_id, discovery in discovery_by_reference.items()
     }
     for finding in (contribution_editor_findings(references.values(), container_records)
-                    + chapter_form_findings(references.values(), extraction.citation_format)
+                    + chapter_form_findings(references.values(), extraction.citation_format, container_records)
                     + reference_element_findings(references.values(), extraction.citation_format)):
         reference = references[finding['reference_id']]
         layout = reference_layout.get(reference.reference_id)
         finding['source'] = _reference_view(reference, layout)
-        if layout is not None and layout.rectangles:
+        if finding.get('locate_value'):
+            # The part the finding concerns (a chapter title, "In <book>") is
+            # placed by the field matcher; the whole entry only if it cannot
+            # be (owner request 2026-10-16).
+            pass
+        elif layout is not None and layout.rectangles:
             # Mark it on the reference itself, like the other reference-form
             # findings; a panel nobody opens is not a report.
             finding['rectangles'] = [item.model_dump(mode='json') for item in layout.rectangles]
@@ -647,8 +652,7 @@ def build_evidence_report_view(
                 "rectangles": [],
                 "localization_status": "not_assessed",
             })
-        if (conflict.get("record_lacks_journal") and conflict.get("field_differences")
-                and getattr(reference, "source_kind", "") == "journal_article"):
+        if _states_record_lacks_journal(conflict, reference):
             reference_practice.append({
                 "finding_type": "bibliographic_conflict",
                 "reference_id": reference_id,
@@ -1742,8 +1746,10 @@ _LINK_SUMMARY_KINDS = frozenset({'submitted_link_issue', 'submitted_link_homepag
                                  'reference_identifier_conflict', 'required_doi_missing', 'assessment_link_missing',
                                  'reference_identifier_placeholder'})
 _INCORRECT_SUMMARY_KINDS = frozenset({'identity_conflict', 'publication_year_discrepancy', 'bibliographic_field_conflict',
-                                      'reference_author_conflict', 'reference_publisher_repeated',
-                                      'contribution_author_is_volume_editor'})
+                                      'reference_author_conflict', 'reference_publisher_repeated'})
+# A part of a single-authored book cited as an edited-volume chapter is a
+# formatting matter, as its window says (owner decision and wording 2026-10-17).
+_MONOGRAPH_AS_COLLECTION_KINDS = frozenset({'contribution_author_is_volume_editor'})
 _MISSING_SUMMARY_KINDS = frozenset({'required_author_missing', 'chapter_editors_missing', 'chapter_pages_missing',
                                     'reference_title_missing'})
 _BROAD_SUMMARY_LINES = (
@@ -1753,6 +1759,9 @@ _BROAD_SUMMARY_LINES = (
     # Academic Practice, as its windows are (owner decision 2026-10-07).
     (_INCORRECT_SUMMARY_KINDS, 'academic_practice', 'reference_incorrect_information',
      '1 reference contains incorrect information', '{n} references contain incorrect information'),
+    (_MONOGRAPH_AS_COLLECTION_KINDS, 'reference_formatting', 'reference_monograph_as_collection',
+     '1 reference formats a monograph as an edited collection',
+     '{n} references format monographs as edited collections'),
     (_MISSING_SUMMARY_KINDS, 'reference_formatting', 'reference_missing_information',
      '1 reference is missing information', '{n} references are missing information'),
 )
@@ -2227,10 +2236,12 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
         panel_templates += _render_reference_window_template(
             entry, reference_practice, citations, citation_format=citation_format,
             patchwriting=patchwriting.get(('reference', entry.get('reference_id'))), paper_key=paper_key,
-            uncited_reference_ids=view.get('uncited_reference_ids'))
+            uncited_reference_ids=view.get('uncited_reference_ids'),
+            archive_page=((view.get('reference_verification') or {}).get(entry.get('reference_id')) or {}).get('archive_page'))
     paper_pages, placed_indexes = _render_continuous_paper(
         view["paper_surface"], citations, reference_practice,
         numbers=numbers, catalog=catalog, passages=passages,
+        uncited_reference_ids=view.get('uncited_reference_ids'),
     )
     # Keep unresolved geometry in retained diagnostics, not a new report section.
     summaries = _render_report_summary(
@@ -2342,7 +2353,7 @@ body[data-export-mode="released_print"] .paper-toolbar{{display:none}}
     if static_judgment:
         rendered = rendered.replace('</style>', '.jw-retry{display:none}</style>', 1)
     rendered = rendered.replace('orange indicator: citation/reference issue', 'orange highlight: citation/reference issue')
-    rendered = rendered.replace('</style>', '.reference-practice-overlay .reference-formatting-hit.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}</style>', 1)
+    rendered = rendered.replace('</style>', '.reference-practice-overlay .reference-formatting-hit.academic-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}.reference-practice-overlay .uncited-highlight{fill:#ffe45c;fill-opacity:.4;stroke:none}</style>', 1)
     rendered = rendered.replace('orange underlines indicate', 'orange highlights indicate').replace('issue underlines and affected-word highlights', 'affected-word highlights')
     rendered = rendered.replace(' Availability is not a correctness judgment.', '')
     rendered = rendered.replace(' full-text references', ' full-text retrieval(s)').replace(' abstract/limited-text references', ' abstract/limited-text retrieval(s)').replace(' unretrieved references', ' unretrieved sources')
@@ -4882,9 +4893,26 @@ def _reference_identity_conflict_view(discovery: dict) -> dict:
     # A located record that names no journal although the reference gives one
     # (Kozlovic: a web essay under the cited title; owner decision 2026-10-02).
     # Absence is not a conflict, so it stays out of the conflicting fields.
+    # Another credible record that names the cited journal makes the absence
+    # that registry's, not the reference's.
+    journal_named_elsewhere = any(
+        (item.get("plausible_identity_match") or item.get("authoritative_identifier_match"))
+        and any(c.get("field_name") == "container_title" and c.get("outcome") == "agreement"
+                for c in item.get("comparisons") or [])
+        for item in candidates)
     result['record_lacks_journal'] = bool(candidate and str(expected.get('container_title') or '').strip()
-                                          and not str(observed.get('container_title') or '').strip())
+                                          and not str(observed.get('container_title') or '').strip()
+                                          and not journal_named_elsewhere)
     return result
+
+
+def _states_record_lacks_journal(conflict: dict, reference) -> bool:
+    """Name the missing journal only beside a difference the student must fix."""
+    return bool(
+        conflict.get("record_lacks_journal")
+        and getattr(reference, "source_kind", "") == "journal_article"
+        and any(_reference_field_difference_is_reportable(d["field_name"], d, reference)
+                for d in conflict.get("field_differences") or []))
 
 
 def _material_limitations(package: dict, displayed: list[dict]) -> list[str]:
@@ -4969,6 +4997,7 @@ def _render_continuous_paper(
     numbers: dict[str, int] | None = None,
     catalog: list[dict] | None = None,
     passages: list[dict] | None = None,
+    uncited_reference_ids: list[str] | None = None,
 ) -> tuple[str, set[int]]:
     numbers = numbers or {}
     catalog = catalog or []
@@ -5248,6 +5277,20 @@ def _render_continuous_paper(
                 f'<a href="#evidence-panel" class="reference-entry-overlay" role="button" tabindex="0" '
                 f'aria-pressed="false" aria-label="Reference {int(entry["number"])}" '
                 f'data-panel-template="{escape(entry["template_id"], quote=True)}">{hits}</a>')
+            if entry.get('reference_id') in set(uncited_reference_ids or []):
+                # The whole entry is the issue: Academic Practice yellow over it,
+                # opening the Reference window that states it (owner request 2026-10-16).
+                marks = ''.join(
+                    f'<rect class="uncited-highlight" x="{float(r["x0"]):.3f}" '
+                    f'y="{float(r["y0"]):.3f}" width="{float(r["x1"])-float(r["x0"]):.3f}" '
+                    f'height="{float(r["y1"])-float(r["y0"]):.3f}" />'
+                    for r in rectangles)
+                # Beneath the entry's own findings, so a finding on part of it
+                # (its "In <book>", say) still shows on top.
+                overlays_by_page.setdefault(page_index, []).insert(0,
+                    f'<a href="#evidence-panel" class="reference-practice-overlay" role="button" tabindex="0" '
+                    f'aria-pressed="false" aria-label="Reference-practice difference" '
+                    f'data-panel-template="{escape(entry["template_id"], quote=True)}">{marks}</a>')
         first = first_rectangle(location.get('rectangles') or [])
         if first:
             overlays_by_page.setdefault(int(first['page_index']), []).append(
@@ -6107,7 +6150,8 @@ def withdraw_unverified_possible_matches(view: dict, citations: list[dict], unve
 def _render_reference_window_template(entry: dict, findings: list[dict], citations: list[dict],
                                       *, citation_format: str = '', patchwriting: list[dict] | None = None,
                                       paper_key: str = '',
-                                      uncited_reference_ids: list[str] | None = None) -> str:
+                                      uncited_reference_ids: list[str] | None = None,
+                                      archive_page: dict | None = None) -> str:
     """One window per reference: the entry, its availability, its citations
     and every located reference-list finding on it, grouped by category.
 
@@ -6143,6 +6187,16 @@ def _render_reference_window_template(entry: dict, findings: list[dict], citatio
             parts.append(_render_upload(citations[first[0] - 1].get('upload_action') or {}))
         if not member.get('unverified'):  # owner decision 2026-09-30
             parts.append(_render_search_again(member.get('search_again_action') or {}))
+    if archive_page and archive_page.get('page_id'):
+        # A magazine page the archive search located but did not read: the
+        # existing Located Record, no added sentence (owner decision 2026-10-16).
+        from app.services.retrieval.media_history_archive import page_link
+        link = page_link(str(archive_page['page_id']))
+        parts.append('<h3>Located Record</h3><p class="full-reference">'
+                     f'{escape(str(archive_page.get("volume_dates") or archive_page.get("publication") or ""))}'
+                     + (f' <a class="reference-url" href="{escape(link, quote=True)}" target="_blank" '
+                        f'rel="noopener noreferrer">{escape(link)}</a>' if _safe_reference_href(link) else '')
+                     + '</p>')
     cited = entry.get('citation_numbers') or []
     if cited:
         parts.append('<p class="reference-citations">Cited in ' + ' '.join(

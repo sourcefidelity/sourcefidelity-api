@@ -210,6 +210,14 @@ def _apa_title(after_year: str) -> str:
             # is not, by itself, a safe title boundary. Preserve the mark.
             end = index + 1
             break
+        elif char in '?!' and depth == 0 and re.match(
+            r'\s+In\s+[^()]{3,300}?(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?\(\s*(?:pp?\.|Eds?\.)',
+            text[index + 1:],
+        ):
+            # A chapter title ending in "?" or "!" before "In Book (pp. ...)"
+            # (2026-10-16). Preserve the mark.
+            end = index + 1
+            break
     if depth:
         return ''
     title = text[:end].strip()
@@ -316,7 +324,10 @@ _CONTAINER_IN_PAGES_RE = re.compile(
 # a book (Franchise 1, 2026-09-29: read as a whole book, the chapter title was
 # searched as a book and the containing book was never looked up).
 _CONTAINER_IN_NO_EDITOR_RE = re.compile(
-    r'\.\s+In\s+' + _CONTAINER_TITLE + r'\s*'
+    r'[.?!]\s+In\s+' + _CONTAINER_TITLE + r'\s*'
+    # An edition note may come before the pages, as for edited volumes:
+    # "In Book title (2nd ed.) (pp. 1-16)" (2026-10-16).
+    r'(?:\(\s*[^()]{1,20}?\bed(?:ition|\.)?\s*\)\s*)?'
     r'\(\s*pp?\.\s*(?P<pages>[\dixvlc]{1,6}\s*[-–—]\s*[\dixvlc]{1,6})\s*\)',
     re.IGNORECASE)
 
@@ -336,15 +347,17 @@ _CONTAINER_IN_EDITORS_AFTER_RE = re.compile(
 # wrong journal could not be compared, let alone reported. The volume, or the
 # issue in parentheses, is the anchor: a bare trailing number is not enough to
 # call the text before it a journal.
+# A title ending in "!" or "?" ends there; the journal name never spans it
+# ("How Rita Hayworth Has Changed! Screenland, 49(10)", 2026-10-16).
 _JOURNAL_RE = re.compile(
-    r'(?:^|(?<=\.)|(?<=\?)|(?<=!))\s*(?P<container>[^\W\d_][^.\n]{2,120}?)\s*,?\s*'
+    r'(?:^|(?<=\.)|(?<=\?)|(?<=!))\s*(?P<container>[^\W\d_][^.!?\n]{2,120}?)\s*,?\s*'
     r'(?P<volume>\d{1,4})\s*'
     r'(?:\(\s*(?P<issue>[^)\n]{1,24})\s*\))?\s*'
     r'(?:,\s*(?P<pages>[A-Za-z]?\d{1,6}\s*[-\u2013\u2014]\s*[A-Za-z]?\d{1,6}|e\d{3,8}))?',
     re.UNICODE)
 # A journal numbered by issue alone, "Law and Society, (11), 6-9." (no volume).
 _JOURNAL_ISSUE_ONLY_RE = re.compile(
-    r'(?:^|(?<=\.)|(?<=\?)|(?<=!))\s*(?P<container>[^\W\d_][^.\n]{2,120}?)\s*,\s*'
+    r'(?:^|(?<=\.)|(?<=\?)|(?<=!))\s*(?P<container>[^\W\d_][^.!?\n]{2,120}?)\s*,\s*'
     r'\(\s*(?P<issue>\d{1,3})\s*\)\s*,\s*(?:pp?\.\s*)?'
     r'(?P<pages>[A-Za-z]?\d{1,6}\s*[-\u2013\u2014]\s*[A-Za-z]?\d{1,6})(?=[.,;\s]|$)',
     re.UNICODE)
@@ -368,11 +381,24 @@ def _journal_parts(ref: str) -> tuple[str, str, str, str]:
         issue_only = [m for m in _JOURNAL_ISSUE_ONLY_RE.finditer(text)
                       if not re.search(r'/|www\.|\.(?:com|org|net)\b', m.group('container') or '')]
         if not issue_only:
-            return '', '', '', ''
+            from app.services.source_type import DATED_PERIODICAL_RE
+            dated = DATED_PERIODICAL_RE.search(text)
+            if not dated:
+                return '', '', '', ''
+            pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', dated.group('pages').strip())
+            return dated.group('container').strip(), '', '', pages
         match = issue_only[-1]
         container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')
         pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', match.group('pages').strip())
         return container, '', match.group('issue'), pages
+    if not match.group('issue'):
+        # A magazine dated to the month with no issue: "Photoplay, 42, 86-87"
+        # lists pages, not a volume and pages (Hayworth reference 23, 2026-10-16).
+        from app.services.source_type import DATED_PERIODICAL_RE
+        dated = DATED_PERIODICAL_RE.search(text)
+        if dated and "," in dated.group('pages'):
+            pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', dated.group('pages').strip())
+            return dated.group('container').strip(), '', '', pages
     container = re.sub(r'\s+', ' ', match.group('container') or '').strip(' .,')
     pages = re.sub(r'\s*[-\u2013\u2014]\s*', '-', (match.group('pages') or '').strip())
     volume = (match.group('volume') or '').strip()
@@ -568,7 +594,7 @@ def extract_fields_apa(ref: str) -> Optional[ParsedReference]:
     # trailing-element rule that finds a book's imprint reads the journal
     # name instead, which put a false publisher on 59 of 179 articles and
     # fed bogus publisher agreement into the merge score.
-    periodical = bool(journal and (volume or issue))
+    periodical = bool(journal and (volume or issue or pages))
     from app.services.source_type import classify_reference_source_kind
     kind = classify_reference_source_kind(ref, title=title, url=url).kind
 
