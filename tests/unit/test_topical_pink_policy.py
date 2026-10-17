@@ -89,3 +89,42 @@ def test_feeds_are_not_article_xml_and_view_pdf_is_retained():
     locations=discover_scholarly_locations(html,'https://journal.example/article')
     assert [l.url for l in locations]==['https://journal.example/article.xml',
         'https://journal.example/download?id=1','https://journal.example/paper.pdf?download=1']
+
+
+def matched_member():
+    member, citation = bound_member()
+    scope = member['abstract_relevance']['scope_assessment']
+    scope.update(relevance='generally_relevant', attention=False, topic_relation='overlapping',
+                 broad_subject_relation='compatible', plausible_connection='present')
+    return member, citation
+
+
+def test_a_generally_relevant_comparison_is_a_topical_match_under_the_mismatch_conditions():
+    from app.services.report_layers import topical_match
+    member, citation = matched_member()
+    assert topical_match(member, citation) and not topical_mismatch(member, citation)
+    member['abstract_relevance']['scope_assessment']['relevance'] = 'uncertain'
+    assert not topical_match(member, citation)
+    for change in ({'reference_identity': {'status': 'possible_match'}}, {'coverage_level': 'full_text'}):
+        other, cited = matched_member()
+        other.update(change)
+        assert not topical_match(other, cited)
+    other, cited = matched_member()
+    cited['members'] = [other, {}, {}]   # however many sources the statement names
+    assert topical_match(other, cited)
+    other, cited = matched_member()
+    cited['student_text'] += ' Changed.'  # no longer the statement assessed
+    assert not topical_match(other, cited)
+
+
+def test_the_window_and_pdf_name_the_topic_in_words():
+    from app.services.evidence_report import _member_label
+    from app.services.report_export import _topic_heading
+    member, citation = matched_member()
+    assert _member_label(member, citation).endswith('Abstract Retrieved</span></span> – Topical Match')
+    assert _topic_heading(member, citation) == 'Abstract Retrieved – Topical Match'
+    mismatch, cited = bound_member()
+    assert _topic_heading(mismatch, cited) == 'Abstract Retrieved – Possible Topical Mismatch'
+    assert 'Topical Match' not in _member_label(mismatch, cited)
+    member['abstract_relevance']['scope_assessment']['relevance'] = 'uncertain'
+    assert _topic_heading(member, citation) == '' and 'Topical' not in _member_label(member, citation)

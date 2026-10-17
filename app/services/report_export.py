@@ -365,7 +365,7 @@ def _append_evidence(document, citations, findings, view) -> dict:
             marks=[r for r in member_marks if r['member_index']==member_index]
             targets.append((member_key,marks,label))
             blocks.append(f'<h2 id="{member_key}">{label}</h2><p class="return" id="return-{member_key}">Back to source citation</p>')
-            blocks.append(_portable_member_html(member))
+            blocks.append(_portable_member_html(member, citation))
             if member.get('show_quotation_check'):
                 from app.services.evidence_report import render_quotation_comparisons
                 comparison = render_quotation_comparisons(
@@ -561,7 +561,22 @@ def _write_evidence_blocks(blocks, css, position):
     return fitz.open(stream=stream.getvalue(), filetype='pdf')
 
 
-def _portable_member_html(member: dict) -> str:
+def _topic_heading(member: dict, citation: dict) -> str:
+    """The source's topic, in words (owner decision 2026-10-17): the PDF has
+    no Judgment, so its label names the text retrieved and the topic only."""
+    from app.services.evidence_report import _EVIDENCE_KIND_LABELS
+    from app.services.report_layers import topical_match, topical_mismatch
+    kind = _EVIDENCE_KIND_LABELS.get(member.get('coverage_level'), '')
+    if not kind:
+        return ''
+    if topical_mismatch(member, citation):
+        return f'{kind} – Possible Topical Mismatch'
+    if topical_match(member, citation):
+        return f'{kind} – Topical Match'
+    return ''
+
+
+def _portable_member_html(member: dict, citation: dict | None = None) -> str:
     """Use the PDF engine's supported block tags, with no interactive widgets."""
     source=member.get('source') or {}
     from app.services.evidence_report import (
@@ -571,6 +586,9 @@ def _portable_member_html(member: dict) -> str:
     translations = member.get('evidence_translations') or {}
     media = _member_is_media(member)
     parts = ['<h3>Media Reference - Cannot Retrieve</h3>'] if media else []
+    topic = _topic_heading(member, citation) if citation is not None and not media else ''
+    if topic:
+        parts.append(f'<h3>{escape(topic)}</h3>')
     parts.append('<p class="full-reference">'+escape(str(source.get('raw_reference') or source.get('title') or 'Reference unavailable'))+'</p>')
     if not media and member.get('availability') and member['availability'] != 'Source Not Retrieved':
         parts.append('<p>'+escape(_panel_statement(member['availability']))+'</p>')

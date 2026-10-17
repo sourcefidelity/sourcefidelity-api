@@ -104,8 +104,8 @@ class TestTheMarkDecidesTheWithholding:
 
 class TestOwnerDecision20261014:
     """Topical mismatch is for abstracts and limited text, never for a fully
-    retrieved text, and never for a citation of three or more sources
-    (owner decisions 2026-10-14 and 2026-09-30; Harlow citation 7)."""
+    retrieved text, whatever the number of sources cited (owner decisions
+    2026-10-14 and 2026-10-17; the three-source exclusion was removed)."""
 
     def test_a_fully_retrieved_text_is_never_a_mismatch(self):
         member = _member(coverage_level="full_text", scope=_scope(scope_coverage="full_text"))
@@ -116,11 +116,11 @@ class TestOwnerDecision20261014:
         item = _withhold_mismatched_evidence(_member(coverage_level="partial_text"), {"student_text": CLAIM})
         assert item["best_evidence"] is None
 
-    def test_three_sources_keep_their_evidence(self):
+    def test_a_statement_citing_three_sources_is_compared_like_any_other(self):
         member = _member(coverage_level="partial_text")
-        assert topical_mismatch(member, {"student_text": CLAIM, "members": [member, {}]})
         three = {"student_text": CLAIM, "members": [member, {}, {}]}
-        assert _withhold_mismatched_evidence(member, three)["best_evidence"] is not None
+        assert topical_mismatch(member, three)
+        assert _withhold_mismatched_evidence(member, three)["best_evidence"] is None
 
 
 def test_the_run_gathers_evidence_even_for_a_topical_mismatch(monkeypatch):

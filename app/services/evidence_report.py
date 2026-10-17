@@ -5510,9 +5510,12 @@ def _member_label(item: dict, citation: dict | None = None) -> str:
     if item.get('unverified') and level == 'unavailable':
         heading += ' – <mark class="issue-heading unverified">Cannot be verified</mark>'
     elif citation is not None:
-        from app.services.report_layers import topical_mismatch
+        from app.services.report_layers import topical_match, topical_mismatch
         if topical_mismatch(item, citation):
             heading += ' – <mark class="issue-heading topical">Possible Topical Mismatch</mark>'
+        elif topical_match(item, citation):
+            # Plain text: a match is not an issue (owner decision 2026-10-17).
+            heading += ' – Topical Match'
     return heading
 
 

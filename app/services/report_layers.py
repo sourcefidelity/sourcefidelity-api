@@ -152,7 +152,33 @@ def _scope_source_text(member: dict) -> tuple[str, bool]:
     return text, bool(text)
 
 
-BROAD_CITATION_SOURCES = 3
+def _bound_scope(member: dict, citation: dict) -> dict | None:
+    """The stored subject comparison, when it may speak about this citation.
+
+    Shared by the mismatch mark and the match label, so the two always answer
+    under the same conditions: an abstract or limited text, an identified work,
+    and a complete assessment bound by hash to the exact text assessed and the
+    statement as written. However many sources the statement cites (the
+    three-source exclusion of 2026-09-30 hid no mismatch over 32 stored
+    reports and 12 matches; removed, owner decision 2026-10-17).
+    """
+    if member.get('coverage_level') not in _SCOPE_COMPARABLE_COVERAGE:
+        return None
+    if not _reference_identified(member):
+        # The subject shown may not be the cited work's subject.
+        return None
+    text, bound = _scope_source_text(member)
+    claim = str(citation.get('student_text') or '')
+    assessment = member.get('abstract_relevance') or {}
+    scope = assessment.get('scope_assessment') or {}
+    hashes = {'abstract_sha256': hashlib.sha256(text.encode()).hexdigest(),
+              'claim_sha256': hashlib.sha256(claim.encode()).hexdigest()}
+    if (text and claim and bound
+            and assessment.get('status') == scope.get('status') == 'complete'
+            and all(assessment.get(k) == value == scope.get(k) for k, value in hashes.items())
+            and _scope_coverage_agrees(member, scope)):
+        return scope
+    return None
 
 
 def topical_mismatch(member: dict, citation: dict) -> bool:
@@ -163,27 +189,12 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
     reference whose work was not identified never carries the mark. Low
     relevance scores and missing passages never become topical mismatch.
     """
-    if member.get('coverage_level') not in _SCOPE_COMPARABLE_COVERAGE:
+    scope = _bound_scope(member, citation)
+    if scope is None:
         return False
-    # A statement about a body of research cites its sources as examples; one
-    # study's own subject cannot mismatch it (Academic Article, 2026-09-30; the
-    # topical comparison's known false marks were such broad statements).
-    if len(citation.get('members') or []) >= BROAD_CITATION_SOURCES:
-        return False
-    if not _reference_identified(member):
-        # The subject shown may not be the cited work's subject.
-        return False
-    text, bound = _scope_source_text(member)
+    text, _bound = _scope_source_text(member)
     claim = str(citation.get('student_text') or '')
-    assessment = member.get('abstract_relevance') or {}
-    scope = assessment.get('scope_assessment') or {}
-    hashes = {'abstract_sha256': hashlib.sha256(text.encode()).hexdigest(),
-              'claim_sha256': hashlib.sha256(claim.encode()).hexdigest()}
-    return bool(text and claim and bound
-        and assessment.get('status') == scope.get('status') == 'complete'
-        and all(assessment.get(k) == value == scope.get(k) for k, value in hashes.items())
-        and _scope_coverage_agrees(member, scope)
-        and scope.get('relevance') == 'apparent_mismatch' and scope.get('attention') is True
+    return bool(scope.get('relevance') == 'apparent_mismatch' and scope.get('attention') is True
         and _qualifying_scope_ground(scope)
         and str(scope.get('subject_comparison') or '').strip()
         and scope.get('confidence') == 'high'
@@ -191,6 +202,16 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
         and scope.get('abstract_span') and scope['abstract_span'] in text
         and scope.get('claim_span') and scope['claim_span'] in claim
         and str(scope.get('rationale') or '').strip())
+
+
+def topical_match(member: dict, citation: dict) -> bool:
+    """The comparison found the abstract or limited text generally relevant to
+    the statement (owner decision 2026-10-17): a statement about the source's
+    topic, not support for its claim. Uncertain and unmarked comparisons are
+    neither a match nor a mismatch."""
+    scope = _bound_scope(member, citation)
+    return bool(scope is not None and scope.get('relevance') == 'generally_relevant'
+                and not topical_mismatch(member, citation))
 
 
 SCOPE_NOTE_CLOSING = 'Read the source to judge whether it supports the statement.'
