@@ -67,9 +67,8 @@ class WholeSourcePlan:
 
 
 def _excluded_roles() -> frozenset:
-    from app.services.evidence_sentence_selection import _EXCLUDED_ROLES
-    from app.services.verification_evidence import _EXCLUDED_RETRIEVAL_ROLES
-    return frozenset(_EXCLUDED_ROLES) | frozenset(_EXCLUDED_RETRIEVAL_ROLES)
+    from app.services.source_roles import NON_EVIDENCE_ROLES, SELECTION_EXCLUDED_ROLES
+    return NON_EVIDENCE_ROLES | SELECTION_EXCLUDED_ROLES
 
 
 def whole_source_passages(source) -> list:
@@ -98,16 +97,19 @@ def whole_source_passages(source) -> list:
 
 def build_plan(artifact, whole_passages) -> WholeSourcePlan:
     """Retrieved sentences first (ids kept), then every other sentence of the source."""
-    from app.services.evidence_sentence_selection import _EXCLUDED_ROLES
-    from app.services.facet_evidence_judgment import _passage_sentences
+    from app.services.facet_evidence_judgment import bounded_passage_sentences
     excluded_roles = _excluded_roles()
     items, seen, excluded = [], set(), 0
     retrieved = sorted(artifact.passages, key=lambda p: (_page_order(p.page_index), p.character_start))
     for passage in retrieved:
-        if passage.passage_role in _EXCLUDED_ROLES:
+        if passage.passage_role in excluded_roles:
             excluded += 1
             continue
-        for sentence in _passage_sentences(passage):
+        sentences = bounded_passage_sentences(passage)
+        if sentences is None:   # a sentence over the bound: skip this passage, never the run
+            excluded += 1
+            continue
+        for sentence in sentences:
             key = absolute_key(passage, sentence.passage_start, sentence.passage_end)
             if key not in seen:
                 seen.add(key)
@@ -115,7 +117,7 @@ def build_plan(artifact, whole_passages) -> WholeSourcePlan:
     for passage in whole_passages:
         if passage.passage_role in excluded_roles:
             continue
-        for sentence in _passage_sentences(passage):
+        for sentence in bounded_passage_sentences(passage) or ():
             key = absolute_key(passage, sentence.passage_start, sentence.passage_end)
             if key not in seen:
                 seen.add(key)

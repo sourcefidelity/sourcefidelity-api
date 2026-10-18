@@ -84,5 +84,10 @@ celery_app.conf.update(
             "task": "retry_incomplete_searches",
             "schedule": max(60, settings.INCOMPLETE_SEARCH_RETRY_SCAN_SECONDS),
         },
+        # A failed judge is asked again (judgment_runs.auto_retry_failed_runs).
+        "retry-failed-judgments": {
+            "task": "retry_failed_judgments",
+            "schedule": 900,
+        },
     },
 )

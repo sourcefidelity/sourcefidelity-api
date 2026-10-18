@@ -110,7 +110,7 @@ _IDENTIFIED_FOR_SUBJECT_COMPARISON = frozenset({
 })
 
 
-def _reference_identified(member: dict) -> bool:
+def reference_identified(member: dict) -> bool:
     """Do we know which work this is, well enough to compare its subject?
 
     The Belton failure was a reference that was never located: 28 candidates,
@@ -125,7 +125,14 @@ def _reference_identified(member: dict) -> bool:
     status = identity.get('status')
     if status in _IDENTIFIED_FOR_SUBJECT_COMPARISON:
         return True
-    return bool(status == 'bibliographic_conflict'
+    if member.get('text_is_located_book') and member.get('located_book'):
+        # The text is the identified single-authored book a chapter was cited
+        # from (Synthetic Embrace citation 3, 2026-10-18).
+        return True
+    # A possible match agreeing on title and author is recognisably the work
+    # too (Hettich: Crossref's online-first year left it a possible match;
+    # owner decision 2026-10-18; +3 matches, no mismatch over stored reports).
+    return bool(status in {'bibliographic_conflict', 'possible_match'}
                 and identity.get('title_and_author_agree'))
 
 
@@ -152,23 +159,48 @@ def _scope_source_text(member: dict) -> tuple[str, bool]:
     return text, bool(text)
 
 
+BROAD_CITATION_SOURCES = 3
+
+
+def assessed_claim_text(citation: dict) -> str:
+    """The statement the subject comparison was made for: the whole claim,
+    also for a citation the report shows as one clause of it (the clause
+    projection of 2026-10-14 had left every clause citation without its topic
+    label, mark or note; Synthetic Embrace citation 7, 2026-10-18)."""
+    return str((citation.get('clause_of') or citation).get('student_text') or '')
+
+
 def _bound_scope(member: dict, citation: dict) -> dict | None:
     """The stored subject comparison, when it may speak about this citation.
 
     Shared by the mismatch mark and the match label, so the two always answer
-    under the same conditions: an abstract or limited text, an identified work,
-    and a complete assessment bound by hash to the exact text assessed and the
-    statement as written. However many sources the statement cites (the
-    three-source exclusion of 2026-09-30 hid no mismatch over 32 stored
-    reports and 12 matches; removed, owner decision 2026-10-17).
+    under the same conditions: an abstract or limited text, a statement naming
+    fewer than three sources, an identified work, and a complete assessment
+    bound by hash to the exact text assessed and the statement as written.
     """
     if member.get('coverage_level') not in _SCOPE_COMPARABLE_COVERAGE:
         return None
-    if not _reference_identified(member):
+    # A statement about a body of research cites its sources as examples; one
+    # study's own subject cannot mismatch it (Academic Article, 2026-09-30).
+    # Removed 2026-10-17 on a measurement the clause-citation fault had
+    # distorted; restored 2026-10-18 (owner decision) when that fault's fix
+    # revealed three such false marks ("Most research on ... (A; B; C)").
+    if len(citation.get('members') or []) >= BROAD_CITATION_SOURCES:
+        return None
+    if not reference_identified(member):
         # The subject shown may not be the cited work's subject.
         return None
+    return _hash_bound_scope(member, citation)
+
+
+def _hash_bound_scope(member: dict, citation: dict) -> dict | None:
+    """A complete comparison bound by hash to the text shown and the statement
+    assessed, on the kind of evidence it was made on: the one test every
+    topic label, mark and note reads (rules audit 2026-10-18)."""
+    if member.get('coverage_level') not in _SCOPE_COMPARABLE_COVERAGE:
+        return None
     text, bound = _scope_source_text(member)
-    claim = str(citation.get('student_text') or '')
+    claim = assessed_claim_text(citation)
     assessment = member.get('abstract_relevance') or {}
     scope = assessment.get('scope_assessment') or {}
     hashes = {'abstract_sha256': hashlib.sha256(text.encode()).hexdigest(),
@@ -193,7 +225,7 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
     if scope is None:
         return False
     text, _bound = _scope_source_text(member)
-    claim = str(citation.get('student_text') or '')
+    claim = assessed_claim_text(citation)
     return bool(scope.get('relevance') == 'apparent_mismatch' and scope.get('attention') is True
         and _qualifying_scope_ground(scope)
         and str(scope.get('subject_comparison') or '').strip()
@@ -202,6 +234,17 @@ def topical_mismatch(member: dict, citation: dict) -> bool:
         and scope.get('abstract_span') and scope['abstract_span'] in text
         and scope.get('claim_span') and scope['claim_span'] in claim
         and str(scope.get('rationale') or '').strip())
+
+
+UNCERTAIN_NOTE_CLOSING = 'Read the source to judge whether it supports the statement.'
+
+
+def topical_uncertain(member: dict, citation: dict) -> bool:
+    """A comparison that ran but settled neither way: uncertain, or an apparent
+    mismatch short of the mark (owner decision 2026-10-18)."""
+    scope = _bound_scope(member, citation)
+    return bool(scope is not None and not topical_mismatch(member, citation)
+                and not topical_match(member, citation))
 
 
 def topical_match(member: dict, citation: dict) -> bool:
@@ -214,7 +257,6 @@ def topical_match(member: dict, citation: dict) -> bool:
                 and not topical_mismatch(member, citation))
 
 
-SCOPE_NOTE_CLOSING = 'Read the source to judge whether it supports the statement.'
 
 
 def abstract_scope_note(member: dict, citation: dict) -> dict | None:
@@ -227,32 +269,35 @@ def abstract_scope_note(member: dict, citation: dict) -> dict | None:
     hash to the abstract shown and the statement as written, for a reference
     whose work was identified, qualifies; no model is called.
     """
-    if member.get('coverage_level') not in {'abstract_only', 'partial_text'}:
+    if not reference_identified(member) or topical_mismatch(member, citation):
         return None
-    if not _reference_identified(member) or topical_mismatch(member, citation):
-        return None
-    text, bound = _scope_source_text(member)
-    claim = str(citation.get('student_text') or '')
-    assessment = member.get('abstract_relevance') or {}
-    scope = assessment.get('scope_assessment') or {}
-    hashes = {'abstract_sha256': hashlib.sha256(text.encode()).hexdigest(),
-              'claim_sha256': hashlib.sha256(claim.encode()).hexdigest()}
+    scope = _hash_bound_scope(member, citation) or {}
     comparison = str(scope.get('subject_comparison') or '').strip()
-    if not (text and claim and bound and comparison
-            and assessment.get('status') == scope.get('status') == 'complete'
-            and all(assessment.get(k) == value == scope.get(k) for k, value in hashes.items())
-            and _scope_coverage_agrees(member, scope)):
+    if not comparison:
         return None
-    return {'note': comparison.rstrip('. ') + '. ' + SCOPE_NOTE_CLOSING}
+    # No closing advice: reading the source is implied (owner decision 2026-10-18).
+    return {'note': comparison.rstrip('. ') + '.'}
+
+
+def check_shown(member: dict, kind: str) -> bool:
+    """A quotation or locator check is shown only for retrieved text: one rule
+    for the window, the PDF, the summary and the paper marks (rules audit
+    2026-10-18: they had four)."""
+    return bool(member.get(f'show_{kind}_check')
+                and member.get('coverage_level') in {'full_text', 'abstract_only', 'partial_text'})
+
+
+def check_attention(member: dict, kind: str) -> bool:
+    """A shown check that found something, from a finished check."""
+    check = member.get(f'{kind}_check') or {}
+    return bool(check_shown(member, kind) and check.get('attention')
+                and check.get('status') in {'complete', 'incomplete'})
 
 
 def locator_attention(member: dict) -> bool:
     """A quotation located outside the supplied locator: an Academic Practice
     issue, marked yellow on the citation (owner request 2026-10-03), not orange."""
-    locator = member.get('locator_check') or {}
-    return bool(member.get('coverage_level') in {'full_text', 'abstract_only', 'partial_text'}
-                and member.get('show_locator_check') and locator.get('attention')
-                and locator.get('status') in {'complete', 'incomplete'})
+    return check_attention(member, 'locator')
 
 
 def locator_rectangles(citation: dict, words_by_page: dict) -> list[dict]:
@@ -279,10 +324,8 @@ def member_layers(member: dict, citation: dict) -> set[str]:
     layers = set()
     if topical_mismatch(member, citation):
         layers.add('relevance')
-    if member.get('coverage_level') in {'full_text', 'abstract_only', 'partial_text'}:
-        check = member.get('quotation_check') or {}
-        if member.get('show_quotation_check') and check.get('attention') and check.get('status') in {'complete', 'incomplete'}:
-            layers.add('practice')
+    if check_attention(member, 'quotation'):
+        layers.add('practice')
     if any(f.get('finding_type') == 'duplicate_citation_key' for f in member.get('reference_findings') or []):
         layers.add('reference')
     return layers
@@ -341,11 +384,12 @@ def scope_disagreement(member: dict, citation: dict) -> dict | None:
     """
     if member.get('coverage_level') not in _SCOPE_COMPARABLE_COVERAGE:
         return None
-    if not _reference_identified(member):
+    if not reference_identified(member):
         return None
-    assessment = member.get('abstract_relevance') or {}
-    scope = assessment.get('scope_assessment') or {}
-    if scope.get('status') != 'complete':
+    # The same hash-bound comparison as the label and the note: a stale one
+    # (made for other wording) is not shown (rules audit 2026-10-18).
+    scope = _hash_bound_scope(member, citation)
+    if scope is None:
         return None
     comparison = str(scope.get('subject_comparison') or scope.get('rationale') or '').strip()
     if not comparison:
@@ -375,8 +419,7 @@ def scope_disagreement(member: dict, citation: dict) -> dict | None:
         'reasons': reasons,
         # The reader gets the comparison and what to do with it. The
         # dissent stays in `reasons` for diagnosis, not in the note.
-        'note': (comparison.rstrip('. ')
-                 + '. ' + SCOPE_NOTE_CLOSING),
+        'note': comparison.rstrip('. ') + '.',
         'source_scope': str(scope.get('source_scope') or '').strip(),
         'claim_scope': str(scope.get('claim_scope') or '').strip(),
         'scope_dimension': str(scope.get('scope_dimension') or '').strip(),

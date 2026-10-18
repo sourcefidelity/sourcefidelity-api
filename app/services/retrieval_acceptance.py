@@ -14,9 +14,9 @@ from app.services.evidence_package import EvidencePackageV1
 
 LEGACY_ACCEPTANCE_CONTRACT_VERSION = "evidence-package-retrieval-acceptance-v1"
 ACCEPTANCE_CONTRACT_VERSION = "evidence-package-retrieval-acceptance-v2"
-EXCLUDED_DISPLAY_ROLES = frozenset(
-    {"reference_list", "publication_metadata", "page_furniture", "author_biography"}
-)
+from app.services.source_roles import NON_EVIDENCE_ROLES
+# An explanatory note may be shown; every other non-evidence role is noise.
+EXCLUDED_DISPLAY_ROLES = NON_EVIDENCE_ROLES - {"citation_notes"}
 
 
 class RetrievalAcceptanceError(ValueError):

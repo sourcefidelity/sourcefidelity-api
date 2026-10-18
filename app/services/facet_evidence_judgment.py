@@ -55,7 +55,8 @@ from app.services.verification_evidence import (
 
 from app.services.text_quality import readable_text
 
-FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v12"
+# v13, 2026-10-18: sentences from the shared source splitter (abbreviations are not ends).
+FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v13"
 FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v7"
 # Measured 2026-09-28 over 824 stored claims: a median of 114 real sentences
 # (p90 163) were merged into 24 paragraph-length units. 128 keeps most claims
@@ -295,6 +296,15 @@ class _EvidenceSentenceBudgetExceeded(ValueError):
     """An exact span cannot enter the bounded optional sentence contract."""
 
 
+def bounded_passage_sentences(passage) -> list[SourceEvidenceSentence] | None:
+    """A passage's sentences, or None when one exceeds the sentence bound, so a
+    caller skips that passage instead of failing the paper run."""
+    try:
+        return _passage_sentences(passage)
+    except _EvidenceSentenceBudgetExceeded:
+        return None
+
+
 def _build_facet_evidence_foundation(
     artifact: VerificationEvidenceArtifact,
     max_sentences: int | None = None,
@@ -359,9 +369,14 @@ def _build_facet_evidence_foundation(
                 if passage is None:
                     incomplete = True
                     continue
-                sentence_groups.append(
-                    (selected.rank, passage, _passage_sentences(passage))
-                )
+                sentences = bounded_passage_sentences(passage)
+                if sentences is None:
+                    # One over-long span (a table read as one "sentence") skips
+                    # its passage, never the statement's whole Judgment
+                    # (2026-10-18).
+                    incomplete = True
+                    continue
+                sentence_groups.append((selected.rank, passage, sentences))
         all_sentence_count = sum(len(group) for _, _, group in sentence_groups)
         if whole_source is not None and candidate.candidate_id not in retrieved_only:
             from app.services.cross_language_whole_source import foundation_sentences
@@ -572,8 +587,9 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
     `artifact` needs only the claim, source binding, verification candidates,
     facet foundation and passages, so a stored report payload can be judged
     later through `judgment_context_from_payload` without the source file.
-    The input budget only decides whether a prompt may be sent; it never
-    changes the prompt, so every caller and judge gets the same bytes.
+    Over the input budget, the lowest-ranked evidence sentences are left out
+    until the prompt fits (2026-10-18); the same input always gives every
+    caller and judge the same bytes.
     """
     if max_input_tokens is None:
         max_input_tokens = settings.VERIFICATION_JUDGMENT_MAX_INPUT_TOKENS
@@ -835,27 +851,47 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             _active_cited_author_label(artifact)
         )
         redactions.update(masked_author.redaction_counts)
-        prompt = json_data_envelope(
-            {
-                "candidate_id": PROMPT_CANDIDATE_ID,
-                "requires_antecedent_context": candidate.requires_antecedent_context,
-                "local_context_resolution": local_context_status,
-                "locally_resolved_antecedents": resolved_antecedent_payload,
-                "cited_author_label": masked_author.text,
-                "complete_citation_unit": masked_unit.text,
-                **({"citation_function": "example_of_described_research"} if example_of_research else {}),
-                "student_context": context_payload,
-                "facets": masked_facets,
-                "evidence_sentences": sentence_payload,
-            }
-        )
-        try:
-            enforce_complete_prompt_budget(
-                system_prompt,
-                prompt,
-                max_input_tokens=max_input_tokens,
+        def build_prompt(evidence):
+            return json_data_envelope(
+                {
+                    "candidate_id": PROMPT_CANDIDATE_ID,
+                    "requires_antecedent_context": candidate.requires_antecedent_context,
+                    "local_context_resolution": local_context_status,
+                    "locally_resolved_antecedents": resolved_antecedent_payload,
+                    "cited_author_label": masked_author.text,
+                    "complete_citation_unit": masked_unit.text,
+                    **({"citation_function": "example_of_described_research"} if example_of_research else {}),
+                    "student_context": context_payload,
+                    "facets": masked_facets,
+                    "evidence_sentences": evidence,
+                }
             )
-        except LLMInputBudgetExceeded:
+
+        # Over the input budget, the lowest-ranked evidence sentences are left
+        # out until the prompt fits, so the statement is still judged
+        # (2026-10-18: it had been Not Judged). The same input always yields
+        # the same bytes.
+        evidence = list(sentence_payload)
+        prompt = build_prompt(evidence)
+        fits = False
+        while True:
+            try:
+                enforce_complete_prompt_budget(system_prompt, prompt, max_input_tokens=max_input_tokens)
+                fits = True
+                break
+            except LLMInputBudgetExceeded:
+                if len(evidence) <= 1:
+                    break
+                evidence = evidence[:len(evidence) - max(1, len(evidence) // 8)]
+                kept = {item["sentence_id"] for item in evidence}
+                evidence = [{**item, "source_discourse_scope": {
+                                **item["source_discourse_scope"],
+                                "scope_evidence_sentence_ids": [
+                                    sid for sid in item["source_discourse_scope"]["scope_evidence_sentence_ids"]
+                                    if sid in kept]}}
+                            if "source_discourse_scope" in item else item for item in evidence]
+                prompt = build_prompt(evidence)
+        if not fits:
             items.append(
                 _failed_finding(
                     bundle,
@@ -1195,35 +1231,16 @@ _ABSTRACT_LABEL = re.compile(r"A\s?B\s?S\s?T\s?R\s?A\s?C\s?T|Abstract|ABSTRACT")
 
 
 def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
-    spans = []
-    start = 0
     text = passage.text
-    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
-    # Han, kana and Hangul sentence ends follow the shared rule, whatever spacing
-    # follows them (a government page's line breaks had joined whole articles
-    # into one "sentence", 2026-10-14; cross-language-evidence-v1).
-    from app.services.sentence_splitter import CJK_SENTENCE_END
-    cjk_cuts = [(m.end(1), m.end(), "boundary") for m in CJK_SENTENCE_END.finditer(text)
-                if m.end(1) < len(text.rstrip())]
+    # The one source splitter (`source_sentence_spans`, shared with
+    # patchwriting; Han, kana and Hangul ends, cross-language-evidence-v1).
     # A front-matter label line ("A B S T R A C T") ends what came before it and
     # is no sentence; the title, author and affiliation lines before an
     # abstract label are metadata, not evidence (the owner's article, 2026-10-07).
+    from app.services.sentence_splitter import source_sentence_spans
     labels = list(_FRONT_MATTER_LABEL.finditer(text))
     abstract_at = next((m.start() for m in labels if _ABSTRACT_LABEL.fullmatch(m.group(1))), None)
-    cuts = sorted([(m.start(), m.end(), "boundary") for m in boundary.finditer(text)] + cjk_cuts
-                  + [(m.start(), m.end(), "label") for m in labels])
-    for cut_start, cut_end, kind in cuts:
-        if cut_start < start:
-            continue
-        if kind == "boundary" and re.search(r"\b[A-Z]\.\s*$", text[:cut_start]):
-            # A single capital plus period is normally an author initial, not a
-            # sentence boundary (for example, "D. Ricardo").
-            continue
-        if trimmed := _trim_optional(text, start, cut_start):
-            spans.append(trimmed)
-        start = cut_end
-    if trimmed := _trim_optional(text, start, len(text)):
-        spans.append(trimmed)
+    spans = source_sentence_spans(text, [(m.start(), m.end()) for m in labels])
     if abstract_at is not None:
         spans = [span for span in spans if span[0] >= abstract_at]
     sentences = []
@@ -1287,12 +1304,16 @@ def _bounded_evidence_sentences(
     for (_, passage, sentences), target in zip(groups, targets):
         for start_index, end_index in _balanced_partitions(len(sentences), target):
             first = sentences[start_index]
+            # Too long to coalesce whole: the longest opening run that fits,
+            # so the cap holds and the statement is still judged (2026-10-18;
+            # it had withheld the whole Judgment).
+            while end_index - 1 > start_index and (
+                    sentences[end_index - 1].passage_end - first.passage_start > 2_000):
+                end_index -= 1
             last = sentences[end_index - 1]
             start = first.passage_start
             end = last.passage_end
             exact = passage.text[start:end]
-            if len(exact) > 2_000:
-                raise _EvidenceSentenceBudgetExceeded
             compacted.append(
                 SourceEvidenceSentence(
                     sentence_id=_stable_id(
@@ -1315,7 +1336,7 @@ def _document_reported_actor_scope_sentences(passages) -> list[SourceEvidenceSen
     """Find one exact document-purpose scope across authorized source passages."""
     declarations = []
     for passage in passages:
-        for sentence in _passage_sentences(passage):
+        for sentence in bounded_passage_sentences(passage) or []:
             for match in _DOCUMENT_REPORTED_ACTOR_SCOPE.finditer(sentence.text):
                 actor = re.sub(r"\s+", " ", match.group("actor")).strip()
                 if actor:

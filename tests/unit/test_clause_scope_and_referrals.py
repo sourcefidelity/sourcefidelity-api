@@ -212,3 +212,19 @@ def test_a_not_judged_result_says_why_in_the_owners_words(reason, note):
     from app.services.judgment_report import judgment_result
     result = judgment_result({"display_state": "not_judged", "reason_code": reason}, {}, None)
     assert note in unescape(result["html"])
+
+
+def test_see_also_skips_only_its_own_source():
+    from app.services.citation_signals import referral_source
+    text = "Attendance rose sharply (Jones, 2021; see also Smith, 2020)."
+    group = {"text": "(Jones, 2021; see also Smith, 2020)", "local_start": 24, "local_end": 59,
+             "reference_ids": ["jones", "smith"]}
+    assert not referral_source(text, [group], "jones", "Jones, A")
+    assert referral_source(text, [group], "smith", "Smith, B")
+    split = [{"text": "(Jones, 2021;", "local_start": 24, "local_end": 37, "reference_ids": ["jones"]},
+             {"text": "see also Smith, 2020)", "local_start": 38, "local_end": 59, "reference_ids": ["smith"]}]
+    assert not referral_source(text, split, "jones") and referral_source(text, split, "smith")
+    narrative = "The debate continues; see also Smith (2020) and, for the data, Jones (2021)."
+    markers = [{"text": "Smith (2020)", "local_start": 31, "local_end": 43, "reference_ids": ["smith"]},
+               {"text": "Jones (2021)", "local_start": 63, "local_end": 75, "reference_ids": ["jones"]}]
+    assert referral_source(narrative, markers, "smith") and not referral_source(narrative, markers, "jones")

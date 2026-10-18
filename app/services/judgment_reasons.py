@@ -18,6 +18,8 @@ NOT_JUDGED_NOTES = {
     "antecedent_unresolved": "Not judged: it could not be determined what this statement refers to.",
     "wider_search_unavailable": ("Not judged: the judge found no evidence in the sentences it read, and no "
                                  "further sentences from the source were available to check."),
+    # Owner wording 2026-10-18 (Synthetic Embrace review).
+    "writer_own_work": "Not judged: this part describes the student's own work, not a claim made by the source.",
 }
 
 # The judge could not decide: the single judge's "uncertain", the older

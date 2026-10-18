@@ -172,6 +172,19 @@ class Settings(BaseSettings):
     # Neither fallback retrieved a source in production (STATE provider table), so
     # none runs unless configured (owner decisions 2026-10-01 and 2026-10-09).
     SEARCH_WEB_FALLBACK_PROVIDER: Literal["searxng", "tavily", "none"] = "none"
+    # The required web provider after Brave. "deepseek" is DeepSeek's Search
+    # API (api-docs.deepseek.com/guides/search, US$0.75 per 1,000 successful
+    # searches, 5/s per account, checked 2026-10-18), called with LLM_API_KEY
+    # when LLM_BASE_URL is DeepSeek's; under owner-authorized measurement.
+    SEARCH_SECOND_REQUIRED_PROVIDER: Literal["exa", "deepseek"] = "exa"
+    # A fetched web-search page whose titles are all in another writing
+    # system gets the configured model's cross-script comparison
+    # (cross-script-identity-v1), at most CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE
+    # pages per reference. "no" makes its title a conflict, so it no longer
+    # holds the reference as an uncompared candidate; "unsure" and unfetched
+    # pages still do. Off until measured (owner-approved trial 2026-10-18).
+    CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED: bool = False
+    CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE: int = Field(default=3, ge=0)
     # Your Tavily plan's price per credit, for Technical details; unset means
     # "no price on record", never zero.
     TAVILY_USD_PER_CREDIT: float | None = None
@@ -494,19 +507,19 @@ class Settings(BaseSettings):
     SEARCH_ESCALATION_PROVIDERS: str = "tavily,exa"
     # Per-process request ceilings for escalation providers. These are safety
     # limits, not targets. Format: comma-separated provider:count pairs.
-    SEARCH_ESCALATION_MAX_CALLS: str = "tavily:50,exa:25"
+    SEARCH_ESCALATION_MAX_CALLS: str = "tavily:50,exa:25,deepseek:25"
     # Calls to each required API provider every reference keeps after the
     # job-wide ceiling above is spent, so a paper's later references are not
     # left with a skipped required search. Brave's ladder is at most three
     # queries (DOI, title, title PDF); Exa's two (no filetype operator).
     # provider:count pairs, bounded by the hard cap below.
-    WEB_SEARCH_PER_REFERENCE_FLOOR: str = "brave:3,exa:2"
+    WEB_SEARCH_PER_REFERENCE_FLOOR: str = "brave:3,exa:2,deepseek:2"
     # Absolute per-run ceiling on required API calls, including floor calls;
     # never below SEARCH_ESCALATION_MAX_CALLS. Worst case about $1.16 per
     # paper run at list prices (see WebSearchRetriever._policy_call_permitted).
     # Lowered from brave:200,exa:150 on 2026-09-29: the spend audit
     # (tmp/search_spend_audit_v1) found no run above brave 91 / exa 51 calls.
-    WEB_SEARCH_HARD_MAX_CALLS: str = "brave:120,exa:80"
+    WEB_SEARCH_HARD_MAX_CALLS: str = "brave:120,exa:80,deepseek:80"
     # Paid searches per UTC day for the whole deployment and for each checking
     # scope (search-daily-budget-v1), e.g. "brave:5000,exa:3000"; empty means
     # no cap. A refused call leaves the search incomplete, never "not found".
@@ -514,11 +527,12 @@ class Settings(BaseSettings):
     WEB_SEARCH_SCOPE_DAILY_MAX_CALLS: str = ""
     # Request starts per second shared by every worker process
     # (provider-gate-v1), below each provider's documented limit (checked
-    # 2026-10-11): Exa 10/s per team (exa.ai/docs/admin/billing), OpenAlex
+    # 2026-10-11): Exa 10/s per team (exa.ai/docs/admin/billing), DeepSeek
+    # Search 5/s per account (checked 2026-10-18), OpenAlex
     # 100/s (help.openalex.org rate limits). Brave's limit depends on the plan
     # and is read from its X-RateLimit headers once seen; 1/s until then.
     # Crossref follows its pool (crossref.py).
-    PROVIDER_REQUESTS_PER_SECOND: str = "brave:1,exa:8,openalex:50"
+    PROVIDER_REQUESTS_PER_SECOND: str = "brave:1,exa:8,deepseek:4,openalex:50"
     PROVIDER_GATE_ENABLED: bool = True
     GOOGLE_SEARCH_API_KEY: SecretStr | None = None
     GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
@@ -611,6 +625,15 @@ class Settings(BaseSettings):
     #   Custom:    "https://library.university.edu/fulltext/"
     # The DOI is appended directly: {DOI_RESOLVER_URL}10.1234/foo
     DOI_RESOLVER_URL: str | None = None
+    # Library permissions: six switches per service, as a JSON object of the
+    # switches the deployment set (app/services/library_permissions.py), e.g.
+    # '{"publisher_pdf": {"acquisition": true, "remote_model": true}}'.
+    LIBRARY_PERMISSIONS: str = "{}"
+    # Where the application is used: "on_campus", "off_campus" or "both"
+    # (both, or not sure, is treated as on campus). On a campus network text
+    # without open-access evidence counts as licensed text
+    # (app/services/library_permissions.py).
+    NETWORK_LOCATION: Literal["on_campus", "off_campus", "both"] = "off_campus"
 
     # Student URL download limits (R9)
     STUDENT_URL_MAX_SIZE_MB: int = 50

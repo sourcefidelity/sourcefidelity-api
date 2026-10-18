@@ -596,7 +596,8 @@ def previous_sentence_antecedent(claim: ClaimEvidence) -> ClaimEvidence:
     referent no exact phrase settled refers to the discussion of the previous
     sentence (owner decision 2026-10-03), unless that sentence is a heading.
     "These"/"Those" do the same (owner request 2026-10-14: "These works"
-    refers to the two works the previous sentence names).
+    refers to the two works the previous sentence names), and so do "It" and
+    "Its" (owner request 2026-10-18).
     A previous sentence citing other sources qualifies too (owner decision
     2026-10-08): it only identifies what "this" means, and the statement judged
     against the source stays its own wording. Returns the claim unchanged when
@@ -604,7 +605,9 @@ def previous_sentence_antecedent(claim: ClaimEvidence) -> ClaimEvidence:
     if claim.context_dependency_status == "resolved":
         return claim
     mention = _dependency_mention(claim)
-    if mention is None or mention[2].split()[0].casefold() not in {"this", "that", "these", "those"}:
+    # "It"/"Its" too (owner request 2026-10-18, Synthetic Embrace citation 19:
+    # "It also echoes ..." after a sentence about the writer's film).
+    if mention is None or mention[2].split()[0].casefold() not in {"this", "that", "these", "those", "it", "its"}:
         return claim
     previous = next((c for c in claim.antecedent_context if c.distance_before == 1), None)
     if previous is None or not re.search(r"[.!?][\"”’')\]]*\s*$", previous.text):

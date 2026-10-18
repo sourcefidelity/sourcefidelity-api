@@ -34,6 +34,9 @@ _AUTHOR_STOPWORDS = {
 }
 
 
+FRONT_MATTER_PAGES = 10
+
+
 def extract_metadata_from_pdf(file_bytes: bytes) -> dict:
     """Extract bibliographic metadata from PDF bytes.
 
@@ -43,10 +46,12 @@ def extract_metadata_from_pdf(file_bytes: bytes) -> dict:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         # Bound identity evidence to front matter. Books may have an image
-        # cover, series/blurb leaf and blank verso before a page-four title.
-        # Do not search the whole source, where cited works could match.
+        # cover, series/blurb leaf and blank verso before a page-four title,
+        # or several pages of praise before a page-eight title (Maynard's
+        # Films from the Future, 2026-10-18). Do not search the whole source,
+        # where cited works could match.
         text = ""
-        for page in doc[:5]:
+        for page in doc[:FRONT_MATTER_PAGES]:
             text += page.get_text()
     finally:
         doc.close()
@@ -74,7 +79,9 @@ def extract_metadata_from_pdf(file_bytes: bytes) -> dict:
         "title": title,
         "year": year,
         "isbn_candidates": sorted(isbn_candidates),
-        "first_page_text": text[:6000],
+        # The whole front matter, not a character prefix: praise pages can
+        # fill 6,000 characters before the title page.
+        "first_page_text": text,
     }
 
 

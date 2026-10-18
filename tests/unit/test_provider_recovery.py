@@ -254,3 +254,12 @@ def test_a_brave_recovery_requeues_a_job_brave_was_blocking(monkeypatch) -> None
         assert session.get(Job, blocked_id).upload_evidence[
             "provider_refresh_reference_ids"] == ["ref-brave"]
         assert session.get(Job, other_id).status == JobStatus.COMPLETED
+
+
+@pytest.fixture(autouse=True)
+def _automatic_searching_on(monkeypatch, request):
+    # These papers' scopes finish searches on their own; the Personal default
+    # (off, owner decision 2026-10-18) is tested on its own.
+    if "owners_setting" not in request.node.name:
+        monkeypatch.setattr("app.services.storage_policy.finishes_searches_automatically",
+                            lambda session, scope_type, scope_id: True)

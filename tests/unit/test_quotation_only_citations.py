@@ -122,3 +122,19 @@ def test_the_heading_reads_the_owners_wording():
     from app.services.judgment_reasons import quotation_only
     assert quotation_only("quotation_only") and not quotation_only("referral_citation")
     assert "i.quotation_only" in script and "'Quotation only'" in script and "'quotation_only'" not in script
+
+
+def test_single_quoted_words_are_a_quotation_and_a_quoted_title_is_not():
+    from types import SimpleNamespace
+    from app.services.quotation_form import claim_type_for
+    from app.services.verification_evidence import _quotation_targets
+    refs = [SimpleNamespace(title="Harbour lights at dusk")]
+    text = "Lane calls it ‘a moral panic’ (Lane, 2020, p. 4)."
+    claim = SimpleNamespace(text=text, claim_type="paraphrase", citation_markers=[])
+    assert claim_type_for(claim, refs) == "quotation"
+    assert _quotation_targets(text) == ["a moral panic"]
+    titled = SimpleNamespace(text="As ‘Harbour Lights at Dusk’ (2010) shows, ports changed.",
+                             claim_type="quotation", citation_markers=[])
+    assert claim_type_for(titled, refs) == "paraphrase"
+    block = SimpleNamespace(text="A block quotation without marks.", claim_type="quotation", citation_markers=[])
+    assert claim_type_for(block, refs) == "quotation"

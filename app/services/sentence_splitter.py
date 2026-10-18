@@ -136,3 +136,50 @@ def split_paragraphs_and_sentences(text: str) -> list[list[str]]:
             if sentences:
                 result.append(sentences)
     return result
+
+
+# Source text keeps exact offsets: one rule for every source-side splitter
+# (the evidence foundation, patchwriting), so a sentence has one identity
+# everywhere (rules audit 2026-10-18: the two had drifted, and neither knew
+# "Dr." or "et al." were not sentence ends).
+_SOURCE_BOUNDARY = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
+_SOURCE_NOT_AN_END = re.compile(
+    r"(?:\b[A-Z]\.|\b(?:Dr|Mr|Mrs|Ms|Prof|St|Rev|vs|cf|ca|pp|Vol|vol|eds|trans|repr|Ph\.D|i\.e|e\.g|U\.S|U\.K)\."
+    r"|\bet al\.|\bp\.)[\"'’”)]*\s*$")
+
+
+def source_sentence_spans(text: str, extra_cuts: list[tuple[int, int]] = ()) -> list[tuple[int, int]]:
+    """Exact (start, end) sentence spans of source text.
+
+    A boundary is a sentence end followed by a capital, digit, quotation mark
+    or bracket, or a blank line; an initial or a common abbreviation before it
+    is not an end. Han, kana and Hangul sentence ends cut whatever follows.
+    `extra_cuts` are (start, end) intervals that end the sentence before them
+    and belong to no sentence (a front-matter label line).
+    """
+    cuts = [(m.start(), m.end(), True) for m in _SOURCE_BOUNDARY.finditer(text)]
+    cuts += [(m.end(1), m.end(), False) for m in CJK_SENTENCE_END.finditer(text)
+             if m.end(1) < len(text.rstrip())]
+    cuts += [(start, end, False) for start, end in extra_cuts]
+    spans, start = [], 0
+    for cut_start, cut_end, checked in sorted(cuts):
+        if cut_start < start:
+            continue
+        if checked and _SOURCE_NOT_AN_END.search(text, max(0, cut_start - 12), cut_start):
+            continue
+        piece = _trimmed(text, start, cut_start)
+        if piece:
+            spans.append(piece)
+        start = cut_end
+    piece = _trimmed(text, start, len(text))
+    if piece:
+        spans.append(piece)
+    return spans
+
+
+def _trimmed(text: str, start: int, end: int):
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return (start, end) if start < end else None

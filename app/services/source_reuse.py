@@ -61,7 +61,7 @@ ROUTE_VERSIONS = {
     # 2026-10-16 (Rita Hayworth review): the magazine archive search, the
     # chapter-title namesake rule and look-alike letter folding.
     "search_rules": RouteVersion(
-        "search-rules-v4",
+        "search-rules-v6",
         "an earlier result without text for a dated periodical article, a chapter whose search "
         "ended in a record conflict or whose book's authorship was unresolved, or a title with "
         "look-alike letters is searched again once"),
@@ -112,7 +112,10 @@ def stored_copy(record, data: bytes, *, kind, title, author, year, normalize_aut
     re-check stay with the resolver."""
     import hashlib
     from app.services.retrieval.base import RepresentationKind
-    if record.completeness_verdict == 'incomplete':
+    from app.services.source_repository import uploaded_limited_text
+    if uploaded_limited_text(record):
+        pass  # the user's own upload as limited text (owner decision 2026-10-18)
+    elif record.completeness_verdict == 'incomplete':
         from app.services.publisher_preview import valid_preview_receipt
         if (not author or not year or record.canonical_work.year != year
                 or normalize_author(record.canonical_work.author) != normalize_author(author)
@@ -218,7 +221,14 @@ def search_rules_due(item: dict, reference) -> bool:
                      or discovery.get("outcome") == "bibliographic_conflict"
                      # The book's authorship was unread: Open Library's main title
                      # and added-material statements are now read.
-                     or (container and (container.get("responsibility") or {}).get("classification") == "unresolved")))
+                     or (container and (container.get("responsibility") or {}).get("classification") == "unresolved")
+                     # A single-authored book without the catalogue's own record:
+                     # its text is now sought as the book (v5, 2026-10-18).
+                     or (container.get("is_monograph") and not container.get("located_record"))
+                     # v6: its text not recorded as the book's (and any copy
+                     # taken from a repository metadata export), 2026-10-18.
+                     or (container.get("is_monograph") and item.get("status") == "transient_authorized"
+                         and not item.get("held_as_book_of_cited_part"))))
     lookalike = fold_lookalikes(reference.get("title") or "") != (reference.get("title") or "")
     # A reference that already has its text needs only its book's authorship
     # checked; the search rules for finding a text do not apply to it.

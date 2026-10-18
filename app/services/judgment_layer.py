@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.models.report import VerificationReportRecord
 from app.services.judgment_input import judgment_eligibility
-from app.services.judgment_report import candidate_paper_ranges, candidate_text
+from app.services.judgment_report import candidate_paper_ranges, candidate_text, names_only_other_sources
 
 WHOLE_CITATION = "__citation__"
 
@@ -156,6 +156,8 @@ def build_judgment_layer(session: Session, view: dict, words_by_page: dict, *,
                               "order": citation.get("paper_character_start") or 0})
                 continue
             for bundle in bundles:
+                if names_only_other_sources(payload, bundle["candidate_id"]):
+                    continue  # another source's part, not this one's
                 ranges = candidate_paper_ranges(payload, bundle["candidate_id"])
                 rects, placement = claim_span_rectangles(citation, ranges, words_by_page)
                 marks.append({"key": f"{number}:{record.id}:{bundle['candidate_id']}",

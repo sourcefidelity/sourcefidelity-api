@@ -84,7 +84,10 @@ def build_judgment_reserve(source, artifact) -> dict | None:
             any_new = any_new or bool(fresh)
             bundles.append(bundle.model_copy(update={"evidence_sentence_ids": fresh}))
         if not any_new:
-            return _whole_source_marker(whole) if whole else None
+            # The wider ranking found no sentence the judge had not read: the
+            # agreed "no evidence" stands (owner direction 2026-10-18: a full
+            # text gets a judgment, not "no further sentences were available").
+            return _whole_source_marker(whole) if whole else _no_new_sentences_marker()
         kept_ids = {sid for b in bundles for sid in [*b.evidence_sentence_ids, *b.source_discourse_sentence_ids]}
         reserve = foundation.model_copy(update={
             "candidate_bundles": bundles,
@@ -123,6 +126,12 @@ def _whole_source_marker(candidates: list[str]) -> dict:
     """No new sentences exist; the judge already read the whole source."""
     return {"reserve_version": RESERVE_VERSION, "retention": settings.JUDGMENT_RESERVE_RETENTION,
             "whole_source_read": list(candidates), "foundation": None, "passages": []}
+
+
+def _no_new_sentences_marker() -> dict:
+    """The wider search was run at check time and found nothing new."""
+    return {"reserve_version": RESERVE_VERSION, "retention": settings.JUDGMENT_RESERVE_RETENTION,
+            "whole_source_read": [], "no_new_sentences": True, "foundation": None, "passages": []}
 
 
 def store_reserve(session, record, reserve: dict) -> None:
@@ -166,6 +175,9 @@ def make_wider_search(session, verification_report_id, run):
             # search is left, so "no evidence" stands (owner decision 2026-10-14).
             return {"display_state": "insufficient", "reason_code": "whole_source_read",
                     "record": {"status": "whole_source_read"}, "spend_usd": 0.0}
+        if reserve.get("no_new_sentences"):
+            return {"display_state": "insufficient", "reason_code": "no_new_sentences_in_wider_search",
+                    "record": {"status": "no_new_sentences"}, "spend_usd": 0.0}
         if not reserve.get("foundation"):
             return None
         foundation = FacetEvidenceFoundation.model_validate(reserve["foundation"])
@@ -177,7 +189,11 @@ def make_wider_search(session, verification_report_id, run):
                       if getattr(i, "candidate_id", None) == item.bundle.candidate_id
                       or getattr(getattr(i, "bundle", None), "candidate_id", None) == item.bundle.candidate_id),
                      None)
-        if match is None or isinstance(match, CandidateFacetFinding) or not match.bundle.evidence_sentence_ids:
+        if match is not None and not isinstance(match, CandidateFacetFinding) and not match.bundle.evidence_sentence_ids:
+            # This part's wider ranking found nothing new: "no evidence" stands.
+            return {"display_state": "insufficient", "reason_code": "no_new_sentences_in_wider_search",
+                    "record": {"status": "no_new_sentences"}, "spend_usd": 0.0}
+        if match is None or isinstance(match, CandidateFacetFinding):
             return None
         result = judge_candidate(match, wide_context, prepared.sentences, routes, run.policy_hash,
                                  cache_lookup=cache.lookup, cache_store=cache.store, call=call)
@@ -195,4 +211,49 @@ def make_wider_search(session, verification_report_id, run):
             state, reason = result.display_state, "found_in_wider_search"
         return {"display_state": state, "reason_code": reason, "record": record, "spend_usd": result.spend_usd}
 
+    def combined(context, item, routes, _run, cache, call):
+        """An undecided statement is judged again on its first sentences plus
+        the reserve's new ones (owner decision 2026-10-18). None when the
+        reserve has nothing new for it: the undecided result then stands."""
+        if reserve is None or not reserve.get("foundation") or reserve.get("no_new_sentences"):
+            return None
+        from app.services.facet_evidence_judgment import MAX_EVIDENCE_SENTENCES_PER_CANDIDATE
+        extra = FacetEvidenceFoundation.model_validate(reserve["foundation"])
+        found = next((b for b in extra.candidate_bundles if b.candidate_id == item.bundle.candidate_id), None)
+        fresh = [sid for sid in (found.evidence_sentence_ids if found else [])
+                 if sid not in item.bundle.evidence_sentence_ids]
+        if not fresh:
+            return None
+        merged_ids = [*item.bundle.evidence_sentence_ids, *fresh][:MAX_EVIDENCE_SENTENCES_PER_CANDIDATE]
+        discourse = list(dict.fromkeys([*item.bundle.source_discourse_sentence_ids,
+                                        *(found.source_discourse_sentence_ids if found else [])]))
+        bundle = item.bundle.model_copy(update={"evidence_sentence_ids": merged_ids,
+                                                "source_discourse_sentence_ids": discourse})
+        original = context.facet_evidence_foundation
+        sentences = {s.sentence_id: s for s in [*original.source_sentences, *extra.source_sentences]}
+        foundation = original.model_copy(update={"candidate_bundles": [bundle],
+                                                 "source_sentences": list(sentences.values())})
+        wide_context = SimpleNamespace(**{**vars(context), "facet_evidence_foundation": foundation,
+                                          "passages": [*context.passages, *[SimpleNamespace(**p)
+                                                                            for p in reserve["passages"]]]})
+        prepared = prepare_candidate_prompts(wide_context, max_input_tokens=settings.JUDGMENT_MAX_INPUT_TOKENS)
+        match = next((i for i in prepared.items
+                      if getattr(getattr(i, "bundle", None), "candidate_id", None) == item.bundle.candidate_id),
+                     None)
+        if match is None or isinstance(match, CandidateFacetFinding):
+            return None
+        result = judge_candidate(match, wide_context, prepared.sentences, routes, run.policy_hash,
+                                 cache_lookup=cache.lookup, cache_store=cache.store, call=call)
+        from app.services.judgment_runs import _panel_json
+        from app.services.judgment_reasons import after_wider_search
+        record = {"status": "completed", "new_sentences": len(fresh), "combined_with_first_selection": True,
+                  "panel": _panel_json(result),
+                  "sentences": {sid: sentence.text for sid, sentence in prepared.sentences.items()}}
+        if result.display_state == "not_judged":
+            state, reason = "not_judged", after_wider_search(result.reason_code)
+        else:
+            state, reason = result.display_state, "decided_in_wider_search"
+        return {"display_state": state, "reason_code": reason, "record": record, "spend_usd": result.spend_usd}
+
+    wider.combined = combined
     return wider

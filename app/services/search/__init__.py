@@ -117,5 +117,18 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
         from app.services.search.exa import ExaSearch
         return ExaSearch(secret_value(settings.EXA_API_KEY))
 
+    if provider_name == "deepseek":
+        # The Search API shares the DeepSeek model key, so it is offered only
+        # when the configured model endpoint is DeepSeek's own.
+        from urllib.parse import urlparse
+        if not settings.LLM_API_KEY or urlparse(settings.LLM_BASE_URL or "").netloc != "api.deepseek.com":
+            logger.warning(
+                "SEARCH_PROVIDER=deepseek needs LLM_API_KEY with LLM_BASE_URL at "
+                "api.deepseek.com — web search disabled"
+            )
+            return None
+        from app.services.search.deepseek import DeepSeekSearch
+        return DeepSeekSearch(secret_value(settings.LLM_API_KEY))
+
     logger.warning("Unknown SEARCH_PROVIDER=%s — web search disabled", provider_name)
     return None

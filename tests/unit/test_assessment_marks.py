@@ -37,7 +37,6 @@ from app.services.paper_workflow import TARGETED_SOURCE_REFRESH_KEY, PaperWorkfl
 from app.services.search_retry import (
     AUTO_RETRY_KEY,
     job_accepts_search_refresh,
-    prepare_search_again_refresh,
 )
 from test_incomplete_search_retry import (  # noqa: F401  (fixture)
     NOW,
@@ -161,26 +160,9 @@ def test_retries_skip_released_assessments_only(monkeypatch, factory):
 # --- Search again -----------------------------------------------------------
 
 
-def test_search_again_is_refused_after_release(factory):
-    _, report_id = _job(factory, [_full_text_incomplete("ref-1", NOW)], assessment_id="A1")
-    _, unassigned_report = _job(factory, [_full_text_incomplete("ref-1", NOW)], name="unassigned")
-    _release(factory)
-    with factory() as session, pytest.raises(PaperWorkflowError) as refused:
-        prepare_search_again_refresh(session, report_id=report_id, reference_id="ref-1", **OWNER, now=NOW)
-    assert refused.value.code == "assessment_marks_released"
-    with factory() as session:
-        prepared = prepare_search_again_refresh(session, report_id=unassigned_report, reference_id="ref-1",
-                                                **OWNER, now=NOW)
-    assert prepared["reference_id"] == "ref-1"
-
-
-def test_button_is_not_attached_after_release(factory):
+def test_marks_release_is_read_per_report_scope(factory):
     from app.routers.report import _report_marks_released
     from app.services.evidence_report import enable_authenticated_paper_actions
-    view = {"paper_surface": {}, "citations": _citations()}
-    members = enable_authenticated_paper_actions(view, report_id="r", search_again_enabled=False)[
-        "citations"][0]["members"]
-    assert all("search_again_action" not in member for member in members)
     _, report_id = _job(factory, [], assessment_id="A1")
     _, unassigned_report = _job(factory, [], name="unassigned")
     principal = SimpleNamespace(**OWNER)
@@ -222,29 +204,6 @@ def api(monkeypatch, factory):
         yield TestClient(app), headers, app
     finally:
         app.dependency_overrides.clear()
-
-
-def test_report_page_and_route_refuse_search_again_after_release(monkeypatch, factory, api):
-    client, headers, _app = api
-    _, report_id = _job(factory, [_full_text_incomplete("ref-text", NOW)], assessment_id="A1")
-    view = {"paper_surface": {}, "citations": _citations()}
-    monkeypatch.setattr("app.routers.report.load_authorized_evidence_report_bundle",
-                        lambda *a, **k: (view, SimpleNamespace(id="artifact-1"), b""))
-    seen = {}
-
-    def capture(_view, **kwargs):
-        seen.update(kwargs)
-        raise HTTPException(status_code=418)
-
-    monkeypatch.setattr("app.routers.report.enable_authenticated_paper_actions", capture)
-    assert client.get(f"/report/{report_id}", headers=headers).status_code == 418
-    assert seen["search_again_enabled"] is True
-    assert client.post("/assessments/A1/marks-released", headers=headers).status_code == 200
-    client.get(f"/report/{report_id}", headers=headers)
-    assert seen["search_again_enabled"] is False
-    response = client.post(f"/report/{report_id}/reference/ref-text/search-again", headers=headers)
-    # 410: the page removes the button, no message (owner decision 2026-09-29).
-    assert response.status_code == 410 and response.json()["detail"] == "assessment_marks_released"
 
 
 # --- endpoints --------------------------------------------------------------
@@ -391,7 +350,7 @@ def test_check_route_passes_the_optional_assessment(monkeypatch):
 
 
 
-def test_personal_deployment_has_no_marks_release_and_keeps_search_again(monkeypatch, factory):
+def test_personal_deployment_has_no_marks_release(monkeypatch, factory):
     import app.services.assessment_marks as marks
     monkeypatch.undo()
     monkeypatch.setattr(settings, "REPORT_AUTH_MODE", "personal_bearer")
@@ -404,7 +363,12 @@ def test_personal_deployment_has_no_marks_release_and_keeps_search_again(monkeyp
 
 
 
-def test_page_removes_the_button_when_marks_were_released_meanwhile():
-    from pathlib import Path
-    script = Path("app/services/report_interactions.js").read_text()
-    assert "if(response.status===410){form.remove();return;}" in script
+
+
+@pytest.fixture(autouse=True)
+def _automatic_searching_on(monkeypatch, request):
+    # These papers' scopes finish searches on their own; the Personal default
+    # (off, owner decision 2026-10-18) is tested on its own.
+    if "owners_setting" not in request.node.name:
+        monkeypatch.setattr("app.services.storage_policy.finishes_searches_automatically",
+                            lambda session, scope_type, scope_id: True)

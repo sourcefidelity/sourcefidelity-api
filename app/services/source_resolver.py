@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from app.services.search.policy import REQUIRED_API_PROVIDERS, REQUIRED_WEB_PROVIDER_NAMES
 from app.services.retrieval_deadline import bounded_reference, expired, POLICY as ELAPSED_POLICY
 
 # Reference-local fallback only: never an accepted location or reusable cache hit.
@@ -60,6 +61,7 @@ def _timed_retrieval(operation):
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
 from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed, cross_script_observed, observed_outcome
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
+from app.services import library_permissions
 
 from app.log_safety import private_value_id, safe_exception_code
 
@@ -512,6 +514,46 @@ def _record_link_title_conflict(url, resp, title, page_titles, *, expected_autho
 # Periodical kinds whose articles the magazine archive can hold; an unknown
 # kind still names a magazine when its container title is one the library holds.
 _PERIODICAL_ARCHIVE_KINDS = frozenset({"journal_article", "news_article", "unknown"})
+# Root elements of library metadata records: METS, MODS, Dublin Core (OAI),
+# MARCXML, DIDL and an OAI-PMH response wrapping any of them.
+_METADATA_RECORD_ROOT = re.compile(
+    rb"^\s*(?:<\?xml[^>]*>\s*)?(?:<!--.*?-->\s*)*<(?:[A-Za-z0-9_]+:)?"
+    rb"(?:mets|mods|modsCollection|dc|oai_dc|record|collection|DIDL|OAI-PMH)\b", re.S)
+
+
+def metadata_record_xml(content: bytes) -> bool:
+    """The response is a library metadata record, not a work's text."""
+    head = (content or b"")[:4096]
+    if not _METADATA_RECORD_ROOT.match(head):
+        return False
+    # "record"/"collection" are common words: also require a metadata namespace.
+    return bool(re.search(rb"loc\.gov/(?:METS|mods|MARC21)|openarchives\.org/OAI|purl\.org/dc/elements"
+                          rb"|mpeg21|xmlns:(?:mets|mods|dc|oai_dc|marc)=", head, re.I))
+
+
+_CATALOGUE_PROVIDERS = ("google_books", "open_library", "internet_archive", "openalex", "crossref")
+
+
+def _best_book_record(discovery: dict) -> dict:
+    """The catalogue record that best agrees with a looked-up book: credible,
+    without a material conflict, title agreeing; catalogues before web pages."""
+    best, rank = {}, None
+    for candidate in (discovery or {}).get("candidates") or []:
+        comparisons = {c.get("field_name"): c.get("outcome") for c in candidate.get("comparisons") or []}
+        if (not (candidate.get("plausible_identity_match") or candidate.get("authoritative_identifier_match"))
+                or "material_conflict" in comparisons.values()
+                or comparisons.get("title") not in {"agreement", "minor_difference"}):
+            continue
+        provider = str(candidate.get("provider") or "")
+        score = (provider in _CATALOGUE_PROVIDERS, sum(v == "agreement" for v in comparisons.values()))
+        if rank is None or score > rank:
+            observed = candidate.get("observed") or {}
+            best, rank = {"title": str(observed.get("title") or "")[:500],
+                          "authors": [str(a)[:200] for a in observed.get("authors") or []][:8],
+                          "year": str(observed.get("year") or ""), "provider": provider}, score
+    return best
+
+
 _WEB_TITLE_WORD = re.compile(r"[^\W\d_]{2,}")
 # A page served instead of the content (bot check, script shell, access or
 # cookie wall) names no work; its title is never a conflict (IMDb's
@@ -889,6 +931,37 @@ def _link_gone(url: str) -> bool:
     """The link checker found the page or file missing or removed (its own
     `not_found`/`removed` outcomes); this record does not classify responses."""
     return observed_outcome(url) in {"not_found", "removed"}
+
+
+_CROSS_SCRIPT_JUDGMENT_FIELDS = ("version", "same_work", "author", "call", "payload_sha256",
+                                 "configured_model", "returned_model")
+
+
+def _cross_script_page_judgment(response, page_titles, *, expected_title, expected_author,
+                                expected_year) -> dict | None:
+    """The model's comparison of a fetched page titled only in another writing
+    system (CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED), bounded per reference.
+
+    Spelling cannot compare such titles, so without it the page stays an
+    uncompared candidate that holds the reference not assessed. Page names
+    are not kept; the answer and its provenance are."""
+    if (not settings.CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED or not expected_title or not page_titles
+            or not all(cross_script_comparison_unresolved(expected_title, title) for title in page_titles)):
+        return None
+    trace = _ACTIVE_DISCOVERY_TRACE.get()
+    used = trace.setdefault("cross_script_page_judgments", 0) if trace is not None else 0
+    if used >= settings.CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE:
+        return None
+    if trace is not None:
+        trace["cross_script_page_judgments"] = used + 1
+    import trafilatura
+    from app.services.cross_script_identity import judge_cross_script_identity
+    text = trafilatura.extract(response.text, include_comments=False, include_links=False,
+                               include_tables=False) or ""
+    judged = judge_cross_script_identity(
+        {"title": expected_title, "author": expected_author or "", "year": expected_year or ""},
+        {"titles": page_titles, "date": "", "text": text})
+    return {key: judged.get(key) for key in _CROSS_SCRIPT_JUDGMENT_FIELDS if judged.get(key) is not None}
 
 
 def _location_exception_disposition(exc: Exception) -> tuple[str, str]:
@@ -1461,7 +1534,7 @@ class SourceResolver:
         sources = []
         for source in self._retrieval_sources:
             if source.name == "web_search" and hasattr(source, "share_run_budget_with"):
-                own = type(source)()
+                own = library_permissions.restrict(type(source)())
                 own.share_run_budget_with(source)
                 sources.append(own)
             else:
@@ -1784,6 +1857,10 @@ class SourceResolver:
                         "source_kind_verdict": location_attempt.get(
                             "source_kind_verdict"
                         ),
+                        # The model's cross-script comparison of the fetched
+                        # page, when CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED made one.
+                        **({"cross_script_judgment": location_attempt["cross_script_judgment"]}
+                           if isinstance(location_attempt.get("cross_script_judgment"), dict) else {}),
                         # What the fetched page showed, or that nothing beyond a
                         # search snippet was ever observed for this location.
                         "title_reason": (
@@ -2192,13 +2269,13 @@ class SourceResolver:
                 "submitted_reference": getattr(reference, 'raw_ref', '') or '',
                 "search_policy_version": settings.SEARCH_POLICY_VERSION,
                 "search_retention_policy": "brave-operational-transient-v1" if settings.BRAVE_SEARCH_TRANSIENT_ENABLED else None,
-                "required_web_providers": ["brave", "exa"] if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
+                "required_web_providers": list(REQUIRED_API_PROVIDERS) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
                 "expected": expected,
                 "required": set(
                     required_reference_discovery_routes(
                         expected,
                         library_metadata_enabled=bool(
-                            expected.doi and settings.DOI_RESOLVER_URL
+                            expected.doi and _campus_resolver_active()
                         ),
                     )
                 ),
@@ -2255,6 +2332,11 @@ class SourceResolver:
                 mismatch = self._doi_title_mismatch()
                 if mismatch:
                     exc.reference_discovery["doi_title_mismatch"] = mismatch
+            book = None if identity_only else self._single_authored_book_text(reference, exc.reference_discovery)
+            if book is not None:
+                book.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
+                book.metadata['reference_discovery'] = exc.reference_discovery
+                return book
             candidates = _PROVISIONAL_CANDIDATES.get()
             if native is not None and (native.full_text or native.abstract):
                 native.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
@@ -2289,6 +2371,10 @@ class SourceResolver:
             self._attach_native_route(trace_payload, discovery_payload,
                                       (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
             self._attach_periodical_archive(trace_payload, discovery_payload)
+            if not identity_only and not result.full_text:
+                book = self._single_authored_book_text(reference, discovery_payload)
+                if book is not None:
+                    result = book
             if not identity_only:
                 self._update_search_memo(result, trace_payload)
             result.metadata["reference_discovery_trace"] = trace_payload
@@ -2479,7 +2565,7 @@ class SourceResolver:
                 if attempt.route_category == "academic_adapter":
                     if query.execution_outcome in {"results", "no_results"}:
                         adapters.add(attempt.provider)
-                elif query.execution_provider in {"brave", "exa"}:
+                elif query.execution_provider in REQUIRED_WEB_PROVIDER_NAMES:
                     if query.execution_outcome in {"results", "no_results"}:
                         web.add(query.execution_provider)
                     elif query.execution_outcome in {"budget_skipped", "cooldown_skipped"}:
@@ -2631,6 +2717,37 @@ class SourceResolver:
                 }
         return None
 
+    def _single_authored_book_text(self, reference, discovery: dict | None):
+        """The text of the single-authored book a part was cited from, sought
+        as the book itself (owner decision 2026-10-18: the work that exists is
+        the book; the chapter framing is the student's). Searched under the
+        located record's title and author; None when the book was not
+        identified as single-authored or no text was found."""
+        container = (discovery or {}).get("container_identity") if isinstance(discovery, dict) else None
+        if (not container or not container.get("is_monograph") or expired()
+                or getattr(reference, "source_kind", "") != "book_section"):
+            return None
+        from app.services.book_of_part import book_of_cited_part
+        book = book_of_cited_part(container, cited_container_title=getattr(reference, "container_title", ""),
+                                  cited_author=getattr(reference, "author", ""))
+        title, author = (book["title"], book["author"]) if book else ("", "")
+        if not title or not author:
+            return None
+        probe = reference.model_copy(update={
+            "title": title, "author": author, "container_title": "", "pages": "",
+            "source_kind": "monograph", "source_kind_confidence": "medium",
+            "source_kind_evidence": ["single-authored book of a cited part"], "needs_review": False})
+        try:
+            found = self.resolve_reference(probe)
+        except (SourceResolutionError, ValueError, RuntimeError):
+            return None
+        if not found.full_text:
+            return None
+        found.metadata = {**(found.metadata or {}), "held_as_book_of_cited_part": True,
+                          "book_of_cited_part": {"title": title, "author": author,
+                                                 "policy": "single-authored-book-of-part-v1"}}
+        return found
+
     def _attach_container_identity(self, reference, trace_payload: dict | None,
                                    discovery: dict | None, *,
                                    identity_only: bool = False) -> tuple[dict | None, dict | None]:
@@ -2737,6 +2854,9 @@ class SourceResolver:
         elif responsibility.get("classification") == "single_authored" and not is_monograph:
             is_monograph, kind, kind_confidence = True, "monograph", "medium"
         return {
+            # The catalogue's own record of the book, so later steps use its
+            # real title and author rather than the student's (2026-10-18).
+            "located_record": _best_book_record(discovery),
             "located_source_kind": kind,
             "located_source_kind_confidence": kind_confidence,
             "is_monograph": is_monograph,
@@ -2755,7 +2875,8 @@ class SourceResolver:
 
     def _container_responsibility(self, title: str, author: str) -> dict:
         source = next((s for s in self._retrieval_sources
-                       if hasattr(s, "statements_of_responsibility")), None)
+                       if hasattr(s, "statements_of_responsibility")
+                       and library_permissions.permitted(getattr(s, "name", ""), "search")), None)
         if source is None or not author:
             return {"classification": "unresolved", "reason": "catalogue_not_configured" if source is None
                     else "no_cited_author"}
@@ -3087,7 +3208,7 @@ class SourceResolver:
             return
         adapter = next((s for s in getattr(self, "_retrieval_sources", [])
                         if isinstance(s, CrossrefRetriever)), None)
-        if adapter is None:
+        if adapter is None or not library_permissions.permitted(adapter.name, "search"):
             return
         # Reserve structural room for every bounded result before any request.
         if len(trace["candidates"]) > 73 or len(trace["queries"]) > 62 or len(trace["attempts"]) > 126:
@@ -3273,7 +3394,13 @@ class SourceResolver:
             "partial, so this is not evidence that the reference is incorrect."
         )
 
-    def resolve(
+    def resolve(self, *args, **kwargs) -> RetrievalResult:
+        """Resolve a reference, then withhold what the library permissions of
+        the service that supplied the result do not permit
+        (`library_permissions.apply`)."""
+        return library_permissions.apply(self._resolve_routes(*args, **kwargs))
+
+    def _resolve_routes(
         self,
         doi: str | None = None,
         isbn: str | None = None,
@@ -3426,7 +3553,10 @@ class SourceResolver:
         capabilities = getattr(self, "_acquisition_capabilities", None)
         if student_url and capabilities is not None and 'student_url' not in capabilities:
             link_not_visited(student_url, 'capability_disabled')
-        if student_url and (capabilities is None or "student_url" in capabilities):
+        if student_url and not library_permissions.permitted(library_permissions.STUDENT_URL, "search"):
+            link_not_visited(student_url, 'capability_disabled')
+        if (student_url and (capabilities is None or "student_url" in capabilities)
+                and library_permissions.permitted(library_permissions.STUDENT_URL, "search")):
             if is_library_locator_url(student_url):
                 link_not_visited(student_url, 'library_locator_only')
                 url_failure_reason = (
@@ -3535,7 +3665,7 @@ class SourceResolver:
         #      — the proxy handles subscription authentication.
         if (
             doi
-            and settings.DOI_RESOLVER_URL
+            and _campus_resolver_active()
             and (capabilities is None or "doi_resolver" in capabilities)
         ):
             result = self._try_doi_resolver(
@@ -3775,7 +3905,8 @@ class SourceResolver:
                 unquote(parsed_student_url.path).lstrip('/').casefold() == doi.casefold() and
                 (capabilities is None or "student_url" in capabilities))
             direct = None
-            if (doi and not settings.DOI_RESOLVER_URL and not doi_url_visited
+            if (doi and not _campus_resolver_active() and not doi_url_visited
+                    and library_permissions.permitted(library_permissions.PUBLIC_DOI, "search")
                     and (capabilities is None or "doi_resolver" in capabilities)):
                 direct = self._try_doi_resolver(doi, title,
                     expected_source_kind=expected_kind, public=True,
@@ -3950,7 +4081,8 @@ class SourceResolver:
                 capability_part,
                 providers,
                 settings.RETRIEVAL_PROVIDER_CONFIG,
-                "doi_resolver" if settings.DOI_RESOLVER_URL else "no_doi_resolver",
+                "doi_resolver" if _campus_resolver_active() else "no_doi_resolver",
+                *((library_permissions.signature(),) if library_permissions.signature() else ()),
             )
         )
         return hashlib.sha256(context.encode("utf-8")).hexdigest()
@@ -5277,6 +5409,11 @@ class SourceResolver:
                         headers={"Accept": location.media_type or "application/xml,text/plain,*/*"},
                         timeout=settings.DISCOVERY_CANDIDATE_TIMEOUT_SECONDS,
                     )
+                    if metadata_record_xml(response.content):
+                        # A repository's METS/MODS/Dublin Core export describes
+                        # the work; it is never its text (Synthetic Embrace
+                        # reference 12, 2026-10-18).
+                        raise ValueError("repository metadata record, not the work's text")
                     text = _extract_text_representation(
                         response.content,
                         location.representation_kind,
@@ -5307,6 +5444,8 @@ class SourceResolver:
                         headers={"Accept": "text/html,application/xhtml+xml,*/*"},
                         timeout=settings.DISCOVERY_CANDIDATE_TIMEOUT_SECONDS,
                     )
+                    if metadata_record_xml(response.content):
+                        raise ValueError("repository metadata record, not the work's text")
                     discovered = discover_scholarly_locations(
                         response.text,
                         str(response.url),
@@ -5354,6 +5493,11 @@ class SourceResolver:
                         else None
                     )
                     if page_title_match is False:
+                        judged = _cross_script_page_judgment(
+                            response, page_titles, expected_title=expected_title,
+                            expected_author=expected_author, expected_year=expected_year)
+                        if judged is not None:
+                            attempt["cross_script_judgment"] = judged
                         # A generic application/login/results title describes
                         # the interface, not necessarily the requested work.
                         # Require independent bibliographic corroboration before
@@ -5988,6 +6132,13 @@ class SourceResolver:
             return {'web_fetch_diagnostic': WebFetchDiagnostic(
                 reason=reason, observed_content_sha256=hashlib.sha256(resp.content).hexdigest(),
             ).model_dump()}
+
+        if metadata_record_xml(resp.content):
+            # A repository metadata export about the work, not its text
+            # (Synthetic Embrace reference 12, 2026-10-18).
+            return RetrievalResult(source_name="web_fetch", success=False,
+                                   error="Repository metadata record, not the work's text",
+                                   metadata=diagnostic("readable_text_unavailable"))
 
         _record_registry_link_identity(url, resp, title, expected_author=expected_author,
                                        expected_year=expected_year, expected_doi=expected_doi)
@@ -7434,11 +7585,19 @@ class SourceResolver:
                     )
 
             # If OA download failed or wasn't available, try publisher PDF
-            # (works on campus networks with IP-based access)
+            # (works on campus networks with IP-based access). That is
+            # licensed-content acquisition, so it needs its library permission.
             capabilities = getattr(self, "_acquisition_capabilities", None)
+            publisher_refusal = library_permissions.acquisition_refusal(
+                library_permissions.PUBLISHER_PDF)
+            if (result.full_text is None and result.doi and publisher_refusal
+                    and (capabilities is None or "publisher_url" in capabilities)):
+                result.metadata = result.metadata or {}
+                result.metadata["publisher_pdf_not_attempted"] = publisher_refusal
             if (
                 result.full_text is None
                 and result.doi
+                and publisher_refusal is None
                 and (capabilities is None or "publisher_url" in capabilities)
             ):
                 from app.services.publisher_urls import try_download_publisher_pdf
@@ -7458,6 +7617,8 @@ class SourceResolver:
                         )
                     )
                     downloaded_via_publisher = True
+                    result.metadata = result.metadata or {}
+                    result.metadata["library_service"] = library_permissions.PUBLISHER_PDF
                     logger.info(
                         "Downloaded PDF for %s via publisher URL (publisher=%s)",
                         result.doi, publisher or "unknown",
@@ -7688,7 +7849,9 @@ class SourceResolver:
 
                 if should_cache and downloaded_via_publisher and not is_oa:
                     # Paywalled content accessed via campus IP
-                    if not self._storage().sources.keep_licensed_copies:
+                    if not (self._storage().sources.keep_licensed_copies
+                            and library_permissions.licensed_switch(
+                                library_permissions.PUBLISHER_PDF, "retention")):
                         should_cache = False
                         logger.info(
                             "Paywalled PDF for %s verified in-memory, NOT cached "
@@ -7779,6 +7942,9 @@ class SourceResolver:
         if policy is None:
             from app.services.storage_policy import deployment_defaults
             policy = deployment_defaults()
+        service = library_permissions.service_for(result)
+        if service is not None and not library_permissions.permitted(service, "retention"):
+            return None, "library_retention_off"
         metadata = result.metadata or {}
         explicit = metadata.get("license_class")
         if explicit in LICENSE_CLASSES:
@@ -7791,11 +7957,19 @@ class SourceResolver:
             for location in result.locations
         )):
             return "open_access", "provider_oa_or_licence_evidence"
-        if (
-            policy.sources.keep_licensed_copies
-            and (downloaded_via_publisher or result.source_name == "elsevier")
-        ):
-            return "paywalled_db_retrieved", "deployment_subscription_retention_policy"
+        if downloaded_via_publisher or result.source_name == "elsevier":
+            # A licensed copy is kept only when the storage settings keep
+            # licensed copies and the deployment turned on the acquiring
+            # service's retention switch itself; otherwise it is never stored.
+            service = (library_permissions.ELSEVIER_INSTITUTIONAL if result.source_name == "elsevier"
+                       else library_permissions.service_for(result) if result.source_name == "doi_resolver"
+                       else library_permissions.PUBLISHER_PDF)
+            kept = (library_permissions.licensed_switch(service, "retention")
+                    if service in library_permissions.LICENSED_SERVICES
+                    else library_permissions.explicitly_on(service, "retention"))
+            if policy.sources.keep_licensed_copies and kept:
+                return "paywalled_db_retrieved", "deployment_subscription_retention_policy"
+            return None, "licensed_copy_retention_not_permitted"
 
         representation = result.representation
         source_url = (
@@ -8222,6 +8396,10 @@ def _expected_page_range(result: RetrievalResult) -> tuple[int, int] | None:
         if start <= end and 1 < end - start + 1 <= 500:
             return start, end
     return None
+
+
+def _campus_resolver_active() -> bool:
+    return library_permissions.campus_resolver_active()
 
 
 def _check_is_oa(result: RetrievalResult) -> bool:

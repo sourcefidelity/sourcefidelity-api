@@ -199,7 +199,8 @@ class PatchwritingAtCheck:
                 )
                 for claim, statement in body.statements
             ]
-            result = pw.detect_in_body(body.text, [index], statements=statements)
+            result = pw.detect_in_body(body.text, [index], statements=statements,
+                                       reference_titles=[getattr(r, "title", "") for r in getattr(self._artifact, "references", None) or ()])
             result.limitations.extend(f"extraction:{item[:120]}" for item in extraction_limits)
             self.sources[reference_id] = bounded_result(result, reference_id=reference_id,
                                                         completeness=getattr(source, "completeness_verdict", None))

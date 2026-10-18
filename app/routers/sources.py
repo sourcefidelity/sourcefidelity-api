@@ -23,6 +23,7 @@ from app.models.source_repository import (
 )
 from app.services.retrieval.base import RepresentationKind, SourceRepresentation
 from app.services.source_repository import (
+    UPLOADED_LIMITED_TEXT_KEY,
     AdmissionError,
     AdmissionRequest,
     WorkIdentity,
@@ -258,6 +259,7 @@ def upload_source(
         fallback.completeness.upper() if upload_inspection else None
     )
     review_status = "accepted"
+    flagged_completeness = False
     logical_pages: int | None = (fallback.page_count or None) if upload_inspection else None
 
     if settings.COMPLETENESS_CHECK_ENABLED:
@@ -287,6 +289,7 @@ def upload_source(
                 warnings.append("web_page_completeness: " + web["reason"])
 
         flagged = completeness_verdict in (INCOMPLETE, UNCERTAIN)
+        flagged_completeness = flagged
         if flagged:
             warnings.extend(report.messages)
             warnings.extend(f"signal: {s}" for s in report.signals)
@@ -308,8 +311,10 @@ def upload_source(
                     "messages": warnings,
                 },
             )
-        if flagged and mode == "standard":
-            review_status = "pending_review"
+        # An upload whose identity was verified but whose completeness is
+        # uncertain or incomplete is accepted as limited text: there is no
+        # review step to wait for (owner decision 2026-10-18, Stefanopoulou).
+        # It is never judged; strict mode still refuses it above.
 
     # Pure scans in standard mode are also held for review (they're unusable
     # until OCR'd). In lenient they're accepted with a warning; in strict
@@ -391,6 +396,9 @@ def upload_source(
                     admitted_by=None,
                     validation_evidence={
                         "upload_verification": messages,
+                        **({UPLOADED_LIMITED_TEXT_KEY: {"policy": "uploaded-limited-text-v1",
+                                                        "completeness": completeness_verdict}}
+                           if flagged_completeness else {}),
                         "file_safety": {
                             "structural_verdict": safety_report.structural_verdict.value,
                             "malware_verdict": safety_report.malware_verdict.value,

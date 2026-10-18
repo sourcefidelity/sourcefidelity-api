@@ -23,10 +23,8 @@ def retry_incomplete_searches() -> dict:
     if not settings.PROVIDER_RECOVERY_REFRESH_ENABLED:
         return {"jobs_requeued": 0, "reference_members": 0,
                 "disabled": "PROVIDER_RECOVERY_REFRESH_ENABLED"}
-    from app.services.assessment_marks import institutional_deployment
-    if not institutional_deployment():
-        # Personal: searching again is always the user's choice (owner decision 2026-09-29).
-        return {"jobs_requeued": 0, "reference_members": 0, "disabled": "personal_deployment"}
+    # Both profiles retry on their own; there is no Search again button
+    # (owner decision 2026-10-18, replacing the Personal user's choice of 2026-09-29).
     delays = retry_delays()
     if not delays:
         return {"jobs_requeued": 0, "reference_members": 0}
@@ -56,7 +54,11 @@ def retry_incomplete_searches() -> dict:
                 .with_for_update(skip_locked=True)
             )
         )
+        from app.services.storage_policy import finishes_searches_automatically
         for job in jobs:
+            # Personal scopes only when their owner turned it on (owner decision 2026-10-18).
+            if not finishes_searches_automatically(session, job.scope_type, job.scope_id):
+                continue
             retried = prepare_incomplete_search_retry(
                 session, job, now=now, delays=delays, window=window
             )

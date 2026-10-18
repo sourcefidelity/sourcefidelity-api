@@ -756,3 +756,20 @@ def test_abstract_cannot_enter_durable_content_store(session: Session) -> None:
 
     with pytest.raises(AdmissionError, match="not durable source content"):
         admit_representation(session, storage, request)
+
+
+def test_the_users_own_verified_upload_is_accepted_as_limited_text(session: Session) -> None:
+    from dataclasses import replace
+    from app.services.source_repository import UPLOADED_LIMITED_TEXT_KEY, find_accepted_representation
+    mark = {UPLOADED_LIMITED_TEXT_KEY: {"policy": "uploaded-limited-text-v1"}}
+    marked = replace(_request(completeness_verdict="uncertain"), validation_evidence=mark)
+    storage = MemoryStorage()
+    record = admit_representation(session, storage, marked)
+    assert record.admission_state == "accepted" and record.completeness_verdict == "uncertain"
+    assert find_accepted_representation(session, scope_type=record.scope_type, scope_id=record.scope_id,
+                                        doi="https://doi.org/10.1234/EXAMPLE") is not None
+    # An unmarked upload, or a retrieved copy with the mark, is still held.
+    for request in (_request(completeness_verdict="uncertain", scope_id="owner-2"),
+                    replace(_request(completeness_verdict="uncertain", scope_id="owner-3"),
+                            provenance="retrieval_pipeline", validation_evidence=mark)):
+        assert admit_representation(session, storage, request).admission_state == "needs_review"

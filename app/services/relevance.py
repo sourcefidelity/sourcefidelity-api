@@ -131,9 +131,9 @@ def extract_surnames(author_string: str) -> list[str]:
         return []
 
     surnames: list[str] = []
-    # Split on common multi-author separators
-    authors = re.split(r"(?:,?\s*(?:&|and)\s*|;\s*)", author_string)
-    for a in authors:
+    # "et al." is the versioned et-al comparison policy's to remove
+    # (reference_discovery), not this reader's.
+    for a in author_segments(author_string, strip_et_al=False):
         a = a.strip().strip(".")
         if not a:
             continue
@@ -144,11 +144,33 @@ def extract_surnames(author_string: str) -> list[str]:
             # Format "First Last" -> surname is the last word
             parts = a.split()
             surname = parts[-1] if parts else a
-        # Clean: lowercase, strip non-alpha
-        surname = re.sub(r"[^a-zA-Z]", "", surname).lower()
+        surname = fold_name(surname)
         if len(surname) > 1:
             surnames.append(surname)
     return surnames
+
+
+def author_segments(expected_author: str | None, *, strip_et_al: bool = True) -> list[str]:
+    """Split a cited author list into one string per person.
+
+    The one splitter (rules audit 2026-10-18): "and" is a whole word
+    ("Sanders" is one name), and "Quint, A., Moor, L." holds two people
+    separated after an initial.
+    """
+    value = " ".join(str(expected_author or "").split())
+    if strip_et_al:
+        value = re.sub(r"(?i),?\s+et\.?\s+al\.?\s*$", "", value)
+    segments = []
+    for part in re.split(r"(?:,?\s*(?:&|\band\b)\s*|;\s*)", value):
+        segments.extend(re.split(r"(?<=\.)\s*,\s*(?=[^\W\d_][^,]*,)", part))
+    return [segment.strip(" ,") for segment in segments if segment.strip(" ,.")]
+
+
+def fold_name(value: str) -> str:
+    """Lowercase letters only, accents folded ("Müller" -> "muller")."""
+    import unicodedata
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(c for c in decomposed if c.isalpha() and not unicodedata.combining(c)).casefold()
 
 
 def _surname_similarity(s1: str, s2: str) -> float:

@@ -27,6 +27,7 @@ import httpx
 
 from app.services.processing_metrics import record_provider_request
 from app.config import secret_value, settings
+from app.services.library_permissions import ELSEVIER_INSTITUTIONAL, acquisition_refusal
 from app.log_safety import private_value_id, safe_exception_code
 from app.services.retrieval.provider_runtime import (
     ProviderHealthStore,
@@ -84,7 +85,9 @@ class ElsevierRetriever(RetrievalSource):
             "Accept": "application/json",
             "User-Agent": "SourceFidelity/0.1.0 (source-verification-bot)",
         }
-        if settings.ELSEVIER_INST_TOKEN:
+        # The institutional token unlocks paywalled full text, which is
+        # licensed-content acquisition and needs its library permission.
+        if settings.ELSEVIER_INST_TOKEN and acquisition_refusal(ELSEVIER_INSTITUTIONAL) is None:
             headers["X-ELS-Insttoken"] = secret_value(settings.ELSEVIER_INST_TOKEN)
         return headers
 
@@ -169,10 +172,13 @@ class ElsevierRetriever(RetrievalSource):
             # - Paywalled articles: on a campus network, IP grants access
             #   (no insttoken needed). Off-campus without insttoken, the API
             #   returns 401/403 and we fall back to abstract.
-            # So we always try it and let the API decide entitlement. This key
-            # rejects an explicit FULL view, while the documented native XML
-            # representation works and includes article markup when entitled.
-            full_text = self._fetch_full_text(doi)
+            # A paywalled article's text is licensed-content acquisition, so it
+            # is requested only with that library permission; otherwise the API
+            # decides entitlement. This key rejects an explicit FULL view, while
+            # the documented native XML representation works and includes
+            # article markup when entitled.
+            refusal = None if is_oa else acquisition_refusal(ELSEVIER_INSTITUTIONAL)
+            full_text = None if refusal else self._fetch_full_text(doi)
             if full_text:
                 logger.info(
                     "Retrieved Elsevier FULL text for %s (oa=%s, insttoken=%s)",
@@ -201,6 +207,8 @@ class ElsevierRetriever(RetrievalSource):
                     "coredata": coredata,
                     "is_oa": is_oa,
                     "pii": coredata.get("pii"),
+                    **({"full_text_not_requested": refusal} if refusal else {}),
+                    **({"library_service": ELSEVIER_INSTITUTIONAL} if full_text and not is_oa else {}),
                 },
             )
         except httpx.HTTPStatusError as e:

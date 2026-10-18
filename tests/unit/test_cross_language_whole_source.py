@@ -246,3 +246,21 @@ def test_whole_source_selection_is_on_and_a_whole_read_stands_as_not_supported()
     assert _whole_source_read(payload, "c1")
     assert not _whole_source_read(payload, "c2") and not _whole_source_read(payload, "c3")
     assert not _whole_source_read({}, "c1")
+
+
+def test_whole_source_plan_skips_a_passage_with_an_over_bound_sentence(monkeypatch):
+    # 2026-10-18: an over-bound sentence must skip its passage, never fail the run.
+    from app.services import cross_language_whole_source as whole
+    from app.services import facet_evidence_judgment as facets
+
+    def sentences(passage):
+        if passage.passage_id.startswith("long"):
+            raise facets._EvidenceSentenceBudgetExceeded
+        return [SimpleNamespace(passage_start=0, passage_end=9, text="Sentence.")]
+
+    monkeypatch.setattr(facets, "_passage_sentences", sentences)
+    passage = lambda pid, start: SimpleNamespace(passage_id=pid, page_index=1, character_start=start,
+                                                 passage_role="body_prose", text="Sentence.")
+    artifact = SimpleNamespace(passages=[passage("long-r", 0), passage("ok-r", 100)])
+    plan = whole.build_plan(artifact, [passage("long-w", 200), passage("ok-w", 300)])
+    assert plan.excluded == 1

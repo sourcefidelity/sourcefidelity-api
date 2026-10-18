@@ -19,7 +19,7 @@ from app.services.body_title_formatting import BodyTitleAssessment, assess_body_
 from app.services.citation_extractor import SignalConfig, extract_citations
 from app.services.antecedent_resolver import resolve_claim_antecedents
 from app.services.discourse_context import resolve_claim_discourse_dependencies
-from app.services.quotation_form import QUOTATION_FORM_VERSION, claim_quotation_form
+from app.services.quotation_form import QUOTATION_FORM_VERSION, claim_quotation_form, claim_type_for
 from app.services.claim_atomizer import (
     AtomizationArtifact,
     atomize_claim_unit,
@@ -337,9 +337,12 @@ def extract_paper_evidence(
             )
             parent_claim = resolve_claim_antecedents(body_text, parent_claim)
             parent_claim = resolve_claim_discourse_dependencies(parent_claim)
+            form = claim_quotation_form(parent_claim, references)
             parent_claim = parent_claim.model_copy(update={
-                "quotation_form": claim_quotation_form(parent_claim, references),
+                "quotation_form": form,
                 "quotation_form_version": QUOTATION_FORM_VERSION,
+                # One reading of "is this a quotation" (`quotation_form`).
+                "claim_type": claim_type_for(parent_claim, references),
             })
         except ValueError as exc:
             claim_boundary_rejections.append(

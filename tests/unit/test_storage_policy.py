@@ -88,8 +88,20 @@ def test_what_public_copies_are_kept_follows_the_setting(keep, oa, expected):
     assert decided == expected
 
 
-@pytest.mark.parametrize("keep,expected", [(True, "paywalled_db_retrieved"), (False, None)])
-def test_licensed_copies_are_kept_only_when_chosen(keep, expected):
+@pytest.mark.parametrize("location,keep,grants,expected", [
+    ("off_campus", True, "{}", "paywalled_db_retrieved"),
+    ("off_campus", False, "{}", None),
+    ("off_campus", True, '{"publisher_pdf": {"retention": false}}', None),
+    ("on_campus", True, "{}", None),
+    ("on_campus", True, '{"publisher_pdf": {"retention": true}}', "paywalled_db_retrieved"),
+    ("on_campus", True, '{"doi_resolver": {"retention": true}}', None),
+])
+def test_licensed_copies_are_kept_only_when_chosen(monkeypatch, location, keep, grants, expected):
+    """Kept only when the storage settings keep licensed copies and the
+    acquiring service's retention switch allows it; on a campus network the
+    publisher route's switch starts off."""
+    monkeypatch.setattr(settings, "LIBRARY_PERMISSIONS", grants)
+    monkeypatch.setattr(settings, "NETWORK_LOCATION", location)
     policy = StoragePolicy.model_validate({"sources": {"keep_licensed_copies": keep}})
     result, _ = _public()
     decided, _ = SourceResolver._retrieval_retention_decision(result, downloaded_via_publisher=True, policy=policy)
@@ -99,6 +111,7 @@ def test_licensed_copies_are_kept_only_when_chosen(keep, expected):
 @pytest.mark.parametrize("days,licensed,expect_expiry", [(0, False, False), (30, False, True), (0, True, True)])
 def test_a_kept_copy_expires_after_the_chosen_days(monkeypatch, days, licensed, expect_expiry):
     from types import SimpleNamespace
+    monkeypatch.setattr(settings, "LIBRARY_PERMISSIONS", '{"publisher_pdf": {"retention": true}}')
     from unittest.mock import MagicMock, Mock
     resolver = SourceResolver.__new__(SourceResolver)
     resolver._backend = Mock()

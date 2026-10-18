@@ -923,14 +923,9 @@ def _contains_name(normalized_text: str, name: str, normalize=_name_identity_tex
 
 
 def _cited_author_segments(expected_author: str | None) -> list[str]:
-    """Split a cited author list into one string per person."""
-    value = " ".join(str(expected_author or "").split())
-    value = re.sub(r"(?i),?\s+et\.?\s+al\.?\s*$", "", value)
-    segments = []
-    for part in re.split(r"(?:,?\s*(?:&|\band\b)\s*|;\s*)", value):
-        # "Quint, A., Moor, L." holds two people separated after an initial.
-        segments.extend(re.split(r"(?<=\.)\s*,\s*(?=[^\W\d_][^,]*,)", part))
-    return [segment.strip(" ,") for segment in segments if segment.strip(" ,.")]
+    """Split a cited author list into one string per person (the one splitter)."""
+    from app.services.relevance import author_segments
+    return author_segments(expected_author)
 
 
 def _segment_surname(segment: str) -> str:

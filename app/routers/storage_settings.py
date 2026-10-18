@@ -24,6 +24,7 @@ from app.services.storage_policy import (
     SUBMITTED_FILE_OUTLIVES_REPORT,
     StoragePolicy,
     policy_for,
+    profile_for,
     set_policy,
     settings_scope_for,
 )
@@ -47,7 +48,7 @@ def _days(name: str, label: str, value: int, *, until_deleted: bool) -> str:
     return field
 
 
-def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
+def _page(policy: StoragePolicy, error: str | None = None, *, personal: bool = False) -> HTMLResponse:
     nonce = secrets.token_urlsafe(24)
     sources, papers, reports = policy.sources, policy.papers, policy.reports
     public = "".join(
@@ -63,6 +64,13 @@ def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
         f'{" checked" if papers.keep_submitted_file == (value == "on") else ""}> {label}</label>'
         for value, label in (("on", "On"), ("off", "Off")))
     alert = f'<p role="alert">{escape(error)}</p>' if error else ""
+    # Personal only (owner wording 2026-10-18); Institutional always finishes them.
+    searches = ("<fieldset><legend>Searches</legend><fieldset><legend>Finish incomplete searches automatically"
+                "</legend>" + "".join(
+                    f'<label><input type="radio" name="finish_incomplete_automatically" value="{value}"'
+                    f'{" checked" if policy.searches.finish_incomplete_automatically == (value == "on") else ""}>'
+                    f' {label}</label>' for value, label in (("on", "On"), ("off", "Off")))
+                + "</fieldset></fieldset>") if personal else ""
     body = (
         '<h1>Storage</h1>' + alert + '<form method="post" action="/settings/storage">'
         '<fieldset><legend>Sources</legend>'
@@ -79,7 +87,7 @@ def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
                 until_deleted=True)
         + '</fieldset><fieldset><legend>Reports</legend>'
         + _days("report_days", "Keep reports for", reports.report_days, until_deleted=True)
-        + '</fieldset><button type="submit">Save</button></form>')
+        + '</fieldset>' + searches + '<button type="submit">Save</button></form>')
     return HTMLResponse(
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Storage</title>'
@@ -97,7 +105,7 @@ class _MissingDays(Exception):
     """A days box left empty with Until deleted unticked."""
 
 
-def _changes(form) -> dict:
+def _changes(form, *, personal: bool = False) -> dict:
     """The submitted form as a full storage policy body; HTTP 400 when malformed."""
     def days(name: str, *, until_deleted: bool) -> int:
         if until_deleted and form.get(f"{name}_until_deleted") == "true":
@@ -124,7 +132,15 @@ def _changes(form) -> dict:
     if (kept == "on" or str(form.get("submitted_file_days") or "").strip()
             or form.get("submitted_file_days_until_deleted") == "true"):
         papers["submitted_file_days"] = days("submitted_file_days", until_deleted=True)
+    searches = {}
+    finish = form.get("finish_incomplete_automatically")
+    if personal and finish is not None:
+        # Absent (an older page): the stored choice stays.
+        if finish not in {"on", "off"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+        searches = {"finish_incomplete_automatically": finish == "on"}
     return {
+        **({"searches": searches} if searches else {}),
         "sources": {"keep_public_copies": public,
                     "public_copy_days": days("public_copy_days", until_deleted=True),
                     "keep_licensed_copies": licensed == "on",
@@ -138,7 +154,8 @@ def _changes(form) -> dict:
 def storage_settings_page(principal: AuthenticatedPrincipal = Depends(get_authenticated_principal),
                           session: Session = Depends(get_db)):
     principal.require(STORAGE_SETTINGS_CAPABILITY)
-    return _page(policy_for(session, *settings_scope_for(principal.scope_type, principal.scope_id)))
+    return _page(policy_for(session, *settings_scope_for(principal.scope_type, principal.scope_id)),
+                 personal=profile_for(principal.scope_type) == "personal")
 
 
 @router.post("/storage", response_class=HTMLResponse)
@@ -148,10 +165,11 @@ async def save_storage_settings(request: Request,
     require_same_origin_request(request)
     principal.require(STORAGE_SETTINGS_CAPABILITY)
     scope = settings_scope_for(principal.scope_type, principal.scope_id)
+    personal = profile_for(principal.scope_type) == "personal"
     try:
-        changes = _changes(await request.form())
+        changes = _changes(await request.form(), personal=personal)
     except _MissingDays:
-        return _page(policy_for(session, *scope), DAYS_OR_UNTIL_DELETED)
+        return _page(policy_for(session, *scope), DAYS_OR_UNTIL_DELETED, personal=personal)
     current = policy_for(session, *scope)
     try:
         StoragePolicy.model_validate({"version": "storage-policy-v1", "sources": changes["sources"],
@@ -163,7 +181,7 @@ async def save_storage_settings(request: Request,
             papers=current.papers.model_copy(update=changes["papers"]),
             reports=current.reports.model_copy(update=changes["reports"]))
         return _page(shown, SUBMITTED_FILE_LONGER_THAN_REPORT if SUBMITTED_FILE_OUTLIVES_REPORT in str(exc)
-                     else PAPER_LONGER_THAN_REPORT)
+                     else PAPER_LONGER_THAN_REPORT, personal=personal)
     set_policy(session, *scope, changes, updated_by=f"{principal.provider}:{principal.subject}")
     session.commit()
     return RedirectResponse("/settings/storage", status_code=status.HTTP_303_SEE_OTHER)

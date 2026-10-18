@@ -104,6 +104,21 @@ def candidate_text(payload: dict, candidate_id: str) -> str:
     return claim
 
 
+def names_only_other_sources(payload: dict, candidate_id: str) -> bool:
+    """The part carries other references' markers and none of this source's,
+    so it is theirs to support: neither judged nor shown for this source
+    (Synthetic Embrace citation 1, 2026-10-18)."""
+    reference_id = (payload.get("source_binding") or {}).get("reference_id")
+    if not reference_id:
+        return False
+    text = candidate_text(payload, candidate_id)
+    markers = [m for m in (payload.get("claim") or {}).get("citation_markers") or []
+               if isinstance(m, dict) and str(m.get("text") or "").strip() and str(m["text"]) in text]
+    if not markers:
+        return False
+    return all(reference_id not in (m.get("reference_ids") or []) for m in markers)
+
+
 def candidate_paper_ranges(payload: dict, candidate_id: str) -> list[tuple[int, int]]:
     """The candidate's exact student wording as paper character ranges."""
     for candidate in (payload.get("verification_candidates") or {}).get("candidates") or []:

@@ -421,6 +421,9 @@ def retrieve_paper_sources(
             result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
         from app.services.source_reuse import SEARCH_RULES_VERSION
         result_record["search_rules"] = SEARCH_RULES_VERSION
+        if (getattr(result, "metadata", None) or {}).get("held_as_book_of_cited_part"):
+            # The text is the identified single-authored book's (2026-10-18).
+            result_record["held_as_book_of_cited_part"] = True
         if getattr(result, "source_name", None) == "lantern":
             from app.services.source_reuse import LANTERN_PAGES_VERSION
             result_record["lantern_pages"] = LANTERN_PAGES_VERSION
@@ -1352,8 +1355,13 @@ def prepare_uploaded_source_refresh(
     representation_id: str | uuid.UUID,
     commit: bool = True,
     refresh_reason: str = "user_source_upload",
+    reverify_current: bool = False,
 ) -> dict:
     """Bind one admitted upload to its exact paper member and targeted refresh.
+
+    `reverify_current` re-checks a source the report already holds, so changed
+    evidence or Judgment rules reach it without a search (development refresh,
+    2026-10-18).
 
     The report-local member is only a hint.  This function independently checks
     the admitted representation, authorization scope, canonical work identity,
@@ -1478,7 +1486,8 @@ def prepare_uploaded_source_refresh(
         None,
     )
     if (
-        current
+        not reverify_current
+        and current
         and current.get("status") == "durable_authorized"
         and current.get("representation_id") == str(representation.id)
     ):

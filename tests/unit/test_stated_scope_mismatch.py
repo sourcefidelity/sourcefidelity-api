@@ -765,3 +765,16 @@ def test_a_national_library_title_page_decides_when_open_library_has_none():
         assert resolver._container_responsibility("The Star System", "Quillby, O.")["classification"] == "unresolved"
     finally:
         catalogues.catalogue_statements = original
+
+
+def test_a_book_found_by_its_title_page_keeps_the_chapter_from_cannot_be_verified():
+    from types import SimpleNamespace
+    from app.services.reference_verification import assess_reference_verification
+    ref = SimpleNamespace(reference_id='r', source_kind='book_section', title='A chapter here', raw_ref='x')
+    discovery = {'outcome': 'search_incomplete', 'expected': {'title': 'A chapter here', 'source_kind': 'book_section'},
+                 'attempts': [{'route_category': 'academic_adapter'}], 'queries': [], 'candidates': [],
+                 'container_identity': {'status': 'not_confirmed', 'outcome': 'search_incomplete', 'title': 'Book',
+                                        'responsibility': {'classification': 'single_authored',
+                                                           'statements': ['Orla Quillby.'], 'provider': 'library_of_congress'}}}
+    result = assess_reference_verification(ref, discovery)
+    assert result['status'] == 'possible_match' and result['reason_code'] == 'containing_work_possible_match'

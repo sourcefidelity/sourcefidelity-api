@@ -108,12 +108,8 @@ def requeue_recovered_provider_work(provider: str, force_search: bool = False, a
     normalized = provider.strip().casefold()
     if not normalized:
         return {"provider": "", "jobs_requeued": 0, "reference_members": 0}
-    from app.services.assessment_marks import institutional_deployment
-    if automatic and not institutional_deployment():
-        # Personal: no automatic re-searching; the user decides with Search again
-        # (owner decision 2026-09-29). A hand-started run passes automatic=False.
-        return {"provider": normalized, "jobs_requeued": 0, "reference_members": 0,
-                "disabled": "personal_deployment"}
+    # Both profiles re-run on their own once a provider recovers (owner decision
+    # 2026-10-18, replacing the Personal user's Search again of 2026-09-29).
     if not settings.PROVIDER_RECOVERY_REFRESH_ENABLED:
         # The single gate every automatic re-run passes through: the probe and
         # live web search both reach this task via `schedule_provider_recovery`.
@@ -139,7 +135,12 @@ def requeue_recovered_provider_work(provider: str, force_search: bool = False, a
                 .with_for_update(skip_locked=True)
             )
         )
+        from app.services.storage_policy import finishes_searches_automatically
         for job in jobs:
+            # A hand-started run passes automatic=False; otherwise Personal
+            # scopes only when their owner turned it on (owner decision 2026-10-18).
+            if automatic and not finishes_searches_automatically(session, job.scope_type, job.scope_id):
+                continue
             affected = prepare_provider_recovery_refresh(
                 session,
                 job.id,

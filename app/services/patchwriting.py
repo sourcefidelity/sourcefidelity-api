@@ -39,7 +39,7 @@ from typing import Any, Iterable, Literal, Sequence
 
 from pydantic import BaseModel, Field
 
-POLICY_VERSION = "patchwriting-v5"   # v5: field terminology is conventional (2026-10-04)
+POLICY_VERSION = "patchwriting-v6"   # v5: field terminology is conventional (2026-10-04); v6: source roles from the shared blocks, cited titles excluded (2026-10-18)
 
 # --- Provisional thresholds (for owner calibration) ------------------------
 # unquoted_verbatim: a contiguous shared word run (exact word forms).
@@ -73,10 +73,7 @@ MAX_POSTING_FLOOR = 200      # ...and more than this many are not used to retrie
 MAX_FINDINGS_PER_STUDENT_SENTENCE = 3
 # Matches against these source roles are measured but never flagged: a
 # bibliography entry or note reproduces titles, not the source's prose.
-NOT_FLAGGED_SOURCE_ROLES = frozenset({
-    "reference_list", "citation_notes", "publication_metadata", "document_metadata",
-    "page_furniture", "author_biography",
-})
+from app.services.source_roles import PATCHWRITING_UNFLAGGED_ROLES as NOT_FLAGGED_SOURCE_ROLES
 # A student region whose content words are mostly capitalized (not sentence-
 # initial) is a title or name sequence, not prose; measured but not flagged.
 TITLE_CASE_SHARE = 0.75
@@ -146,15 +143,11 @@ _CONVENTIONAL_BY_FIRST: dict[str, list[tuple[str, ...]]] = {}
 for _phrase in sorted(CONVENTIONAL_PHRASES, key=len, reverse=True):
     _CONVENTIONAL_BY_FIRST.setdefault(_phrase[0], []).append(_phrase)
 
-# Same sentence boundaries as facet_evidence_judgment._passage_sentences, so a
-# reported sentence has the identity the report's evidence lists use.
-_BOUNDARY = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
 _CLAUSE_BOUNDARY = re.compile(r"[,;:()\[\]—–]|\s-\s")
 _WORD_CHAR = re.compile(r"\w")
 _TOKEN = re.compile(
     r"(?P<hb>[^\W\d_]+-[ \t]*\n[ \t]*[a-z]+)|(?P<w>[^\W_]+(?:['’][^\W_]+)*)"
 )
-_REFERENCE_HEADING = re.compile(r"(?im)^\s*(?:references|bibliography|works\s+cited)\s*$")
 _QUOTE_PATTERNS = (
     ("double_quotation", re.compile(r'"[^"]*"')),
     ("double_quotation", re.compile(r"“[^”]*”")),
@@ -175,8 +168,46 @@ Kind = Literal["unquoted_verbatim", "close_paraphrase"]
 Label = Literal["citation_statement_vs_cited_source", "body_sentence"]
 ExclusionKind = Literal[
     "double_quotation", "single_quotation", "unclosed_quotation", "block_quotation",
-    "citation_marker", "citation_parenthetical", "web_address",
+    "citation_marker", "citation_parenthetical", "web_address", "reference_title",
 ]
+
+
+# --- Titles of the paper's own references ----------------------------------------
+# A student naming a work they cite ("Altman's semantic/syntactic approach to
+# film genre") reproduces its title, not a source's prose (Synthetic Embrace,
+# owner decision 2026-10-18). One rule for the check and for stored findings.
+_LEADING_ARTICLE = {"a", "an", "the"}
+
+
+def _title_word_runs(titles) -> list[list[str]]:
+    runs = []
+    for title in titles or ():
+        title = str(title or "")
+        for variant in {title, re.split(r"\s*[:?]\s+", title, 1)[0]}:
+            words = re.findall(r"[^\W_]+", variant.casefold())
+            while words and words[0] in _LEADING_ARTICLE:
+                words = words[1:]
+            if len(words) >= 3 and words not in runs:
+                runs.append(words)
+    return runs
+
+
+def reference_title_spans(text: str, titles) -> list[tuple[int, int]]:
+    """Where the text reproduces a reference-list title (or its main title),
+    leading article optional, punctuation between words free."""
+    spans = []
+    for words in _title_word_runs(titles):
+        pattern = r"(?<![^\W_])" + r"[\W_]+".join(re.escape(w) for w in words) + r"(?![^\W_])"
+        spans.extend(m.span() for m in re.finditer(pattern, text, re.IGNORECASE))
+    return spans
+
+
+def copied_only_titles(region_text: str, region_start: int, matched_spans, titles) -> bool:
+    """Every word a stored finding marks as copied lies inside a cited title
+    the student wrote out; prose around the title keeps the finding."""
+    covered = [(region_start + a, region_start + b) for a, b in reference_title_spans(region_text, titles)]
+    spans = [(s, e) for s, e in matched_spans or () if e > s]
+    return bool(covered and spans and all(any(cs <= s and e <= ce for cs, ce in covered) for s, e in spans))
 # A web address or DOI is a locator, never borrowed wording (the long article's
 # "https://doi.org/10.1075…" matched the source's own DOI, 2026-10-08).
 _WEB_ADDRESS = re.compile(r"(?:https?://|www\.|doi:\s*)\S+|\b10\.\d{4,9}/\S+", re.IGNORECASE)
@@ -331,7 +362,7 @@ class PatchwritingCoverage(BaseModel):
 
 class PatchwritingResult(BaseModel):
     policy_version: Literal["patchwriting-v1", "patchwriting-v2", "patchwriting-v3", "patchwriting-v4",
-                            "patchwriting-v5"] = POLICY_VERSION
+                            "patchwriting-v5", "patchwriting-v6"] = POLICY_VERSION
     status: Literal["compared", "not_assessed"]
     reason: str | None = None
     claim_id: str | None = None
@@ -473,28 +504,10 @@ def _trim(text: str, start: int, end: int) -> tuple[int, int] | None:
     return (start, end) if start < end else None
 
 
-def _ends_with_initial(text: str, position: int) -> bool:
-    """Equivalent of re.search(r"\\b[A-Z]\\.\\s*$", text[:position]) in O(gap)."""
-    j = position
-    while j > 0 and text[j - 1].isspace():
-        j -= 1
-    if j < 2 or text[j - 1] != "." or not ("A" <= text[j - 2] <= "Z"):
-        return False
-    return j < 3 or not _WORD_CHAR.match(text[j - 3])
-
-
 def sentence_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for match in _BOUNDARY.finditer(text):
-        if _ends_with_initial(text, match.start()):
-            continue
-        if trimmed := _trim(text, start, match.start()):
-            spans.append(trimmed)
-        start = match.end()
-    if trimmed := _trim(text, start, len(text)):
-        spans.append(trimmed)
-    return spans
+    """The one source splitter, shared with the evidence foundation."""
+    from app.services.sentence_splitter import source_sentence_spans
+    return source_sentence_spans(text)
 
 
 def clause_spans(text: str, start: int = 0, end: int | None = None) -> list[tuple[int, int]]:
@@ -515,28 +528,32 @@ def source_sentences_from_pages(pages: Iterable[Any]) -> list[SourceSentence]:
 
     Offsets are page-absolute, so `sentence_key` matches
     evidence_report.evidence_sentence_key for a whole-page passage.
+
+    A sentence takes the role of the source block that holds most of it, as
+    retrieval classifies blocks (`verification_evidence._source_blocks`):
+    one rule for reference sections, contents, headings, notes and furniture
+    (rules audit 2026-10-18; patchwriting's own sticky "References" rule let
+    a contents entry silence a whole book).
     """
+    from app.services.verification_evidence import _source_blocks
+    pages = [page for page in pages if (getattr(page, "text", "") or "")]
+    blocks: dict[int, list[tuple[int, int, str]]] = {}
+    for block_page, start, end, _text, role in _source_blocks(pages):
+        blocks.setdefault(id(block_page), []).append((start, end, role))
     sentences: list[SourceSentence] = []
-    in_references = False
     for page in pages:
-        text = getattr(page, "text", "") or ""
-        structural = [
-            (span.start, span.end, span.role)
-            for span in (getattr(page, "structural_spans", ()) or ())
-        ]
-        heading = _REFERENCE_HEADING.search(text)
+        text = page.text
+        page_blocks = blocks.get(id(page), [])
         for start, end in sentence_spans(text):
-            if heading is not None and not in_references and start >= heading.start():
-                in_references = True
-            role = "reference_list" if in_references else "body"
+            role = "body"
+            for b_start, b_end, b_role in page_blocks:
+                # A role labels a sentence only when its block covers most of
+                # it; a header touching a long sentence does not.
+                if b_role in NOT_FLAGGED_SOURCE_ROLES and min(end, b_end) - max(start, b_start) >= (end - start) / 2:
+                    role = b_role
+                    break
             if role == "body" and _looks_bibliographic(text[start:end]):
                 role = "citation_notes"
-            for s_start, s_end, s_role in structural:
-                # A structural role labels a sentence only when it covers most
-                # of it; a header touching a long sentence does not.
-                if min(end, s_end) - max(start, s_start) >= (end - start) / 2:
-                    role = s_role
-                    break
             sentences.append(SourceSentence(
                 text=text[start:end],
                 page_index=getattr(page, "index", None),
@@ -549,15 +566,18 @@ def source_sentences_from_pages(pages: Iterable[Any]) -> list[SourceSentence]:
 
 
 _BIBLIOGRAPHIC = re.compile(
-    r"University Press|\bPress\b|\(\s*[A-Z][\w .]+:\s*[^()]{2,80}\)|\bdoi\b|https?://|\bpp?\.\s*\d|\bvol\.\s*\d",
+    r"\(\s*[A-Z][\w .]+:\s*[^()]{2,80}\)|\bdoi\b|https?://|\bpp?\.\s*\d|\bvol\.\s*\d",
     re.IGNORECASE,
 )
+# A publisher ("Oxford University Press", "Bloomsbury Press"), not "the press
+# coverage in 1998" (rules audit 2026-10-18).
+_PUBLISHER = re.compile(r"\b[A-Z][\w&.'’-]+\s+Press\b")
 _YEAR = re.compile(r"\b(?:1[6-9]|20)\d{2}\b")
 
 
 def _looks_bibliographic(text: str) -> bool:
     """A note or bibliography entry: publication details plus a year."""
-    return bool(_BIBLIOGRAPHIC.search(text) and _YEAR.search(text))
+    return bool((_BIBLIOGRAPHIC.search(text) or _PUBLISHER.search(text)) and _YEAR.search(text))
 
 
 def sentence_key(page_index, absolute_start: int, absolute_end: int) -> str:
@@ -1232,6 +1252,21 @@ def _mark_clause_breaks(text: str, units: list[_StudentSentence]) -> None:
 
 # --- Detection -----------------------------------------------------------------
 
+def _whole_words(text: str, start: int, end: int) -> tuple[int, int]:
+    """A passage shown on the paper begins and ends on whole words: a region
+    starting after an excluded marker ("Altman" of "Altman’s") took the
+    leftover "s" and could not be placed (Synthetic Embrace, 2026-10-18)."""
+    def joined(i: int) -> bool:
+        # The character before position i continues the same word.
+        before = text[i - 1] if i > 0 else " "
+        return before.isalnum() or (before in "'’" and i > 1 and text[i - 2].isalnum())
+    while start < len(text) and (text[start].isalnum() or text[start] in "'’") and joined(start):
+        start -= 1
+    while end < len(text) and text[end].isalnum() and text[end - 1].isalnum():
+        end += 1
+    return start, end
+
+
 def _span(text: str, start: int, end: int, paper_offset) -> StudentSpan:
     paper = paper_offset(start, end)
     return StudentSpan(local_start=start, local_end=end,
@@ -1308,7 +1343,7 @@ def _compare(text: str, units: list[_StudentSentence], sources: Sequence[SourceI
                 claim_ids=list(unit.claim_ids),
                 student_sentence_index=unit.index,
                 student_sentence=_span(text, unit.start, unit.end, paper_offset),
-                student_region=_span(text, *item.student_region, paper_offset),
+                student_region=_span(text, *_whole_words(text, *item.student_region), paper_offset),
                 student_matched_spans=[_span(text, s, e, paper_offset) for s, e in item.student_spans],
                 source_representation_id=source.representation_id,
                 source=_matched_sentence(source, touched[0], item.source_spans),
@@ -1411,7 +1446,8 @@ def detect_patchwriting(statement: StudentStatement, source: SourceIndex | Seque
 
 def detect_in_body(body_text: str, sources: Sequence[SourceIndex], *,
                    statements: Sequence[CitationStatement] = (),
-                   include_sentence_measures: bool = False) -> PatchwritingResult:
+                   include_sentence_measures: bool = False,
+                   reference_titles: Sequence[str] = ()) -> PatchwritingResult:
     """Compare every body sentence (paper offsets = body offsets) with the sources; never raises."""
     try:
         limitations: list[str] = []
@@ -1424,6 +1460,9 @@ def detect_in_body(body_text: str, sources: Sequence[SourceIndex], *,
         blocks = [(s.paper_start, min(s.paper_end, len(text))) for s in statements
                   if s.block_quotation and s.paper_start < len(text)]
         excluded = _excluded_spans(text, marker_spans=markers, block_ranges=blocks)
+        excluded += [ExcludedStudentSpan(kind="reference_title", local_start=start, local_end=end)
+                     for start, end in reference_title_spans(text, reference_titles)]
+        excluded.sort(key=lambda span: (span.local_start, span.local_end))
         return _run(text, excluded, list(sources), paper_offset=lambda s, e: (s, e),
                     statements=statements, limitations=limitations,
                     include_sentence_measures=include_sentence_measures)

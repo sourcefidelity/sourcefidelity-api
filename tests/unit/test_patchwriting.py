@@ -46,7 +46,7 @@ def test_unquoted_verbatim_run_is_flagged_with_exact_spans():
     text = ("Researchers observe that social media platforms have fundamentally transformed "
             "the ways in which adolescents communicate (Smith, 2020).")
     result = detect_patchwriting(_statement(text, marker="Smith, 2020"), _index())
-    assert result.policy_version == POLICY_VERSION == "patchwriting-v5"
+    assert result.policy_version == POLICY_VERSION == "patchwriting-v6"
     assert result.status == "compared"
     assert result.decision_applied is False
     kinds = [finding.kind for finding in result.findings]
@@ -418,3 +418,39 @@ def test_field_terminology_does_not_count_toward_a_close_paraphrase():
     words = ("vertical integration", "production", "distribution", "and exhibition")
     spans = [(text.index(w), text.index(w) + len(w)) for w in words]
     assert matched_content_counts(text, 0, spans) == (5, 0)
+
+
+def test_a_contents_entry_does_not_silence_the_book():
+    contents = SimpleNamespace(index=0, label="v", text="Contents\nIntroduction 1\nReferences\nIndex 230",
+                               structural_spans=())
+    body = SimpleNamespace(index=1, label="17", text=(
+        "The press coverage in 1998 framed the debate about reading habits among rural teenagers. "
+        "Later studies examined the same questions in cities."), structural_spans=())
+    roles = [s.role for s in source_sentences_from_pages([contents, body]) if s.page_index == 1]
+    assert roles == ["body", "body"]
+    note = SimpleNamespace(index=2, label="200", text="Smith, J. 2001. Reading Lives. Oxford University Press, 2001.",
+                           structural_spans=())
+    assert source_sentences_from_pages([note])[-1].role != "body"
+
+
+def test_a_cited_title_is_not_patchwriting():
+    from app.services.patchwriting import copied_only_titles, reference_title_spans
+    titles = ["A semantic/syntactic approach to film genre", "Harbour lights: Ports and their keepers"]
+    text = "Lane draws on Altman’s semantic/syntactic approach to film genre and on Harbour Lights."
+    assert [text[a:b] for a, b in reference_title_spans(text, titles)] == ["semantic/syntactic approach to film genre"]
+    region = "s semantic/syntactic approach to film genre"
+    assert copied_only_titles(region, 100, [(102, 110), (111, 143)], titles)
+    prose = "Jenkins redefined the term in Harbour Lights: Ports and their keepers, a study of ports"
+    title_at = prose.index("Harbour")
+    assert not copied_only_titles(prose, 0, [(title_at, title_at + 7), (len(prose) - 14, len(prose))], titles)
+
+
+def test_a_passage_begins_and_ends_on_whole_words():
+    from app.services.patchwriting import _whole_words
+    from app.services.patchwriting_report import _probe_texts
+    text = "Lane draws on Altman’s approach to film genre today."
+    start = text.index("s approach")
+    assert text[slice(*_whole_words(text, start, text.index(" today")))] == "Altman’s approach to film genre"
+    assert text[slice(*_whole_words(text, start + 2, text.index("genre") + 2))] == "approach to film genre"
+    probes = _probe_texts({"text": "s approach to film genre", "start": 10, "end": 34})
+    assert probes[1] == ("approach to film genre", 12, 34)

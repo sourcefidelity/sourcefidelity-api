@@ -40,7 +40,6 @@ from app.services.evidence_report import (
     EvidenceReportError,
     enable_authenticated_paper_actions,
     load_authorized_evidence_report_bundle,
-    member_search_incomplete,
     render_evidence_report_html,
     project_reference_flags,
 )
@@ -58,7 +57,6 @@ from app.services.paper_workflow import (
 )
 from app.services.report_export import ReportExportError, build_released_report_export
 from app.tasks.source_reanalysis import schedule_uploaded_source_reanalysis
-from app.services.search_retry import SearchAgainRateLimited, prepare_search_again_refresh
 from app.tasks.check_paper import dispatch_paper_workflow
 
 router = APIRouter()
@@ -152,9 +150,7 @@ def get_report(
     principal.require(REPORT_VIEW_CAPABILITY)
     view, artifact, paper_content = _load_bundle(session, backend, report_id, principal)
     nonce = secrets.token_urlsafe(24)
-    view = enable_authenticated_paper_actions(
-        view, report_id=report_id,
-        search_again_enabled=not _report_marks_released(session, report_id, principal))
+    view = enable_authenticated_paper_actions(view, report_id=report_id)
     with fitz.open(stream=paper_content, filetype="pdf") as document:
         view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
         view["paper_surface"]["selectable_words"] = {
@@ -733,6 +729,7 @@ def upload_citation_source(
             detail="Supplied HTML source intake is disabled; upload a PDF",
         )
     matches = []
+    books = _located_books(session, report_id, principal)
     for member in candidates:
         source = member.get("source") or {}
         if supplied_page:
@@ -766,6 +763,21 @@ def upload_citation_source(
         )
         if verified:
             matches.append(member)
+            continue
+        # The whole book a cited chapter is in (owner requests 2026-10-18,
+        # Synthetic Embrace: Maynard's book for a chapter reference): first as
+        # the catalogue records it, then as the student wrote it.
+        for book, book_author in _book_identities(source, books.get(str(member.get("reference_id") or ""))):
+            if verify_instructor_upload(file_bytes, provided_title=book, provided_author=book_author or None)[0]:
+                matches.append({**member, "_uploaded_book_title": book})
+                break
+    # One book cited for several of its chapters serves them all (rules audit
+    # 2026-10-18: it was refused as "cannot be uniquely matched").
+    same_book = bool(len(matches) > 1 and all(m.get("_uploaded_book_title") for m in matches)
+                     and len({m["_uploaded_book_title"] for m in matches}) == 1)
+    book_members = matches if same_book else []
+    if same_book:
+        matches = matches[:1]
     if len(matches) != 1:
         label = "page" if supplied_page else "PDF"
         detail = (
@@ -781,19 +793,21 @@ def upload_citation_source(
         filename=file.filename or ("source.html" if supplied_page else "source.pdf"),
         headers=file.headers,
     )
+    book = member.get("_uploaded_book_title")
     result = admit_uploaded_source(
         request=request,
         file=checked_file,
         doi=str(source.get("doi") or "") or None,
         isbn=None,
-        title=str(source.get("title") or "") or None,
+        title=book or str(source.get("title") or "") or None,
         author=str(source.get("author") or "") or None,
         year=str(source.get("year") or "") or None,
         expected_pages=None,
-        expected_first_page=_stated_page_range(source)[0],
-        expected_last_page=_stated_page_range(source)[1],
-        document_kind=None,
-        source_kind=(
+        # A whole book is checked as a book, not against the chapter's pages.
+        expected_first_page=None if book else _stated_page_range(source)[0],
+        expected_last_page=None if book else _stated_page_range(source)[1],
+        document_kind="book" if book else None,
+        source_kind="monograph" if book else (
             str(source.get("source_kind") or "")
             if str(source.get("source_kind") or "") not in {"", "unknown"}
             else None
@@ -815,6 +829,10 @@ def upload_citation_source(
         reference_id=reference_id,
         admission=result,
     )
+    # The book's other chapter references refresh after this one (queued).
+    for other in book_members[1:]:
+        _start_uploaded_source_reanalysis(session, backend, report_id=report_id,
+                                          reference_id=str(other.get("reference_id") or ""), admission=result)
     return {
         "status": result.get("status", "ok"),
         "review_status": result.get("review_status"),
@@ -823,70 +841,25 @@ def upload_citation_source(
     }
 
 
-@router.post("/{report_id}/reference/{reference_id}/search-again")
-def search_reference_again(
-    report_id: str,
-    reference_id: str,
-    request: Request,
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Search one reference with an incomplete search again (owner decision 2026-09-29).
 
-    Starts a forced targeted refresh of that reference only; the page then
-    follows the successor report exactly as after a source upload.
-    """
-    principal.require(REPORT_SOURCE_CAPABILITY)
-    require_same_origin_request(request)
-    view, _, _ = _load_bundle(session, backend, report_id, principal)
-    members = [
-        member
-        for citation in view.get("citations", [])
-        for member in citation.get("members", [])
-        if member.get("reference_id") == reference_id
-    ]
-    if not members:
-        raise HTTPException(status_code=404, detail="Reference not found")
-    if not any(member_search_incomplete(member) for member in members):
-        raise HTTPException(status_code=409, detail="This reference has no incomplete search")
+
+def _located_books(session: Session, report_id: str, principal) -> dict:
+    """reference id -> the book a chapter was found to be part of."""
     try:
-        prepared = prepare_search_again_refresh(
-            session,
-            report_id=report_id,
-            reference_id=reference_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-        )
-    except SearchAgainRateLimited as exc:
-        raise HTTPException(
-            status_code=429,
-            detail=str(exc),
-            headers={"Retry-After": str(exc.retry_after_seconds)},
-        ) from exc
-    except PaperWorkflowError as exc:
-        if exc.code == "assessment_marks_released":
-            # Marks were released after the page was opened: the page removes
-            # the button (owner decision 2026-09-29).
-            raise HTTPException(status_code=410, detail=exc.code) from exc
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    publication_pending = False
-    try:
-        task_id = dispatch_paper_workflow(prepared["job_id"], prepared["attempt_id"])
-    except Exception:
-        # The committed attempt is resumed by bounded workflow recovery.
-        task_id = None
-        publication_pending = True
-    return {
-        "reanalysis_status": "scheduled",
-        "base_report_id": prepared.get("report_id"),
-        "attempt_id": prepared["attempt_id"],
-        "task_id": task_id,
-        "publication_pending": publication_pending,
-        "status_url": f"/report/{report_id}/successor",
-    }
+        job = _report_job(session, report_id, principal)
+    except Exception:  # noqa: BLE001 - optional: the student's own book title is still tried
+        return {}
+    return {str(item.get("reference_id")): (item.get("reference_discovery") or {}).get("container_identity") or {}
+            for item in (getattr(job, "source_results", None) or []) if isinstance(item, dict)}
+
+
+def _book_identities(source: dict, container: dict | None) -> list[tuple[str, str]]:
+    """(title, author) pairs to match an uploaded whole book against (`book_of_part`)."""
+    if str(source.get("source_kind") or "") != "book_section":
+        return []
+    from app.services.book_of_part import book_identities
+    return book_identities(container, cited_container_title=str(source.get("container_title") or ""),
+                           cited_author=str(source.get("author") or ""))
 
 
 def _start_uploaded_source_reanalysis(

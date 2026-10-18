@@ -31,3 +31,10 @@ def test_abbreviation_does_not_invent_author_or_rescue_different_title():
     assert next(x for x in c.comparisons if x.field_name=='author').outcome=='material_conflict'
     _,c=candidate('Yann LeCun et al.',['Yann LeCun'],title='Botanical classification of tropical trees')
     assert next(x for x in c.comparisons if x.field_name=='title').outcome=='material_conflict'
+
+
+def test_surnames_keep_whole_names_and_fold_accents():
+    from app.services.relevance import extract_surnames
+    assert extract_surnames("Sanders, J., Rowland, B., & Brandt, W.") == ["sanders", "rowland", "brandt"]
+    assert extract_surnames("Parc, J., Messerlin, P., & Kim, K.") == ["parc", "messerlin", "kim"]
+    assert extract_surnames("Müller, K.") == ["muller"] and extract_surnames("Charles Dickens") == ["dickens"]

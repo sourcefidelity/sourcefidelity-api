@@ -37,7 +37,7 @@ from app.services.judge_arms import JudgePanelUnavailable, coaching_route, forma
 from app.services.judgment_input import JudgmentInputUnavailable, judgment_eligibility, prepare_from_payload
 from app.services.citation_structure import describes_research_literature
 from app.services.judgment_coaching import COACHED_STATES, coach
-from app.services.judgment_report import candidate_text
+from app.services.judgment_report import candidate_text, names_only_other_sources
 from app.services.judgment_panel import PANEL_VERSION, ArmResult, CandidatePanelResult, judge_candidate
 
 from app.services.llm_service import chat_completion_json
@@ -91,6 +91,56 @@ def create_run(session: Session, report_id: uuid.UUID, principal, *, force_new: 
     return run
 
 
+# A judge that failed is asked again later, automatically (owner direction
+# 2026-10-18: a full text gets a judgment, not a "Try Again" note). A retry is
+# a new run: cached valid answers are reused, so only failed answers are paid
+# for again. At most three automatic retries per report version.
+AUTO_RETRY_SUBJECT = "judgment-auto-retry"
+MAX_AUTO_RETRIES = 3
+AUTO_RETRY_AFTER = timedelta(minutes=10)
+AUTO_RETRY_WINDOW = timedelta(days=7)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def auto_retry_failed_runs(session: Session, *, dispatch: Callable, now: datetime | None = None) -> dict:
+    """Start a new run for each newest report version whose latest run failed or
+    left a part with a failed judge."""
+    from types import SimpleNamespace
+    now = now or _now()
+    latest: dict = {}
+    for run in session.scalars(select(JudgmentRun).where(JudgmentRun.created_at >= now - AUTO_RETRY_WINDOW)
+                               .order_by(JudgmentRun.created_at.desc())):
+        latest.setdefault((run.report_id, run.scope_type, run.scope_id), run)
+    started = 0
+    for (report_id, scope_type, scope_id), run in latest.items():
+        if run.status in ACTIVE or _aware(run.updated_at) > now - AUTO_RETRY_AFTER:
+            continue
+        report = session.get(Report, report_id)
+        if report is None or session.scalar(select(Report.id).where(
+                Report.job_id == report.job_id).order_by(Report.report_version.desc(),
+                                                         Report.created_at.desc()).limit(1)) != report.id:
+            continue   # a newer version of the report exists
+        failed = run.status == "failed" or any(
+            judgment_reasons.retryable(code) for code in session.scalars(
+                select(JudgmentCandidateResult.reason_code).where(JudgmentCandidateResult.run_id == run.id)))
+        if not failed:
+            continue
+        attempts = session.scalar(select(func.count()).select_from(JudgmentRun).where(
+            JudgmentRun.report_id == report_id, JudgmentRun.requested_by == AUTO_RETRY_SUBJECT)) or 0
+        if attempts >= MAX_AUTO_RETRIES:
+            continue
+        principal = SimpleNamespace(scope_type=scope_type, scope_id=scope_id, subject=AUTO_RETRY_SUBJECT)
+        new = create_run(session, report_id, principal, force_new=True)
+        session.commit()
+        if getattr(new, "created_now", False):
+            dispatch(new.id)
+            started += 1
+    return {"retried": started}
+
+
 def eligible_members(view: dict) -> list[tuple[int | None, str]]:
     """(citation number, verification report id) in paper order, de-duplicated."""
     seen, members = set(), []
@@ -101,6 +151,38 @@ def eligible_members(view: dict) -> list[tuple[int | None, str]]:
                 seen.add((citation.get("citation_number"), record_id))
                 members.append((citation.get("citation_number"), str(record_id)))
     return members
+
+
+def _writer_own_work(view: dict, citation_number, record_id: str, payload: dict, prepared, route, call,
+                     cache) -> dict:
+    """Which judgeable parts of one cited statement describe the writer's own work."""
+    from app.services.writer_own_work import own_work_parts
+    if not settings.PAPER_LLM_PROCESSING_ENABLED:
+        return {"own_work": set(), "cost_usd": 0.0}
+    citations = view.get("citations") or []
+    index = next((i for i, c in enumerate(citations) if c.get("citation_number") == citation_number), None)
+    citation = citations[index] if index is not None else {}
+    statement = str((citation.get("clause_of") or citation).get("student_text")
+                    or (payload.get("claim") or {}).get("text") or "")
+    # The sentences just before the statement, as the resolver and the judge
+    # read them (rules audit 2026-10-18: the previous citations missed an
+    # uncited "My film follows a robot." before "It echoes ...").
+    context = sorted((payload.get("claim") or {}).get("antecedent_context") or [],
+                     key=lambda segment: -int(segment.get("distance_before") or 0))
+    before = (" ".join(str(segment.get("text") or "") for segment in context) if context else
+              " ".join(str(c.get("student_text") or "") for c in citations[max(0, (index or 0) - 2):index or 0]))
+    member = next((m for m in citation.get("members") or [] if str(m.get("verification_report_id")) == record_id), {})
+    # Judgeable parts, and parts left unresolved by "it"/"this" (which may be
+    # the writer's own work).
+    parts = []
+    for item in prepared.items:
+        if not isinstance(item, CandidateFacetFinding):
+            parts.append((item.bundle.candidate_id, candidate_text(payload, item.bundle.candidate_id)))
+        elif _pre_call_reason(item) == "antecedent_unresolved":
+            parts.append((item.candidate_id, candidate_text(payload, item.candidate_id)))
+    reference = str((member.get("source") or {}).get("raw_reference") or "")
+    return own_work_parts(statement, before, reference, parts, route=route, call=call,
+                          cache_lookup=cache.coaching_lookup, cache_store=cache.coaching_store)
 
 
 def _pre_call_reason(finding: CandidateFacetFinding) -> str:
@@ -296,9 +378,28 @@ def execute_run(
             continue
         run.candidate_total += sum(1 for _ in prepared.items)
         wider_search = wider_search_factory(session, record_id, run)
+        # Parts about the writer's own work are not judged against the source
+        # (writer-own-work-v1, owner direction 2026-10-18).
+        own_work = _writer_own_work(view, citation_number, record_id, payload, prepared, note_route, call, cache)
+        run.spend_usd += own_work["cost_usd"]
         for item in prepared.items:
+            candidate_id = item.candidate_id if isinstance(item, CandidateFacetFinding) else item.bundle.candidate_id
+            if names_only_other_sources(payload, candidate_id):
+                # A part carrying only other references' markers is theirs to
+                # support, not this source's (Synthetic Embrace citation 1,
+                # 2026-10-18): it is left out of this source's window, as the
+                # Judgment layer leaves out its mark (rules audit 2026-10-18).
+                run.candidate_total -= 1
+                continue
             if isinstance(item, CandidateFacetFinding):
-                write(citation_number, record_id, item.candidate_id, "not_judged", _pre_call_reason(item))
+                reason = _pre_call_reason(item)
+                if reason == "antecedent_unresolved" and candidate_id in own_work["own_work"]:
+                    # "It also echoes ..." where "it" is the writer's own work.
+                    reason = "writer_own_work"
+                write(citation_number, record_id, candidate_id, "not_judged", reason)
+                continue
+            if item.bundle.candidate_id in own_work["own_work"]:
+                write(citation_number, record_id, item.bundle.candidate_id, "not_judged", "writer_own_work")
                 continue
             limit = _spend_limit_reached(session, run)
             if limit:
@@ -323,6 +424,16 @@ def execute_run(
                     wider = {"status": "unavailable"}
                     result.display_state, result.reason_code = "not_judged", "wider_search_unavailable"
                 else:
+                    wider = outcome["record"]
+                    spend += outcome.get("spend_usd", 0.0)
+                    result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]
+            elif (result.display_state == "not_judged" and judgment_reasons.undecided(result.reason_code)
+                    and getattr(wider_search, "combined", None)):
+                # An undecided statement is judged again with the wider
+                # search's new sentences added to its first ones (owner
+                # decision 2026-10-18); with nothing new, undecided stands.
+                outcome = wider_search.combined(context, item, routes, run, cache, call)
+                if outcome is not None:
                     wider = outcome["record"]
                     spend += outcome.get("spend_usd", 0.0)
                     result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]

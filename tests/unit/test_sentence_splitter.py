@@ -37,3 +37,11 @@ def test_a_citation_after_a_closing_quotation_stays_with_its_sentence():
     # A parenthetical that is its own sentence still stands alone.
     assert split_sentences("He left. (See the appendix for the full list.) Then he returned.") == [
         "He left.", "(See the appendix for the full list.)", "Then he returned."]
+
+
+def test_source_spans_are_exact_and_know_abbreviations():
+    from app.services.sentence_splitter import source_sentence_spans
+    text = "Smith et al. (2001) found the effect. See Dr. Jones on this. D. Ricardo agreed."
+    pieces = [text[a:b] for a, b in source_sentence_spans(text)]
+    assert pieces == ["Smith et al. (2001) found the effect.", "See Dr. Jones on this.", "D. Ricardo agreed."]
+    assert [("他说。她走了。")[a:b] for a, b in source_sentence_spans("他说。她走了。")] == ["他说。", "她走了。"]

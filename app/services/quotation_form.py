@@ -96,6 +96,43 @@ def _single_spans(text: str, outside: list[tuple[int, int]]) -> list[tuple[int, 
     return spans
 
 
+def quoted_spans(text: str) -> list[tuple[int, int]]:
+    """Every quoted span, marks included: double quotes, and single quotes
+    outside them (an apostrophe is not a quote). The one reading of "what is
+    quoted" for the quotation form, the quotation check and the exact-quote
+    search (rules audit 2026-10-18; owner decision: single-quoted quotations
+    get the quotation and locator checks). Unbalanced marks fall back to
+    complete double-quoted spans."""
+    text = str(text or "")
+    try:
+        double = _double_spans(text)
+        return sorted(double + _single_spans(text, double))
+    except _Unbalanced:
+        return [m.span() for m in re.finditer(r"“[^”]{2,}”|\"[^\"]{2,}\"", text)]
+
+
+def quoted_words(text: str, *, marker_spans=(), titles=()) -> list[tuple[int, int]]:
+    """Quoted spans that quote someone: not a reference-list title and not
+    inside a citation marker (a quoted title used as the marker)."""
+    known_titles = {_normal(t) for t in titles if len(_normal(t).split()) >= 2}
+    return [(a, b) for a, b in quoted_spans(text)
+            if _normal(text[a + 1:b - 1]) not in known_titles
+            and not any(start <= a and b <= end for start, end in marker_spans)]
+
+
+def claim_type_for(claim, references) -> str:
+    """A statement quoting someone is a quotation; one whose quoted words are
+    all titles is not; a block quotation without marks stays one."""
+    text = str(getattr(claim, "text", "") or "")
+    markers = [(m.local_start, m.local_end) for m in getattr(claim, "citation_markers", []) or []]
+    titles = [getattr(r, "title", "") for r in references or ()]
+    if quoted_words(text, marker_spans=markers, titles=titles):
+        return "quotation"
+    if quoted_spans(text):
+        return "paraphrase"   # every quoted span is a title
+    return claim.claim_type
+
+
 def _normal(value: str) -> str:
     return " ".join(re.findall(r"[^\W_]+", value.casefold()))
 

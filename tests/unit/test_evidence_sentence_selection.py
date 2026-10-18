@@ -37,3 +37,25 @@ def test_an_empty_selection_is_valid_and_means_nothing_chosen():
 def test_any_contract_violation_rejects_the_whole_response(raw):
     with pytest.raises(SelectionResponseInvalid):
         bind_response(raw, _request())
+
+
+def test_a_passage_with_an_over_bound_sentence_is_skipped_not_fatal(monkeypatch):
+    # 2026-10-18: a 30-reference paper failed its whole run when one source
+    # passage held a "sentence" over 2,000 characters (_EvidenceSentenceBudgetExceeded).
+    from types import SimpleNamespace
+    from app.services import evidence_sentence_selection as selection
+    from app.services import facet_evidence_judgment as facets
+
+    def sentences(passage):
+        if passage.passage_id == "long":
+            raise facets._EvidenceSentenceBudgetExceeded
+        return [SimpleNamespace(passage_start=0, passage_end=9, text="Sentence.")]
+
+    monkeypatch.setattr(facets, "_passage_sentences", sentences)
+    passage = lambda pid, start: SimpleNamespace(passage_id=pid, page_index=1, character_start=start,
+                                                 passage_role="body_prose")
+    artifact = SimpleNamespace(claim=SimpleNamespace(text="Claim.", citation_marker="(A, 2020)"),
+                               passages=[passage("long", 0), passage("ok", 100)])
+    prepared = selection.prepare_request(artifact)
+    assert prepared.excluded_passages == 1
+    assert [ref.passage_id for ref in prepared.sentences.values()] == ["ok"]

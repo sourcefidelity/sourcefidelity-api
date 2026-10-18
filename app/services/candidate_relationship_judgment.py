@@ -53,7 +53,8 @@ from app.services.verification_evidence import (
 PROMPT_CANDIDATE_ID = "c1"
 
 
-CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v11-list-tail"
+# v12, 2026-10-18: a narrative lead-in is judged when nothing else is.
+CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v12-narrative-lead-in"
 CANDIDATE_JUDGMENT_VERSION = "one-candidate-relationship-v2"
 MAX_CANDIDATES = 16
 MAX_PASSAGES = 3
@@ -363,6 +364,20 @@ def attach_verification_candidates(
                      if spec.spans and all(start >= marker_span[1] for start, _ in spec.spans)
                      and spec.attribution == "cited_source" else spec for spec in specs]
     specs = _deduplicate_specs(specs)[: MAX_CANDIDATES - 1]
+    # A narrative citation whose only wording is its lead-in ("... also aligns
+    # with Hess's theory.", "... the Hollywood system introduced by Dyer.")
+    # attributes that wording to the source; with nothing else to judge it is
+    # the part judged (owner direction 2026-10-18: a full text is judged; the
+    # writer's-own-work check still sets the student's own work aside).
+    if (claim.citation_marker_type == "narrative" and specs
+            and not any(spec.relationship_eligible for spec in specs)):
+        specs = [replace(spec, kind="clause", method="narrative_leading_source_statement",
+                         attribution="cited_source", relationship_eligible=True,
+                         verification_scope="bounded_passage_relationship",
+                         requires_context=_requires_parent_context(claim.text, spec.spans))
+                 if spec.method == "narrative_leading_student_context"
+                 and _substantive_word_count(" ".join(claim.text[a:b] for a, b in spec.spans)) >= 3
+                 else spec for spec in specs]
     specialized_voice = any(
         spec.attribution != "cited_source" or not spec.relationship_eligible
         for spec in specs

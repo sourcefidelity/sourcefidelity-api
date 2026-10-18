@@ -172,7 +172,7 @@ def test_this_portrayal_resolves_to_the_portraying_phrase_before_it():
     _validate_claim_antecedents(resolved)
 
 
-def test_secondary_citation_is_flagged_only_when_every_bearing_sentence_cites_another_work():
+def test_secondary_citation_is_flagged_only_when_every_chosen_sentence_cites_another_work():
     from app.services.secondary_citation import attributed_names, secondary_citation
     doster = {"author": "Doster, I. V.", "raw_reference": "Doster, I. V. (2002). The Disney dilemma."}
     assert attributed_names("In fact, some authors (Boltanski and Chiapello, 1999) see projects as a logic.") == [
@@ -181,8 +181,13 @@ def test_secondary_citation_is_flagged_only_when_every_bearing_sentence_cites_an
     assert attributed_names("The system ended in 1948 (p. 12).") == []
     flagged = secondary_citation([
         {"key": "a", "reason": "bears_on_statement", "text": "Grabher (2002) argues projects are temporary."},
-        {"key": "b", "reason": "necessary_context", "text": "Context without a citation."}], doster)
-    assert flagged["sentence_keys"] == ["a"] and flagged["attributed_to"] == ["Grabher"]
+        {"key": "b", "reason": "necessary_context", "text": "As Ibert (2004) adds, they end."}], doster)
+    assert flagged["sentence_keys"] == ["a", "b"] and flagged["attributed_to"] == ["Grabher", "Ibert"]
+    # A qualifying or context sentence in the source's own voice clears it (2026-10-18).
+    for reason in ("necessary_context", "qualifies_or_contradicts"):
+        assert secondary_citation([
+            {"key": "a", "reason": "bears_on_statement", "text": "Grabher (2002) argues projects are temporary."},
+            {"key": "b", "reason": reason, "text": "I call this second square project ecologies."}], doster) is None
     # A bearing sentence in the source's own voice, or its own author, clears the flag.
     assert secondary_citation([
         {"key": "a", "reason": "bears_on_statement", "text": "Grabher (2002) argues projects are temporary."},
@@ -223,7 +228,7 @@ def test_a_media_reference_window_says_it_cannot_be_assessed():
                         "source": {"source_kind": "traditional_media", "raw_reference": "Burton, T. (2010). Alice [Film]."}},
              "citation_numbers": [1]}
     html = _render_reference_window_template(entry, [], [{}])
-    assert '<h3 class="reference-availability">Media Reference - Cannot Assess</h3>' in html
+    assert '<h3 class="reference-availability">Media Reference - Cannot Retrieve</h3>' in html
 
 
 def test_an_undecided_judge_has_its_own_label_and_note():

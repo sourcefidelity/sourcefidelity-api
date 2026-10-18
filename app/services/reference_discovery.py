@@ -130,7 +130,7 @@ CandidateAcquisitionOutcome = Literal[
 ]
 
 
-_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "tavily", "searxng", "bright_data", "mojeek"})
+_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "deepseek", "tavily", "searxng", "bright_data", "mojeek"})
 
 
 class ExpectedBibliographicFields(BaseModel):

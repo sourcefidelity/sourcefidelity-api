@@ -26,6 +26,7 @@ import hashlib
 import json
 import re
 
+from app.services.search.policy import REQUIRED_WEB_PROVIDER_NAMES
 from app.services.reference_review_scope import text_key
 from app.services.source_type import is_bibliographically_searchable, normalize_source_kind
 
@@ -65,7 +66,7 @@ REQUIRED_ADAPTERS = {
     'thesis': ('openalex', 'crossref', 'datacite'),
     'unknown': ('openalex', 'crossref', 'datacite'),
 }
-WEB_PROVIDERS = frozenset({'brave', 'exa'})
+WEB_PROVIDERS = REQUIRED_WEB_PROVIDER_NAMES
 BOOK_CATALOGUES = frozenset({'google_books', 'open_library', 'internet_archive'})
 COMPLETED_ROUTE = frozenset({'no_match', 'candidate_found', 'candidates_processed'})
 COMPLETED_QUERY = frozenset({'results', 'no_results'})
@@ -78,7 +79,7 @@ CONFIRMED = frozenset({'confirmed', 'confirmed_with_minor_differences'})
 PROVIDER_NAMES = {
     'crossref': 'Crossref', 'openalex': 'OpenAlex', 'datacite': 'DataCite',
     'google_books': 'Google Books', 'open_library': 'Open Library',
-    'brave': 'Brave Search', 'exa': 'Exa',
+    'brave': 'Brave Search', 'exa': 'Exa', 'deepseek': 'DeepSeek Search',
 }
 
 
@@ -408,9 +409,16 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         result.update(status='container_located', reason_code='containing_work_located',
                       containing_work={k: container.get(k) for k in ('title', 'authors', 'year', 'provider')})
         return result
-    if container.get('outcome') == 'possible_match':
+    responsibility = container.get('responsibility') or {}
+    title_page_found = bool(responsibility.get('statements')
+                            and responsibility.get('classification') in {'single_authored', 'edited'})
+    if container.get('outcome') == 'possible_match' or title_page_found:
         # A possible match is shown but never flagged; that holds for the book
-        # a part names as much as for the part (Belton's 2026-09-27 rerun).
+        # a part names as much as for the part (Belton's 2026-09-27 rerun). A
+        # catalogue's title page for the book under its main title and the
+        # cited author also shows the book exists, though the search under the
+        # entry's own garbled title found nothing (Synthetic Embrace reference
+        # 10, owner decision 2026-10-18).
         result.update(status='possible_match', reason_code='containing_work_possible_match',
                       containing_work={k: container.get(k) for k in ('title', 'authors', 'year', 'provider')})
         return result

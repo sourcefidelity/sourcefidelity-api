@@ -71,12 +71,21 @@ class ReportStorage(BaseModel):
     report_days: int = Field(default=0, ge=0)
 
 
+class SearchSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Incomplete searches are finished by paid re-searches on their own:
+    # always in Institutional; in Personal only when the owner turns it on
+    # (owner decision 2026-10-18).
+    finish_incomplete_automatically: bool = True
+
+
 class StoragePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: Literal["storage-policy-v1"] = POLICY_VERSION
     sources: SourceStorage = Field(default_factory=SourceStorage)
     papers: PaperStorage = Field(default_factory=PaperStorage)
     reports: ReportStorage = Field(default_factory=ReportStorage)
+    searches: SearchSettings = Field(default_factory=SearchSettings)
 
     @model_validator(mode="after")
     def _paper_copy_within_report(self):
@@ -108,7 +117,15 @@ def deployment_defaults(profile: Profile = "personal") -> StoragePolicy:
         # Institutional until the administrator decides (owner decision 2026-10-13).
         papers=PaperStorage(paper_copy_days=max(1, int(settings.FORMATIVE_REPORT_PAPER_RETENTION_DAYS)),
                             keep_submitted_file=profile == "personal"),
+        searches=SearchSettings(finish_incomplete_automatically=profile != "personal"),
     )
+
+
+def finishes_searches_automatically(session: Session | None, scope_type: str, scope_id: str) -> bool:
+    """Whether a scope's incomplete searches are re-searched on their own."""
+    if profile_for(scope_type) != "personal":
+        return True
+    return policy_for(session, scope_type, scope_id).searches.finish_incomplete_automatically
 
 
 def _merged(base: dict, changes: dict) -> dict:

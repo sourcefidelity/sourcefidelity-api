@@ -366,7 +366,8 @@ def _append_evidence(document, citations, findings, view) -> dict:
             targets.append((member_key,marks,label))
             blocks.append(f'<h2 id="{member_key}">{label}</h2><p class="return" id="return-{member_key}">Back to source citation</p>')
             blocks.append(_portable_member_html(member, citation))
-            if member.get('show_quotation_check'):
+            from app.services.report_layers import check_shown
+            if check_shown(member, 'quotation'):
                 from app.services.evidence_report import render_quotation_comparisons
                 comparison = render_quotation_comparisons(
                     member.get('quotation_check') or {},
@@ -380,7 +381,8 @@ def _append_evidence(document, citations, findings, view) -> dict:
             from app.services.report_layers import topical_mismatch
             if topical_mismatch(member, citation):
                 scope = member['abstract_relevance']['scope_assessment']
-                blocks.append('<p>The abstract appears unrelated to the topic attributed to this source. '
+                from app.services.evidence_report import topical_mismatch_sentence
+                blocks.append('<p>'+escape(topical_mismatch_sentence(member))+' '
                               +escape(scope['rationale'])+'</p>')
         from app.services.evidence_report import citation_after_punctuation
         if citation_after_punctuation(citation):
@@ -426,7 +428,8 @@ def _append_evidence(document, citations, findings, view) -> dict:
             blocks.append(credibility_records_html(finding))
         if finding.get('finding_type') == 'source_topical_mismatch':
             blocks.append('<h3>Selected Citation</h3><blockquote>'+escape(finding['citation_text'])+
-                '</blockquote><h3>Abstract</h3><blockquote>'+translated_text_html(
+                '</blockquote><h3>'+('Limited Text' if finding.get('limited_text') else 'Abstract')
+                +'</h3><blockquote>'+translated_text_html(
                     finding['abstract_text'], finding.get('evidence_translations'), plain=True)+
                 '</blockquote>')
         difference = finding.get('field_difference') or {}
@@ -565,7 +568,7 @@ def _topic_heading(member: dict, citation: dict) -> str:
     """The source's topic, in words (owner decision 2026-10-17): the PDF has
     no Judgment, so its label names the text retrieved and the topic only."""
     from app.services.evidence_report import _EVIDENCE_KIND_LABELS
-    from app.services.report_layers import topical_match, topical_mismatch
+    from app.services.report_layers import topical_match, topical_mismatch, topical_uncertain
     kind = _EVIDENCE_KIND_LABELS.get(member.get('coverage_level'), '')
     if not kind:
         return ''
@@ -573,6 +576,8 @@ def _topic_heading(member: dict, citation: dict) -> str:
         return f'{kind} – Possible Topical Mismatch'
     if topical_match(member, citation):
         return f'{kind} – Topical Match'
+    if topical_uncertain(member, citation):
+        return f'{kind} – Topical Relevance Uncertain'
     return ''
 
 
@@ -595,7 +600,9 @@ def _portable_member_html(member: dict, citation: dict | None = None) -> str:
     disagreement = member.get('scope_disagreement') or (
         member.get('abstract_scope_note') if member.get('coverage_level') in {'abstract_only', 'partial_text'} else None) or {}
     if not media and disagreement.get('note'):
-        parts.append('<p class="muted">'+escape(_panel_statement(disagreement['note']))+'</p>')
+        from app.services.report_layers import UNCERTAIN_NOTE_CLOSING, topical_uncertain
+        closing = (' ' + UNCERTAIN_NOTE_CLOSING) if citation is not None and topical_uncertain(member, citation) else ''
+        parts.append('<p class="muted">'+escape(_panel_statement(disagreement['note']) + closing)+'</p>')
     for primary in _member_evidence_extracts(member):
         parts.append('<blockquote>'+translated_text_html(primary.get('display_text', primary.get('text')) or '', translations, plain=True)
                      +_inline_locator(primary)+'</blockquote>')
@@ -619,7 +626,8 @@ def _portable_member_html(member: dict, citation: dict | None = None) -> str:
         parts.append('<p>'+escape(secondary)+'</p>')
     for key,label in (('quotation','Quotation'),('locator','Locator')):
         check=member.get(key+'_check') or {}
-        if member.get('show_'+key+'_check') and member.get('coverage_level') != 'unavailable':
+        from app.services.report_layers import check_shown
+        if check_shown(member, key):
             parts.append('<p>'+escape(_panel_statement(_check_sentence(label, check)))+'</p>')
     return '<div>'+''.join(parts)+'</div>'
 

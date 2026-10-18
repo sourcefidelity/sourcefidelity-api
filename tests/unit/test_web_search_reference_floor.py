@@ -49,8 +49,8 @@ def _exa_outcomes(result):
 
 def test_defaults_are_bounded():
     from app.config import Settings
-    assert Settings.model_fields["WEB_SEARCH_PER_REFERENCE_FLOOR"].default == "brave:3,exa:2"
-    assert Settings.model_fields["WEB_SEARCH_HARD_MAX_CALLS"].default == "brave:120,exa:80"
+    assert Settings.model_fields["WEB_SEARCH_PER_REFERENCE_FLOOR"].default == "brave:3,exa:2,deepseek:2"
+    assert Settings.model_fields["WEB_SEARCH_HARD_MAX_CALLS"].default == "brave:120,exa:80,deepseek:80"
 
 
 def test_later_references_keep_a_floor_after_the_job_ceiling_is_spent(cascade):

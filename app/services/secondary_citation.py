@@ -1,7 +1,10 @@
 """Secondary citation from the GLM-selected evidence sentences (owner request 2026-09-29).
 
-A source is flagged when every sentence GLM chose as bearing on the student's
-statement attributes that content to another work: an in-text citation to
+A source is flagged when every sentence GLM chose for the statement, whatever
+its reason (bearing, qualifying or context), attributes its content to another
+work (owner decision 2026-10-18: a qualifying or context sentence in the
+source's own voice, "I call this square SF bodies", clears it; one
+literature-review sentence had flagged an author's own term): an in-text citation to
 authors other than the source's own ("(Boltanski and Chiapello, 1999)",
 "Grabher (2002) argues", "according to Smith"). The student may then be citing
 a secondary source for another author's idea. Deterministic and inspectable:
@@ -13,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-SECONDARY_CITATION_VERSION = "glm-sentence-secondary-citation-v1"
+SECONDARY_CITATION_VERSION = "glm-sentence-secondary-citation-v2"
 _YEAR = r"(?:1[5-9]|20)\d{2}[a-z]?"
 _SURNAME = r"[A-Z][A-Za-z'’\-]+(?:\s+(?:de|van|von|der|la|le)\s+[A-Z][A-Za-z'’\-]+)?"
 _PARENTHETICAL = re.compile(rf"\(([^()]*?\b{_YEAR}\b[^()]*)\)")
@@ -53,13 +56,13 @@ def _own_authors(source: dict) -> set[str]:
 
 
 def secondary_citation(evidence_sentences: list[dict], source: dict) -> dict | None:
-    """The flag, or None: every bearing sentence attributes to other authors."""
-    bearing = [s for s in evidence_sentences or [] if s.get("reason") == "bears_on_statement"]
-    if not bearing:
+    """The flag, or None: every chosen sentence attributes to other authors."""
+    chosen = [s for s in evidence_sentences or [] if str(s.get("text") or "").strip()]
+    if not any(s.get("reason") == "bears_on_statement" for s in chosen):
         return None
     own = _own_authors(source or {})
     attributed = []
-    for sentence in bearing:
+    for sentence in chosen:
         others = [n for n in attributed_names(str(sentence.get("text") or "")) if n.casefold() not in own]
         if not others:
             return None

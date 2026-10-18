@@ -156,7 +156,9 @@ class TestTheNoteReachesTheReader:
         from app.services.evidence_report import _render_member
         html = _render_member(self._member_with_note())
         assert "Australian filmmaking" in html
-        assert "Read the source to judge" in html
+        # The closing advice is implied, and dropped even from stored notes
+        # (owner decision 2026-10-18).
+        assert "Read the source to judge" not in html
 
     def test_it_is_styled_below_a_mark(self):
         """A mark carries `attention`; a disagreement is visibly weaker."""
@@ -218,7 +220,7 @@ class TestEveryAbstractShowsItsComparison:
         assert scope_disagreement(member, CITATION) is None
         note = abstract_scope_note(member, CITATION)
         assert note == {"note": "The abstract concerns Australian filmmaking; the statement concerns "
-                                "Hollywood. Read the source to judge whether it supports the statement."}
+                                "Hollywood."}
 
     @pytest.mark.parametrize("change", ["abstract_hash", "claim_hash", "identity", "llm_off",
                                         "incomplete", "no_comparison", "full_text", "coverage_mismatch",
@@ -266,8 +268,7 @@ class TestEveryAbstractShowsItsComparison:
     def test_the_window_shows_it_muted(self):
         from app.services.evidence_report import _render_member
         html = _render_member(self._with_note())
-        assert ('<p class="muted">The abstract concerns Australian filmmaking. '
-                'Read the source to judge whether it supports the statement.</p>') in html
+        assert '<p class="muted">The abstract concerns Australian filmmaking.</p>' in html
         assert "Judgment" not in html
 
     def test_a_limited_text_window_shows_it(self):
