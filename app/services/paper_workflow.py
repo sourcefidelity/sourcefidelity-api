@@ -449,6 +449,10 @@ def retrieve_paper_sources(
         )
         result_record["reference_discovery"] = metadata.get("reference_discovery")
         result_record["submitted_link_observations"] = metadata.get("submitted_link_observations")
+        declared = str(metadata.get("declared_document_url") or "")
+        if declared.startswith("https://"):
+            # The PDF a page named but the app could not fetch (2026-10-18).
+            result_record["declared_document_url"] = declared
         if plan["identity_only"]:
             # Identity observations do not authorize a representation, abstract,
             # verification run or source admission, even from an injected adapter.
@@ -492,11 +496,20 @@ def retrieve_paper_sources(
             return
         representation = result.representation
         if representation is None or not representation.content:
+            # The record that supplied a merged abstract is kept with it
+            # (Television Without Frontiers reference 3, 2026-10-18: the source
+            # of a misleading abstract could not be traced).
+            provenance = metadata.get("abstract_provenance")
+            merged_from = ((metadata.get("canonical_work") or {}).get("abstract_provider")
+                           if isinstance(metadata.get("canonical_work"), dict) else None)
+            if merged_from and not isinstance(provenance, dict):
+                provenance = {"abstract_provider": str(merged_from)[:120]}
             abstract_evidence = _bounded_abstract_evidence(
                 result.abstract,
                 source_name=result.source_name,
-                provenance=metadata.get("abstract_provenance"),
+                provenance=provenance,
             )
+
             # A required web search that was skipped (call ceiling, cooldown,
             # elapsed budget) or failed did not finish; "not retrieved" would
             # read as a completed search. The providers named are the ones a
@@ -613,6 +626,11 @@ def retrieve_paper_sources(
                 result_record['public_source_access'] = dict(
                     version='verified-public-source-access-v1', href=source_url,
                     content_sha256=hashlib.sha256(representation.content).hexdigest())
+                # The PDF the retrieved page names, for the reader to open
+                # (the app read only the page, 2026-10-18).
+                declared = str((getattr(result, 'metadata', None) or {}).get('declared_document_url') or '')
+                if declared.startswith('https://'):
+                    result_record['public_source_access']['document_href'] = declared
             # A page accepted as complete under rule A is recorded for review.
             stated = (representation.metadata or {}).get('stated_page_completeness')
             if isinstance(stated, dict):

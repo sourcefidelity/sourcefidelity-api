@@ -362,8 +362,13 @@ def build_evidence_report_view(
                         and access.get('content_sha256')
                         and access.get('content_sha256') == (item.get('source_navigation') or {}).get('content_sha256')
                         and _safe_reference_href(str(access.get('href') or ''))):
+                    # Limited text read from a page that names its PDF opens the
+                    # PDF, not the page the DOI already reaches (2026-10-18).
+                    document = str(access.get('document_href') or '')
+                    href = (document if item['coverage_level'] != 'full_text' and document.startswith('https://')
+                            and _safe_reference_href(document) else access['href'])
                     item['source_action'] = dict(enabled=True, status='verified_public_source_available',
-                        href=access['href'], label='Open available text' if item['coverage_level'] != 'full_text' else 'Open source')
+                        href=href, label='Open available text' if item['coverage_level'] != 'full_text' else 'Open source')
                 if item["coverage_level"] == "full_text":
                     available_reference_ids.add(reference_id)
                 else:
@@ -569,14 +574,18 @@ def build_evidence_report_view(
                                     else 'not_assessed'),
         })
     from app.services.reference_formatting import (chapter_form_findings, contribution_editor_findings,
-                                                   reference_element_findings)
+                                                   reference_detail_findings, reference_element_findings,
+                                                   whole_edited_book_findings)
     container_records = {
         reference_id: (discovery or {}).get('container_identity') or {}
         for reference_id, discovery in discovery_by_reference.items()
     }
     for finding in (contribution_editor_findings(references.values(), container_records)
                     + chapter_form_findings(references.values(), extraction.citation_format, container_records)
-                    + reference_element_findings(references.values(), extraction.citation_format)):
+                    + reference_element_findings(references.values(), extraction.citation_format)
+                    + whole_edited_book_findings(references.values(), extraction.citation_format)
+                    + reference_detail_findings(references.values(), extraction.citation_format,
+                                                discovery_by_reference)):
         reference = references[finding['reference_id']]
         layout = reference_layout.get(reference.reference_id)
         finding['source'] = _reference_view(reference, layout)
@@ -802,6 +811,19 @@ def build_evidence_report_view(
     # Possible-match copies are withdrawn before anything is counted, so the
     # summary, findings and window agree (owner decision 2026-10-14; rules
     # audit 2026-10-18). The window's own pass stays for older reports.
+    # A page named its PDF but the app could not fetch it: every member of that
+    # reference opens the PDF (2026-10-18), whatever text was read.
+    declared_by_reference = {item.get("reference_id"): str(item.get("declared_document_url") or "")
+                             for item in job.source_results or []}
+    for citation in citations:
+        for member in citation.get("members") or []:
+            declared = declared_by_reference.get(member.get("reference_id")) or ""
+            if (declared.startswith("https://") and _safe_reference_href(declared)
+                    and member.get("coverage_level") != "full_text"):
+                member["source_action"] = dict(enabled=True, status="declared_document_available",
+                                               href=declared, label="Open available text")
+    for citation in citations:
+        citation["form_issues"] = citation_form_issues(citation, extraction.citation_format)
     withdrawn = withdraw_possible_match_members(citations, at_build=True)
     available_reference_ids -= {rid for rid, level in withdrawn.items() if level == 'full_text'}
     overview = {
@@ -1014,6 +1036,45 @@ def _summary_numbers(citations: list[dict], reference_practice: list[dict] | Non
         return numbers
     from app.services.report_references import reference_numbers
     return reference_numbers({"citations": citations, "reference_practice": reference_practice or []})
+
+
+# In-text citation form (owner decision 2026-10-18: descriptions, not
+# directions): window line, summary singular, summary plural.
+CITATION_FORM_TEXTS = {
+    'citation_comma_missing': (
+        'This parenthetical citation lacks a comma between the author and the year.',
+        '1 parenthetical citation lacks a comma between the author and the year',
+        '{n} parenthetical citations lack a comma between the author and the year'),
+    'citation_page_space_missing': (
+        'This citation lacks a space after "p." in its page number.',
+        '1 citation lacks a space after "p." in its page number',
+        '{n} citations lack a space after "p." in their page numbers'),
+    'citation_space_before_parenthesis_missing': (
+        'This citation lacks a space before its opening parenthesis.',
+        '1 citation lacks a space before its opening parenthesis',
+        '{n} citations lack a space before their opening parenthesis'),
+}
+_YEAR_WITHOUT_COMMA = re.compile(
+    r"\s*(?:(?:see(?:\s+also)?|e\.g\.,?|cf\.)\s+)?[A-Z][^,;()]*?[A-Za-z.]\s+(?:(?:19|20)\d{2}[a-z]?|n\.d\.)\b.*",
+    re.I)
+
+
+def citation_form_issues(citation: dict, citation_format: str) -> list[str]:
+    """In-text citation form differences: an APA author and year without a
+    comma ("(McChesney 2004)"), "p.503" without a space, and a parenthesis
+    joined to the word before it ("circulation(Wilkins, 1991)")."""
+    marker = str(citation.get("citation_marker") or "").strip()
+    text = str(citation.get("student_text") or "")
+    issues = []
+    if str(citation_format or "").casefold() == "apa" and marker.startswith("(") and marker.endswith(")"):
+        if any(_YEAR_WITHOUT_COMMA.fullmatch(part) for part in marker[1:-1].split(";")):
+            issues.append("citation_comma_missing")
+    if re.search(r"\bpp?\.(?=\d)", marker):
+        issues.append("citation_page_space_missing")
+    at = text.find(marker) if marker.startswith("(") else -1
+    if at > 0 and text[at - 1].isalnum():
+        issues.append("citation_space_before_parenthesis_missing")
+    return issues
 
 
 def citation_after_punctuation(citation: dict) -> bool:
@@ -1326,6 +1387,15 @@ def _build_report_summary(
                               '{count} film or book titles lack required italics in the paper.')),
         ('reference_order', ('{count} reference is not in alphabetical order.',
                              '{count} references are not in alphabetical order.')),
+        # Owner-approved wording (2026-10-18).
+        ('whole_edited_book_cited', ('{count} reference cites a whole edited book.',
+                                     '{count} references cite whole edited books.')),
+        ('doi_old_form', ('{count} reference writes its DOI in the older "doi:" form.',
+                          '{count} references write their DOIs in the older "doi:" form.')),
+        ('doi_prefix_missing', ('{count} reference gives a DOI missing its "10." prefix.',
+                                '{count} references give DOIs missing their "10." prefix.')),
+        ('article_pages_missing', ('{count} journal article reference lacks a complete page range.',
+                                   '{count} journal article references lack complete page ranges.')),
         ('contribution_author_is_volume_editor',
          ('{count} reference cites part of a book like it was an edited collection.',
           '{count} references cite parts of books like they were edited collections.')),
@@ -1383,7 +1453,9 @@ def _build_report_summary(
             text = (f"{count} {'quotation lacks' if count == 1 else 'quotations lack'} page or paragraph locators "
                     "in the parenthetical citation."
                     if kind == 'required_quotation_locator_missing' else message[count != 1].format(count=count))
-            add('evidence' if kind in REFERENCE_DIFFERENCE_FINDINGS else 'reference_formatting',
+            from app.services.highlight_priority import finding_category
+            add('evidence' if kind in REFERENCE_DIFFERENCE_FINDINGS
+                else 'academic_practice' if finding_category(kind) == 'academic' else 'reference_formatting',
                 kind, text, lead=text.removesuffix('.'), rest='.', instances=instances, count=count)
     if conflicting_references:
         n = len(conflicting_references)
@@ -1433,6 +1505,15 @@ def _build_report_summary(
         instances = cite(misplaced)
         add('reference_formatting', 'citation_after_punctuation', f"{lead} ({_instance_list(instances)}).",
             lead=lead, rest='.', instances=instances, count=n)
+    for kind, (_window, one, many) in CITATION_FORM_TEXTS.items():
+        flagged = [index for index, citation in enumerate(all_citations, 1)
+                   if kind in (citation.get("form_issues") or [])]
+        if flagged:
+            n = len(flagged)
+            lead = one if n == 1 else many.format(n=n)
+            instances = cite(flagged)
+            add('reference_formatting', kind, f"{lead} ({_instance_list(instances)}).",
+                lead=lead, rest='.', instances=instances, count=n)
     if duplicate_key_references:
         n = len(duplicate_key_references)
         lead = f"{n} references share the same author and year, so their in-text citations do not distinguish the works"
@@ -2250,9 +2331,11 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
         template = _render_panel_template(item, index, patchwriting=patchwriting, numbers=numbers)
         overlapping = [(f, j) for j, f in enumerate(reference_practice, 1) if _formatting_overlaps(item, f)]
         # Owner wording 2026-09-30 for a parenthetical after the final punctuation.
-        placement = ({'formatting': '<p class="reference-issue">This parenthetical citation is placed after '
-                                    'the sentence\'s final punctuation.</p>'}
-                     if citation_after_punctuation(item) else None)
+        lines = (['<p class="reference-issue">This parenthetical citation is placed after '
+                  'the sentence\'s final punctuation.</p>'] if citation_after_punctuation(item) else [])
+        lines += [f'<p class="reference-issue">{escape(CITATION_FORM_TEXTS[kind][0])}</p>'
+                  for kind in item.get('form_issues') or [] if kind in CITATION_FORM_TEXTS]
+        placement = {'formatting': ''.join(lines)} if lines else None
         related = _grouped_findings(overlapping, combined=True, guidance=False, extra=placement)
         # One style-guide paragraph at the bottom of the citation window.
         related += guidance_links(_citation_guidance_kinds(item) + [f.get('finding_type') for f, _ in overlapping],
@@ -3391,11 +3474,16 @@ def _with_sentence_evidence(view: dict, record, claim) -> dict:
     from app.services.cross_language_whole_source import stored_passages
     from app.services.text_quality import readable_text
     passages = {item.get("passage_id"): item for item in stored_passages(payload)}
+    # A source with printed page numbers gives an unnumbered page (a preface)
+    # no number: its PDF position would collide with a printed page ("viii"
+    # shown as "p. 9", 2026-10-18). Without printed numbers the PDF page stands.
+    printed = any(item.get("page_label") for item in passages.values())
     items = []
     for item in selection.get("items") or []:
         passage = passages.get(item.get("passage_id")) or {}
         start = int(passage.get("character_start") or 0)
-        page = passage.get("page_label") or (item["page_index"] + 1 if item.get("page_index") is not None else None)
+        page = passage.get("page_label") or (item["page_index"] + 1 if item.get("page_index") is not None
+                                             and not printed else None)
         items.append({"key": evidence_sentence_key(item.get("page_index"), start + item["passage_start"],
                                                    start + item["passage_end"]),
                       "text": readable_text(item["text"]), "page": page, "reason": item.get("reason")})
@@ -5112,7 +5200,7 @@ def _render_continuous_paper(
         targets = citation.get('source_member_targets')
         if targets is None:
             targets = member_targets(citation, surface.get('marker_words') or surface.get('selectable_words') or {})
-        if citation_after_punctuation(citation):
+        if citation_after_punctuation(citation) or citation.get('form_issues'):
             # The misplaced parenthetical, marked in the formatting orange (2026-09-30).
             for target in targets:
                 overlays_by_page.setdefault(target['page_index'], []).append(
@@ -6465,7 +6553,8 @@ def _member_action_html(member: dict, reference_html: str = '') -> str:
     link itself gets its button too (owner request 2026-10-03)."""
     action = member.get("source_action") or {}
     retrieved = action.get("status") in _RETRIEVED_TEXT_ACTIONS
-    if (member.get("coverage_level") != "abstract_only" and action.get("enabled")
+    if ((member.get("coverage_level") != "abstract_only" or action.get("status") == "declared_document_available")
+            and action.get("enabled")
             and action.get("status") not in {"canonical_landing_available", "cited_https_route_available"}
             and action.get("href") and (retrieved or escape(action["href"], quote=True) not in reference_html)):
         return (
@@ -6622,6 +6711,10 @@ def _reference_side(row: dict, member: dict) -> str:
             author = author or value
         elif kind in {'author_count', 'coauthor'}:
             author = author or _reference_authors(member)
+    if author and not year:
+        # A name difference keeps the reference's year, so "Mirlees, 2013 vs.
+        # Mirrlees" does not read as a year difference (owner decision 2026-10-18).
+        year = str(((member or {}).get('source') or {}).get('year') or '').strip()
     return ', '.join(part for part in (author, year) if part)
 
 
@@ -6869,7 +6962,9 @@ def _render_formatted_reference(source: dict, fallback: str) -> str:
 # `10.x/...` is left alone because it cannot be told from ordinary text safely.
 _REFERENCE_ADDRESS_RE = re.compile(
     r"(?P<url>https?://[^\s<>\"\u201c\u201d]+)"
-    r"|(?P<doi>\bdoi:\s*10\.\d{4,9}/[^\s<>\"\u201c\u201d]+)",
+    # A DOI written without its "10." ("doi:1007/978-…") still links to the
+    # DOI it names (Television Without Frontiers reference 10, 2026-10-18).
+    r"|(?P<doi>\bdoi:\s*(?:10\.)?\d{4,9}/[^\s<>\"\u201c\u201d]+)",
     re.IGNORECASE,
 )
 
@@ -6900,6 +6995,8 @@ def _link_reference_text(text: str, *, suppressed_dois: frozenset[str] = frozens
         label = match.group().rstrip(".,;)")
         if match.group("doi"):
             identifier = label.split(":", 1)[1].strip()
+            if not identifier.startswith("10."):
+                identifier = "10." + identifier
             if identifier.casefold() in suppressed_dois:
                 continue
             href = "https://doi.org/" + identifier

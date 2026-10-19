@@ -266,10 +266,22 @@ class CanonicalWorkGraph:
         return max(candidates, key=_representation_result_score)
 
     def _best_abstract_result(self) -> RetrievalResult | None:
-        candidates = [result for result in self.accepted_results if result.abstract]
+        candidates = [result for result in self.accepted_results
+                      if result.abstract and not self._abstract_author_conflict(result)]
         if not candidates:
             return None
         return max(candidates, key=lambda result: len(result.abstract or ""))
+
+    def _abstract_author_conflict(self, result: RetrievalResult) -> bool:
+        """A record whose people share no surname with the cited authors or
+        editors does not supply the work's abstract: an edited book's DOI
+        record listing one chapter's author carried that chapter's summary,
+        and the topic was compared against it (Television Without Frontiers
+        reference 3, 2026-10-18). A record without authors is not a conflict."""
+        from app.services.relevance import extract_surnames
+        cited = set(extract_surnames(re.sub(r"\((?:eds?|editors?)\.?\)", " ", self.expected_author or "", flags=re.I)))
+        recorded = {name for author in (result.authors or []) for name in extract_surnames(str(author))}
+        return bool(cited and recorded and not cited & recorded)
 
     @property
     def corroborated_results(self) -> list[RetrievalResult]:

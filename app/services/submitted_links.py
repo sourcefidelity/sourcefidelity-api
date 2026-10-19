@@ -43,6 +43,20 @@ def is_site_homepage(html: str, url: str) -> bool:
     return bool(soup.title and soup.title.get_text(strip=True))
 
 
+def redirected_to_site_root(requested_url: str, final_url: str) -> bool:
+    """A link to a page deep in a site that now redirects to a site's front
+    page: the page moved or is gone, whatever the front page holds (news
+    teasers in <article> elements had hidden it; Television Without Frontiers
+    reference 9, 2026-10-18)."""
+    try:
+        requested, final = urlsplit(requested_url), urlsplit(final_url)
+    except ValueError:
+        return False
+    deep = len([part for part in (requested.path or '/').split('/') if part]) >= 2
+    root = re.fullmatch(r'/(?:[a-z]{2}(?:-[a-z]{2})?/?)?(?:index\.(?:html?|aspx?|php))?', final.path or '/', re.I)
+    return bool(deep and root and not final.query and (requested.netloc, requested.path) != (final.netloc, final.path))
+
+
 class LinkHop(BaseModel):
     model_config = ConfigDict(extra="forbid")
     destination_sha256: Hash

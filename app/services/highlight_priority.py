@@ -2,7 +2,9 @@
 from copy import deepcopy
 import xml.etree.ElementTree as ET
 
-ACADEMIC_FINDINGS = frozenset({'duplicate_reference_entry', 'reference_author_conflict'})
+# A whole edited book cited for a claim does not say which text was read: an
+# Academic Practice issue (owner decision 2026-10-18).
+ACADEMIC_FINDINGS = frozenset({'duplicate_reference_entry', 'reference_author_conflict', 'whole_edited_book_cited'})
 # A DOI that registers a different work is a submitted-link issue, whichever
 # check noticed it (owner decision 2026-09-24).
 SUBMITTED_LINK_FINDINGS = frozenset({'submitted_link_issue', 'reference_identifier_conflict',

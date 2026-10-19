@@ -21,7 +21,10 @@ def test_every_route_version_says_what_bumping_it_reads_again():
 
 
 def test_a_refused_earlier_result_names_its_reason():
-    assert earlier_result({"status": "abstract_only", "reference_discovery": CONFIRMED}, REF).reusable
+    assert earlier_result({"status": "abstract_only", "reference_discovery": CONFIRMED,
+                           "abstract_evidence": {"provenance": {"abstract_provider": "crossref"}}}, REF).reusable
+    # An abstract stored without its source record is searched again once (v7).
+    assert not earlier_result({"status": "abstract_only", "reference_discovery": CONFIRMED}, REF).reusable
     stale = earlier_result({"status": "durable_authorized", "representation_id": "x", "source_name": "lantern"}, REF)
     assert (stale.reusable, stale.reason) == (False, "lantern_pages_changed")
     incomplete = earlier_result({"status": "unavailable", "reason_code": "full_text_search_incomplete",

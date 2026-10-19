@@ -384,10 +384,13 @@ def _append_evidence(document, citations, findings, view) -> dict:
                 from app.services.evidence_report import topical_mismatch_sentence
                 blocks.append('<p>'+escape(topical_mismatch_sentence(member))+' '
                               +escape(scope['rationale'])+'</p>')
-        from app.services.evidence_report import citation_after_punctuation
-        if citation_after_punctuation(citation):
-            blocks.append("<h3>Citation and Reference Formatting</h3><p>This parenthetical citation is placed after "
-                          "the sentence's final punctuation.</p>")
+        from app.services.evidence_report import CITATION_FORM_TEXTS, citation_after_punctuation
+        form_lines = (["<p>This parenthetical citation is placed after the sentence's final punctuation.</p>"]
+                      if citation_after_punctuation(citation) else [])
+        form_lines += ['<p>' + escape(CITATION_FORM_TEXTS[kind][0]) + '</p>'
+                       for kind in citation.get('form_issues') or [] if kind in CITATION_FORM_TEXTS]
+        if form_lines:
+            blocks.append("<h3>Citation and Reference Formatting</h3>" + ''.join(form_lines))
         blocks.append(_render_citation_information(citation, index).replace('<details>', '<div>').replace('</details>', '</div>').replace('<summary>', '<h4>').replace('</summary>', '</h4>'))
         blocks.append(guidance_links(_citation_guidance_kinds(citation), citation_format))
     for index, finding in enumerate(findings, 1):

@@ -270,3 +270,31 @@ def test_a_search_found_page_the_application_opened_keeps_its_own_address():
     assert build_reference_discovery_candidate(**common).page_url is None
     opened = build_reference_discovery_candidate(**common, opened_page_url='https://example.org/work/1')
     assert opened.page_url == 'https://example.org/work/1'
+
+
+def test_a_chapter_record_naming_another_book_is_a_conflict_and_a_journal_translation_is_not():
+    from types import SimpleNamespace
+    from app.services.reference_discovery import _chapter_record_names_another_book
+    agree = [SimpleNamespace(field_name="title", outcome="agreement"),
+             SimpleNamespace(field_name="author", outcome="agreement")]
+    chapter = SimpleNamespace(source_kind="book_section", pages="23-42")
+    assert _chapter_record_names_another_book(chapter, agree, "Sringer eBooks",
+                                              "Neoliberalism and Post-Soviet Transition", "23-42")
+    assert not _chapter_record_names_another_book(chapter, agree, "Neoliberalism and post-Soviet transition: essays",
+                                                  "Neoliberalism and Post-Soviet Transition", "23-42")
+    assert not _chapter_record_names_another_book(chapter, agree, "Sringer eBooks",
+                                                  "Neoliberalism and Post-Soviet Transition", "40-61")
+    journal = SimpleNamespace(source_kind="journal_article", pages="1-9")
+    assert not _chapter_record_names_another_book(journal, agree, "Economics and Law", "Ekonomia i Prawo", "1-9")
+
+
+def test_a_whole_edited_book_is_named_and_a_chapter_is_not():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import WHOLE_EDITED_BOOK_TEXT, whole_edited_book_findings
+    book = SimpleNamespace(reference_id="r1", source_kind="edited_collection", source_kind_confidence="high",
+                           title="The harbour and social theory",
+                           raw_ref="Lane, A., & Moor, B. (Eds.). (2008). The harbour and social theory. Harbour Press.")
+    chapter = SimpleNamespace(reference_id="r2", source_kind="edited_collection", source_kind_confidence="high",
+                              title="Ports", raw_ref="Kay, C. (2008). Ports. In A. Lane (Eds.), Harbours. Harbour Press.")
+    [finding] = whole_edited_book_findings([book, chapter], "apa")
+    assert finding["reference_id"] == "r1" and finding["finding"] == WHOLE_EDITED_BOOK_TEXT

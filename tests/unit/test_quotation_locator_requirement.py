@@ -134,3 +134,11 @@ def test_other_sentence_date_and_ordinary_figure_are_not_locators():
 def test_according_to_is_explicit_source_attribution():
     a=extract('According to Smith (2020), the figure was “unpredictable”, but also “careful with words”.')
     assert any(r.status=='missing' for r in a.quotation_locator_requirements)
+
+
+def test_shared_reporting_verbs_and_a_trailing_participle():
+    import re
+    from app.services.quotation_form import NARRATIVE_REPORTING_VERBS
+    assert "emphasized" in NARRATIVE_REPORTING_VERBS and "noted" in NARRATIVE_REPORTING_VERBS
+    trailing = ", underscoring the challenge faced by smaller companies."
+    assert re.match(r'[,\s]*[a-z]+ing\b', trailing)

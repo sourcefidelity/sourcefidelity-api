@@ -1073,7 +1073,10 @@ def build_reference_discovery_candidate(
 
     metadata = result.metadata or {}
     container = metadata.get('container_title') or ''
-    pages = metadata.get('pages') or metadata.get('page') or ''
+    # A publisher or repository page states its pages in its own metadata
+    # (citation_firstpage/lastpage), read into its web identity (2026-10-18).
+    web_identity = metadata.get('web_identity') if isinstance(metadata.get('web_identity'), dict) else {}
+    pages = metadata.get('pages') or metadata.get('page') or web_identity.get('pages') or ''
     # The imprint is one of the four identity fields, so the trace has to show
     # whether it agreed. Measured over 9,935 stored candidate records, not one
     # retained a publisher, which is why no merge could ever evidence it.
@@ -1107,6 +1110,9 @@ def build_reference_discovery_candidate(
                 # made `material_conflict` unreachable for these fields and
                 # the field-conflict finding unable to fire at all.
                 outcome, reason = 'material_conflict', 'component_field_values_disagree'
+            elif field == 'container_title' and _chapter_record_names_another_book(
+                    expected, comparisons, submitted_value, observed_value, pages):
+                outcome, reason = 'material_conflict', 'chapter_record_names_another_book'
             else:
                 outcome, reason = 'unknown', 'component_field_missing_or_unresolved'
             comparisons.append(_comparison(field, submitted_value, observed_value,
@@ -1314,6 +1320,28 @@ def _abbreviation_compatible(left: str, right: str) -> bool:
             return False
         index += 1
     return True
+
+
+_BOOK_TITLE_FILLER = frozenset({"a", "an", "the", "of", "and", "in", "on", "for", "to", "ebook", "ebooks"})
+
+
+def _chapter_record_names_another_book(expected, comparisons, submitted: str, observed: str, observed_pages) -> bool:
+    """A chapter's record agrees on its title, author and pages but names a
+    book sharing no word with the one the student wrote ("Sringer eBooks" for
+    "Neoliberalism and Post-Soviet Transition"): the book title is wrong.
+    Owner decision 2026-10-18, narrower than the general container rule that
+    stays off (a translated journal title had fired it): chapters only, and
+    only with the record's title, author and pages in agreement."""
+    if expected.source_kind != "book_section" or not submitted or not observed:
+        return False
+    outcomes = {comparison.field_name: comparison.outcome for comparison in comparisons}
+    if outcomes.get("title") != "agreement" or outcomes.get("author") not in {"agreement", "minor_difference"}:
+        return False
+    numbers = lambda value: re.findall(r"\d+", str(value or ""))
+    if not numbers(expected.pages) or numbers(expected.pages) != numbers(observed_pages):
+        return False
+    words = lambda value: {t for t in _conflict_tokens(value) if t not in _BOOK_TITLE_FILLER}
+    return bool(words(submitted) and words(observed) and not words(submitted) & words(observed))
 
 
 def _field_materially_conflicts(field: str, submitted: str, observed: str) -> bool:

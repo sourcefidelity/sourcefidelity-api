@@ -35,6 +35,14 @@ _REPORTING_VERBS = frozenset({
     "asserts", "asserted", "contends", "contended", "remarks", "remarked",
     "termed", "labelled", "labeled",
 })
+# Reporting verbs a narrative quotation's author may take ("As Smith (2020)
+# emphasized, “…”"): one list for the quotation form and the locator rule
+# (2026-10-18; the locator rule's own shorter list missed "emphasized").
+NARRATIVE_REPORTING_VERBS = _REPORTING_VERBS | frozenset({
+    "emphasizes", "emphasized", "emphasises", "emphasised", "suggests", "suggested",
+    "highlights", "highlighted", "points", "pointed", "reports", "reported", "maintains", "maintained",
+    "insists", "insisted", "acknowledges", "acknowledged", "warns", "warned", "concludes", "concluded",
+})
 # Only these follow a copula in a signal frame ("was called", "is described as").
 _PASSIVE_REPORTING = frozenset({"called", "described", "defined", "termed", "labelled", "labeled"})
 _MAX_CONTENT_WORDS = 2

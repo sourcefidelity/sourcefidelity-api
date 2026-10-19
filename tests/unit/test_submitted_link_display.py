@@ -236,3 +236,24 @@ def test_a_film_cited_by_its_credits_is_traditional_media_whatever_site_it_links
     assert classify_reference_source_kind(film, title="Lanterns", url="https://youtu.be/abc123").kind == "traditional_media"
     upload = "Harbour Channel. (2017, May 2). Lanterns [Video]. YouTube. https://youtu.be/abc123"
     assert classify_reference_source_kind(upload, title="Lanterns", url="https://youtu.be/abc123").kind == "video"
+
+
+def test_a_deep_link_redirected_to_a_front_page_is_a_moved_page():
+    from app.services.submitted_links import redirected_to_site_root
+    assert redirected_to_site_root("http://lawcommons.example.edu/iclr/vol14/iss1/9", "https://lira.example.edu/")
+    assert not redirected_to_site_root("https://example.org/", "https://example.org/")
+    assert not redirected_to_site_root("https://example.org/a/b", "https://example.org/a/b/")
+
+
+def test_a_doi_without_its_prefix_still_links():
+    from app.services.evidence_report import _link_reference_text
+    html = _link_reference_text("In Harbour Books (pp. 23–42). doi:1007/978-3-319-00000-0_2")
+    assert 'href="https://doi.org/10.1007/978-3-319-00000-0_2"' in html
+
+
+def test_bepress_repositories_name_their_pdf():
+    from app.services.retrieval.landing_page import discover_scholarly_locations
+    page = ('<html><head><meta name="bepress_citation_pdf_url" '
+            'content="https://commons.example.edu/cgi/viewcontent.cgi?article=1&amp;context=jil"></head></html>')
+    [location] = discover_scholarly_locations(page, "https://commons.example.edu/jil/vol1/iss1/1/")
+    assert location.url.endswith("viewcontent.cgi?article=1&context=jil")

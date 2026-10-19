@@ -15,7 +15,9 @@ from app.services.source_type import normalize_source_kind
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 2
+# v3, 2026-10-18: abstracts cached before a record had to share an author
+# with the reference are looked up again (canonical_work._abstract_author_conflict).
+_SCHEMA_VERSION = 3
 
 
 def _utcnow() -> datetime:

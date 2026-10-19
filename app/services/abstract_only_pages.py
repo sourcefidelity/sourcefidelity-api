@@ -98,6 +98,40 @@ def _heading_key(line: str) -> str | None:
     return re.sub(r"\s+", " ", key).strip().casefold()
 
 
+MAINLY_ABSTRACT_POLICY = "mainly-abstract-landing-page-v1"
+_META_ABSTRACT_NAMES = ("citation_abstract", "dc.description", "dcterms.abstract", "description", "og:description")
+
+
+def mainly_abstract_page(page_text: str, page_html: str) -> str | None:
+    """The abstract of a landing page whose readable text is mainly that
+    abstract, with or without notes and references after it (owner decision
+    2026-10-18: such a page is an abstract, not limited text). The abstract is
+    the page's "Abstract" section, else its own abstract metadata of at least
+    25 words; the text before any back-matter heading may hold little more
+    (title, names, page furniture)."""
+    observation = landing_abstract_and_back_matter(page_text)
+    abstract = observation["abstract"] if observation else ""
+    if not abstract:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(page_html or "", "html.parser")
+        for name in _META_ABSTRACT_NAMES:
+            node = (soup.find("meta", attrs={"name": lambda v: v and v.lower() == name})
+                    or soup.find("meta", attrs={"property": lambda v: v and v.lower() == name}))
+            value = re.sub(r"\s+", " ", str(node.get("content") or "")).strip() if node else ""
+            if _words(value) >= 25:
+                abstract = value
+                break
+    if not abstract:
+        return None
+    front = []
+    for raw in str(page_text or "").splitlines():
+        key = _heading_key(raw.strip()) if raw.strip() else None
+        if key is not None and (key in _BACK_MATTER_HEADINGS or _APPENDIX_HEADING.match(key)):
+            break
+        front.append(raw)
+    return abstract if _words("\n".join(front)) <= 2 * _words(abstract) + 200 else None
+
+
 def landing_abstract_and_back_matter(text: str) -> dict | None:
     """The abstract of a landing page that carries only an abstract and back matter.
 

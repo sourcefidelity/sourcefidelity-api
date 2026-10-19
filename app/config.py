@@ -461,9 +461,11 @@ class Settings(BaseSettings):
     # stated_scope_conflict=absent. It is kept selectable, but it costs 439
     # characters of abstract budget for no measured gain, so it is not the
     # default. Set ABSTRACT_SCOPE_POLICY_VERSION=abstract-topic-v6 to use it.
+    # v8 (default since 2026-10-18) = v5 with the note naming "the student's
+    # statement" rather than "the attributed statement"; wording only.
     ABSTRACT_SCOPE_POLICY_VERSION: Literal[
-        "abstract-topic-v5", "abstract-topic-v6"
-    ] = "abstract-topic-v5"
+        "abstract-topic-v5", "abstract-topic-v6", "abstract-topic-v8"
+    ] = "abstract-topic-v8"
     SEARCH_PROVIDER: str | None = None  # "google"|"searxng"|"brave"|"brightdata"|"tavily"|"exa"|None
     # New resolutions use the versioned API-first policy. Legacy configuration
     # remains selectable; stored traces never inherit a new policy implicitly.

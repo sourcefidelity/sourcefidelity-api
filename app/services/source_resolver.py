@@ -2378,6 +2378,9 @@ class SourceResolver:
             if not identity_only:
                 self._update_search_memo(result, trace_payload)
             result.metadata["reference_discovery_trace"] = trace_payload
+            declared = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("declared_document_url")
+            if declared and not result.full_text:
+                result.metadata.setdefault("declared_document_url", declared)
             if discovery_payload is not None:
                 result.metadata["reference_discovery"] = discovery_payload
                 mismatch = self._doi_title_mismatch()
@@ -2770,13 +2773,23 @@ class SourceResolver:
             # whether the book is single-authored still decides how a missing
             # editor is reported: the free title-page check only (2026-10-16).
             container = (getattr(reference, "container_title", "") or "").strip()
-            if getattr(reference, "source_kind", "") == "book_section" and container:
-                responsibility = self._container_responsibility(container, getattr(reference, "author", "") or "")
+            # The book as the record that confirmed the chapter names it, not
+            # as the student wrote it ("Sringer eBooks" for the book
+            # "Neoliberalism and Post-Soviet Transition"; Television Without
+            # Frontiers reference 10, 2026-10-18).
+            recorded = next((str((candidate.get("observed") or {}).get("container_title") or "").strip()
+                             for candidate in discovery.get("candidates") or []
+                             if (candidate.get("plausible_identity_match")
+                                 or candidate.get("authoritative_identifier_match"))
+                             and str((candidate.get("observed") or {}).get("container_title") or "").strip()), "")
+            if getattr(reference, "source_kind", "") == "book_section" and (recorded or container):
+                book = recorded or container
+                responsibility = self._container_responsibility(book, getattr(reference, "author", "") or "")
                 discovery["container_identity"] = {
                     "policy_version": "container-work-identity-v2",
                     "status": ("part_confirmed" if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES
                                else "title_page_only"),
-                    "searched_title": container, "title": container,
+                    "searched_title": book, "title": book,
                     "is_monograph": responsibility.get("classification") == "single_authored",
                     "responsibility": responsibility}
             return trace_payload, discovery
@@ -4729,12 +4742,14 @@ class SourceResolver:
         soup = BeautifulSoup(resp.text, "html.parser")
         pdf_url = None
 
-        # Method 1: citation_pdf_url meta tag (highest confidence — academic standard)
-        meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
-        if meta and meta.get("content"):
-            pdf_url = meta["content"]
+        # Method 1: the page's declared PDF (citation_pdf_url and its
+        # repository variants), read by the one landing-page discovery.
+        declared = [location for location in discover_scholarly_locations(resp.text, str(resp.url))
+                    if location.representation_kind is RepresentationKind.PDF]
+        if declared:
+            pdf_url = declared[0].url
             logger.info(
-                "Found PDF via citation_pdf_url meta tag: %s",
+                "Found PDF via declared meta tag: %s",
                 private_value_id("url", pdf_url),
             )
 
@@ -5855,10 +5870,20 @@ class SourceResolver:
         evidence with the page as provenance.
         """
         from app.services.abstract_only_pages import (
-            landing_abstract_and_back_matter, landing_abstract_provenance)
+            landing_abstract_and_back_matter, landing_abstract_provenance, mainly_abstract_page)
         observation = landing_abstract_and_back_matter(article_text)
         if observation is None:
-            return False
+            # A page that is mainly its abstract, without an access prompt
+            # (owner decision 2026-10-18), is an abstract too.
+            page_abstract = mainly_abstract_page(article_text, (content or b"").decode("utf-8", "replace"))
+            if not page_abstract or not identity_confirmed:
+                # Unconfirmed, the page stays limited text as before rather
+                # than leaving the reference without any text (2026-10-18).
+                return False
+            observation = {"abstract": page_abstract, "back_matter_sections": [],
+                           "abstract_sha256": hashlib.sha256(page_abstract.encode("utf-8")).hexdigest(),
+                           "abstract_words": len(re.findall(r"\w+", page_abstract)),
+                           "policy": "mainly-abstract-landing-page-v1"}
         content_sha256 = hashlib.sha256(content or b"").hexdigest()
         attempt["landing_abstract_only"] = {
             **{key: value for key, value in observation.items() if key != "abstract"},
@@ -6232,7 +6257,9 @@ class SourceResolver:
                     return RetrievalResult(source_name="web_fetch", success=False,
                                            error="Access wall answered in place of the page",
                                            metadata=diagnostic('access_wall'))
-                homepage = is_site_homepage(resp.text, final_url)
+                from app.services.submitted_links import redirected_to_site_root
+                homepage = (is_site_homepage(resp.text, final_url)
+                            or redirected_to_site_root(url, final_url))
                 logger.info(
                     "Web fetch identity mismatch for %s",
                     private_value_id("url", url),
@@ -6278,6 +6305,7 @@ class SourceResolver:
         # the work, not the work. Ordinary identity, safety and validation
         # gates still apply to the acquired bytes, and a failed acquisition
         # falls through to the existing HTML handling below.
+        declared_document_url = None
         advertised = [
             location
             for location in discover_scholarly_locations(
@@ -6320,6 +6348,14 @@ class SourceResolver:
                 landing.success = True
                 return landing
             self._clear_retrieved_representation(landing)
+            # The page names its PDF but the PDF was not fetched (a browser
+            # check, 2026-10-18): the reader can still open it. The page is a
+            # record about the work, so only its own summary is kept, as an
+            # abstract; a breadcrumb and a recommended citation are not text.
+            declared_document_url = advertised[0].url
+            active = _ACTIVE_DISCOVERY_TRACE.get()
+            if isinstance(active, dict):
+                active.setdefault("declared_document_url", declared_document_url)
 
         # Extract readable text
         import trafilatura
@@ -6444,6 +6480,29 @@ class SourceResolver:
                 and length_fits_kind(len(re.findall(r"\w+", page_text)), expected_source_kind.kind) is False):
             # Its length cannot be a whole work of the cited kind (2026-09-30).
             web_coverage = {**web_coverage, "verdict": "not_assessed", "reason": "length_does_not_fit_kind"}
+        from app.services.abstract_only_pages import MAINLY_ABSTRACT_POLICY, mainly_abstract_page
+        page_abstract = (mainly_abstract_page(page_text, resp.text)
+                         if web_coverage.get("verdict") != "complete" else None)
+        if page_abstract:
+            # A landing page that is mainly its abstract (with or without
+            # notes and references) is an abstract, not limited text
+            # (owner decision 2026-10-18).
+            return RetrievalResult(
+                source_name="web_fetch", success=True, title=observed["title"],
+                authors=observed["authors"], year=observed["year"], doi=observed["doi"],
+                abstract=page_abstract,
+                metadata={"web_identity": observed,
+                          **({"declared_document_url": declared_document_url} if declared_document_url else {}),
+                          "abstract_provenance": {
+                              "policy": MAINLY_ABSTRACT_POLICY, "basis": "mainly_abstract_landing_page",
+                              "provider": "web_fetch",
+                              "page_content_sha256": hashlib.sha256(resp.content).hexdigest()}})
+        if declared_document_url and web_coverage.get("verdict") != "complete":
+            return RetrievalResult(
+                source_name="web_fetch", success=False,
+                error="The page names its PDF; the PDF was not fetched",
+                metadata={**diagnostic("readable_text_unavailable"),
+                          "declared_document_url": declared_document_url, "web_identity": observed})
         result = RetrievalResult(
             source_name="web_fetch",
             success=True,
@@ -6468,6 +6527,7 @@ class SourceResolver:
             metadata={
                 "web_identity": observed,
                 "web_completeness": web_coverage,
+                **({"declared_document_url": declared_document_url} if declared_document_url else {}),
                 "requested_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
                 "representation_kind": RepresentationKind.PLAIN_TEXT.value,
                 "expected_source_kind": expected_source_kind.kind,

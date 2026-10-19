@@ -48,9 +48,12 @@ ROUTE_VERSIONS = {
     # linked Chinese abstract pages; v3, the same day: such abstracts by the
     # cross-language naming standard, the one page-identity rule for DOI
     # pages; v4, Chinese author-field labels are not names; v5, the model's
-    # same-work answer for a page naming the work also keeps its abstract.
+    # same-work answer for a page naming the work also keeps its abstract;
+    # v6, 2026-10-18: a page's declared PDF (Digital Commons) is read and kept;
+    # v7, the same day: a landing page that is mainly its abstract is an abstract;
+    # v8: only when the page confirms the work (else limited text, as before).
     "student_link_routes": RouteVersion(
-        "student-link-routes-v5",
+        "student-link-routes-v8",
         "an earlier result with a student link and no text, or a search-found page's text, "
         "is searched again once; a stored copy or text the student's own link gave is kept"),
     # Owner decision 2026-10-14: pages separated by form feeds with printed page numbers.
@@ -61,10 +64,10 @@ ROUTE_VERSIONS = {
     # 2026-10-16 (Rita Hayworth review): the magazine archive search, the
     # chapter-title namesake rule and look-alike letter folding.
     "search_rules": RouteVersion(
-        "search-rules-v6",
+        "search-rules-v9",
         "an earlier result without text for a dated periodical article, a chapter whose search "
         "ended in a record conflict or whose book's authorship was unresolved, or a title with "
-        "look-alike letters is searched again once"),
+        "look-alike letters, or an abstract stored without its source record, is searched again once"),
 }
 STUDENT_LINK_ROUTES_VERSION = ROUTE_VERSIONS["student_link_routes"].version
 SEARCH_RULES_VERSION = ROUTE_VERSIONS["search_rules"].version
@@ -230,6 +233,19 @@ def search_rules_due(item: dict, reference) -> bool:
                      or (container.get("is_monograph") and item.get("status") == "transient_authorized"
                          and not item.get("held_as_book_of_cited_part"))))
     lookalike = fold_lookalikes(reference.get("title") or "") != (reference.get("title") or "")
+    # v7-v8, 2026-10-18: an abstract taken before a record had to share an author
+    # with the reference (an edited book's DOI record carried one chapter's
+    # summary); its source was not recorded, so it is searched again once.
+    unchecked_abstract = (item.get("status") == "abstract_only"
+                          and not ((item.get("abstract_evidence") or {}).get("provenance")))
+    if unchecked_abstract:
+        return True
+    # v9, 2026-10-19: a confirmed work left without text under v8, when a
+    # landing page mainly holding its abstract was set aside unconfirmed and
+    # nothing was kept, is searched again once.
+    if (item.get("search_rules") == "search-rules-v8" and item.get("status") == "unavailable"
+            and discovery.get("outcome") in {"confirmed", "confirmed_with_minor_differences"}):
+        return True
     # A reference that already has its text needs only its book's authorship
     # checked; the search rules for finding a text do not apply to it.
     has_text = item.get("status") in {"durable_authorized", "transient_authorized"} or downloadable(item)

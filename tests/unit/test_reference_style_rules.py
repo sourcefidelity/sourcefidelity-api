@@ -352,3 +352,48 @@ def test_a_joined_reference_is_flagged_as_split():
     ref.reference_id = 's'
     ref.split_parts = ['Santillana, M. (2023). Freedom of the press', 'under pressure. In Media (pp. 1-2). Springer.']
     assert ('s', SPLIT_ENTRY_TEXT) in {(f['reference_id'], f['finding']) for f in reference_entry_findings({'s': ref})}
+
+
+def test_a_lower_case_word_inside_a_name_keeps_title_case():
+    from app.services.reference_formatting import title_case_title
+    assert title_case_title("Harbours without Frontiers: The European Union’s Continuing Struggle for Cultural Survival")
+    assert not title_case_title("The Washington Post and the New York Times coverage of Iraq")
+
+
+def test_citation_form_differences():
+    from app.services.evidence_report import citation_form_issues
+    assert citation_form_issues({"citation_marker": "(Lane 2004)", "student_text": "Ports grew (Lane 2004)."}, "apa") == [
+        "citation_comma_missing"]
+    assert citation_form_issues({"citation_marker": "(Lane 2004)", "student_text": "Ports grew (Lane 2004)."}, "mla") == []
+    assert citation_form_issues({"citation_marker": "(Lane, 2004, p.17)", "student_text": "x (Lane, 2004, p.17)."},
+                                "apa") == ["citation_page_space_missing"]
+    assert citation_form_issues({"citation_marker": "(Lane, 2004)", "student_text": "harbours(Lane, 2004)."},
+                                "apa") == ["citation_space_before_parenthesis_missing"]
+
+
+def test_reference_detail_findings():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import reference_detail_findings
+    old = SimpleNamespace(reference_id="r1", source_kind="journal_article", pages="1-9", container_title="Ports",
+                          raw_ref="Lane, A. (2004). Harbours. Ports, 3(1), 1-9. doi:10.1234/abc")
+    bad = SimpleNamespace(reference_id="r2", source_kind="book_section", pages="", container_title="",
+                          raw_ref="Kay, B. (2017). Cranes. In Harbour eBooks. doi:1007/978-3-00000-000-0_2")
+    record = {"candidates": [{"plausible_identity_match": True, "observed": {"pages": "195-230"},
+                              "comparisons": [{"field_name": "title", "outcome": "agreement"},
+                                              {"field_name": "author", "outcome": "agreement"}]}]}
+    first = SimpleNamespace(reference_id="r3", source_kind="journal_article", pages="195", container_title="Law Review",
+                            raw_ref="Wil, K. (1991). Frontiers. Law Review, 14(1), 195.")
+    online = SimpleNamespace(reference_id="r4", source_kind="journal_article", pages="", container_title="Online",
+                             raw_ref="Ola, P. (2020). Streams. Online, 5, e102.")
+    kinds = {(f["reference_id"], f["finding_type"]) for f in reference_detail_findings(
+        [old, bad, first, online], "apa", {"r3": record, "r4": {"candidates": []}})}
+    assert kinds == {("r1", "doi_old_form"), ("r2", "doi_prefix_missing"), ("r3", "article_pages_missing")}
+
+
+def test_a_landing_page_that_is_mainly_its_abstract():
+    from app.services.abstract_only_pages import mainly_abstract_page
+    summary = " ".join(["This article studies harbour regulation across member states and its effects."] * 4)
+    html = f'<html><head><meta name="description" content="{summary}"></head></html>'
+    assert mainly_abstract_page("Harbour Rules\nA. Lane\n" + summary + "\nReferences\nB. Kay (2001). Ports.", html)
+    long_page = "Harbour Rules\n" + " ".join(["The body of the article continues at length here."] * 80)
+    assert mainly_abstract_page(long_page, html) is None
