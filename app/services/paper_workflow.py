@@ -1148,15 +1148,15 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     }
     refresh_reference_ids = _refresh_reference_ids(job)
     refresh = dict((job.upload_evidence or {}).get(TARGETED_SOURCE_REFRESH_KEY) or {})
-    previous_report = None
-    if refresh_reference_ids:
-        previous_report = session.scalar(
-            select(Report)
-            .where(Report.job_id == job.id)
-            .order_by(Report.report_version.desc(), Report.created_at.desc())
-            .limit(1)
-            .with_for_update()
-        )
+    # Any later run on a job with a report is that report's next version, even
+    # when its refresh marker is missing, so a version number is never reused.
+    previous_report = session.scalar(
+        select(Report)
+        .where(Report.job_id == job.id)
+        .order_by(Report.report_version.desc(), Report.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
     report = Report(
         job_id=job.id,
         total_references=str(len(extraction.references)),

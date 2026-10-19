@@ -56,7 +56,9 @@ def test_owner_confirmed_expectations_are_checked_per_window():
 def test_the_automatic_check_records_without_text_and_never_raises(monkeypatch):
     from types import SimpleNamespace
     from app.services import report_check
-    session = SimpleNamespace(commit=lambda: None, rollback=lambda: None)
+    refreshed = []
+    session = SimpleNamespace(commit=lambda: None, rollback=lambda: None,
+                              refresh=lambda obj, **kw: refreshed.append(kw))
     report, job = SimpleNamespace(id="rep-1"), SimpleNamespace(upload_evidence={})
     html = _report('Ames. <a href="https://example.test/a?b=1">https://example.test/a?b=1</a> &amp;c=2')
     monkeypatch.setattr(report_check, "render_for_check", lambda *a: (html, {}))
@@ -64,6 +66,8 @@ def test_the_automatic_check_records_without_text_and_never_raises(monkeypatch):
     assert outcome["passed"] is False and outcome["counts"] == {"split_link": 1}
     assert job.upload_evidence["report_check"]["windows"] == ["reference-entry-panel-1"]
     assert "example.test" not in str(job.upload_evidence["report_check"])
+    # The job is re-read under a lock, so a refresh started meanwhile keeps its marker.
+    assert refreshed == [{"with_for_update": True}]
 
     def broken(*_args):
         raise RuntimeError("render failed")
