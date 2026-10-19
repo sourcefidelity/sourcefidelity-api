@@ -1,10 +1,8 @@
 from bs4 import BeautifulSoup
-import fitz
 from app.services.evidence_report import _render_reference_panel_template,_render_formatted_reference,_render_continuous_paper
 from app.services.paper_extraction import _build_marker_census
 from app.services.citation_extractor import extract_citations
 from app.services.schemas import ParsedReference
-from app.services.report_export import _render_pdf
 
 
 def test_standalone_and_combined_formatting_categories_match():
@@ -71,21 +69,6 @@ def test_diamond_and_entry_open_the_reference_window_without_a_paper_link():
     entry=soup.select_one('a.reference-entry-overlay')
     assert entry['data-panel-template']=='reference-entry-panel-1'
     assert entry.select_one('rect.reference-entry-hit')['width']=='200.000'
-
-
-def test_pdf_diamond_link_does_not_replace_original_url_target():
-    doc=fitz.open();p=doc.new_page();p.insert_text((50,70),'https://example.org/book')
-    rect=p.search_for('https://example.org/book')[0]
-    p.insert_link({'kind':fitz.LINK_URI,'from':rect,'uri':'https://example.org/book'})
-    raw=doc.tobytes();doc.close()
-    r={'page_index':0,'x0':rect.x0,'y0':rect.y0,'x1':rect.x1,'y1':rect.y1}
-    finding={'finding_type':'submitted_link_issue','rectangles':[r],'finding':'Submitted link returned a missing page.','source':{'raw_reference':'A reference.'}}
-    output,_=_render_pdf(raw,citations=[],reference_practice=[finding],export_binding='diamond-test')
-    with fitz.open(stream=output,filetype='pdf') as result:
-        links=result[0].get_links()
-        assert any(l.get('uri')=='https://example.org/book' for l in links)
-        center=fitz.Point(rect.x1+7,(rect.y0+rect.y1)/2)
-        assert any(l['kind']==fitz.LINK_GOTO and l['from'].contains(center) for l in links)
 
 
 def test_an_uncited_reference_is_marked_yellow_over_its_whole_entry():

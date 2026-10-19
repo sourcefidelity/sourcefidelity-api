@@ -2029,7 +2029,7 @@ def _retryable_provider_dependencies(
     no-match, bibliographic conflict, or insufficient citation metadata must
     never be silently converted into provider-recovery work. Within that, only
     providers the completion gate itself counts as blocking are named -- see
-    `search_blocking_providers`. ``discovery_trace`` is no longer read; the
+    `search_completion.assess_record`. ``discovery_trace`` is no longer read; the
     trace lists every provider that was queried, required or not, which is how
     an optional provider came to trigger re-runs it could never complete.
     """
@@ -2069,17 +2069,15 @@ def _blocking_providers_from_record(discovery_record: dict | None) -> list[str]:
     which is the safe outcome, whereas guessing would re-run it on a trigger
     nobody can justify.
     """
-    from app.services.reference_discovery import (
-        ReferenceDiscoveryRecord, search_blocking_providers)
+    from app.services.reference_discovery import ReferenceDiscoveryRecord
+    from app.services.search_completion import assess_record
     if (discovery_record or {}).get("outcome") != "search_incomplete":
         return []
     try:
         record = ReferenceDiscoveryRecord.model_validate(discovery_record)
     except ValueError:
         return []
-    return search_blocking_providers(
-        record.required_route_categories, record.attempts, record.queries,
-        record.search_policy_version, record.required_web_providers)
+    return list(assess_record(record).blocking_providers)
 
 
 def _report_source_failure_reason(source_result: dict) -> str:

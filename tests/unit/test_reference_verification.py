@@ -250,7 +250,7 @@ def _johnson(*, unscoped_title_searches, structured=False):
 def test_doi_naming_a_different_work_then_unscoped_title_searches_without_match_cannot_be_verified():
     result = assess_reference_verification(ref(), _johnson(unscoped_title_searches=True))
     assert result['status'] == 'cannot_be_verified'
-    assert result['policy_version'] == 'reference-verification-v3'
+    assert result['policy_version'] == 'reference-verification-v4'
 
 
 def test_a_structured_unscoped_title_query_counts_as_title_led():
@@ -396,7 +396,7 @@ def _with_web_query(found, engine, outcome):
 def test_a_web_provider_skipped_by_our_own_budget_leaves_the_search_incomplete():
     """Owner decision 2026-10-01: Exa skipped by our budget while Brave completed is not complete coverage."""
     result = assess_reference_verification(ref(), _with_web_query(discovery(web=('brave',)), 'exa', 'budget_skipped'))
-    assert result['status'] == 'search_incomplete' and result['reason_code'] == 'web_search_skipped_by_budget'
+    assert result['status'] == 'search_incomplete' and result['reason_code'] == 'web_search_skipped_by_us'
     assert result['incomplete_routes'] == ['Exa'] and result['findings'] == []
 
 
@@ -479,7 +479,7 @@ def searched(reference, **change):
 
 def test_an_ordinary_english_reference_still_cannot_be_verified():
     result = assess_reference_verification(ref(), discovery())
-    assert result['status'] == 'cannot_be_verified' and result['policy_version'] == 'reference-verification-v3'
+    assert result['status'] == 'cannot_be_verified' and result['policy_version'] == 'reference-verification-v4'
     english = other_ref(title='Can men change (A study of masculinity in example towns)')
     assert other_language_signals(english) == []
     assert assess_reference_verification(english, searched(english))['status'] == 'cannot_be_verified'

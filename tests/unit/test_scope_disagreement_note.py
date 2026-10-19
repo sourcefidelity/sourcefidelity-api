@@ -177,11 +177,6 @@ class TestTheNoteReachesTheReader:
         assert "appears unrelated" not in html and "Stated scopes differ." in html
         assert "Read the source to judge" not in html
 
-    def test_the_portable_export_shows_it(self):
-        from app.services.report_export import _portable_member_html
-        html = _portable_member_html(self._member_with_note())
-        assert "Australian filmmaking" in html
-
     def test_a_member_without_a_note_renders_nothing_extra(self):
         from app.services.evidence_report import _render_member
         member = self._member_with_note()
@@ -287,6 +282,3 @@ class TestEveryAbstractShowsItsComparison:
             abstract_relevance={"scope_assessment": {"rationale": "Stated scopes differ."}}))
         assert "Stated scopes differ." in html and "Read the source to judge" not in html
 
-    def test_the_portable_export_shows_it(self):
-        from app.services.report_export import _portable_member_html
-        assert "Australian filmmaking" in _portable_member_html(self._with_note())

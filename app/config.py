@@ -160,22 +160,23 @@ class Settings(BaseSettings):
     # Pace rate-limited providers (Semantic Scholar, CORE) across every worker
     # process through Redis; falls back to per-process pacing when unavailable.
     RETRIEVAL_SHARED_PACING_ENABLED: bool = True
-    # The web fallback after Brave and Exa: "none" (default), "searxng" or "tavily".
-    # Neither fallback retrieved a source in production (STATE provider table), so
+    # The web fallback after the required providers: "none" (default) or "tavily".
+    # No fallback retrieved a source in production (STATE provider table), so
     # none runs unless configured (owner decisions 2026-10-01 and 2026-10-09).
-    SEARCH_WEB_FALLBACK_PROVIDER: Literal["searxng", "tavily", "none"] = "none"
+    SEARCH_WEB_FALLBACK_PROVIDER: Literal["tavily", "none"] = "none"
     # The required web provider after Brave. "deepseek" is DeepSeek's Search
     # API (api-docs.deepseek.com/guides/search, US$0.75 per 1,000 successful
     # searches, 5/s per account, checked 2026-10-18), called with LLM_API_KEY
-    # when LLM_BASE_URL is DeepSeek's; under owner-authorized measurement.
-    SEARCH_SECOND_REQUIRED_PROVIDER: Literal["exa", "deepseek"] = "exa"
+    # when LLM_BASE_URL is DeepSeek's. Default since 2026-10-19 (owner
+    # decision, measured in STATE §6); "exa" remains available.
+    SEARCH_SECOND_REQUIRED_PROVIDER: Literal["exa", "deepseek"] = "deepseek"
     # A fetched web-search page whose titles are all in another writing
     # system gets the configured model's cross-script comparison
     # (cross-script-identity-v1), at most CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE
     # pages per reference. "no" makes its title a conflict, so it no longer
     # holds the reference as an uncompared candidate; "unsure" and unfetched
-    # pages still do. Off until measured (owner-approved trial 2026-10-18).
-    CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED: bool = False
+    # pages still do. On by default since 2026-10-19 (owner decision, measured).
+    CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED: bool = True
     CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE: int = Field(default=3, ge=0)
     # Your Tavily plan's price per credit, for Technical details; unset means
     # "no price on record", never zero.
@@ -184,9 +185,6 @@ class Settings(BaseSettings):
     # $5.00 per 1,000 requests on 2026-09-25 (api-dashboard.search.brave.com,
     # before the $5 monthly free credit); recorded per request Brave served.
     BRAVE_USD_PER_REQUEST: float | None = 0.005
-    # Bright Data bills successful SERP requests only, at a plan-dependent
-    # price not shown publicly; unset means "no price on record", never zero.
-    BRIGHTDATA_USD_PER_REQUEST: float | None = None
     PAPER_EXPERIMENTAL_JOINT_SELECTION_ENABLED: bool = False
     VERIFICATION_JUDGMENT_MODE: Literal["shadow", "adjudicate"] = "shadow"
     VERIFICATION_JUDGMENT_MAX_PASSAGES: int = 3
@@ -296,7 +294,7 @@ class Settings(BaseSettings):
     # deployed app keeps no search-result links, and SEARCH_CANDIDATE_AUDIT_URLS
     # below is the only development audit of web-search candidates.
     DEVELOPMENT_RETAIN_DISCOVERY_LEAD_URLS: bool = False
-    # Development audit only. Records each Exa, Tavily and SearXNG web-search
+    # Development audit only. Records each Exa and Tavily web-search
     # candidate's URL, query id, rank and disposition under `candidate_audit`
     # on the bounded-web discovery attempt. Must stay False in any deployed
     # profile. Brave is never recorded (Brave API terms §3.2(i)).
@@ -384,11 +382,9 @@ class Settings(BaseSettings):
     # that was blocking them recovers. On by default: a reference left
     # unfinished by a temporary outage is finished without resubmission,
     # and each re-run writes a new report version with the earlier one
-    # preserved. Set false to stop all automatic re-runs; provider health
-    # probing continues either way, since live searches rely on it.
+    # preserved. Set false to stop all automatic re-runs.
     PROVIDER_RECOVERY_REFRESH_ENABLED: bool = True
     PROVIDER_RECOVERY_MAX_JOBS: int = 25
-    PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS: int = 60
     # Automatic retries of a completed paper's incomplete searches (owner
     # decision 2026-09-29). Each retry is a targeted refresh of the affected
     # references and writes a new report version. Retry n runs the n-th delay
@@ -448,15 +444,10 @@ class Settings(BaseSettings):
     ABSTRACT_SCOPE_POLICY_VERSION: Literal[
         "abstract-topic-v5", "abstract-topic-v6", "abstract-topic-v8"
     ] = "abstract-topic-v8"
-    SEARCH_PROVIDER: str | None = None  # "google"|"searxng"|"brave"|"brightdata"|"tavily"|"exa"|None
+    SEARCH_PROVIDER: str | None = None  # "google"|"brave"|"tavily"|"exa"|"deepseek"|None
     # New resolutions use the versioned API-first policy. Legacy configuration
     # remains selectable; stored traces never inherit a new policy implicitly.
     SEARCH_POLICY_VERSION: Literal["configured-search-v1", "api-first-search-v2"] = "api-first-search-v2"
-    # A self-hosted metasearch fallback behind the two paid APIs. Enabled
-    # 2026-09-21 after measuring 11-20 results in 0.5-1.5s from this network,
-    # against a 59-69s mean per paid search call, and after an Exa outage
-    # removed six findings from a single paper.
-    SEARCH_SEARXNG_FALLBACK_ENABLED: bool = True
     # Required API routes fail closed until account-specific retention rights
     # are confirmed. Credits alone are not a storage/evaluation permission.
     BRAVE_SEARCH_RETENTION_PERMITTED: bool = False
@@ -520,52 +511,6 @@ class Settings(BaseSettings):
     PROVIDER_GATE_ENABLED: bool = True
     GOOGLE_SEARCH_API_KEY: SecretStr | None = None
     GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
-    # SearXNG (self-hosted meta-search — recommended for institutions)
-    SEARXNG_URL: str | None = None  # e.g., "http://localhost:8080"
-    # Ordered semicolon-separated engine groups. Each group may contain a
-    # comma-separated SearXNG engine list. The next group runs only when the
-    # earlier group yields no results. These defaults were live-checked from
-    # the project Compose deployment; operators may replace them for their
-    # regional network without changing application code.
-    # Live-checked 2026-09-21 against the project Compose deployment by reading
-    # the engine credited on each result, not the result count: SearXNG falls
-    # back to its default engines when a name is unrecognised, which makes an
-    # unavailable engine look like a working one. Verified answering: google
-    # cse (20), google scholar (10), bing (10), openairepublications (10).
-    # "brave" is dropped: it times out on every call here, and the application
-    # already queries the Brave API directly. DuckDuckGo and Startpage return
-    # CAPTCHAs from this address and are not configured.
-    # Verified engine by engine against the per-result `engines` field, because
-    # Verify an engine by the relevance of its results, never by their count.
-    # SearXNG silently answers an unrecognised name with its default engine
-    # set, and `bing` answers a phrase query with results for its first word:
-    # a quoted book title returned dictionary entries for "The". Measured over
-    # five real reference titles, `google cse` is the only general engine that
-    # works from here (5/5 relevant, 20 results, 0.44s) and it needs no
-    # credentials; `bing` scored 0/5 while returning 10 results every time.
-    # This engine is a scraper: Google suspends it with "too many requests"
-    # under sustained load, which is why SearXNG stays an unrequired fallback.
-    SEARXNG_ENGINE_GROUPS: str = "google cse"
-    # Optional retries apply only to upstream timeouts. CAPTCHA/access/rate
-    # failures open the circuit immediately. Retries remain off until a
-    # controlled source-admission experiment demonstrates benefit.
-    SEARXNG_TIMEOUT_RETRIES: int = 0
-    SEARXNG_TIMEOUT_CIRCUIT_THRESHOLD: int = 3
-    # First cooldown after an engine answers "too many requests". Each further
-    # consecutive failure multiplies it by four (health store); success resets.
-    SEARXNG_RATE_LIMIT_COOLDOWN_SECONDS: int = 30
-    SEARXNG_REQUEST_TIMEOUT_SECONDS: float = 15.0
-    # Per-request ceiling forwarded to SearXNG for its upstream engines. This
-    # remains at the current three-second baseline until a controlled corpus
-    # experiment establishes that a larger value improves admitted sources.
-    # Above the measured 2.9-8.0s engine latency from this network, and below
-    # the container's 20s max_request_timeout ceiling.
-    SEARXNG_ENGINE_TIMEOUT_SECONDS: float = 12.0
-    # SearXNG requests also honor RETRIEVAL_PROVIDER_CONFIG's existing
-    # min_interval_seconds (default 1s), shared across local worker processes.
-    # Increasing the engine limit requires the instance max_request_timeout
-    # to permit it; the Compose template permits at most 6s, not an automatic
-    # six-second production default.
     # Brave Search API; account credits and retention rights are independent.
     BRAVE_SEARCH_API_KEY: SecretStr | None = None
     # Tavily (AI-focused search, free tier 1000/month)
@@ -576,27 +521,6 @@ class Settings(BaseSettings):
     # The key travels in the query string, so callers must keep request URLs
     # out of logs and exception text.
     MOJEEK_API_KEY: SecretStr | None = None
-    # Bright Data SERP API: a contracted service returning parsed engine
-    # results. Both the token and a SERP zone name are required; the zone is
-    # created in the Bright Data console and names the product being billed.
-    # Unset by default — an absent token is a provider that is not configured,
-    # never an empty search.
-    BRIGHTDATA_API_TOKEN: SecretStr | None = None
-    BRIGHTDATA_SERP_ZONE: str | None = None
-    # Which engine the SERP zone queries. Verified by relevance on real
-    # reference titles before any reliance, as with every other provider.
-    BRIGHTDATA_SERP_ENGINE: Literal["google", "bing"] = "google"
-    # Measured 2026-09-22 from this network: median 6-31s across runs with
-    # maxima near 80s, so 30s produced spurious timeouts. The retrieval
-    # deadline still caps this, so a slow provider cannot extend a run.
-    # Budget for one search in total, retries and their pauses included.
-    BRIGHTDATA_TIMEOUT_SECONDS: float = 60.0
-    # Interface language and result region sent with every query, and the
-    # collection region pinned in the request body. Without them the
-    # engine and the zone each infer one, so identical queries can return
-    # different result sets between calls.
-    BRIGHTDATA_SEARCH_LANGUAGE: str = "en"
-    BRIGHTDATA_SEARCH_REGION: str = "us"
 
     # The user's DOI resolver address, used only to build each reference's DOI
     # link (owner decision 2026-10-19); the application itself follows public
@@ -633,8 +557,7 @@ class Settings(BaseSettings):
     # code (for example the Institutional ones, 2026-10-19) cannot stop startup.
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
-    @field_validator("TAVILY_USD_PER_CREDIT", "BRAVE_USD_PER_REQUEST", "BRIGHTDATA_USD_PER_REQUEST",
-                     mode="before")
+    @field_validator("TAVILY_USD_PER_CREDIT", "BRAVE_USD_PER_REQUEST", mode="before")
     @classmethod
     def _plain_price(cls, value):
         """Accept a price written as "$0.008" or "0.008 USD"; a stray currency

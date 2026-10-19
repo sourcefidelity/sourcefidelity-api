@@ -1012,17 +1012,38 @@ class TestOurOwnFailuresAreNotReportedAsProviderOutcomes:
         ) == "access_restricted"
 
     def test_an_internal_error_is_never_a_completed_observation(self):
-        """It must not become evidence that a source does not exist."""
-        from app.services.reference_discovery import assess_reference_discovery_trace
-        import inspect
+        """It must not become evidence that a source does not exist.
 
-        source = inspect.getsource(assess_reference_discovery_trace.__module__ and
-                                   __import__("app.services.reference_discovery",
-                                              fromlist=["x"]))
-        assert '"internal_error",' in source
-        # Present in the incomplete set, so it can never satisfy a required route.
-        marker = source.index("incomplete_execution_outcomes")
-        assert "internal_error" in source[marker:marker + 400]
+        The former source-text check read a set deleted with the one
+        completion rule (search-completion-v1); this asks that rule directly.
+        """
+        from app.services.search_completion import COMPLETED_QUERY, assess_search_completion
+
+        assert "internal_error" not in COMPLETED_QUERY
+        title = "A synthetic internal error title"
+        now = "2026-10-19T10:00:00+00:00"
+
+        def record(adapter_outcome, web_outcome):
+            queries, attempts = [], []
+            for provider, category, outcome, text in (
+                    ("crossref", "academic_adapter", "no_results", f"title:{title}"),
+                    ("openalex", "academic_adapter", adapter_outcome, f"title:{title}"),
+                    ("brave", "bounded_web", web_outcome, f'"{title}"'),
+                    ("exa", "bounded_web", web_outcome, f'"{title}"')):
+                queries.append({"query_id": provider, "route_category": category, "provider": provider,
+                                "execution_provider": provider, "execution_outcome": outcome,
+                                "normalized_query": text})
+                attempts.append({"attempt_id": provider, "route_category": category, "provider": provider,
+                                 "query_ids": [provider], "outcome": "no_match", "permitted": True,
+                                 "completed_at": now, "required": True})
+            return {"expected": {"title": title, "source_kind": "journal_article"},
+                    "required_web_providers": ["brave", "exa"], "queries": queries, "attempts": attempts}
+
+        assert assess_search_completion(record("no_results", "no_results")).complete
+        # An index whose only query raised in our code has not answered.
+        assert not assess_search_completion(record("internal_error", "no_results")).complete
+        # Nor has a web search whose every query raised in our code.
+        assert not assess_search_completion(record("no_results", "internal_error")).complete
 
     def test_a_category_blocker_carries_its_real_cause(self):
         from app.services.reference_discovery import ReferenceDiscoveryCompletion

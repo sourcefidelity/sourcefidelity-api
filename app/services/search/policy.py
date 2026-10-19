@@ -9,7 +9,9 @@ API_FIRST_SEARCH_POLICY = "api-first-search-v2"
 # Exa stay valid after the setting changes, and the reverse.
 SECOND_REQUIRED_WEB_PROVIDERS = frozenset({"exa", "deepseek"})
 REQUIRED_WEB_PROVIDER_NAMES = frozenset({"brave"}) | SECOND_REQUIRED_WEB_PROVIDERS
-REQUIRED_API_PROVIDERS = ("brave", settings.SEARCH_SECOND_REQUIRED_PROVIDER)
+def required_api_providers() -> tuple[str, str]:
+    """Brave and the configured second provider, read at call time."""
+    return ("brave", settings.SEARCH_SECOND_REQUIRED_PROVIDER)
 
 
 def is_required_web_provider_set(names) -> bool:

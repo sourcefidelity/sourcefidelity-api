@@ -48,6 +48,34 @@ def _attempt(category="academic_adapter", outcome="no_match", *, required=True):
     )
 
 
+def _completed_routes(title="A sufficiently specific scholarly work",
+                      adapters=("openalex", "crossref", "datacite"), extra_attempts=()):
+    """Every index the kind requires and a web search, each finished on the title.
+
+    search-completion-v1 counts an index only through a title-led query and a
+    web search only through one containing the title, by a real provider.
+    """
+    queries, attempts = [], []
+    for provider, category, value in (
+        *((name, "academic_adapter", f"title:{title}") for name in adapters),
+        ("brave", "bounded_web", f'"{title}"'),
+    ):
+        queries.append(ReferenceSearchQuery(
+            query_id=f"query-{provider}", route_category=category, provider=provider,
+            execution_provider=provider, execution_outcome="no_results", result_count=0,
+            normalized_query=value, query_sha256=hashlib.sha256(value.encode()).hexdigest(),
+        ))
+        attempts.append(ReferenceRouteAttempt(
+            attempt_id=f"attempt-{provider}", route_category=category, provider=provider,
+            required=True, permitted=True, query_ids=[f"query-{provider}"],
+            outcome="no_match", started_at=NOW, completed_at=NOW,
+        ))
+    for attempt in extra_attempts:
+        queries.append(_query(attempt.route_category))
+        attempts.append(attempt)
+    return queries, attempts
+
+
 def _comparison(field, outcome):
     digest = hashlib.sha256(field.encode()).hexdigest()
     return BibliographicFieldComparison(
@@ -174,13 +202,14 @@ def test_material_field_conflict_is_neutral_bibliographic_conflict():
 
 
 def test_only_completed_required_routes_can_be_unlocated_after_search():
-    attempts = [
-        _attempt("academic_adapter"),
-        _attempt("bounded_web"),
-    ]
-    record = _record(
-        attempts=attempts,
-        required=["academic_adapter", "bounded_web"],
+    queries, attempts = _completed_routes()
+    record = derive_reference_discovery_record(
+        reference_id="ref-0001",
+        expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]
+        ),
+        required_route_categories=["academic_adapter", "bounded_web"],
+        queries=queries, attempts=attempts, candidates=[], created_at=NOW,
     )
     assert record.outcome == "unlocated_after_search"
     assert record.contributes_to_neutral_pattern is True
@@ -204,14 +233,15 @@ def test_failed_unattempted_or_forbidden_required_route_is_search_incomplete(
 
 
 def test_optional_unpermitted_library_route_does_not_block_completed_search():
-    attempts = [
-        _attempt("academic_adapter"),
-        _attempt("bounded_web"),
-        _attempt("library_metadata", "not_permitted", required=False),
-    ]
-    record = _record(
-        attempts=attempts,
-        required=["academic_adapter", "bounded_web"],
+    queries, attempts = _completed_routes(
+        extra_attempts=[_attempt("library_metadata", "not_permitted", required=False)])
+    record = derive_reference_discovery_record(
+        reference_id="ref-0001",
+        expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]
+        ),
+        required_route_categories=["academic_adapter", "bounded_web"],
+        queries=queries, attempts=attempts, candidates=[], created_at=NOW,
     )
     assert record.outcome == "unlocated_after_search"
 
@@ -330,14 +360,8 @@ def test_trace_completion_refuses_missing_route_policy():
 
 
 def test_trace_completion_accepts_complete_no_match_routes():
-    queries = [_query("academic_adapter"), _query("bounded_web")]
-    queries[1] = queries[1].model_copy(
-        update={
-            "execution_provider": "public-search",
-            "execution_outcome": "no_results",
-            "result_count": 0,
-        }
-    )
+    queries, attempts = _completed_routes(
+        "A Sufficiently Specific Scholarly Work", adapters=("crossref", "openalex"))
     completion = assess_reference_discovery_trace(
         ReferenceDiscoveryTrace(
             reference_id="ref-complete-miss",
@@ -347,7 +371,7 @@ def test_trace_completion_accepts_complete_no_match_routes():
             ),
             required_route_categories=["academic_adapter", "bounded_web"],
             queries=queries,
-            attempts=[_attempt("academic_adapter"), _attempt("bounded_web")],
+            attempts=attempts,
         ),
         created_at=NOW,
     )

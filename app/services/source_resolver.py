@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from app.services.search.policy import REQUIRED_API_PROVIDERS, REQUIRED_WEB_PROVIDER_NAMES
+from app.services.search.policy import REQUIRED_WEB_PROVIDER_NAMES, required_api_providers
 from app.services.retrieval_deadline import bounded_reference, expired, POLICY as ELAPSED_POLICY
 
 # Reference-local fallback only: never an accepted location or reusable cache hit.
@@ -2268,7 +2268,7 @@ class SourceResolver:
                 "submitted_reference": getattr(reference, 'raw_ref', '') or '',
                 "search_policy_version": settings.SEARCH_POLICY_VERSION,
                 "search_retention_policy": "brave-operational-transient-v1" if settings.BRAVE_SEARCH_TRANSIENT_ENABLED else None,
-                "required_web_providers": list(REQUIRED_API_PROVIDERS) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
+                "required_web_providers": list(required_api_providers()) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
                 "expected": expected,
                 "required": set(
                     required_reference_discovery_routes(
@@ -2504,7 +2504,7 @@ class SourceResolver:
 
         if admitted is None and not identity_only:
             admitted = self._native_admit_metadata_record(found, expected, expected_kind)
-        route.update(self._native_route_completion(trace, route["attempt_ids"]))
+        route.update(self._native_route_completion(trace, route["attempt_ids"], native_title))
         if admitted is not None:
             admitted.metadata = admitted.metadata or {}
             admitted.metadata["native_script_route"] = True
@@ -2553,27 +2553,23 @@ class SourceResolver:
         return abstract
 
     @staticmethod
-    def _native_route_completion(trace: dict, attempt_ids: list[str]) -> dict:
-        """Whether the native-script route completed, from its own queries."""
+    def _native_route_completion(trace: dict, attempt_ids: list[str], native_title: str) -> dict:
+        """Whether the native-script route completed, by the one completion rule
+        (search-completion-v1) over its own attempts and its own-script title;
+        one finished index suffices."""
+        from app.services.search_completion import assess_search_completion
+        completion = assess_search_completion(
+            {"expected": trace["expected"], "queries": trace["queries"], "attempts": trace["attempts"],
+             "required_web_providers": trace.get("required_web_providers")},
+            title=native_title, attempt_ids=set(attempt_ids), any_adapter=True)
         attempts = [a for a in trace["attempts"] if a.attempt_id in set(attempt_ids)]
-        queries = {q.query_id: q for q in trace["queries"]}
-        adapters, web, skipped = set(), set(), set()
-        for attempt in attempts:
-            for query in (queries.get(q) for q in attempt.query_ids):
-                if query is None:
-                    continue
-                if attempt.route_category == "academic_adapter":
-                    if query.execution_outcome in {"results", "no_results"}:
-                        adapters.add(attempt.provider)
-                elif query.execution_provider in REQUIRED_WEB_PROVIDER_NAMES:
-                    if query.execution_outcome in {"results", "no_results"}:
-                        web.add(query.execution_provider)
-                    elif query.execution_outcome in {"budget_skipped", "cooldown_skipped"}:
-                        skipped.add(query.execution_provider)
-        completed = bool(adapters and web and not (skipped - web))
-        return {"status": "completed" if completed else "incomplete",
-                "adapters_completed": sorted(adapters), "web_completed": sorted(web),
-                "web_skipped": sorted(skipped - web)}
+        skipped = sorted({q.execution_provider for a in attempts for q in trace["queries"]
+                          if q.query_id in set(a.query_ids) and q.execution_outcome in {"budget_skipped", "cooldown_skipped"}}
+                         - set(completion.web_routes))
+        return {"status": "completed" if completion.complete else "incomplete",
+                "completion_reason": completion.reason_code,
+                "adapters_completed": list(completion.completed_adapters),
+                "web_completed": list(completion.web_routes), "web_skipped": skipped}
 
     @staticmethod
     def _attach_native_route(trace_payload: dict | None, discovery_payload: dict | None, route: dict | None) -> None:
@@ -4052,7 +4048,9 @@ class SourceResolver:
                 "journal-visible-metadata-body-v1",
                 "journal-title-author-near-year-v1",
                 "provisional-short-title-exclusion-v1",
-                str(settings.SEARCH_SEARXNG_FALLBACK_ENABLED),
+                # A retired fallback flag's former default, kept so stored
+                # lookup signatures stay fresh.
+                "True",
                 str(settings.BRAVE_SEARCH_RETENTION_PERMITTED),
                 str(settings.BRAVE_SEARCH_TRANSIENT_ENABLED),
                 settings.SEARCH_ESCALATION_MAX_CALLS,

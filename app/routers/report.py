@@ -55,7 +55,6 @@ from app.services.paper_workflow import (
     PaperWorkflowError,
     prepare_uploaded_source_refresh,
 )
-from app.services.report_export import ReportExportError, build_released_report_export
 from app.tasks.source_reanalysis import schedule_uploaded_source_reanalysis
 from app.tasks.check_paper import dispatch_paper_workflow
 
@@ -191,16 +190,6 @@ def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id
     return layer
 
 
-def _export_judgment_summary(session: Session, report_id: str, principal) -> dict | None:
-    """The page's Judgment tally for the PDF's Sources to Upload, or None."""
-    try:
-        details = _run_details(session, report_id, principal)
-    except Exception:  # noqa: BLE001 - the PDF is still built without the count
-        return None
-    summary = details.get("judgment_summary") if isinstance(details, dict) else None
-    return summary if isinstance(summary, dict) else None
-
-
 def _run_details(session: Session, report_id: str, principal) -> dict:
     """Judged citations and single-run technical details (owner requests 2026-09-28)."""
     from sqlalchemy import select
@@ -250,82 +239,11 @@ def get_interactive_report_download(
     view['judgment_layer'] = _static_judgment_layer(session, view, paper, report_id, principal)
     try:
         content = build_interactive_report_html(view, paper)
-    except (ValueError, ReportExportError) as exc:
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail='Interactive export is unavailable') from exc
     return Response(content, media_type='text/html', headers={
         'Content-Disposition': 'attachment; filename="interactive-report.html"',
         'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff'})
-
-
-@router.get("/{report_id}/export.pdf")
-def get_released_report_pdf(
-    report_id: str,
-    audience: str | None = Query(None, include_in_schema=False),
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Return a deterministic released-only derivative of the retained PDF."""
-    principal.require(REPORT_PAPER_CAPABILITY)
-    try:
-        exported = build_released_report_export(
-            session,
-            backend,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            judgment_summary=_export_judgment_summary(session, report_id, principal),
-        )
-    except EvidenceReportAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, ReportExportError) as exc:
-        raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
-    return Response(
-        content=exported.content,
-        media_type="application/pdf",
-        headers={
-            "Cache-Control": "no-store, private",
-            "Content-Disposition": 'attachment; filename="sourcefidelity-report.pdf"',
-            "Content-Security-Policy": "sandbox",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-            "X-SourceFidelity-Export-SHA256": exported.manifest["export_sha256"],
-            "X-SourceFidelity-Manifest-SHA256": exported.manifest_sha256,
-        },
-    )
-
-
-@router.get("/{report_id}/export/manifest")
-def get_released_report_manifest(
-    report_id: str,
-    audience: str | None = Query(None, include_in_schema=False),
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Return the text-free binding manifest for the current released export."""
-    principal.require(REPORT_PAPER_CAPABILITY)
-    try:
-        exported = build_released_report_export(
-            session,
-            backend,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            judgment_summary=_export_judgment_summary(session, report_id, principal),
-        )
-    except EvidenceReportAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, ReportExportError) as exc:
-        raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
-    return JSONResponse(
-        {**exported.manifest, "manifest_sha256": exported.manifest_sha256},
-        headers={
-            "Cache-Control": "no-store, private",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
 
 
 @router.get("/{report_id}/successor")

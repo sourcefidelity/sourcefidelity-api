@@ -11,7 +11,6 @@ from app.services.retrieval.openalex import OpenAlexRetriever
 from app.services.retrieval.provider_runtime import ProviderHealthStore, ProviderPolicy
 from app.services.retrieval.semantic_scholar import SemanticScholarRetriever
 from app.services.search.tavily import TavilySearch
-from app.services.search.brightdata import BrightDataSearch
 from app.services.search.brave import BraveSearch
 from app.config import settings
 
@@ -31,41 +30,6 @@ def test_tavily_quota_response_opens_run_level_circuit(monkeypatch) -> None:
     assert provider.search("second query") == []
     assert provider.last_status == "rate_limited"
     request.assert_called_once()
-
-
-def test_brightdata_unparsed_body_is_not_reported_as_completed_no_results(
-    monkeypatch,
-) -> None:
-    """A body without an organic block is a failure, not a certified empty.
-
-    The distinction decides whether the application may treat the answer as
-    evidence that a reference was not found anywhere.
-    """
-    response = _response(200)
-    response._content = json.dumps({"status": "blocked"}).encode()
-    monkeypatch.setattr(
-        "app.services.search.brightdata.httpx.post", Mock(return_value=response)
-    )
-    provider = BrightDataSearch("token", "zone")
-
-    assert provider.search("bounded query") == []
-    assert provider.last_status != "completed"
-    assert provider.last_reason_code == "brightdata_serp_v1_missing_organic"
-
-
-def test_brightdata_explicit_empty_organic_is_a_completed_search(
-    monkeypatch,
-) -> None:
-    response = _response(200)
-    response._content = json.dumps({"organic": []}).encode()
-    monkeypatch.setattr(
-        "app.services.search.brightdata.httpx.post", Mock(return_value=response)
-    )
-    provider = BrightDataSearch("token", "zone")
-
-    assert provider.search("bounded query") == []
-    assert provider.last_status == "completed"
-    assert provider.last_reason_code == "brightdata_serp_v1_empty"
 
 
 def test_search_failure_log_hashes_query_and_omits_request_url(
@@ -495,21 +459,21 @@ def test_provider_health_probe_lease_is_persistent_and_single_claim(tmp_path) ->
     first = ProviderHealthStore(str(path))
     second = ProviderHealthStore(str(path))
     policy = ProviderPolicy(cooldown_seconds=0, max_cooldown_seconds=0)
-    first.record_unavailable("searxng:google cse", policy, status="rate_limited")
+    first.record_unavailable("example:engine a", policy, status="rate_limited")
 
-    assert first.claim_recovery_probe("searxng:google cse", lease_seconds=60) is True
-    assert second.claim_recovery_probe("searxng:google cse", lease_seconds=60) is False
-    assert second.incident("searxng:google cse")["last_status"] == "rate_limited"
+    assert first.claim_recovery_probe("example:engine a", lease_seconds=60) is True
+    assert second.claim_recovery_probe("example:engine a", lease_seconds=60) is False
+    assert second.incident("example:engine a")["last_status"] == "rate_limited"
 
 
 def test_provider_success_reports_recovery_once_and_clears_incident(tmp_path) -> None:
     store = ProviderHealthStore(str(tmp_path / "health.json"))
     policy = ProviderPolicy(cooldown_seconds=0, max_cooldown_seconds=0)
-    store.record_timeout("searxng:google scholar", policy)
+    store.record_timeout("example:engine b", policy)
 
-    assert store.record_success("searxng:google scholar") is True
-    assert store.record_success("searxng:google scholar") is False
-    assert store.incident("searxng:google scholar") is None
+    assert store.record_success("example:engine b") is True
+    assert store.record_success("example:engine b") is False
+    assert store.incident("example:engine b") is None
 
 
 def test_core_opens_circuit_after_cumulative_intermittent_timeouts(

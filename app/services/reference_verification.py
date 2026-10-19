@@ -43,8 +43,8 @@ from app.services.source_type import is_bibliographically_searchable, normalize_
 # (native-script-route-v1) completed; a failed or unattempted route stays
 # neutral, and that route's searches neither complete nor fail the ordinary
 # required routes.
-POLICY = 'reference-verification-v3'
-POLICY_VERSIONS = ('reference-verification-v1', 'reference-verification-v2', POLICY)
+POLICY = 'reference-verification-v4'
+POLICY_VERSIONS = ('reference-verification-v1', 'reference-verification-v2', 'reference-verification-v3', POLICY)
 FINDING_TYPE = 'unverified_reference'
 LABEL = 'Cannot be verified'
 # Owner wording 2026-09-30.
@@ -293,56 +293,7 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
     return candidate.get('provider') == 'web_search' and _page_title_matches(expected, observed)
 
 
-# Structured title parameters: Crossref `query.title`, OpenAlex `title.search`
-# (as a parameter or inside `filter`).
-_TITLE_PARAMETERS = ('query.title', 'title.search')
-# A parameter or path that confines the search to one journal or source. A
-# title query inside one journal cannot show that the work is absent from the
-# index, so it never satisfies the title-led requirement by itself.
-_SCOPE_MARKERS = ('/journals/', 'issn:', 'container-title', 'primary_location.source', 'locations.source',
-                  'host_venue', 'source.id', 'journal')
-
-
-def _structured_query(text: str) -> dict | None:
-    """Parse a recorded structured request: JSON ``{path, params}`` or ``k=v&...``."""
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict):
-        params = parsed.get('params') if isinstance(parsed.get('params'), dict) else parsed
-        return {'path': str(parsed.get('path') or ''), 'params': {str(k): str(v) for k, v in params.items()}}
-    if '=' in text and not text.startswith(('title:', 'doi:', 'isbn:')):
-        from urllib.parse import parse_qsl, urlsplit
-        split = urlsplit(text)
-        return {'path': split.path, 'params': dict(parse_qsl(split.query or text))}
-    return None
-
-
-def _title_led(query: dict) -> bool:
-    """A query that searched the index by the cited title, not only an identifier.
-
-    The resolver records `title:<title> author:<author>`; journal discovery and
-    other structured requests record their parameters instead, so
-    `query.title` / `title.search` count too (reference-verification-v2). A
-    structured title query confined to one journal or source does not count.
-    """
-    text = str(query.get('normalized_query') or '')
-    # Google Books records its title search as `intitle:<title>`. Counted
-    # since 2026-09-30, together with the title-only fallback search and the
-    # tolerant book-title match that keep genuine books unflagged.
-    if text.startswith(('title:', 'intitle:')) or ' title:' in text or ' intitle:' in text:
-        return True
-    structured = _structured_query(text)
-    if structured is None:
-        return False
-    params = structured['params']
-    titled = any(key in params for key in _TITLE_PARAMETERS) or any(
-        f'{key}:' in params.get('filter', '') for key in _TITLE_PARAMETERS)
-    scoped = any(marker in structured['path'] for marker in _SCOPE_MARKERS) or any(
-        marker in f'{key}={value}' for key, value in params.items()
-        if key not in _TITLE_PARAMETERS for marker in _SCOPE_MARKERS)
-    return titled and not scoped
+from app.services.search_completion import _structured_query, _title_led  # noqa: E402,F401
 
 
 def assess_reference_verification(reference, discovery: dict | None, web_page_check: dict | None = None,
@@ -439,54 +390,22 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         result['reason_code'] = 'cross_script_page_unresolved'
         return result
 
-    queries = {q.get('query_id'): q for q in discovery.get('queries') or []}
-    title = text_key(expected.get('title') or getattr(reference, 'title', '') or '')
-    completed, failed, web, self_skipped = set(), set(), set(), set()
-    # The native-script route has its own completion record; its searches
-    # neither complete nor fail the ordinary required routes.
+    # One answer for every use (search-completion-v1, owner decisions 2026-10-19).
+    # The native-script route has its own completion; its searches neither
+    # complete nor fail the ordinary required routes.
+    from app.services.search_completion import assess_search_completion
     native_attempts = set((discovery.get('native_script_route') or {}).get('attempt_ids') or [])
-    for attempt in discovery.get('attempts') or []:
-        if attempt.get('attempt_id') in native_attempts:
-            continue
-        category, provider = attempt.get('route_category'), attempt.get('provider')
-        attempted = [queries[q] for q in attempt.get('query_ids') or [] if q in queries]
-        route_done = attempt.get('permitted') and attempt.get('completed_at') and attempt.get('outcome') in COMPLETED_ROUTE
-        if category == 'academic_adapter':
-            done = [q for q in attempted if q.get('execution_outcome') in COMPLETED_QUERY and _title_led(q)]
-            if route_done and done:
-                completed.add(provider)
-            elif (attempt.get('outcome') in {'operational_failure', 'unavailable', 'access_restricted'}
-                    and attempt.get('reason_code') != 'route_not_applicable'):   # declined, not failed
-                failed.add(provider)
-        elif category == 'bounded_web':
-            for q in attempted:
-                engine = q.get('execution_provider')
-                if engine not in WEB_PROVIDERS:
-                    continue
-                if (route_done and q.get('execution_outcome') in COMPLETED_QUERY
-                        and title and title in text_key(q.get('normalized_query'))):
-                    web.add(engine)
-                elif q.get('execution_outcome') not in COMPLETED_QUERY:
-                    failed.add(engine)
-                    if q.get('execution_outcome') in SELF_SKIPPED_QUERY:
-                        self_skipped.add(engine)
-    # A web page is held by web search, not by the scholarly indexes.
-    required = () if web_rule else required_adapters(kind)
-    missing = [p for p in required if p not in completed]
-    result.update(required_routes=list(required), completed_routes=sorted(completed & set(required)),
-                  web_routes=sorted(web))
-    if missing or not web:
-        result.update(status='search_incomplete',
-                      reason_code='required_route_incomplete' if missing else 'title_web_search_incomplete',
-                      incomplete_routes=missing + ([] if web else ['web search']),
-                      failed_routes=sorted(failed))
+    completion = assess_search_completion(
+        discovery, kind=kind, title=expected.get('title') or getattr(reference, 'title', '') or '',
+        web_rule=web_rule, exclude_attempt_ids=native_attempts)
+    result.update(required_routes=list(completion.required_routes),
+                  completed_routes=list(completion.completed_routes), web_routes=list(completion.web_routes))
+    if not completion.complete:
+        result.update(status='search_incomplete', reason_code=completion.reason_code,
+                      incomplete_routes=list(completion.incomplete_routes),
+                      failed_routes=list(completion.failed_routes))
         return result
-    budget_skipped = sorted(self_skipped - web)
-    if budget_skipped:
-        result.update(status='search_incomplete', reason_code='web_search_skipped_by_budget',
-                      incomplete_routes=[PROVIDER_NAMES[p] for p in budget_skipped],
-                      failed_routes=sorted(failed))
-        return result
+    required, web = completion.required_routes, set(completion.web_routes)
     doi_state = registered_unread_doi(reference, discovery, link_observations)
     if doi_state == 'agrees':
         result.update(status='possible_match', reason_code='registered_doi_agrees')

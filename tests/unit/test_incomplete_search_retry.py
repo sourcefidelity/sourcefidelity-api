@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import uuid
 
-import fitz
 import pytest
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
@@ -234,11 +233,10 @@ def test_no_search_again_button_is_offered():
     assert "search-again" not in _render_reference_window_template(entry, [], [{"members": members}])
 
 
-def test_exports_never_contain_the_button(export_store, monkeypatch):  # noqa: F811
+def test_exports_never_contain_the_button(export_store):  # noqa: F811
     import hashlib
     from app.services.interactive_report_export import build_interactive_report_html
-    from app.services.report_export import build_released_report_export
-    session, storage, report, _artifact, view, paper = export_store
+    _session, _storage, _report, _artifact, view, paper = export_store
     member = view["citations"][0]["members"][0]
     member.update(status="source_unavailable", coverage_level="unavailable",
                   reason_code="full_text_search_incomplete",
@@ -248,11 +246,6 @@ def test_exports_never_contain_the_button(export_store, monkeypatch):  # noqa: F
     portable["paper_surface"]["presentation_sha256"] = hashlib.sha256(paper).hexdigest()
     html = build_interactive_report_html(portable, paper).decode()
     assert "Search Again" not in html and "search-again\"" not in html
-    monkeypatch.setattr("app.services.report_export.project_reference_flags", lambda value, *a: value)
-    exported = build_released_report_export(session, storage, report_id=report.id,
-                                            scope_type="personal_owner", scope_id="owner-1")
-    with fitz.open(stream=exported.content, filetype="pdf") as document:
-        assert "Search Again" not in " ".join(page.get_text() for page in document)
 
 
 @pytest.fixture

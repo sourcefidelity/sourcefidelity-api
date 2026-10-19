@@ -12,10 +12,11 @@ import unicodedata
 from html import escape
 from urllib.parse import quote
 
+from app.services.search_completion import assess_record
 from app.services.search.policy import is_required_web_provider_set
 from app.services.reference_discovery import (
     ReferenceDiscoveryRecord, ReferenceDiscoveryTrace, assess_reference_discovery_trace,
-    _normalize_doi, _normalize_text, _value_hash, _search_is_incomplete,
+    _normalize_doi, _normalize_text, _value_hash,
     is_edition_sensitive_reference, build_reference_discovery_candidate,
 )
 from app.services.retrieval.base import RetrievalResult
@@ -301,9 +302,7 @@ is only a factual identifier error. Books/editions remain outside this rule.
                 and parsed.required_route_categories == record.required_route_categories)
     except (ValueError, TypeError):
         same, completion = False, None
-    if not same or not completion.ready or completion.record.outcome != record.outcome or _search_is_incomplete(
-            record.required_route_categories, record.attempts, record.queries, record.search_policy_version,
-            record.required_web_providers):
+    if not same or not completion.ready or completion.record.outcome != record.outcome or not assess_record(record, completed_negative=True).complete:
         result['reason_code'] = 'compound_discrepancy_search_incomplete'
         return result
     if any(not _bound_candidate(record, c) or any(
@@ -369,8 +368,7 @@ def assess_reference_credibility(reference, discovery=None, trace=None):
             or not is_required_web_provider_set(parsed.required_web_providers)
             or not {'academic_adapter','bounded_web'} <= set(record.required_route_categories)):
         return result
-    if _search_is_incomplete(record.required_route_categories, record.attempts, record.queries, record.search_policy_version,
-            record.required_web_providers):
+    if not assess_record(record, completed_negative=True).complete:
         result['cumulative_reason_code'] = 'required_identity_search_incomplete'
         return result
     # No guess about missing fields, access failures or source completeness.

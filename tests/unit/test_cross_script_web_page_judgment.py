@@ -33,8 +33,10 @@ def _judgment(**kwargs):
         expected_author="Writer, A.", expected_year="2020", **kwargs)
 
 
-def test_off_by_default(judge):
-    assert settings.CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED is False
+def test_on_by_default_and_off_when_switched_off(judge, monkeypatch):
+    from app.config import Settings
+    assert Settings.model_fields["CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED"].default is True
+    monkeypatch.setattr(settings, "CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED", False)
     assert _judgment() is None and judge == []
 
 

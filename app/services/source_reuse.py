@@ -200,8 +200,8 @@ def earlier_result(item: dict, reference: dict | None = None) -> Reuse:
     if _network_failed(discovery):
         return refuse("network_failed")
     if discovery.get("outcome") == "search_incomplete":
-        return (REUSE if _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
-                else refuse("search_incomplete"))
+        # An incomplete search is never reused (owner decision 2026-10-19).
+        return REUSE if _required_searches_completed(item, reference) else refuse("search_incomplete")
     return REUSE if discovery else refuse("no_search_record")
 
 
@@ -301,22 +301,6 @@ def _required_searches_completed(item: dict, reference: dict | None) -> bool:
         return False
     verdict = assess_reference_verification(parsed, item.get("reference_discovery"))
     return verdict.get("reason_code") in COMPLETED_WITHOUT_MATCH_REASONS
-
-
-def _no_provider_at_fault(discovery: dict) -> bool:
-    """Incomplete only for reasons a repeat would meet again: every required
-    provider answered, and the gaps are filtered index records, unresolved
-    web-search leads or pages that did not confirm the work (owner decision
-    2026-10-07; Franchise 2's 8 such references were searched again each run).
-    A provider whose failure holds the search incomplete still forces a new
-    search; so does a reference whose parse was incomplete."""
-    from app.services.paper_workflow import _blocking_providers_from_record
-    if (discovery.get("expected") or {}).get("reference_parse_review"):
-        return False
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    if not any(a.get("route_category") == "bounded_web" for a in attempts):
-        return False
-    return not _blocking_providers_from_record(discovery)
 
 
 def _web_search_answered(discovery: dict) -> bool:

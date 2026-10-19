@@ -75,7 +75,7 @@ Personal deployment works on its own but takes some setup, because the applicati
 
 - **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, ERIC, Europe PMC, Unpaywall, Elsevier (optional)
 - **Books, archives and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource, Wayback Machine (archived copies of cited web pages)
-- **Web search:** Brave Search and Exa, both used for every web search; Tavily or the included self-hosted SearXNG can be configured as an optional backup
+- **Web search:** Brave Search and Exa, both used for every web search; Tavily can be configured as an optional backup
 - **LLMs:** DeepSeek, GLM (Z.ai); other providers can be configured behind the same interface
 
 ---
@@ -84,7 +84,7 @@ Personal deployment works on its own but takes some setup, because the applicati
 
 - **Python 3.12**, FastAPI, Celery workers
 - **PostgreSQL** (jobs, reports, evidence packages), **Redis** (task broker), **Silo / S3-compatible storage** (papers and sources)
-- **ClamAV** (virus scanning), **SearXNG** (self-hosted metasearch, optional backup search)
+- **ClamAV** (virus scanning)
 - **Alembic** (database migrations)
 - **Docker Compose** (deployment)
 
@@ -104,7 +104,7 @@ cp .env.example .env
 
 In `.env`:
 
-- Set `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD` and `SEARXNG_SECRET`, and use the same database password in `DATABASE_URL`.
+- Set `POSTGRES_PASSWORD` and `MINIO_ROOT_PASSWORD`, and use the same database password in `DATABASE_URL`.
 - Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY`, `BRAVE_SEARCH_API_KEY` and `EXA_API_KEY` (web searches stay incomplete without both), and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `TAVILY_API_KEY` only if Tavily is configured as the backup search.
 - For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
 - For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
@@ -115,7 +115,7 @@ In `.env`:
 docker compose up -d --build
 ```
 
-This starts the API, the paper and judgment workers, the scheduler, PostgreSQL, Redis, Silo (object storage), ClamAV and SearXNG. ClamAV downloads its virus definitions on first start, which can take several minutes; the API waits for it.
+This starts the API, the paper and judgment workers, the scheduler, PostgreSQL, Redis, Silo (object storage) and ClamAV. ClamAV downloads its virus definitions on first start, which can take several minutes; the API waits for it.
 
 **3. Create the database tables** (first run, and after each update)
 

@@ -11,7 +11,6 @@ from app.services.evidence_report import project_reference_flags, _render_refere
 from tests.unit.test_report_layers import mismatch
 from app.services.report_member_navigation import marker_words, member_targets
 from app.services.parsers.apa_parser import ApaParser
-from app.services.report_export import _render_pdf
 from app.services.evidence_report import _render_how_to_read
 
 
@@ -99,11 +98,6 @@ def test_bibliography_outline_reuses_bound_advisory_and_exact_geometry():
             'page_href_template':'page-{page_index}.png'},[],reference_practice=[finding])
         assert 'reference-field-marker layer-mark mark-relevance' in html
         assert '<circle' not in html
-        output,_=_render_pdf(doc.tobytes(),citations=[],reference_practice=[finding],export_binding='synthetic')
-        with fitz.open(stream=output,filetype='pdf') as rendered:
-            assert any(d['fill'] and all(abs(a-b)<.002 for a,b in zip(d['fill'],(.937,.510,.729)))
-                       for d in rendered[0].get_drawings())
-            assert 'Potential Topical Mismatch' in ''.join(p.get_text() for p in rendered)
         broken = deepcopy(result)
         broken['citations'][0]['student_text'] += ' Changed.'
         assert not project_reference_flags(broken,doc,'hash')['reference_practice']

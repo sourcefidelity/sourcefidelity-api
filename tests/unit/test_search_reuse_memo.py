@@ -50,17 +50,16 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", False)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:40,exa:40,tavily:40")
     monkeypatch.setattr(settings, "SEARCH_REUSE_PAUSE_DAYS", 30)
     monkeypatch.setattr(settings, "DOI_RESOLVER_URL", None)
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng", "tavily")}
+                 for name in ("brave", "exa", "tavily")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name or "tavily"))
     return providers
 
 

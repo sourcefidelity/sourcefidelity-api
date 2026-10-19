@@ -150,17 +150,6 @@ def test_an_abstract_shows_each_translated_sentence_followed_by_its_translation(
     assert translated_text_html(abstract, {}) == abstract
 
 
-def test_the_pdf_export_shows_the_translation_in_brackets():
-    from app.services.report_export import _portable_member_html
-    item = {"text": HAN_1, "display_text": HAN_1, "evidence_kind": "passage", "locator": ""}
-    pdf_member = {"reference_id": "r1", "source": SOURCE, "coverage_level": "full_text",
-                  "best_evidence": item, "evidence_sentences": []}
-    calls = []
-    _, view = translate_report_view(view_of(pdf_member), completion=fake_completion(calls))
-    html = _portable_member_html(view["citations"][0]["members"][0])
-    assert f"{HAN_1} [{ENGLISH[HAN_1]}]" in html
-
-
 def test_the_judgment_result_delivers_translations_for_the_page_script():
     from app.services.judgment_report import judgment_result
     payload = {

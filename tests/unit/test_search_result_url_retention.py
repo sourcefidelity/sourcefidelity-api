@@ -33,14 +33,13 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", False)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", True)
     monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "tavily")
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:4,exa:4,tavily:4")
     monkeypatch.setattr(settings, "SEARCH_CANDIDATE_AUDIT_URLS", False)
     # The retired flag is ignored even when an old deployment still sets it.
     monkeypatch.setattr(settings, "DEVELOPMENT_RETAIN_DISCOVERY_LEAD_URLS", True)
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng", "tavily")}
+                 for name in ("brave", "exa", "tavily")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
@@ -49,7 +48,7 @@ def cascade(monkeypatch):
         SearchResult(TAVILY_URL, TAVILY_TITLE_URL, "snippet"),
     ]
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name or "tavily"))
     return WebSearchRetriever(health_store=Mock()), providers
 
 

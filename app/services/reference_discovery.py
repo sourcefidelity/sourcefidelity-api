@@ -23,7 +23,7 @@ from app.services.cross_language_identity import (
     latin_title_part_match,
 )
 from app.services.retrieval.base import OBSERVED_AUTHOR_LIMIT, RetrievalResult
-from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, REQUIRED_API_PROVIDERS, is_required_web_provider_set
+from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, is_required_web_provider_set, required_api_providers
 from app.services.search.transient import TransientSearchAudit
 from app.services.search.candidate_audit import SearchCandidateAudit
 from app.services.journal_discovery import JournalCheck
@@ -34,9 +34,7 @@ SearchPolicyVersion = Literal["configured-search-v1", "api-first-search-v2"]
 
 # These observations preserve a successful HTTP lookup without inventing an
 # empty registry or completed identity adjudication of discarded records.
-INCOMPLETE_METADATA_SEARCH_REASONS = frozenset({
-    'metadata_candidates_filtered', 'metadata_empty_response_unqualified',
-})
+from app.services.search_completion import UNCERTIFIED_METADATA_REASONS as INCOMPLETE_METADATA_SEARCH_REASONS  # noqa: E402
 
 
 ReferenceDiscoveryOutcome = Literal[
@@ -130,7 +128,11 @@ CandidateAcquisitionOutcome = Literal[
 ]
 
 
-_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "deepseek", "tavily", "searxng", "bright_data", "mojeek"})
+_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "deepseek", "tavily", "mojeek"})
+# Optional web fallbacks, whose unresolved candidates never hold a search
+# incomplete. "searxng" was removed 2026-10-19 and stays named so stored
+# traces that record it are assessed as before.
+_OPTIONAL_WEB_FALLBACK_PROVIDERS = frozenset({"tavily", "searxng"})
 
 
 class ExpectedBibliographicFields(BaseModel):
@@ -1572,7 +1574,7 @@ def _record_web_providers(required_web_providers) -> tuple[str, ...]:
     searched; the current setting only for a new search that names none."""
     if is_required_web_provider_set(required_web_providers):
         return tuple(required_web_providers)
-    return REQUIRED_API_PROVIDERS
+    return required_api_providers()
 
 
 def derive_reference_discovery_record(
@@ -1640,8 +1642,8 @@ def derive_reference_discovery_record(
             limitations.append(
                 "The reference could not be parsed completely; source identity remains unresolved."
             )
-        elif _search_is_incomplete(required_route_categories, attempts, queries, search_policy_version,
-                                   required_web_providers):
+        elif not _search_completion(required_route_categories, attempts, queries, search_policy_version,
+                                    required_web_providers, expected).complete:
             outcome = "search_incomplete"
             limitations.append(
                 "At least one required search route failed, was unavailable, or did not complete."
@@ -1653,7 +1655,7 @@ def derive_reference_discovery_record(
              or (c.acquisition_outcome == "metadata_only" and not any(
                  comparison.field_name in {"title", "doi"} and comparison.outcome == "material_conflict"
                  for comparison in c.comparisons)))
-            and c.discovery_provider not in {"searxng", "tavily"}
+            and c.discovery_provider not in _OPTIONAL_WEB_FALLBACK_PROVIDERS
             for c in candidates
         ):
             outcome = "search_incomplete"
@@ -1723,73 +1725,18 @@ def _validate_bindings(
         raise ValueError("Candidate provider does not match its route attempt")
 
 
-# Query outcomes a provider recovering could plausibly cure. Excluded:
-# `budget_skipped` (our elapsed budget, not the provider), `internal_error`
-# (our own code), `unknown`, and the metadata reasons in
-# INCOMPLETE_METADATA_SEARCH_REASONS (the provider answered; what it returned
-# was not accepted as a certified empty result).
-_PROVIDER_CURABLE_EXECUTION_OUTCOMES = frozenset({
-    "timeout", "captcha", "operational_failure", "access_restricted",
-    "rate_limited", "response_invalid", "cooldown_skipped",
-    "recovery_probe_in_progress",
-})
-
-
-def search_blocking_providers(
-    required: list[RouteCategory],
-    attempts: list[ReferenceRouteAttempt],
-    queries: list[ReferenceSearchQuery],
-    search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
-    required_web_providers: list[str] | None = None,
-) -> list[str]:
-    """Providers whose failure is what holds this search incomplete.
-
-    Mirrors the provider-attributable branches of `_search_is_incomplete`
-    directly below and must change with it: a required attempt that failed,
-    a required web API that never executed, and a required query that did
-    not complete. A provider named here is one whose recovery could let the
-    reference complete. Unresolved web leads and never-attempted categories
-    are not attributable to one provider and name none.
-
-    Until 2026-09-24 the recovery trigger listed every provider with any
-    incomplete query, required or not. All four re-run waves on 2026-09-23 --
-    192 reference re-runs -- were triggered by SearXNG, which cannot complete or
-    invalidate a search under `api-first-search-v2`, and they changed
-    potentially-fabricated-reference flags back and forth across report
-    versions without changing any completion gate.
-    """
-    api_first = search_policy_version == API_FIRST_SEARCH_POLICY
-    failure_outcomes = {"operational_failure", "access_restricted", "unavailable", "not_permitted"}
-    blocking = {
-        attempt.provider for attempt in attempts
-        if attempt.required and attempt.outcome in failure_outcomes
-        and not (api_first and attempt.route_category == "bounded_web")
-        # Our own budget ran out; the provider did nothing wrong.
-        and attempt.reason_code != "route_elapsed_budget_exhausted"
-    }
-    required_attempt_ids = {attempt.attempt_id for attempt in attempts if attempt.required}
-    required_query_ids = {
-        query_id for attempt in attempts
-        if attempt.attempt_id in required_attempt_ids
-        for query_id in attempt.query_ids
-    }
-    if api_first:
-        web_queries = [q for q in queries
-                       if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        providers = _record_web_providers(required_web_providers)
-        blocking |= set(providers) - {q.execution_provider for q in web_queries}
-        required_query_ids -= {q.query_id for q in web_queries
-                               if q.execution_provider not in providers}
-    blocking |= {
-        query.execution_provider for query in queries
-        if query.query_id in required_query_ids and query.execution_provider
-        and query.execution_outcome in _PROVIDER_CURABLE_EXECUTION_OUTCOMES
-    }
-    return sorted(str(p).strip().casefold() for p in blocking if p)
+def _search_completion(required, attempts, queries, search_policy_version, required_web_providers, expected):
+    """The one completion rule (`search_completion.assess_record`) over a record's parts."""
+    from app.services.search_completion import assess_record
+    return assess_record(completed_negative=True, record={
+        "expected": expected, "required_route_categories": list(required), "attempts": attempts,
+        "queries": queries, "search_policy_version": search_policy_version,
+        "required_web_providers": list(_record_web_providers(required_web_providers))
+        if search_policy_version == API_FIRST_SEARCH_POLICY else list(required_web_providers or [])})
 
 
 # A required full-text search query that did not run to an answer. Unlike
-# `_PROVIDER_CURABLE_EXECUTION_OUTCOMES`, `budget_skipped` counts: a call
+# `search_completion.PROVIDER_CURABLE`, `budget_skipped` counts: a call
 # ceiling or elapsed budget left the search unfinished even though the
 # provider did nothing wrong, and "full text was not retrieved" must not read
 # as a completed search.
@@ -1829,7 +1776,7 @@ def full_text_search_incompleteness(discovery: dict | None) -> dict | None:
         return None
     api_first = discovery.get("search_policy_version") == API_FIRST_SEARCH_POLICY
     required_providers = [str(p).casefold() for p in (
-        discovery.get("required_web_providers") or REQUIRED_API_PROVIDERS)] if api_first else []
+        discovery.get("required_web_providers") or required_api_providers())] if api_first else []
     web_queries = [queries[qid] for attempt in web_attempts
                    for qid in attempt.get("query_ids") or [] if qid in queries]
     incomplete: set[str] = set()
@@ -1853,69 +1800,3 @@ def full_text_search_incompleteness(discovery: dict | None) -> dict | None:
     if incomplete or route_failed:
         return {"providers": sorted(incomplete)}
     return None
-
-
-def _search_is_incomplete(
-    required: list[RouteCategory],
-    attempts: list[ReferenceRouteAttempt],
-    queries: list[ReferenceSearchQuery],
-    search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
-    required_web_providers: list[str] | None = None,
-) -> bool:
-    api_first = search_policy_version == API_FIRST_SEARCH_POLICY
-    if any(a.unresolved or a.not_attempted or a.identity_established
-           for attempt in attempts for a in attempt.transient_search_audits):
-        # Affirmative independently bound candidates are selected before this
-        # negative gate. A count alone cannot establish or rule out identity.
-        return True
-    completed = {attempt.route_category for attempt in attempts if attempt.required}
-    if set(required) - completed:
-        return True
-    failure_outcomes = {
-        "operational_failure",
-        "access_restricted",
-        "unavailable",
-        "not_permitted",
-    }
-    if any(
-        attempt.required and attempt.outcome in failure_outcomes
-        and not (api_first and attempt.route_category == "bounded_web")
-        for attempt in attempts
-    ):
-        return True
-    incomplete_execution_outcomes = {
-        "timeout",
-        "captcha",
-        "operational_failure",
-        "access_restricted",
-        "rate_limited",
-        "response_invalid",
-        "budget_skipped",
-        "cooldown_skipped",
-        "recovery_probe_in_progress",
-        "internal_error",
-        "unknown",
-    }
-    required_attempt_ids = {
-        attempt.attempt_id for attempt in attempts if attempt.required
-    }
-    required_query_ids = {
-        query_id
-        for attempt in attempts
-        if attempt.attempt_id in required_attempt_ids
-        for query_id in attempt.query_ids
-    }
-    if api_first:
-        web_queries = [q for q in queries if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        providers = _record_web_providers(required_web_providers)
-        if set(providers) - {q.execution_provider for q in web_queries}:
-            return True
-        # Optional SearXNG/Tavily cannot satisfy or invalidate required APIs.
-        required_query_ids -= {q.query_id for q in web_queries if q.execution_provider not in providers}
-    return any(
-        query.query_id in required_query_ids
-        and query.execution_provider is not None
-        and (query.execution_outcome in incomplete_execution_outcomes
-             or query.reason_code in INCOMPLETE_METADATA_SEARCH_REASONS)
-        for query in queries
-    )

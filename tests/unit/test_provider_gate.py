@@ -162,7 +162,6 @@ def retriever(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", True)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:4,exa:4")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None) for name in ("brave", "exa")}
     for name, provider in providers.items():

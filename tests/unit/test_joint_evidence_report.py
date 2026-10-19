@@ -7,7 +7,6 @@ import pytest
 from app.services.evidence_report import (
     _joint_report_selection, _member_evidence_contexts, _render_member,
 )
-from app.services.report_export import _portable_member_html
 
 
 def inputs():
@@ -84,12 +83,8 @@ def test_conditional_short_extracts_one_heading_and_bounded_context(count):
     before = deepcopy(value)
     html = _render_member(value)
     # The window shows only GLM-selected sentences now (owner decision
-    # 2026-09-28); the relevance gate's extracts remain in the PDF.
+    # 2026-09-28).
     assert '<blockquote' not in html and 'Additional Evidence and Context' not in html
-    pdf_html = _portable_member_html(value)
-    assert pdf_html.count('<blockquote') == 2 * count
-    assert pdf_html.count('Additional Evidence and Context') == 1
-    assert 'Full context for the selected excerpt' not in pdf_html
     assert value == before
 
 
@@ -97,7 +92,6 @@ def test_no_joint_receipt_keeps_one_historical_primary():
     value = member(3)
     value.pop('display_selection')
     assert '<blockquote' not in _render_member(value)
-    assert _portable_member_html(value).count('<blockquote') == 4
 
 
 def test_context_omits_equal_shorter_or_repeated_text_and_caps_three():
@@ -109,7 +103,6 @@ def test_context_omits_equal_shorter_or_repeated_text_and_caps_three():
     assert len(_member_evidence_contexts(value)) == 1
     value['evidence_extracts'][2]['display_text'] = '<script>unsafe</script>'
     assert '<script>unsafe' not in _render_member(value)
-    assert '&lt;script&gt;unsafe' in _portable_member_html(value)
 
 
 def test_real_payload_validator_roundtrip_and_moved_receipt_rejection(monkeypatch):

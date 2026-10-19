@@ -17,7 +17,6 @@ link irrevocably before acquisition.
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
 from datetime import datetime, timezone
 from functools import wraps
 import logging
@@ -49,7 +48,7 @@ from app.services.retrieval.provider_gate import ProviderBusy
 from app.services.safe_fetch import safe_fetch_bytes
 from app.services.search.base import SearchProvider
 from app.services.search.base import classify_search_failure
-from app.services.search.policy import API_FIRST_SEARCH_POLICY, REQUIRED_API_PROVIDERS
+from app.services.search.policy import API_FIRST_SEARCH_POLICY, required_api_providers
 from app.services.search.transient import BRAVE_TRANSIENT_POLICY
 from app.services.candidate_budget import inspection_capacity
 from app.services.search.candidate_ranking import candidate_score, POLICY as RANKING_POLICY, PURPOSE
@@ -86,18 +85,16 @@ def _query_inspection_capacity(query, provider=None):
             capacity = min(capacity, html_slots - 1)
     return capacity
 
-# Direct (non-SearXNG) providers whose cooldown, incident and recovery-probe
-# state this retriever manages itself. Brave and Exa are not here: the
-# API-first policy governs them. Bright Data is selected as a configured
-# provider on this direct path, so nothing else would manage it -- and a full
-# paper measured on 2026-09-23 met four rate limits it then kept calling
-# through. Its own bounded retry handles a single transient fault; this
-# handles the account-level limit that retrying cannot clear.
-_HEALTH_MANAGED_DIRECT_PROVIDERS: frozenset[str] = frozenset({"brightdata"})
+# Direct providers (selected on the configured path) whose cooldown,
+# incident and recovery-probe state this retriever manages itself. Brave and
+# Exa are not here: the API-first policy governs them. Empty since the only
+# member was removed (2026-10-19); the mechanism stays for a provider that
+# meets account-level limits its own bounded retry cannot clear.
+_HEALTH_MANAGED_DIRECT_PROVIDERS: frozenset[str] = frozenset()
 
 # Outcomes of a real Brave or Exa request that mean the provider itself
 # failed. Kept aligned with the curable outcomes in
-# `reference_discovery.search_blocking_providers`: an incident is opened
+# `search_completion` blocking providers: an incident is opened
 # exactly when the failure could be what holds a search incomplete.
 _REQUIRED_API_INCIDENT_OUTCOMES = frozenset({
     "operational_failure", "timeout", "rate_limited", "response_invalid",
@@ -132,7 +129,7 @@ _REQUIRED_API_HEALTH_POLICY = ProviderPolicy(
     max_cooldown_seconds=3600,
 )
 
-_SEARXNG_DEFAULT_POLICY = ProviderPolicy(
+_DIRECT_PROVIDER_DEFAULT_POLICY = ProviderPolicy(
     timeout_seconds=15.0,
     cooldown_seconds=180,
     max_cooldown_seconds=3600,
@@ -165,29 +162,6 @@ def reference_search_scoped(function):
     return scoped
 
 
-def _searx_rate_limit_policy(policy: ProviderPolicy) -> ProviderPolicy:
-    """A shorter first cooldown for a rate limit; growth stays the store's.
-
-    Until 2026-09-29 one "too many requests" answer suspended the engine for
-    the rest of the paper: 29 later searches in one run were recorded as
-    `cooldown_skipped` after a single rate limit. A rate limit usually clears
-    within seconds, so the first one now pauses the engine for
-    `SEARXNG_RATE_LIMIT_COOLDOWN_SECONDS` (default 30s). The health store
-    multiplies the cooldown by four for each further consecutive failure
-    (30s, 2m, 8m, 32m, capped by `max_cooldown_seconds`) and a success resets
-    it, so only a repeatedly rate-limited engine is paused for long.
-    """
-    initial = max(0, settings.SEARXNG_RATE_LIMIT_COOLDOWN_SECONDS)
-    return replace(policy, cooldown_seconds=min(initial, policy.cooldown_seconds,
-                                                policy.max_cooldown_seconds))
-
-
-def _rate_limit_incident(store: ProviderHealthStore, provider_key: str) -> bool:
-    """An open incident caused by a rate limit is a pause, not a run-long stop."""
-    incident = store.incident(provider_key)
-    return isinstance(incident, dict) and incident.get("last_status") == "rate_limited"
-
-
 def _provider_search_outcome(provider: object, results: list) -> str:
     if results:
         return "results"
@@ -204,14 +178,25 @@ def _provider_search_outcome(provider: object, results: list) -> str:
     return "no_results"
 
 
+def _limits_over_defaults(name: str) -> dict[str, int]:
+    """A `provider:count` setting over its code default, provider by provider
+    (owner decision 2026-10-19): a provider the configured value does not name
+    keeps its default rather than getting no calls. Only an explicit 0 turns a
+    provider off."""
+    from app.config import Settings
+    default = Settings.model_fields[name].default or ""
+    return {**WebSearchRetriever._parse_escalation_limits(default),
+            **WebSearchRetriever._parse_escalation_limits(getattr(settings, name) or "")}
+
+
 class WebSearchRetriever(RetrievalSource):
     """Find ranked public-web locations after structured retrieval fails.
 
     Uses exact identifiers and bibliographic queries, then adds a PDF-specific
     query only when the earlier results do not yield enough distinct locations.
 
-    API-first runs Brave then Exa, followed by optional SearXNG. The legacy
-    configured cascade remains explicitly selectable, including Tavily.
+    API-first runs the required API providers, followed by optional Tavily.
+    The legacy configured cascade remains explicitly selectable.
     Escalation follows empty searches or rejection of a nonempty candidate tier.
     Exact queries are cached for this retriever so repeated canonical works do not
     consume another external search. Unofficial HTML scrapers are never added
@@ -228,9 +213,6 @@ class WebSearchRetriever(RetrievalSource):
         self,
         search_provider: Optional[SearchProvider] = None,
         *,
-        searx_engine_groups: tuple[str, ...] | None = None,
-        searx_timeout_retries: int | None = None,
-        searx_timeout_circuit_threshold: int | None = None,
         health_store: ProviderHealthStore | None = None,
         on_provider_recovered: Callable[[str], None] | None = None,
     ):
@@ -238,11 +220,9 @@ class WebSearchRetriever(RetrievalSource):
         self._policy_providers = {}
         self._policy_query_cache = {}
         if self.policy_version == API_FIRST_SEARCH_POLICY and search_provider is None:
-            names = [*REQUIRED_API_PROVIDERS]
-            fallback = getattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "searxng")
-            if fallback == "searxng" and settings.SEARCH_SEARXNG_FALLBACK_ENABLED:
-                names.append("searxng")
-            elif fallback == "tavily":
+            names = [*required_api_providers()]
+            fallback = getattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "none")
+            if fallback == "tavily":
                 names.append("tavily")
             self._policy_providers = {name: get_search_provider(name) for name in names}
         self._search = search_provider or (self._policy_providers.get("brave") if self._policy_providers else get_search_provider())
@@ -256,38 +236,18 @@ class WebSearchRetriever(RetrievalSource):
                 self._escalation.append(provider)
         self._query_cache: dict[str, list] = {}
         self._query_attempts: dict[str, list[dict]] = {}
-        self._suspended_searx_groups: set[str] = set()
         self._suspended_search_providers: set[str] = set()
-        self._searx_timeout_failures: Counter[str] = Counter()
         self._provider_timeout_failures: Counter[str] = Counter()
         self._health_store = health_store or ProviderHealthStore()
-        self._searx_policy = provider_policy("searxng", _SEARXNG_DEFAULT_POLICY)
         self.recovered_provider_keys: set[str] = set()
         self._recovery_notifications: set[str] = set()
         self._on_provider_recovered = (
             on_provider_recovered or _schedule_provider_recovery
         )
-        self._searx_engine_groups = searx_engine_groups
-        self._searx_timeout_retries = (
-            settings.SEARXNG_TIMEOUT_RETRIES
-            if searx_timeout_retries is None
-            else max(0, searx_timeout_retries)
-        )
-        self._searx_timeout_circuit_threshold = (
-            settings.SEARXNG_TIMEOUT_CIRCUIT_THRESHOLD
-            if searx_timeout_circuit_threshold is None
-            else max(1, searx_timeout_circuit_threshold)
-        )
         self.search_metrics: Counter[str] = Counter()
-        self._escalation_limits = self._parse_escalation_limits(
-            settings.SEARCH_ESCALATION_MAX_CALLS
-        )
-        self._hard_call_limits = self._parse_escalation_limits(
-            settings.WEB_SEARCH_HARD_MAX_CALLS
-        )
-        self._per_reference_floor = self._parse_escalation_limits(
-            settings.WEB_SEARCH_PER_REFERENCE_FLOOR
-        )
+        self._escalation_limits = _limits_over_defaults("SEARCH_ESCALATION_MAX_CALLS")
+        self._hard_call_limits = _limits_over_defaults("WEB_SEARCH_HARD_MAX_CALLS")
+        self._per_reference_floor = _limits_over_defaults("WEB_SEARCH_PER_REFERENCE_FLOOR")
         if not self._search:
             logger.info("WebSearchRetriever: no primary search provider configured")
 
@@ -370,14 +330,14 @@ class WebSearchRetriever(RetrievalSource):
             # which named Brave or Exa as the cause and so as a re-run trigger.
             # `budget_skipped` keeps the search incomplete without blaming them.
             return [], [{"provider": name, "query": query, "outcome": "budget_skipped",
-                         "required": name in REQUIRED_API_PROVIDERS, "provider_calls": 0,
+                         "required": name in required_api_providers(), "provider_calls": 0,
                          "result_count": 0, "latency_seconds": 0.0, "cost_usd": None,
                          "reason_code": "reference_elapsed_budget_timeout"}]
         num_results = min(inspection_capacity(_MAX_DOWNLOAD_ATTEMPTS),
                           _MAX_DOWNLOAD_ATTEMPTS if num_results is None else num_results)
         if num_results <= 0:
             return [], [{"provider": name, "query": query, "outcome": "budget_skipped",
-                         "required": name in REQUIRED_API_PROVIDERS, "provider_calls": 0,
+                         "required": name in required_api_providers(), "provider_calls": 0,
                          "result_count": 0, "latency_seconds": 0.0, "cost_usd": None,
                          "reason_code": "candidate_inspection_capacity_exhausted"}]
         key = (name, query, num_results)
@@ -396,26 +356,13 @@ class WebSearchRetriever(RetrievalSource):
             outcome, reason = "access_restricted", "search_retention_permission_unconfirmed"
         elif provider is None:
             outcome, reason = "operational_failure", "provider_not_configured"
-        elif name != "searxng" and not self._reserve_policy_call(name):
+        elif not self._reserve_policy_call(name):
             outcome, reason = "budget_skipped", "configured_call_ceiling"
             self.search_metrics[f"budget_skips:{name}"] += 1
-        elif name != "searxng" and (daily := self._reserve_daily_call(name))[0]:
+        elif (daily := self._reserve_daily_call(name))[0]:
             self._release_policy_call(name)
             outcome, reason = "budget_skipped", daily[0]
             self.search_metrics[f"budget_skips:{name}"] += 1
-        elif name == "searxng":
-            # Reuse the existing per-engine health, pacing and recovery path.
-            # Isolate its query cache from API results; never clear health.
-            original = self._search, self._escalation, self._query_cache, self._query_attempts
-            self._search, self._escalation, self._query_cache, self._query_attempts = provider, [], {}, {}
-            try:
-                results = self._run_search(query)
-                attempts = self._query_attempts.get(query, [])
-            finally:
-                self._search, self._escalation, self._query_cache, self._query_attempts = original
-            attempts = [{**a, "required": False} for a in attempts]
-            self._policy_query_cache[key] = results, attempts
-            return results, attempts
         else:
             from app.services.retrieval import provider_gate
             calls = 1
@@ -448,7 +395,7 @@ class WebSearchRetriever(RetrievalSource):
         if calls:
             self._track_required_api_health(name, outcome)
         attempt = {"provider": name, "query": query, "outcome": outcome,
-                   "result_count": len(results), "required": name in REQUIRED_API_PROVIDERS,
+                   "result_count": len(results), "required": name in required_api_providers(),
                    "provider_calls": calls, "latency_seconds": elapsed,
                    "cost_usd": getattr(provider, "last_cost_usd", None) if calls else None,
                    "credits_remaining": None, "reason_code": reason}
@@ -521,7 +468,7 @@ class WebSearchRetriever(RetrievalSource):
         ceiling = self._escalation_limits.get(name, 0)
         if calls < ceiling:
             return True
-        if name not in REQUIRED_API_PROVIDERS or ceiling <= 0:
+        if name not in required_api_providers() or ceiling <= 0:
             # A provider the operator gave no ceiling stays off.
             return False
         hard_cap = max(ceiling, getattr(self, "_hard_call_limits", {}).get(name, 0))
@@ -879,193 +826,23 @@ class WebSearchRetriever(RetrievalSource):
                 return str(attempt.get("provider") or "unknown").lower()
         return "unknown"
 
-    def _result_engine_group_for_query(self, query: str) -> str | None:
-        """Return the exact SearXNG engine group that supplied retained results."""
-        attempts = getattr(self, "_query_attempts", {}).get(query, [])
-        for attempt in reversed(attempts):
-            if attempt.get("outcome") != "results":
-                continue
-            if str(attempt.get("provider") or "").lower() != "searxng":
-                return None
-            value = str(attempt.get("engines") or "").strip()
-            return value or None
-        return None
-
     def _run_search(self, query: str) -> list:
         """Run a cached primary search, then bounded configured escalation.
 
         OpenAlex already incorporates Unpaywall OA locations, including arXiv
         preprints linked to works. Crossref and CORE also run as direct
-        retrieval adapters. SearXNG therefore does not repeat those academic
-        APIs; it is an opportunistic public-web fallback only.
+        retrieval adapters. The configured web provider therefore does not
+        repeat those academic APIs; it is an opportunistic public-web fallback.
         """
         if query in self._query_cache:
             self.search_metrics["query_cache_hits"] += 1
             return self._query_cache[query]
 
-        from app.services.search.searxng import SearXNGSearch
-
         query_attempts: list[dict] = []
         if not hasattr(self, "_query_attempts"):
             self._query_attempts = {}
 
-        if isinstance(self._search, SearXNGSearch):
-            # Upstream engines can fail independently of the self-hosted
-            # SearXNG service. A failed group is suspended for the rest of the
-            # run to avoid repeated CAPTCHA, access-denial and timeout traffic.
-            # The ordered groups are deployment-configurable because upstream
-            # reachability differs by region.
-            results: list = []
-            configured_groups = getattr(self, "_searx_engine_groups", None)
-            engine_groups = list(configured_groups or ()) or [
-                item.strip()
-                for item in settings.SEARXNG_ENGINE_GROUPS.split(";")
-                if item.strip()
-            ]
-            for engines in engine_groups:
-                if engines in self._suspended_searx_groups:
-                    query_attempts.append(
-                        {
-                            "provider": "searxng",
-                            "engines": engines,
-                            "query": query,
-                            "outcome": "cooldown_skipped",
-                            "result_count": 0,
-                        }
-                    )
-                    continue
-                provider_key = _searx_provider_key(engines)
-                cooldown_remaining = self._health_store.cooldown_remaining(provider_key)
-                if cooldown_remaining > 0:
-                    self.search_metrics[f"cooldown_skips:{provider_key}"] += 1
-                    if not _rate_limit_incident(self._health_store, provider_key):
-                        # A rate-limit pause is rechecked on the next query;
-                        # other hard failures stop the engine for this run.
-                        self._suspended_searx_groups.add(engines)
-                    query_attempts.append(
-                        {
-                            "provider": "searxng",
-                            "engines": engines,
-                            "query": query,
-                            "outcome": "cooldown_skipped",
-                            "result_count": 0,
-                            "cooldown_remaining_seconds": round(cooldown_remaining),
-                        }
-                    )
-                    continue
-                if (
-                    self._health_store.incident(provider_key) is not None
-                    and not self._health_store.claim_recovery_probe(provider_key)
-                ):
-                    self.search_metrics[f"probe_lease_skips:{provider_key}"] += 1
-                    if not _rate_limit_incident(self._health_store, provider_key):
-                        self._suspended_searx_groups.add(engines)
-                    query_attempts.append(
-                        {
-                            "provider": "searxng",
-                            "engines": engines,
-                            "query": query,
-                            "outcome": "recovery_probe_in_progress",
-                            "result_count": 0,
-                        }
-                    )
-                    continue
-                timeout_retries = getattr(self, "_searx_timeout_retries", 0)
-                for attempt_number in range(1, timeout_retries + 2):
-                    self.search_metrics[f"provider_calls:searxng:{engines}"] += 1
-                    from app.services.processing_metrics import record_search_usage
-                    record_search_usage('searxng', 1, 0.)
-                    search_started = time.monotonic()
-                    results = self._search.search(
-                        query,
-                        num_results=10,
-                        engines=engines,
-                    )
-                    outcome = _provider_search_outcome(self._search, results)
-                    failures = list(
-                        getattr(self._search, "last_failure_reasons", []) or []
-                    )
-                    query_attempts.append(
-                        {
-                            "provider": "searxng",
-                            "engines": engines,
-                            "query": query,
-                            "page_number": 1,
-                            "attempt_number": attempt_number,
-                            "provider_calls": 1,
-                            "latency_seconds": time.monotonic() - search_started,
-                            "outcome": outcome,
-                            "result_count": len(results),
-                            "failure_reasons": failures,
-                            "unresponsive_engines": [
-                                item[0]
-                                for item in self._search.last_unresponsive_engines
-                            ],
-                        }
-                    )
-                    if results:
-                        self._searx_timeout_failures[engines] = 0
-                        if self._health_store.record_success(provider_key):
-                            self.recovered_provider_keys.add(provider_key)
-                            self.search_metrics[f"recoveries:{provider_key}"] += 1
-                            self._notify_recovery("searxng")
-                        self._query_attempts[query] = query_attempts
-                        self._query_cache[query] = results
-                        return results
-
-                    failure_categories = {
-                        str(item.get("category") or "") for item in failures
-                    }
-                    hard_failure = bool(
-                        failure_categories
-                        & {"captcha", "access_restricted", "rate_limited"}
-                    )
-                    if hard_failure:
-                        hard_status = next(
-                            category
-                            for category in (
-                                "captcha",
-                                "rate_limited",
-                                "access_restricted",
-                            )
-                            if category in failure_categories
-                        )
-                        rate_limited_only = hard_status == "rate_limited"
-                        if not rate_limited_only:
-                            # CAPTCHA and access denial do not clear in
-                            # seconds; keep them off for the rest of the run.
-                            self._suspended_searx_groups.add(engines)
-                        cooldown = self._health_store.record_unavailable(
-                            provider_key,
-                            _searx_rate_limit_policy(self._searx_policy)
-                            if rate_limited_only else self._searx_policy,
-                            status=hard_status,
-                        )
-                        self.search_metrics[f"cooldown_seconds:{provider_key}"] = cooldown
-                        break
-                    if outcome != "timeout":
-                        if outcome == "no_results" and self._health_store.record_success(
-                            provider_key
-                        ):
-                            self.recovered_provider_keys.add(provider_key)
-                            self.search_metrics[f"recoveries:{provider_key}"] += 1
-                            self._notify_recovery("searxng")
-                        break
-                    if attempt_number <= timeout_retries:
-                        self.search_metrics[f"timeout_retries:searxng:{engines}"] += 1
-                        continue
-                    self._searx_timeout_failures[engines] += 1
-                    threshold = getattr(
-                        self, "_searx_timeout_circuit_threshold", 1
-                    )
-                    if self._searx_timeout_failures[engines] >= threshold:
-                        self._suspended_searx_groups.add(engines)
-                        cooldown = self._health_store.record_timeout(
-                            provider_key, self._searx_policy
-                        )
-                        self.search_metrics[f"cooldown_seconds:{provider_key}"] = cooldown
-                    break
-        elif self._search:
+        if self._search:
             provider_name = str(self._search.name).strip().casefold()
             health_managed = provider_name in _HEALTH_MANAGED_DIRECT_PROVIDERS
             if health_managed and provider_name in self._suspended_search_providers:
@@ -1104,7 +881,7 @@ class WebSearchRetriever(RetrievalSource):
                         self._suspended_search_providers.add(provider_name)
                         cooldown = self._health_store.record_unavailable(
                             provider_name,
-                            provider_policy(provider_name, _SEARXNG_DEFAULT_POLICY),
+                            provider_policy(provider_name, _DIRECT_PROVIDER_DEFAULT_POLICY),
                             status=outcome,
                         )
                         self.search_metrics[f"cooldown_seconds:{provider_name}"] = cooldown
@@ -1114,7 +891,7 @@ class WebSearchRetriever(RetrievalSource):
                             self._suspended_search_providers.add(provider_name)
                             cooldown = self._health_store.record_timeout(
                                 provider_name,
-                                provider_policy(provider_name, _SEARXNG_DEFAULT_POLICY),
+                                provider_policy(provider_name, _DIRECT_PROVIDER_DEFAULT_POLICY),
                             )
                             self.search_metrics[
                                 f"cooldown_seconds:{provider_name}"
@@ -1176,8 +953,7 @@ class WebSearchRetriever(RetrievalSource):
 
         Until 2026-09-24 the required web APIs had no health record at all, so
         a reference held incomplete by a Brave or Exa outage could never be
-        re-run automatically: only SearXNG and Bright Data could report a
-        recovery. This is **passive** -- it observes calls a paper was making
+        re-run automatically. This is **passive** -- it observes calls a paper was making
         anyway and adds no request of its own, so it costs nothing. An active
         probe would detect recovery sooner but spends paid API calls on a
         schedule, and is not authorised.
@@ -1187,7 +963,7 @@ class WebSearchRetriever(RetrievalSource):
         real request (`calls == 1`), so our own ceilings, retention
         permission, missing configuration and elapsed budget never open one.
         """
-        if name not in REQUIRED_API_PROVIDERS:
+        if name not in required_api_providers():
             return
         if outcome in _REQUIRED_API_INCIDENT_OUTCOMES:
             self._health_store.record_unavailable(
@@ -1269,7 +1045,7 @@ def _significant_tokens(value: str) -> list[str]:
 
 
 # Engines whose query language supports `filetype:pdf`.
-_FILETYPE_OPERATOR_PROVIDERS = frozenset({"brave", "searxng"})
+_FILETYPE_OPERATOR_PROVIDERS = frozenset({"brave"})
 
 
 def _exact_bibliographic_query(
@@ -1304,13 +1080,6 @@ def _search_author_hint(author: str | None) -> str:
     if len(first_author) > _MAX_SEARCH_AUTHOR_CHARS:
         first_author = first_author[:_MAX_SEARCH_AUTHOR_CHARS].rsplit(" ", 1)[0]
     return first_author.strip()
-
-
-def _searx_provider_key(engines: str) -> str:
-    normalized = ",".join(
-        item.strip().casefold() for item in engines.split(",") if item.strip()
-    )
-    return f"searxng:{normalized or 'default'}"
 
 
 def _schedule_provider_recovery(provider: str) -> None:

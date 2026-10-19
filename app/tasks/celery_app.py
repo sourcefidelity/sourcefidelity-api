@@ -76,10 +76,6 @@ celery_app.conf.update(
             "task": "cleanup_stale_paper_job_inputs",
             "schedule": max(60, settings.PAPER_UPLOAD_CLEANUP_INTERVAL_SECONDS),
         },
-        "probe-retrieval-provider-recovery": {
-            "task": "probe_retrieval_provider_recovery",
-            "schedule": max(60, settings.PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS),
-        },
         "retry-incomplete-searches": {
             "task": "retry_incomplete_searches",
             "schedule": max(60, settings.INCOMPLETE_SEARCH_RETRY_SCAN_SECONDS),

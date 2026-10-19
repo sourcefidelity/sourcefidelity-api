@@ -2042,7 +2042,7 @@ _SEARCH_NAMES = {
 }
 
 
-def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
+def _render_technical_details(metrics: dict) -> str:
     """Operational record for one run of the report: runtime, requests, tokens and cost.
 
     Figures cover a single run (owner request 2026-09-28): the first complete
@@ -2117,10 +2117,8 @@ def _render_technical_details(metrics: dict, manifest_href: str = '') -> str:
     total = usd(metrics.get('estimated_cost_usd'))
     sections.append('<section><h2>Estimated Cost (Before Credits)</h2>'
                     f'<p><strong>{total or "not recorded"}</strong></p></section>')
-    link = (f'<p class="verification-record"><a href="{escape(manifest_href.split("?")[0], quote=True)}">'
-            'Download Verification Record (JSON)</a></p>' if manifest_href else '')
     return ('<details class="technical-details"><summary><strong>Technical Details</strong></summary>'
-            f'<div class="tech-grid">{"".join(sections)}</div>{link}</details>')
+            f'<div class="tech-grid">{"".join(sections)}</div></details>')
 
 
 def _render_report_gauges(gauges: list[dict]) -> str:
@@ -2382,8 +2380,7 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     if (view.get('assessment_configuration') or {}).get('require_reference_links'):
         summaries += '<p class="assessment-requirement">Assessment requirement: every reference must contain a DOI, URL, or library link. Link presence is checked separately from validity or access.</p>'
     # Shown to everyone for now; the PDF carries none (ARCHITECTURE §8).
-    how_to_read = _render_how_to_read(view) + _render_technical_details(
-        view.get('processing_metrics') or {}, str((view.get('export_action') or {}).get('manifest_href') or ''))
+    how_to_read = _render_how_to_read(view) + _render_technical_details(view.get('processing_metrics') or {})
     gauges = ''  # Retain diagnostic counts in the snapshot, not the user report.
     export_action = view.get("export_action") or {}
     if export_mode not in {"interactive", "released_print"}:
@@ -2392,7 +2389,6 @@ def render_evidence_report_html(view: dict, *, csp_nonce: str) -> str:
     if export_action:
         export_links = (
             f'<a href="{escape(str(export_action.get("report_href") or "#").split("?")[0], quote=True)}/export.html">Download Interactive Report</a>'
-            f'<a href="{escape(str(export_action.get("pdf_href") or "#").split("?")[0], quote=True)}">Download PDF</a>'
 
         )
     print_links = (
@@ -2526,8 +2522,6 @@ def enable_authenticated_paper_actions(view: dict, *, report_id: str) -> dict:
     }
     result["export_action"] = {
         "report_href": f"/report/{report_id}",
-        "pdf_href": f"/report/{report_id}/export.pdf",
-        "manifest_href": f"/report/{report_id}/export/manifest",
     }
     for citation in result.get("citations", []):
         location = citation.get("paper_location") or {}
@@ -5558,16 +5552,6 @@ def _render_upload(upload: dict) -> str:
         '<span class="upload-status" aria-live="polite"></span></form>'
     )
 
-
-def _render_export_details(action: dict) -> str:
-    if not action.get("manifest_href"):
-        return ""
-    return (
-        '<details class="technical-export"><summary>Technical Export Record</summary>'
-        '<p>For verification and support: identifies the report version, original paper and PDF fingerprint. '
-        'These details help an owner or administrator establish which version was shared; they are not academic findings.</p>'
-        f'<a href="{escape(action["manifest_href"].split("?")[0], quote=True)}">Download Verification Record (JSON)</a></details>'
-    )
 
 
 # One wording for availability in every window (owner decision 2026-09-30).

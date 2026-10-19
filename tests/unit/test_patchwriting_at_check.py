@@ -160,7 +160,7 @@ def test_only_the_report_projection_reads_the_result():
     # projection module; renderers never read the stored block or its internals.
     root = Path(__file__).resolve().parents[2] / "app"
     renderers = [
-        "services/evidence_report.py", "services/report_export.py", "services/interactive_report_export.py",
+        "services/evidence_report.py", "services/interactive_report_export.py",
         "services/report_interactions.js", "services/report_judgment.js", "services/judgment_report.py",
         "services/verification_report.py", "routers/report.py", "routers/status.py",
     ]

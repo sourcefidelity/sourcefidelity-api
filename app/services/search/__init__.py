@@ -47,20 +47,6 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
             settings.GOOGLE_SEARCH_CSE_ID,
         )
 
-    if provider_name == "searxng":
-        if not settings.SEARXNG_URL:
-            logger.warning(
-                "SEARCH_PROVIDER=searxng but SEARXNG_URL not set — web search disabled. "
-                "Self-host: docker run -d -p 8080:8080 searxng/searxng"
-            )
-            return None
-        from app.services.search.searxng import SearXNGSearch
-        return SearXNGSearch(
-            settings.SEARXNG_URL,
-            request_timeout_seconds=settings.SEARXNG_REQUEST_TIMEOUT_SECONDS,
-            engine_timeout_seconds=settings.SEARXNG_ENGINE_TIMEOUT_SECONDS,
-        )
-
     if provider_name == "brave":
         if settings.SEARCH_POLICY_VERSION == "configured-search-v1" and not settings.BRAVE_SEARCH_RETENTION_PERMITTED:
             logger.warning("Brave transient discovery requires API-first orchestration; legacy retained-output route unavailable")
@@ -73,23 +59,6 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
         from app.services.search.brave import BraveSearch
         return BraveSearch(secret_value(settings.BRAVE_SEARCH_API_KEY))
 
-    if provider_name == "brightdata":
-        if not settings.BRIGHTDATA_API_TOKEN or not settings.BRIGHTDATA_SERP_ZONE:
-            logger.warning(
-                "SEARCH_PROVIDER=brightdata but BRIGHTDATA_API_TOKEN or "
-                "BRIGHTDATA_SERP_ZONE not set — web search disabled"
-            )
-            return None
-        from app.services.search.brightdata import BrightDataSearch
-        return BrightDataSearch(
-            secret_value(settings.BRIGHTDATA_API_TOKEN),
-            settings.BRIGHTDATA_SERP_ZONE,
-            engine=settings.BRIGHTDATA_SERP_ENGINE,
-            timeout_seconds=settings.BRIGHTDATA_TIMEOUT_SECONDS,
-            language=settings.BRIGHTDATA_SEARCH_LANGUAGE,
-            region=settings.BRIGHTDATA_SEARCH_REGION,
-        )
-
     if provider_name == "duckduckgo":
         # Removed 2026-09-22. The adapter used DuckDuckGo's unofficial HTML
         # endpoint, which its terms do not permit. The official Instant Answer
@@ -99,7 +68,7 @@ def get_search_provider(provider_name: str | None = None) -> Optional[SearchProv
         logger.warning(
             "SEARCH_PROVIDER=duckduckgo is no longer supported — the "
             "unofficial HTML endpoint it used is not permitted by "
-            "DuckDuckGo's terms. Configure brave, exa, brightdata or searxng."
+            "DuckDuckGo's terms. Configure brave, exa, deepseek or tavily."
         )
         return None
 

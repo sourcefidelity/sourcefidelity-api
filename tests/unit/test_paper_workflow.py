@@ -966,24 +966,29 @@ def test_report_distinguishes_failed_cited_webpage_with_metadata_only():
 def test_only_blocking_providers_become_retry_dependencies():
     """A provider is a re-run trigger only if the completion gate counts it.
 
-    Rewritten 2026-09-24. The previous version asserted that SearXNG became a
+    Rewritten 2026-09-24. The previous version asserted that an optional fallback became a
     trigger because its query was cooldown-skipped, whatever its role. All four
     re-run waves on 2026-09-23 -- 192 reference re-runs -- came from exactly
-    that, though SearXNG cannot complete or invalidate a search under
+    that, though an optional fallback cannot complete or invalidate a search under
     `api-first-search-v2`, and they moved fabrication flags between report
     versions without changing any completion gate.
     """
     from tests.unit.blocked_discovery import blocked_record
 
     optional = blocked_record("r1", policy="api-first-search-v2", web_outcomes={
-        "brave": "results", "exa": "results", "searxng": "cooldown_skipped"})
+        "brave": "results", "exa": "results", "tavily": "cooldown_skipped"})
     required_web = blocked_record("r2", policy="api-first-search-v2",
-                                  web_outcomes={"brave": "timeout", "exa": "results"})
-    adapter = blocked_record("r3", adapter="core")
+                                  web_outcomes={"brave": "timeout", "exa": "timeout"})
+    one_web_failed = blocked_record("r2b", policy="api-first-search-v2",
+                                    web_outcomes={"brave": "timeout", "exa": "results"})
+    adapter = blocked_record("r3", adapter="crossref")
 
     assert _retryable_provider_dependencies(None, optional) == []
-    assert _retryable_provider_dependencies(None, required_web) == ["brave"]
-    assert _retryable_provider_dependencies(None, adapter) == ["core"]
+    assert _retryable_provider_dependencies(None, required_web) == ["brave", "exa"]
+    # Exa finishing leaves Brave's provider-side failure non-blocking:
+    # search-completion-v1, owner decision 2026-10-19.
+    assert _retryable_provider_dependencies(None, one_web_failed) == []
+    assert _retryable_provider_dependencies(None, adapter) == ["crossref"]
     # A reference that got a real answer is never re-run.
     assert _retryable_provider_dependencies(
         None, {**adapter, "outcome": "unlocated_after_search"}) == []
@@ -2088,13 +2093,13 @@ def test_provider_recovery_refreshes_only_affected_member_as_immutable_successor
         failed = next(item for item in source_results if item["status"] == "unavailable")
         failed_reference_id = failed["reference_id"]
         # The refresh recomputes blocking providers from the stored record, so
-        # the record must genuinely be held incomplete by SearXNG. Under the
-        # legacy policy SearXNG is a required web route, which it is not under
+        # the record must genuinely be held incomplete by Tavily. Under the
+        # legacy policy Tavily is a required web route, which it is not under
         # api-first.
         from tests.unit.blocked_discovery import blocked_record
         failed["reference_discovery"] = blocked_record(
-            failed_reference_id, web_outcomes={"searxng": "cooldown_skipped"})
-        failed["retryable_provider_dependencies"] = ["searxng"]
+            failed_reference_id, web_outcomes={"tavily": "cooldown_skipped"})
+        failed["retryable_provider_dependencies"] = ["tavily"]
         job.source_results = source_results
         session.commit()
 
@@ -2103,7 +2108,7 @@ def test_provider_recovery_refreshes_only_affected_member_as_immutable_successor
     with factory() as session:
         first_report_id = finalize_paper_job(session, storage, job_id)["report_id"]
         assert prepare_provider_recovery_refresh(
-            session, job_id, provider="searxng"
+            session, job_id, provider="tavily"
         ) == [failed_reference_id]
         resolver = CompoundResolver()
         retrieve_paper_sources(session, storage, job_id, resolver=resolver)

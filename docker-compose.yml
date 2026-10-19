@@ -42,9 +42,6 @@ services:
       CLAMD_PORT: 3310
       MALWARE_SCAN_REQUIRED: "true"
       DOCX_PRESENTATION_RENDERING_ENABLED: "true"
-      # Host-side development uses localhost:8080 from .env. Containers must
-      # address the managed service by its Compose DNS name instead.
-      SEARXNG_URL: http://searxng:8080
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
   worker:
@@ -65,7 +62,6 @@ services:
       - provider_health_state:/app/.sourcefidelity
     environment:
       <<: *app-internal-environment
-      SEARXNG_URL: http://searxng:8080
       CLAMD_HOST: clamav
       CLAMD_PORT: 3310
       MALWARE_SCAN_REQUIRED: "true"
@@ -137,41 +133,6 @@ services:
     volumes:
       - redis_data:/data
 
-  searxng:
-    # SearXNG used to be a manually started standalone container, so Docker
-    # Desktop restarts left it stopped. It now follows the same managed
-    # lifecycle as the rest of SourceFidelity's local services.
-    # Pin the verified 2026.8.11 image; update deliberately after a smoke test.
-    image: searxng/searxng@sha256:7a39e9e2610fb6f332393d0f1c69534d5f1fd4e85cb4b204cd1b1768195b8ee9
-    restart: unless-stopped
-    ports:
-      # The JSON search endpoint is needed by a host-side development process,
-      # but it must not be exposed to the LAN or public internet.
-      - "127.0.0.1:8080:8080"
-    environment:
-      # Optional operator-supplied value. On first boot the wrapper generates
-      # a random secret and persists it in searxng_config when this is unset.
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
-    volumes:
-      - searxng_config:/etc/searxng
-      - searxng_cache:/var/cache/searxng
-      - ./config/searxng/settings.yml.template:/tmp/sourcefidelity-settings.yml.template:ro
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-        if [ ! -s /etc/searxng/settings.yml ]; then
-          python -c 'import os, pathlib, secrets; template = pathlib.Path("/tmp/sourcefidelity-settings.yml.template").read_text(); secret = os.environ.get("SEARXNG_SECRET") or secrets.token_urlsafe(48); pathlib.Path("/etc/searxng/settings.yml").write_text(template.replace("__SEARXNG_SECRET__", secret))'
-        fi
-        exec /usr/local/searxng/entrypoint.sh
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   clamav:
     # Feature-release tag follows ClamAV's recommendation and receives patch
     # updates without jumping automatically to a new feature release.
@@ -232,5 +193,3 @@ volumes:
   redis_data:
   postgres_data:
   minio_data:
-  searxng_config:
-  searxng_cache:

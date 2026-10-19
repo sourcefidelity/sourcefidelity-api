@@ -11,8 +11,13 @@ from datetime import datetime, timezone
 _NOW = datetime(2026, 9, 24, tzinfo=timezone.utc).isoformat()
 
 
+_TITLE = "A synthetic work title for recovery tests"
+
+
 def _query(query_id, category, provider, execution_provider, outcome):
-    text = f"synthetic {query_id}"
+    # A web query counts toward completion only when it searched the title
+    # (search-completion-v1).
+    text = f'"{_TITLE}" synthetic {query_id}' if category == "bounded_web" else f"synthetic {query_id}"
     return {
         "query_id": query_id, "route_category": category, "provider": provider,
         "normalized_query": text,
@@ -56,7 +61,7 @@ def blocked_record(reference_id, *, adapter=None, web_outcomes=None,
     return {
         "reference_id": reference_id, "created_at": _NOW, "outcome": "search_incomplete",
         "contributes_to_neutral_pattern": False,
-        "expected": {"title": "A synthetic work title for recovery tests",
+        "expected": {"title": _TITLE,
                      "authors": ["Writer, A."], "year": "2020",
                      "source_kind": "journal_article"},
         "search_policy_version": policy,

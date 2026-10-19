@@ -23,17 +23,16 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", True)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:1,exa:1")
     monkeypatch.setattr(settings, "WEB_SEARCH_PER_REFERENCE_FLOOR", "brave:1,exa:1")
     monkeypatch.setattr(settings, "WEB_SEARCH_HARD_MAX_CALLS", "brave:3,exa:3")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng")}
+                 for name in ("brave", "exa")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name))
     return WebSearchRetriever(health_store=Mock()), providers
 
 

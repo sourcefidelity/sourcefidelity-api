@@ -7,8 +7,6 @@ consumer-search scraping is unstable or unsupported.
 API: https://api.search.brave.com/res/v1/web/search
 Pricing and monthly credits change independently of the application; consult
 Brave's current primary pricing documentation before deployment.
-
-Good for personal users (Path A/C) who don't want to self-host SearXNG.
 """
 
 import logging

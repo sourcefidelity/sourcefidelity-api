@@ -117,17 +117,12 @@ def test_a_generally_relevant_comparison_is_a_topical_match_under_the_mismatch_c
     assert not topical_match(other, cited)
 
 
-def test_the_window_and_pdf_name_the_topic_in_words():
+def test_the_window_names_the_topic_in_words():
     from app.services.evidence_report import _member_label
-    from app.services.report_export import _topic_heading
     member, citation = matched_member()
     assert _member_label(member, citation).endswith('Abstract Retrieved</span></span> – Topical Match')
-    assert _topic_heading(member, citation) == 'Abstract Retrieved – Topical Match'
     mismatch, cited = bound_member()
-    assert _topic_heading(mismatch, cited) == 'Abstract Retrieved – Possible Topical Mismatch'
     assert 'Topical Match' not in _member_label(mismatch, cited)
-    member['abstract_relevance']['scope_assessment']['relevance'] = 'uncertain'
-    assert _topic_heading(member, citation) == 'Abstract Retrieved – Topical Relevance Uncertain'
 
 
 def test_a_possible_match_agreeing_on_title_and_author_carries_topic_labels():
@@ -163,7 +158,6 @@ def test_the_text_of_an_identified_single_authored_book_carries_topic_labels():
 
 def test_an_unsettled_comparison_reads_topical_relevance_uncertain():
     from app.services.evidence_report import _member_label, _render_panel_template
-    from app.services.report_export import _topic_heading
     from app.services.report_layers import topical_uncertain
     member, citation = matched_member()
     scope = member['abstract_relevance']['scope_assessment']
@@ -171,7 +165,6 @@ def test_an_unsettled_comparison_reads_topical_relevance_uncertain():
     member['abstract_scope_note'] = {'note': 'Both concern material strength.'}
     assert topical_uncertain(member, citation)
     assert _member_label(member, citation).endswith(' – Topical Relevance Uncertain')
-    assert _topic_heading(member, citation) == 'Abstract Retrieved – Topical Relevance Uncertain'
     html = _render_panel_template(citation, 1)
     assert 'Both concern material strength. Read the source to judge whether it supports the statement.' in html
     scope['relevance'] = 'generally_relevant'   # a match keeps its note without the sentence

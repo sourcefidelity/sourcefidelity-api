@@ -1,6 +1,6 @@
 """One request gate per provider, shared by every worker process (2026-10-11).
 
-`provider-gate-v1`. Before this, only CORE, Semantic Scholar and SearXNG were
+`provider-gate-v1`. Before this, only CORE, Semantic Scholar and a self-hosted metasearch fallback were
 paced across processes; Brave, Exa, OpenAlex and Crossref were not paced at
 all, and Gutenberg, DataCite, Open Library, ERIC and Europe PMC declared an
 interval that nothing enforced. One paper at a time hid that; many papers at
@@ -51,17 +51,27 @@ class ProviderBusy(Exception):
     reason_code = "provider_call_skipped_paced_beyond_budget"
 
 
-def configured_rate(provider: str) -> float | None:
-    """Requests per second set for `provider`, or None."""
-    for item in str(getattr(settings, "PROVIDER_REQUESTS_PER_SECOND", "") or "").split(","):
-        name, separator, value = item.strip().partition(":")
+def _rate_in(value: str, provider: str) -> tuple[bool, float | None]:
+    for item in str(value or "").split(","):
+        name, separator, raw = item.strip().partition(":")
         if separator and name.strip().lower() == provider.lower():
             try:
-                rate = float(value)
+                rate = float(raw)
             except ValueError:
-                return None
-            return rate if rate > 0 else None
-    return None
+                return True, None
+            return True, rate if rate > 0 else None
+    return False, None
+
+
+def configured_rate(provider: str) -> float | None:
+    """Requests per second set for `provider`, or None. A provider the
+    configured value does not name keeps the code default's rate
+    (owner decision 2026-10-19)."""
+    from app.config import Settings
+    named, rate = _rate_in(getattr(settings, "PROVIDER_REQUESTS_PER_SECOND", ""), provider)
+    if named:
+        return rate
+    return _rate_in(Settings.model_fields["PROVIDER_REQUESTS_PER_SECOND"].default, provider)[1]
 
 
 def interval_for(provider: str, default_interval: float = 0.0) -> float:

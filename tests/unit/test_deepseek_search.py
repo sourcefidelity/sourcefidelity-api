@@ -105,7 +105,7 @@ def test_retriever_runs_deepseek_as_the_second_required_provider(monkeypatch):
     from app.services.search.policy import API_FIRST_SEARCH_POLICY
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "none")
-    monkeypatch.setattr(web_search, "REQUIRED_API_PROVIDERS", ("brave", "deepseek"))
+    monkeypatch.setattr(settings, "SEARCH_SECOND_REQUIRED_PROVIDER", "deepseek")
     built = []
     monkeypatch.setattr(web_search, "get_search_provider", lambda name=None: built.append(name) or None)
     web_search.WebSearchRetriever()
@@ -119,7 +119,7 @@ def test_a_stored_record_is_judged_by_the_providers_it_names(monkeypatch):
     from datetime import datetime, timezone
     from app.services import reference_discovery as rd
     from app.services.search.policy import API_FIRST_SEARCH_POLICY
-    monkeypatch.setattr(rd, "REQUIRED_API_PROVIDERS", ("brave", "deepseek"))
+    monkeypatch.setattr(settings, "SEARCH_SECOND_REQUIRED_PROVIDER", "deepseek")
     now = datetime.now(timezone.utc)
     import hashlib
     queries = [rd.ReferenceSearchQuery(query_id=f"q-{p}", route_category="bounded_web", provider=p,
@@ -130,9 +130,33 @@ def test_a_stored_record_is_judged_by_the_providers_it_names(monkeypatch):
     attempts = [rd.ReferenceRouteAttempt(attempt_id="a-web", provider="brave", query_ids=[q.query_id for q in queries],
                                          route_category="bounded_web", required=True, permitted=True,
                                          outcome="no_match", started_at=now, completed_at=now)]
-    args = (["bounded_web"], attempts, queries, API_FIRST_SEARCH_POLICY)
-    assert rd._search_is_incomplete(*args, ["brave", "exa"]) is False
-    assert rd.search_blocking_providers(*args, ["brave", "exa"]) == []
-    # A new search that names no pair still uses the current setting.
-    assert rd._search_is_incomplete(*args) is True
-    assert rd.search_blocking_providers(*args) == ["deepseek"]
+    from app.services.search_completion import assess_record
+
+    def record(attempts, queries, names):
+        return {"expected": {"title": "A title"}, "required_route_categories": ["bounded_web"],
+                "search_policy_version": API_FIRST_SEARCH_POLICY, "attempts": attempts,
+                "queries": queries, "required_web_providers": names}
+    named = assess_record(record(attempts, queries, ["brave", "exa"]))
+    assert named.complete is True
+    assert named.blocking_providers == ()
+    # A new search that names no pair still uses the current setting. Brave
+    # finishing alone now suffices (search-completion-v1, owner decision
+    # 2026-10-19), so only Exa's query is kept to show the setting is read.
+    exa_only = [q for q in queries if q.execution_provider == "exa"]
+    attempts[0].query_ids = [q.query_id for q in exa_only]
+    current = assess_record(record(attempts, exa_only, None))
+    assert current.complete is False
+    assert current.blocking_providers == ("brave", "deepseek")
+
+
+def test_a_provider_the_setting_leaves_out_keeps_its_default_ceiling(monkeypatch):
+    # 2026-10-19: an env value naming only brave, tavily and exa gave DeepSeek no calls.
+    from app.services.retrieval import provider_gate, web_search
+    monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:100,tavily:50,exa:25")
+    limits = web_search._limits_over_defaults("SEARCH_ESCALATION_MAX_CALLS")
+    assert limits["brave"] == 100 and limits["deepseek"] == 25
+    monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "deepseek:0")
+    assert web_search._limits_over_defaults("SEARCH_ESCALATION_MAX_CALLS")["deepseek"] == 0
+    monkeypatch.setattr(settings, "PROVIDER_REQUESTS_PER_SECOND", "brave:1")
+    assert provider_gate.configured_rate("deepseek") == 4
+    assert provider_gate.configured_rate("brave") == 1

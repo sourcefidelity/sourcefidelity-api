@@ -69,17 +69,14 @@ def test_exa_sends_no_category(monkeypatch):
     assert "category" not in post.call_args.kwargs["json"]
 
 
-@pytest.mark.parametrize(("fallback", "searx_enabled", "expected"), [
-    ("tavily", False, {"brave", "exa", "tavily"}),
-    ("searxng", True, {"brave", "exa", "searxng"}),
-    ("searxng", False, {"brave", "exa"}),
-    ("none", True, {"brave", "exa"}),
+@pytest.mark.parametrize(("fallback", "expected"), [
+    ("tavily", {"brave", "exa", "tavily"}),
+    ("none", {"brave", "exa"}),
 ])
-def test_configured_web_fallback_provider(monkeypatch, fallback, searx_enabled, expected):
+def test_configured_web_fallback_provider(monkeypatch, fallback, expected):
     from app.services.search.policy import API_FIRST_SEARCH_POLICY
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", fallback)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", searx_enabled)
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
                         lambda name=None: Mock(name=name))
     search = WebSearchRetriever(health_store=Mock())

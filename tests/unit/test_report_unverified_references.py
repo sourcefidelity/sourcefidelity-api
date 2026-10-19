@@ -145,21 +145,6 @@ def test_a_citation_without_a_space_after_the_comma_is_still_highlighted():
     assert (target['x0'], target['x1']) == (142, 230)
 
 
-def test_the_identified_record_completes_the_doi_sentence_in_the_pdf():
-    import fitz
-    from app.services.report_export import _render_pdf
-    identifier = {'finding_type': 'reference_identifier_conflict', 'reference_id': rid(1), 'source': source(1),
-                  'finding': 'old text', 'rectangles': [entry_box(0, 100)],
-                  'records': [{'observed': {'title': 'Identified other work', 'authors': ['Someone, B.']}}]}
-    doc = fitz.open(); doc.new_page()
-    rendered, _ = _render_pdf(doc.tobytes(), citations=[], reference_practice=[identifier], 
-                              export_binding='synthetic-test', view=None)
-    with fitz.open(stream=rendered, filetype='pdf') as exported:
-        text = ' '.join(' '.join(page.get_text() for page in exported).split())
-    start = text.index('The submitted DOI identi')
-    assert text.index('other work', start) < text.index('Reference as submitted: Writer', start)
-
-
 def test_citation_window_heading_links_its_reference_in_the_reference_colour():
     soup = render([])
     template = BeautifulSoup(soup.find('template', id='citation-panel-1').decode_contents(), 'html.parser')
