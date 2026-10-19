@@ -42,7 +42,8 @@ def provider_contribution(traces, provider="exa"):
             required_route_categories=trace.required_route_categories,
             queries=trace.queries, attempts=trace.attempts, candidates=trace.candidates,
             search_policy_version=trace.search_policy_version,
-            search_retention_policy=trace.search_retention_policy)
+            search_retention_policy=trace.search_retention_policy,
+            required_web_providers=trace.required_web_providers)
         qualified = {c.candidate_id for c in credible_field_candidates(record, fields=("title", "author"))
                      if c.agreement_count >= 2 and not any(
                          v.reason_code == "book_edition_year_unresolved" for v in c.comparisons)}

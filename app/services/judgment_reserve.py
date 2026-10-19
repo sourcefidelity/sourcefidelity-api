@@ -14,11 +14,7 @@ wider prompt is an ordinary prompt of the same contract. No model is used to
 build the reserve and building it can never fail a paper run.
 
 Retention: kept with the verification report (deleted with it) under
-`JUDGMENT_RESERVE_RETENTION`; `off` builds none. An "until_grades_released"
-reserve is purged when marks are released for the paper's assessment
-(assessment_marks.py; set manually now, by the planned LMS signal later) and
-is not stored for a paper whose assessment already has marks released. A paper
-without an assessment keeps it with the verification report.
+`JUDGMENT_RESERVE_RETENTION`; `off` builds none.
 """
 from __future__ import annotations
 
@@ -141,11 +137,6 @@ def store_reserve(session, record, reserve: dict) -> None:
         JudgmentSourceReserve.verification_report_id == record.id))
     if existing is not None:
         return
-    if reserve.get("retention") == "until_grades_released":
-        from app.services.assessment_marks import paper_version_marks_released
-        if paper_version_marks_released(session, paper_version_id=record.paper_version_id,
-                                        scope_type=record.scope_type, scope_id=record.scope_id):
-            return
     session.add(JudgmentSourceReserve(
         verification_report_id=record.id, scope_type=record.scope_type, scope_id=record.scope_id,
         reserve_version=reserve["reserve_version"], retention_policy=reserve["retention"], payload=reserve))

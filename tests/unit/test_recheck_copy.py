@@ -30,8 +30,6 @@ def _completed(session, storage, *, keep: dict | None, scope="personal_owner"):
 def test_the_upload_records_the_scopes_choice():
     assert recheck_copy.retention_at_upload(None, "personal_owner", "owner-1") == {
         "policy": recheck_copy.POLICY, "days": 30}
-    # Institutional keeps nothing until the administrator turns it on.
-    assert recheck_copy.retention_at_upload(None, "assessment", "assessment-1") is None
 
 
 def test_a_kept_file_waits_for_its_period_and_an_unkept_one_goes_at_once(session):

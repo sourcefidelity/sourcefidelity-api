@@ -63,21 +63,13 @@ class RetentionMode(str, Enum):
     """Policy modes for the lifecycle of a source representation."""
 
     VERIFICATION_RUN = "verification_run"
-    ASSESSMENT = "assessment"
-    COURSE = "course"
     DURABLE = "durable"
 
 
 SCOPE_RETENTION_MODES = {
     "verification_run": RetentionMode.VERIFICATION_RUN,
-    "assessment": RetentionMode.ASSESSMENT,
-    "course_offering": RetentionMode.COURSE,
     "personal_owner": RetentionMode.DURABLE,
-    "institution": RetentionMode.DURABLE,
 }
-EXPIRING_RETENTION_MODES = frozenset(
-    {RetentionMode.ASSESSMENT, RetentionMode.COURSE}
-)
 
 
 class AdmissionError(ValueError):
@@ -435,10 +427,6 @@ def admit_representation(
         raise AdmissionError(
             "Verification-run representations must remain ephemeral and cannot "
             "enter durable admission"
-        )
-    if retention_mode in EXPIRING_RETENTION_MODES and request.expires_at is None:
-        raise AdmissionError(
-            f"{retention_mode.value} retention requires an explicit expiry"
         )
 
     validation_evidence = dict(request.validation_evidence)

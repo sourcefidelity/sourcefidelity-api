@@ -14,19 +14,15 @@ class Settings(BaseSettings):
     APP_NAME: str = "SourceFidelity API"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
-    # Report delivery fails closed unless a deployment authentication adapter
-    # is explicitly enabled. The personal bearer is a prototype/operator
-    # credential; Institutional deployments replace it with their identity/LMS
-    # adapter while producing the same scoped principal contract.
-    REPORT_AUTH_MODE: Literal[
-        "disabled", "personal_local", "personal_bearer", "institutional_adapter"
-    ] = "disabled"
+    # Report delivery fails closed unless a Personal authentication mode is
+    # explicitly enabled.
+    REPORT_AUTH_MODE: Literal["disabled", "personal_local", "personal_bearer"] = "disabled"
     REPORT_PERSONAL_ACCESS_TOKEN: SecretStr | None = None
     REPORT_SESSION_TTL_SECONDS: int = 900
     REPORT_SESSION_COOKIE_SECURE: bool = True
     API_BIND_HOST: Literal["127.0.0.1", "::1", "localhost"] = "127.0.0.1"
     # Comma-separated exact origins. Empty disables cross-origin browser API
-    # access; Moodle deep links do not require CORS.
+    # access.
     CORS_ALLOWED_ORIGINS: str = ""
     CORS_ALLOW_CREDENTIALS: bool = False
 
@@ -158,13 +154,9 @@ class Settings(BaseSettings):
     JUDGMENT_MAX_USD_PER_REPORT: float | None = None
     JUDGMENT_MAX_USD_PER_DAY: float | None = None
     # Wider-search sentence reserve (owner decision 13). "paper_retention":
-    # kept with the verification report and deleted with it (Personal default);
-    # "until_grades_released": Institutional, kept until marks are released for
-    # the paper's assessment (assessment_marks.py: set by an instructor now, by
-    # the planned Moodle signal later); a paper without an assessment keeps it
-    # with the verification report;
+    # kept with the verification report and deleted with it;
     # "off": not built, so an agreed "no evidence" stays not judged.
-    JUDGMENT_RESERVE_RETENTION: Literal["paper_retention", "until_grades_released", "off"] = "paper_retention"
+    JUDGMENT_RESERVE_RETENTION: Literal["paper_retention", "off"] = "paper_retention"
     # Pace rate-limited providers (Semantic Scholar, CORE) across every worker
     # process through Redis; falls back to per-process pacing when unavailable.
     RETRIEVAL_SHARED_PACING_ENABLED: bool = True
@@ -233,12 +225,8 @@ class Settings(BaseSettings):
     DOCX_PRESENTATION_RENDERER_EXECUTABLE: str = "soffice"
     DOCX_PRESENTATION_RENDER_TIMEOUT_SECONDS: int = 120
     DOCX_PRESENTATION_RENDER_MAX_MB: int = 100
-    # Only temporary is operational. The remaining recognized values reserve
-    # the policy boundary for a later, separately authorized student-paper
-    # comparison corpus; selecting one now fails closed at upload.
-    PAPER_RETENTION_MODE: Literal[
-        "temporary", "assessment", "course", "institutional"
-    ] = "temporary"
+    # Papers are temporary processing input (Personal only, 2026-10-19).
+    PAPER_RETENTION_MODE: Literal["temporary"] = "temporary"
     # Remote citation/relevance judgment, on by default (owner decision
     # 2026-09-29). When false, the workflow still extracts, retrieves, persists
     # candidates, and reports visible not-assessed model stages without sending
@@ -349,9 +337,6 @@ class Settings(BaseSettings):
     # Storage Backend: "s3" | "seafile"
     STORAGE_BACKEND: str = "s3"
 
-    # Campus access content retention (days). 0 = keep indefinitely.
-    CAMPUS_ACCESS_TTL_DAYS: int = 90
-
     # Retrieval Sources (comma-separated priority list).
     # Order matters: sources are tried left-to-right, stopping at the first
     # that returns full text (or abstract if no PDF found). Reorder based on
@@ -432,12 +417,9 @@ class Settings(BaseSettings):
     # Semantic Scholar API
     S2_API_KEY: SecretStr | None = None
 
-    # Elsevier API (Article Retrieval — OA full text + metadata/abstract for paywalled)
-    # API key alone: OA articles + metadata/abstract for all.
-    # Insttoken (optional, via institutional email to apisupport@elsevier.com):
-    #   unlocks paywalled full text if your institution subscribes.
+    # Elsevier API: metadata and abstracts for all articles, full text for
+    # open-access articles only (owner decision 2026-10-19).
     ELSEVIER_API_KEY: SecretStr | None = None
-    ELSEVIER_INST_TOKEN: SecretStr | None = None
 
     # Crossref polite email (uses OPENALEX_EMAIL as fallback)
     CROSSREF_EMAIL: str | None = None
@@ -616,26 +598,11 @@ class Settings(BaseSettings):
     BRIGHTDATA_SEARCH_LANGUAGE: str = "en"
     BRIGHTDATA_SEARCH_REGION: str = "us"
 
-    # DOI Resolver / Campus Proxy (institutional deployment).
-    # When set, the app constructs {DOI_RESOLVER_URL}{doi} to access papers
-    # through the institution's library proxy/subscription. This dramatically
-    # improves full-text retrieval for paywalled content — the proxy handles
-    # authentication, the app gets the PDF.
-    # Examples:
-    #   EZproxy:   "https://proxy.university.edu:2048/login?url=https://doi.org/"
-    #   OpenURL:   "https://resolver.university.edu/sfx?rft_id=info:doi/"
-    #   Custom:    "https://library.university.edu/fulltext/"
-    # The DOI is appended directly: {DOI_RESOLVER_URL}10.1234/foo
+    # The user's DOI resolver address, used only to build each reference's DOI
+    # link (owner decision 2026-10-19); the application itself follows public
+    # DOIs through doi.org. The DOI is appended: {DOI_RESOLVER_URL}10.1234/foo.
+    # Unset: links go to https://doi.org/.
     DOI_RESOLVER_URL: str | None = None
-    # Library permissions: six switches per service, as a JSON object of the
-    # switches the deployment set (app/services/library_permissions.py), e.g.
-    # '{"publisher_pdf": {"acquisition": true, "remote_model": true}}'.
-    LIBRARY_PERMISSIONS: str = "{}"
-    # Where the application is used: "on_campus", "off_campus" or "both"
-    # (both, or not sure, is treated as on campus). On a campus network text
-    # without open-access evidence counts as licensed text
-    # (app/services/library_permissions.py).
-    NETWORK_LOCATION: Literal["on_campus", "off_campus", "both"] = "off_campus"
 
     # Student URL download limits (R9)
     STUDENT_URL_MAX_SIZE_MB: int = 50
@@ -661,19 +628,10 @@ class Settings(BaseSettings):
     # Google Books API key (optional; for page-count lookup). Free key.
     GOOGLE_BOOKS_API_KEY: SecretStr | None = None
 
-    # Whether to persist paywalled (campus-access) PDFs to S3.
-    # When True: paywalled PDFs downloaded via campus IP are cached to S3
-    #   for reuse across checks (efficient, but creates a persistent copy
-    #   of copyrighted content on the institution's server).
-    # When False (default): paywalled PDFs are verified in-memory and
-    #   discarded immediately (like website content). No copyrighted
-    #   paywalled content persists in S3. Re-checking the same article
-    #   requires re-downloading.
-    # Institutions should set this based on their interpretation of publisher
-    # terms and their own copyright policy.
-    CACHE_PAYWALLED_PDFS: bool = False
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Unknown keys in the env file are ignored, so a setting removed from the
+    # code (for example the Institutional ones, 2026-10-19) cannot stop startup.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @field_validator("TAVILY_USD_PER_CREDIT", "BRAVE_USD_PER_REQUEST", "BRIGHTDATA_USD_PER_REQUEST",
                      mode="before")

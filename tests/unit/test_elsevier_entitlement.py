@@ -64,18 +64,9 @@ class TestStillAvailableWhereEntitled:
         if "elsevier" in settings.RETRIEVAL_SOURCES:
             assert "elsevier" in [s.name for s in get_retrieval_sources()]
 
-    def test_an_institutional_token_is_sent_when_configured_and_permitted(self, monkeypatch):
-        from app.config import settings
-        monkeypatch.setattr(settings, "LIBRARY_PERMISSIONS",
-                            '{"elsevier_institutional": {"acquisition": true, "remote_model": true}}')
-        monkeypatch.setattr(settings, "ELSEVIER_INST_TOKEN", SecretStr("token-value"))
-        headers = ElsevierRetriever()._headers()
-        assert headers["X-ELS-Insttoken"] == "token-value"
-
-    def test_no_token_header_when_none_is_configured(self, monkeypatch):
-        from app.config import settings
-        monkeypatch.setattr(settings, "ELSEVIER_INST_TOKEN", None)
-        assert "X-ELS-Insttoken" not in ElsevierRetriever()._headers()
+    def test_no_institutional_token_header_is_ever_sent(self):
+        # The institutional-token path was removed (owner decision 2026-10-19).
+        assert not any("insttoken" in name.casefold() for name in ElsevierRetriever()._headers())
 
 
 class TestDeferralIsNotAFailure:
@@ -110,9 +101,6 @@ class TestDeferralIsNotAFailure:
         assert "route_not_applicable" in source
 
 
-def test_a_configured_token_is_not_sent_without_permission(monkeypatch):
-    """The token unlocks licensed text: acquisition needs its library permission."""
-    from app.config import settings
-    monkeypatch.setattr(settings, "ELSEVIER_INST_TOKEN", SecretStr("token-value"))
-    monkeypatch.setattr(settings, "LIBRARY_PERMISSIONS", "{}")
-    assert "X-ELS-Insttoken" not in ElsevierRetriever()._headers()
+def test_settings_no_longer_carry_an_institutional_token():
+    from app.config import Settings
+    assert "ELSEVIER_INST_TOKEN" not in Settings.model_fields

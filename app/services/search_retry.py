@@ -14,9 +14,6 @@ authorized source. A completed search is never retried here: it may hold a
 completed-search memo (search-reuse-memo-v1), and retrying it would only
 repeat paid work. Both routes record what they started in the job's
 ``upload_evidence``.
-
-Neither route runs for a paper whose assessment has marks released
-(assessment_marks.py): further searching can no longer affect it.
 """
 
 from __future__ import annotations
@@ -31,7 +28,6 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.job import Job, JobStatus
 from app.models.report import Report, ReportPaperArtifactRecord
-from app.services.assessment_marks import job_marks_released
 from app.services.paper_workflow import (
     TARGETED_SOURCE_REFRESH_KEY,
     PaperWorkflowError,
@@ -94,8 +90,6 @@ def job_accepts_search_refresh(session: Session, job: Job, *, now: datetime) -> 
     ):
         return False
     if session.scalar(select(Report.id).where(Report.job_id == job.id).limit(1)) is None:
-        return False
-    if job_marks_released(session, job):
         return False
     artifact = session.scalar(
         select(ReportPaperArtifactRecord).where(ReportPaperArtifactRecord.job_id == job.id)

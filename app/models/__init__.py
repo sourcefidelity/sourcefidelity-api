@@ -30,6 +30,5 @@ from app.models.judgment import (  # noqa: E402, F401
     JudgmentSourceReserve,
 )
 from app.models.search_memo import SearchMemoRecord  # noqa: E402, F401
-from app.models.assessment_marks import AssessmentMarksRelease  # noqa: E402, F401
 from app.models.storage_policy import StoragePolicyRecord  # noqa: E402, F401
 from app.models.llm_cache import LLMCallCacheRecord  # noqa: E402, F401

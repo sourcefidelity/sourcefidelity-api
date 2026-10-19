@@ -132,7 +132,7 @@ def check_paper(
 def _existing_report(session, *, content, filename, require_reference_links, assessment_id, principal):
     """The report this exact submission already has (owner decision 2026-10-09), or None."""
     from app.services.assessment_configuration import AssessmentConfiguration
-    from app.services.assessment_marks import normalize_assessment_id
+    from app.services.assessments import normalize_assessment_id
     from app.services.paper_reuse import find_reusable_report, record_reuse
     from app.services.paper_upload import _safe_filename
     try:

@@ -11,12 +11,6 @@ from app.models.job import Job, JobStatus
 from app.tasks import provider_recovery
 
 
-@pytest.fixture(autouse=True)
-def _institutional_deployment(monkeypatch):
-    """Automatic re-searching happens only in an Institutional deployment
-    (owner decision 2026-09-29); these tests exercise that behaviour."""
-    import app.services.assessment_marks as marks
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
 
 
 

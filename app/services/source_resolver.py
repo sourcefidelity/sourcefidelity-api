@@ -61,7 +61,6 @@ def _timed_retrieval(operation):
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
 from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed, cross_script_observed, observed_outcome
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
-from app.services import library_permissions
 
 from app.log_safety import private_value_id, safe_exception_code
 
@@ -1534,7 +1533,7 @@ class SourceResolver:
         sources = []
         for source in self._retrieval_sources:
             if source.name == "web_search" and hasattr(source, "share_run_budget_with"):
-                own = library_permissions.restrict(type(source)())
+                own = type(source)()
                 own.share_run_budget_with(source)
                 sources.append(own)
             else:
@@ -2274,9 +2273,7 @@ class SourceResolver:
                 "required": set(
                     required_reference_discovery_routes(
                         expected,
-                        library_metadata_enabled=bool(
-                            expected.doi and _campus_resolver_active()
-                        ),
+                        library_metadata_enabled=False,
                     )
                 ),
                 "queries": [],
@@ -2888,8 +2885,7 @@ class SourceResolver:
 
     def _container_responsibility(self, title: str, author: str) -> dict:
         source = next((s for s in self._retrieval_sources
-                       if hasattr(s, "statements_of_responsibility")
-                       and library_permissions.permitted(getattr(s, "name", ""), "search")), None)
+                       if hasattr(s, "statements_of_responsibility")), None)
         if source is None or not author:
             return {"classification": "unresolved", "reason": "catalogue_not_configured" if source is None
                     else "no_cited_author"}
@@ -3221,7 +3217,7 @@ class SourceResolver:
             return
         adapter = next((s for s in getattr(self, "_retrieval_sources", [])
                         if isinstance(s, CrossrefRetriever)), None)
-        if adapter is None or not library_permissions.permitted(adapter.name, "search"):
+        if adapter is None:
             return
         # Reserve structural room for every bounded result before any request.
         if len(trace["candidates"]) > 73 or len(trace["queries"]) > 62 or len(trace["attempts"]) > 126:
@@ -3408,10 +3404,8 @@ class SourceResolver:
         )
 
     def resolve(self, *args, **kwargs) -> RetrievalResult:
-        """Resolve a reference, then withhold what the library permissions of
-        the service that supplied the result do not permit
-        (`library_permissions.apply`)."""
-        return library_permissions.apply(self._resolve_routes(*args, **kwargs))
+        """Resolve a reference."""
+        return self._resolve_routes(*args, **kwargs)
 
     def _resolve_routes(
         self,
@@ -3566,10 +3560,7 @@ class SourceResolver:
         capabilities = getattr(self, "_acquisition_capabilities", None)
         if student_url and capabilities is not None and 'student_url' not in capabilities:
             link_not_visited(student_url, 'capability_disabled')
-        if student_url and not library_permissions.permitted(library_permissions.STUDENT_URL, "search"):
-            link_not_visited(student_url, 'capability_disabled')
-        if (student_url and (capabilities is None or "student_url" in capabilities)
-                and library_permissions.permitted(library_permissions.STUDENT_URL, "search")):
+        if student_url and (capabilities is None or "student_url" in capabilities):
             if is_library_locator_url(student_url):
                 link_not_visited(student_url, 'library_locator_only')
                 url_failure_reason = (
@@ -3670,31 +3661,6 @@ class SourceResolver:
                     if archived is not None:
                         self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                         return archived
-
-        # 2.5. Try DOI resolver / campus proxy (institutional deployment).
-        #      When DOI_RESOLVER_URL is configured, construct {url}{doi} to
-        #      access the paper through the university's library proxy. This
-        #      is the key to high full-text retrieval rates for paywalled content
-        #      — the proxy handles subscription authentication.
-        if (
-            doi
-            and _campus_resolver_active()
-            and (capabilities is None or "doi_resolver" in capabilities)
-        ):
-            result = self._try_doi_resolver(
-                doi, title, expected_source_kind=expected_kind
-            )
-            self._record_discovery_attempt(
-                category="library_metadata",
-                provider="doi_resolver",
-                result=result,
-                required=True,
-            )
-            landing_abstract_result = _landing_abstract_holder(result) or landing_abstract_result
-            if result.success:
-                if result.full_text:
-                    self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
-                return result
 
         # 2.6. A cited magazine article in the Media History Digital Library
         #      (media-history-archive-v1, 2026-10-16): free, before paid search.
@@ -3918,8 +3884,7 @@ class SourceResolver:
                 unquote(parsed_student_url.path).lstrip('/').casefold() == doi.casefold() and
                 (capabilities is None or "student_url" in capabilities))
             direct = None
-            if (doi and not _campus_resolver_active() and not doi_url_visited
-                    and library_permissions.permitted(library_permissions.PUBLIC_DOI, "search")
+            if (doi and not doi_url_visited
                     and (capabilities is None or "doi_resolver" in capabilities)):
                 direct = self._try_doi_resolver(doi, title,
                     expected_source_kind=expected_kind, public=True,
@@ -4094,8 +4059,7 @@ class SourceResolver:
                 capability_part,
                 providers,
                 settings.RETRIEVAL_PROVIDER_CONFIG,
-                "doi_resolver" if _campus_resolver_active() else "no_doi_resolver",
-                *((library_permissions.signature(),) if library_permissions.signature() else ()),
+                "no_doi_resolver",
             )
         )
         return hashlib.sha256(context.encode("utf-8")).hexdigest()
@@ -4285,6 +4249,7 @@ class SourceResolver:
                 if lantern_copy_stale(record):
                     return RetrievalResult(source_name="local_cache", success=False,
                                            metadata={"reuse_refusal": "lantern_pages_changed"})
+                self._record_copy_use(session, record)
                 try:
                     data = self._backend.download(record.content_object.storage_key)
                 except FileNotFoundError:
@@ -6790,8 +6755,8 @@ class SourceResolver:
         at institutions with library subscriptions — it can return full-text
         PDFs that no OA source has.
         """
-        base = "https://doi.org/" if public else settings.DOI_RESOLVER_URL or ""
-        trusted_base = None if public else base
+        base = "https://doi.org/"
+        trusted_base = None
         # Validate + URL-encode the DOI before placing it in the trusted
         # resolver URL (REVIEW §2.4). The DOI is student-controlled; raw
         # concatenation let a DOI like "10.1/x?url=http://internal/..." inject
@@ -7619,7 +7584,7 @@ class SourceResolver:
         Caching policy (applied only to identity-verified content):
         - OA content + public-domain texts: ALWAYS cached (free to store)
         - Paywalled content (accessed via campus IP): cached only if
-          CACHE_PAYWALLED_PDFS=True (institution's copyright-policy decision)
+          the storage setting keeps all copies
         """
         downloaded_via_publisher = False
         safety_report = None
@@ -7644,20 +7609,11 @@ class SourceResolver:
                         expected_source_kind=expected_source_kind,
                     )
 
-            # If OA download failed or wasn't available, try publisher PDF
-            # (works on campus networks with IP-based access). That is
-            # licensed-content acquisition, so it needs its library permission.
+            # If OA download failed or wasn't available, try publisher PDF.
             capabilities = getattr(self, "_acquisition_capabilities", None)
-            publisher_refusal = library_permissions.acquisition_refusal(
-                library_permissions.PUBLISHER_PDF)
-            if (result.full_text is None and result.doi and publisher_refusal
-                    and (capabilities is None or "publisher_url" in capabilities)):
-                result.metadata = result.metadata or {}
-                result.metadata["publisher_pdf_not_attempted"] = publisher_refusal
             if (
                 result.full_text is None
                 and result.doi
-                and publisher_refusal is None
                 and (capabilities is None or "publisher_url" in capabilities)
             ):
                 from app.services.publisher_urls import try_download_publisher_pdf
@@ -7677,8 +7633,6 @@ class SourceResolver:
                         )
                     )
                     downloaded_via_publisher = True
-                    result.metadata = result.metadata or {}
-                    result.metadata["library_service"] = library_permissions.PUBLISHER_PDF
                     logger.info(
                         "Downloaded PDF for %s via publisher URL (publisher=%s)",
                         result.doi, publisher or "unknown",
@@ -7898,7 +7852,7 @@ class SourceResolver:
                 #   (only now that identity is confirmed)
                 # - Content from publisher URL → check if it's actually OA.
                 #   If OA, cache. If not OA (paywalled), cache only if
-                #   CACHE_PAYWALLED_PDFS=True.
+                #   the storage setting keeps all copies.
                 # - Identity "low"/"skipped" → never cached (uncertain source).
                 is_oa = _check_is_oa(result)
                 should_cache = (
@@ -7908,14 +7862,13 @@ class SourceResolver:
                 )
 
                 if should_cache and downloaded_via_publisher and not is_oa:
-                    # Paywalled content accessed via campus IP
-                    if not (self._storage().sources.keep_licensed_copies
-                            and library_permissions.licensed_switch(
-                                library_permissions.PUBLISHER_PDF, "retention")):
+                    # A publisher PDF without an open-access signal is kept
+                    # only when the storage setting keeps all copies.
+                    if self._storage().sources.keep_copies != "all":
                         should_cache = False
                         logger.info(
-                            "Paywalled PDF for %s verified in-memory, NOT cached "
-                            "(OA=False, CACHE_PAYWALLED_PDFS=False)",
+                            "Publisher PDF for %s verified in-memory, not kept "
+                            "(no open-access signal; storage keeps open access only or none)",
                             result.doi,
                         )
 
@@ -8002,34 +7955,26 @@ class SourceResolver:
         if policy is None:
             from app.services.storage_policy import deployment_defaults
             policy = deployment_defaults()
-        service = library_permissions.service_for(result)
-        if service is not None and not library_permissions.permitted(service, "retention"):
-            return None, "library_retention_off"
+        keep = policy.sources.keep_copies
+        if keep == "none":
+            return None, "storage_keeps_no_copies"
         metadata = result.metadata or {}
         explicit = metadata.get("license_class")
         if explicit in LICENSE_CLASSES:
+            if keep == "open_access_only" and explicit not in {"open_access", "public_domain"}:
+                return None, "storage_keeps_open_access_only"
             return explicit, "explicit_representation_metadata"
-        keep_public = policy.sources.keep_public_copies != "none"
-        if keep_public and result.source_name in {"gutenberg", "wikisource"}:
+        if result.source_name in {"gutenberg", "wikisource"}:
             return "public_domain", "public_domain_adapter_policy"
-        if keep_public and (_check_is_oa(result) or any(
+        if _check_is_oa(result) or any(
             location.access_type in {"open_access", "public_domain"}
             for location in result.locations
-        )):
+        ):
             return "open_access", "provider_oa_or_licence_evidence"
+        if keep != "all":
+            return None, "storage_keeps_open_access_only"
         if downloaded_via_publisher or result.source_name == "elsevier":
-            # A licensed copy is kept only when the storage settings keep
-            # licensed copies and the deployment turned on the acquiring
-            # service's retention switch itself; otherwise it is never stored.
-            service = (library_permissions.ELSEVIER_INSTITUTIONAL if result.source_name == "elsevier"
-                       else library_permissions.service_for(result) if result.source_name == "doi_resolver"
-                       else library_permissions.PUBLISHER_PDF)
-            kept = (library_permissions.licensed_switch(service, "retention")
-                    if service in library_permissions.LICENSED_SERVICES
-                    else library_permissions.explicitly_on(service, "retention"))
-            if policy.sources.keep_licensed_copies and kept:
-                return "paywalled_db_retrieved", "deployment_subscription_retention_policy"
-            return None, "licensed_copy_retention_not_permitted"
+            return "paywalled_db_retrieved", "storage_keeps_all_copies"
 
         representation = result.representation
         source_url = (
@@ -8045,7 +7990,7 @@ class SourceResolver:
                 for location in result.locations
             )
         )
-        if publicly_downloaded and policy.sources.keep_public_copies == "all":
+        if publicly_downloaded:
             # Public reachability is not a licence conclusion. The deployment
             # has chosen scoped retention, so keep the representation under the
             # neutral restricted class and preserve the policy basis.
@@ -8120,11 +8065,8 @@ class SourceResolver:
                 ),
             }
 
-        license_expires_at = None
-        keep_days = (policy.sources.licensed_copy_days if license_class == "paywalled_db_retrieved"
-                     else policy.sources.public_copy_days)
-        if keep_days > 0:
-            license_expires_at = datetime.now(timezone.utc) + timedelta(days=keep_days)
+        from app.services.storage_policy import copy_expiry
+        license_expires_at = copy_expiry(policy)
 
         factory = self._repository_session_factory
         with factory() as session:
@@ -8295,6 +8237,21 @@ class SourceResolver:
         from app.services.storage_policy import deployment_defaults
         return getattr(self, "storage_policy", None) or deployment_defaults()
 
+    def _record_copy_use(self, session, record) -> None:
+        """A kept copy used by a check is kept the chosen months from now, or
+        permanently (owner decision 2026-10-19); never shortened here."""
+        from app.services.storage_policy import copy_expiry
+        current = getattr(record, "expires_at", None)
+        if current is None:
+            return
+        renewed = copy_expiry(self._storage())
+        if renewed is None or renewed > current:
+            record.expires_at = renewed
+            try:
+                session.commit()
+            except Exception:  # noqa: BLE001 - a missed renewal never fails the check
+                session.rollback()
+
     def retain_validated_copy(self, reference, result: RetrievalResult) -> None:
         """Keep a validated public copy whatever route found it (owner decision
         2026-10-09): web search and web-page routes never offered theirs for
@@ -8456,10 +8413,6 @@ def _expected_page_range(result: RetrievalResult) -> tuple[int, int] | None:
         if start <= end and 1 < end - start + 1 <= 500:
             return start, end
     return None
-
-
-def _campus_resolver_active() -> bool:
-    return library_permissions.campus_resolver_active()
 
 
 def _check_is_oa(result: RetrievalResult) -> bool:

@@ -2079,7 +2079,7 @@ def _blocking_providers_from_record(discovery_record: dict | None) -> list[str]:
         return []
     return search_blocking_providers(
         record.required_route_categories, record.attempts, record.queries,
-        record.search_policy_version)
+        record.search_policy_version, record.required_web_providers)
 
 
 def _report_source_failure_reason(source_result: dict) -> str:

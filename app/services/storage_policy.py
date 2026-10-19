@@ -1,28 +1,16 @@
-"""What a scope keeps, and for how long: sources, papers and reports.
+"""What the user's deployment keeps, and for how long: sources, papers and reports.
 
-Owner decision 2026-10-09 (PLAN §2 *Shared lifecycle*): individuals and
-institutions differ in what they keep, so storage is configurable per scope
-(a Personal user, or an institution's course or assessment scope), separately
-for sources, papers and reports. The deployment defaults reproduce the
-behaviour before settings existed, so nothing changes until a scope chooses
-otherwise:
-
-* sources: validated publicly downloadable copies are kept with no time
-  limit; copies obtained through a library licence are not kept unless the
-  deployment enables it (then for `CAMPUS_ACCESS_TTL_DAYS`);
-* papers: the copy shown beside the report is kept for
-  `FORMATIVE_REPORT_PAPER_RETENTION_DAYS` after the report was last built
-  or returned again; the submitted original is deleted when the check ends;
-* reports: kept until deleted (0 days).
-
-A day count of 0 means "until deleted". A scope's row holds only its
-differences from the defaults; anything invalid fails closed to the defaults.
-
-Who sets them (owner decision 2026-10-13): the Personal owner for their own
-scope; in Institutional, the administrator who deploys the application, for
-the whole deployment (`INSTITUTIONAL_SCOPE`), because the choices must follow
-university policy. Instructors cannot change them, and the settings page
-writes no course or assessment scope row.
+Owner decisions 2026-10-09 and 2026-10-19 (PLAN §2 *Shared lifecycle*;
+Personal only). Sources follow one setting for every kept copy, the user's own
+uploads included: keep all articles, open-access articles only, or none, and
+keep each copy 3, 6, 9 or 12 months after its last use in a check, or
+permanently (`keep_months` 0). The default is all articles, permanently.
+Papers: the copy shown beside the report is kept for
+`FORMATIVE_REPORT_PAPER_RETENTION_DAYS` after the report was last built or
+returned again. Reports: kept until deleted (0 days).
+A day count of 0 means "until deleted". The row holds only the differences
+from the defaults; anything invalid fails closed to the defaults. Rows written
+under storage-policy-v1 are read with their source fields translated.
 """
 from __future__ import annotations
 
@@ -34,23 +22,20 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 
-POLICY_VERSION = "storage-policy-v1"
-Profile = Literal["personal", "institutional"]
+POLICY_VERSION = "storage-policy-v2"
 PAPER_COPY_OUTLIVES_REPORT = "the paper copy cannot outlive its report"
 SUBMITTED_FILE_OUTLIVES_REPORT = "the submitted file cannot outlive its report"
-# The deployment-wide Institutional settings row every institutional scope inherits.
-INSTITUTIONAL_SCOPE = ("deployment", "institutional")
+KEEP_MONTHS = (0, 3, 6, 9, 12)
+_DAYS_PER_MONTH = 30.44
 
 
 class SourceStorage(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    # Validated publicly downloadable copies, whatever route found them:
-    # "all", only those with an open-access or licence signal, or none.
-    keep_public_copies: Literal["all", "open_access_only", "none"] = "all"
-    public_copy_days: int = Field(default=0, ge=0)
-    # Copies obtained through a library or campus licence.
-    keep_licensed_copies: bool = False
-    licensed_copy_days: int = Field(default=90, ge=0)
+    # Every kept copy, uploads included: all, only those with an open-access
+    # or public-domain signal, or none.
+    keep_copies: Literal["all", "open_access_only", "none"] = "all"
+    # Months after the copy's last use in a check; 0 keeps it permanently.
+    keep_months: Literal[0, 3, 6, 9, 12] = 0
 
 
 class PaperStorage(BaseModel):
@@ -73,15 +58,14 @@ class ReportStorage(BaseModel):
 
 class SearchSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    # Incomplete searches are finished by paid re-searches on their own:
-    # always in Institutional; in Personal only when the owner turns it on
-    # (owner decision 2026-10-18).
-    finish_incomplete_automatically: bool = True
+    # Incomplete searches are finished by paid re-searches on their own only
+    # when the user turns it on (owner decision 2026-10-18).
+    finish_incomplete_automatically: bool = False
 
 
 class StoragePolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal["storage-policy-v1"] = POLICY_VERSION
+    version: Literal["storage-policy-v2"] = POLICY_VERSION
     sources: SourceStorage = Field(default_factory=SourceStorage)
     papers: PaperStorage = Field(default_factory=PaperStorage)
     reports: ReportStorage = Field(default_factory=ReportStorage)
@@ -98,34 +82,56 @@ class StoragePolicy(BaseModel):
         return self
 
 
-def profile_for(scope_type: str) -> Profile:
-    return "personal" if scope_type == "personal_owner" else "institutional"
-
-
-def deployment_defaults(profile: Profile = "personal") -> StoragePolicy:
-    """The deployment's settings as a policy; both profiles start from them.
-    Institutional sharing of kept copies across users (open or library
-    licence only) is a later step and is not expressed here."""
+def deployment_defaults() -> StoragePolicy:
+    """The deployment's settings as a policy."""
     return StoragePolicy(
-        sources=SourceStorage(
-            keep_public_copies=("all" if settings.PUBLIC_RETRIEVAL_RETENTION_POLICY == "store_scoped"
-                                else "open_access_only"),
-            keep_licensed_copies=bool(settings.CACHE_PAYWALLED_PDFS),
-            licensed_copy_days=max(0, int(settings.CAMPUS_ACCESS_TTL_DAYS)),
-        ),
-        # The submitted file is kept 30 days in Personal and not kept in
-        # Institutional until the administrator decides (owner decision 2026-10-13).
         papers=PaperStorage(paper_copy_days=max(1, int(settings.FORMATIVE_REPORT_PAPER_RETENTION_DAYS)),
-                            keep_submitted_file=profile == "personal"),
-        searches=SearchSettings(finish_incomplete_automatically=profile != "personal"),
+                            keep_submitted_file=True),
     )
 
 
+def copy_expiry(policy: StoragePolicy, now=None):
+    """When a kept copy used now expires; None when copies are kept permanently."""
+    from datetime import datetime, timedelta, timezone
+    months = policy.sources.keep_months
+    if not months:
+        return None
+    return (now or datetime.now(timezone.utc)) + timedelta(days=round(months * _DAYS_PER_MONTH))
+
+
+def upload_expiry(policy: StoragePolicy, now=None):
+    """When a user's upload expires (owner decision 2026-10-19: one setting for
+    every kept copy). Under "all" it follows the chosen months; otherwise an
+    upload, having no open-access signal, is kept only as long as the paper
+    copy beside its report, so the check that uses it can still run."""
+    from datetime import datetime, timedelta, timezone
+    if policy.sources.keep_copies == "all":
+        return copy_expiry(policy, now)
+    return (now or datetime.now(timezone.utc)) + timedelta(days=policy.papers.paper_copy_days)
+
+
 def finishes_searches_automatically(session: Session | None, scope_type: str, scope_id: str) -> bool:
-    """Whether a scope's incomplete searches are re-searched on their own."""
-    if profile_for(scope_type) != "personal":
-        return True
+    """Whether the user's incomplete searches are re-searched on their own."""
     return policy_for(session, scope_type, scope_id).searches.finish_incomplete_automatically
+
+
+def _upgrade_v1_row(row: dict) -> dict:
+    """A storage-policy-v1 row's source fields in the v2 shape: the public-copy
+    choice becomes the one choice, its days become the nearest allowed months
+    at or above them (permanently above 12), library-licence fields drop."""
+    sources = row.get("sources")
+    if not isinstance(sources, dict) or not ({"keep_public_copies", "public_copy_days",
+                                              "keep_licensed_copies", "licensed_copy_days"} & set(sources)):
+        return row
+    upgraded = {}
+    if "keep_public_copies" in sources:
+        upgraded["keep_copies"] = sources["keep_public_copies"]
+    days = sources.get("public_copy_days")
+    if isinstance(days, int) and days > 0:
+        upgraded["keep_months"] = next((m for m in KEEP_MONTHS[1:] if m * _DAYS_PER_MONTH >= days), 0)
+    out = {k: v for k, v in row.items() if k != "version"}
+    out["sources"] = upgraded
+    return out
 
 
 def _merged(base: dict, changes: dict) -> dict:
@@ -136,33 +142,23 @@ def _merged(base: dict, changes: dict) -> dict:
 
 
 def policy_for(session: Session | None, scope_type: str, scope_id: str) -> StoragePolicy:
-    """The scope's settings over the deployment defaults; the defaults when
-    the scope has none, the row is invalid or the database is unavailable."""
-    defaults = deployment_defaults(profile_for(scope_type))
+    """The user's settings over the deployment defaults; the defaults when
+    there are none, the row is invalid or the database is unavailable."""
+    defaults = deployment_defaults()
     if session is None:
         return defaults
-    keys = [(scope_type, scope_id)]
-    if profile_for(scope_type) == "institutional" and (scope_type, scope_id) != INSTITUTIONAL_SCOPE:
-        keys.insert(0, INSTITUTIONAL_SCOPE)
+    try:
+        record = _record(session, scope_type, scope_id)
+    except Exception:
+        return defaults
+    row = getattr(record, "settings", None)
     merged = defaults.model_dump()
-    for key in keys:
-        try:
-            record = _record(session, *key)
-        except Exception:
-            return defaults
-        settings_row = getattr(record, "settings", None)
-        if isinstance(settings_row, dict) and settings_row:
-            merged = _merged(merged, settings_row)
+    if isinstance(row, dict) and row:
+        merged = _merged(merged, _upgrade_v1_row(row))
     try:
         return StoragePolicy.model_validate(merged)
     except ValidationError:
         return defaults
-
-
-def settings_scope_for(scope_type: str, scope_id: str) -> tuple[str, str]:
-    """The row a settings-page save writes: the Personal owner's own scope,
-    or the deployment-wide Institutional row."""
-    return (scope_type, scope_id) if profile_for(scope_type) == "personal" else INSTITUTIONAL_SCOPE
 
 
 def _record(session: Session, scope_type: str, scope_id: str):
@@ -176,10 +172,10 @@ def set_policy(session: Session, scope_type: str, scope_id: str, changes: dict, 
     """Store a scope's differences from the defaults; refuses an invalid policy."""
     from datetime import datetime, timezone
     from app.models.storage_policy import StoragePolicyRecord
-    defaults = deployment_defaults(profile_for(scope_type)).model_dump()
+    defaults = deployment_defaults().model_dump()
     record = session.scalar(select(StoragePolicyRecord).where(
         StoragePolicyRecord.scope_type == scope_type, StoragePolicyRecord.scope_id == scope_id))
-    combined = _merged(record.settings if record is not None else {}, changes)
+    combined = _merged(_upgrade_v1_row(record.settings) if record is not None and record.settings else {}, changes)
     policy = StoragePolicy.model_validate(_merged(defaults, combined))
     if record is None:
         record = StoragePolicyRecord(scope_type=scope_type, scope_id=scope_id, settings=combined)

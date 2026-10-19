@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.services.assessment_configuration import AssessmentConfiguration
-from app.services.assessment_marks import AssessmentMarksError, normalize_assessment_id
+from app.services.assessments import AssessmentIdError, normalize_assessment_id
 from app.models.job import Job, JobStage, JobStatus
 from app.services.paper_dispatch import prepare_dispatch, job_execution_lock, WorkflowBusy
 from app.services.file_safety import (
@@ -157,7 +157,7 @@ def create_paper_job(
         raise PaperUploadError('assessment_configuration_invalid', 'Reference-link requirement must be a boolean.') from exc
     try:
         normalized_assessment = normalize_assessment_id(assessment_id)
-    except AssessmentMarksError as exc:
+    except AssessmentIdError as exc:
         raise PaperUploadError(exc.code, str(exc)) from exc
     evidence = inspect_paper_upload(content, filename=safe_name, media_type=media_type)
     requested_retention = paper_retention_mode or settings.PAPER_RETENTION_MODE
@@ -174,9 +174,7 @@ def create_paper_job(
     evidence["input_upload_confirmed"] = False
     normalized_scope = scope_type.strip().casefold()
     normalized_id = scope_id.strip()
-    if normalized_scope not in {
-        "personal_owner", "assessment", "course_offering", "institution"
-    } or not normalized_id:
+    if normalized_scope != "personal_owner" or not normalized_id:
         raise PaperUploadError("scope_invalid", "Paper upload authorization scope is invalid")
     current = _as_utc(now or datetime.now(timezone.utc))
     job_id = uuid.uuid4()

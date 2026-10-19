@@ -28,12 +28,7 @@ PAPER_STATUS_CAPABILITY = "paper:status:view"
 SOURCE_REPOSITORY_READ_CAPABILITY = "source_repository:read"
 SOURCE_REPOSITORY_WRITE_CAPABILITY = "source_repository:write"
 EDITION_REVIEW_CAPABILITY = "source:edition:review"
-# Instructor/administrator: record that marks are released for an assessment
-# (assessment_marks.py). Never granted to the report browser session.
-ASSESSMENT_MARKS_RELEASE_CAPABILITY = "assessment:marks:release"
-# Storage settings (owner decision 2026-10-13): the Personal owner, or in
-# Institutional the administrator who deploys the application for the
-# university; never an instructor, since the choices follow university policy.
+# Storage settings: the deployment's owner (owner decisions 2026-10-13, 2026-10-19).
 STORAGE_SETTINGS_CAPABILITY = "storage:settings:manage"
 
 _bearer = HTTPBearer(auto_error=False)
@@ -213,11 +208,6 @@ def _require_personal_mode() -> None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authenticated report delivery is not configured",
-        )
-    if mode == "institutional_adapter":
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Institutional authentication adapter is not configured",
         )
     if mode == "personal_local" and settings.API_BIND_HOST not in {
         "127.0.0.1",

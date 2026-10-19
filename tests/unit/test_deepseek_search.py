@@ -111,3 +111,28 @@ def test_retriever_runs_deepseek_as_the_second_required_provider(monkeypatch):
     web_search.WebSearchRetriever()
     assert built == ["brave", "deepseek"]
     assert "deepseek" not in web_search._FILETYPE_OPERATOR_PROVIDERS
+
+
+def test_a_stored_record_is_judged_by_the_providers_it_names(monkeypatch):
+    # 2026-10-19: after switching to DeepSeek, records searched with Exa read as
+    # incomplete ("deepseek" blocking) because the current setting was used.
+    from datetime import datetime, timezone
+    from app.services import reference_discovery as rd
+    from app.services.search.policy import API_FIRST_SEARCH_POLICY
+    monkeypatch.setattr(rd, "REQUIRED_API_PROVIDERS", ("brave", "deepseek"))
+    now = datetime.now(timezone.utc)
+    import hashlib
+    queries = [rd.ReferenceSearchQuery(query_id=f"q-{p}", route_category="bounded_web", provider=p,
+                                       normalized_query='"A title"', query_sha256=hashlib.sha256('"A title"'.encode()).hexdigest(),
+                                       execution_provider=p, required=True, execution_outcome="no_results",
+                                       provider_calls=1, result_count=0)
+               for p in ("brave", "exa")]
+    attempts = [rd.ReferenceRouteAttempt(attempt_id="a-web", provider="brave", query_ids=[q.query_id for q in queries],
+                                         route_category="bounded_web", required=True, permitted=True,
+                                         outcome="no_match", started_at=now, completed_at=now)]
+    args = (["bounded_web"], attempts, queries, API_FIRST_SEARCH_POLICY)
+    assert rd._search_is_incomplete(*args, ["brave", "exa"]) is False
+    assert rd.search_blocking_providers(*args, ["brave", "exa"]) == []
+    # A new search that names no pair still uses the current setting.
+    assert rd._search_is_incomplete(*args) is True
+    assert rd.search_blocking_providers(*args) == ["deepseek"]

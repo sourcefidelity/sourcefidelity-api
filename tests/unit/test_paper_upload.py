@@ -185,5 +185,5 @@ def test_unimplemented_paper_retention_modes_reject_before_storage(
             scope_id="personal-default",
             paper_retention_mode=mode,
         )
-    assert captured.value.code == "paper_retention_mode_not_implemented"
+    assert captured.value.code == "paper_retention_mode_invalid"
     assert storage.objects == {}

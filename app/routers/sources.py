@@ -67,6 +67,12 @@ def _storage_backend() -> StorageBackend:
     return get_storage_backend()
 
 
+
+def _upload_expiry(db, principal):
+    """The user's storage setting decides how long an upload is kept."""
+    from app.services.storage_policy import policy_for, upload_expiry
+    return upload_expiry(policy_for(db, principal.scope_type, principal.scope_id))
+
 @router.post("/upload")
 def upload_source(
     request: Request,
@@ -383,6 +389,7 @@ def upload_source(
                     ),
                     provenance="instructor_upload",
                     license_class="commercial_user_upload",
+                    expires_at=_upload_expiry(db, principal),
                     scope_type=principal.scope_type,
                     scope_id=principal.scope_id,
                     identity_verdict="verified",
@@ -757,6 +764,7 @@ def _admit_supplied_html(
                 ),
                 provenance="instructor_upload",
                 license_class="commercial_user_upload",
+                expires_at=_upload_expiry(db, principal),
                 scope_type=principal.scope_type,
                 scope_id=principal.scope_id,
                 identity_verdict="verified",

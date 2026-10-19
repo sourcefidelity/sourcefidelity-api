@@ -23,7 +23,7 @@ from app.services.cross_language_identity import (
     latin_title_part_match,
 )
 from app.services.retrieval.base import OBSERVED_AUTHOR_LIMIT, RetrievalResult
-from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, REQUIRED_API_PROVIDERS
+from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, REQUIRED_API_PROVIDERS, is_required_web_provider_set
 from app.services.search.transient import TransientSearchAudit
 from app.services.search.candidate_audit import SearchCandidateAudit
 from app.services.journal_discovery import JournalCheck
@@ -750,6 +750,7 @@ def assess_reference_discovery_trace(
             attempts=parsed.attempts,
             candidates=parsed.candidates,
             search_policy_version=parsed.search_policy_version,
+            required_web_providers=parsed.required_web_providers,
             search_retention_policy=parsed.search_retention_policy,
             created_at=created_at,
         )
@@ -1490,6 +1491,7 @@ def qualify_legacy_catalog_dates(discovery: dict | None, reference_url: str | No
         required_route_categories=record.required_route_categories,queries=record.queries,
         attempts=record.attempts,candidates=corrected,created_at=record.created_at,
         search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
         search_retention_policy=record.search_retention_policy,
     )
     # Removing an unreliable year cannot establish a newly confirmed edition.
@@ -1525,6 +1527,7 @@ def qualify_book_edition_years(discovery: dict | None, raw_reference: str = "") 
         required_route_categories=record.required_route_categories, queries=record.queries,
         attempts=record.attempts, candidates=candidates, created_at=record.created_at,
         search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
         search_retention_policy=record.search_retention_policy)
     if result.outcome in {"confirmed", "confirmed_with_minor_differences", "unlocated_after_search"}:
         result = result.model_copy(update={"outcome": "possible_match", "contributes_to_neutral_pattern": False})
@@ -1564,6 +1567,14 @@ def credible_field_candidates(record: ReferenceDiscoveryRecord, fields=("title",
             yield candidate
 
 
+def _record_web_providers(required_web_providers) -> tuple[str, ...]:
+    """The pair a record names, so a stored record is judged by the providers it
+    searched; the current setting only for a new search that names none."""
+    if is_required_web_provider_set(required_web_providers):
+        return tuple(required_web_providers)
+    return REQUIRED_API_PROVIDERS
+
+
 def derive_reference_discovery_record(
     *,
     reference_id: str,
@@ -1575,6 +1586,7 @@ def derive_reference_discovery_record(
     search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
     search_retention_policy: Literal["brave-operational-transient-v1"] | None = None,
     created_at: datetime | None = None,
+    required_web_providers: list[str] | None = None,
 ) -> ReferenceDiscoveryRecord:
     """Derive exactly one outcome without treating failed search as absence."""
     _validate_bindings(required_route_categories, queries, attempts, candidates)
@@ -1628,7 +1640,8 @@ def derive_reference_discovery_record(
             limitations.append(
                 "The reference could not be parsed completely; source identity remains unresolved."
             )
-        elif _search_is_incomplete(required_route_categories, attempts, queries, search_policy_version):
+        elif _search_is_incomplete(required_route_categories, attempts, queries, search_policy_version,
+                                   required_web_providers):
             outcome = "search_incomplete"
             limitations.append(
                 "At least one required search route failed, was unavailable, or did not complete."
@@ -1653,7 +1666,7 @@ def derive_reference_discovery_record(
     return ReferenceDiscoveryRecord(
         search_retention_policy=search_retention_policy,
         search_policy_version=search_policy_version,
-        required_web_providers=list(REQUIRED_API_PROVIDERS) if search_policy_version == API_FIRST_SEARCH_POLICY else [],
+        required_web_providers=list(_record_web_providers(required_web_providers)) if search_policy_version == API_FIRST_SEARCH_POLICY else [],
         reference_id=reference_id,
         created_at=created_at or datetime.now(timezone.utc),
         expected=expected,
@@ -1727,6 +1740,7 @@ def search_blocking_providers(
     attempts: list[ReferenceRouteAttempt],
     queries: list[ReferenceSearchQuery],
     search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
+    required_web_providers: list[str] | None = None,
 ) -> list[str]:
     """Providers whose failure is what holds this search incomplete.
 
@@ -1762,9 +1776,10 @@ def search_blocking_providers(
     if api_first:
         web_queries = [q for q in queries
                        if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        blocking |= set(REQUIRED_API_PROVIDERS) - {q.execution_provider for q in web_queries}
+        providers = _record_web_providers(required_web_providers)
+        blocking |= set(providers) - {q.execution_provider for q in web_queries}
         required_query_ids -= {q.query_id for q in web_queries
-                               if q.execution_provider not in REQUIRED_API_PROVIDERS}
+                               if q.execution_provider not in providers}
     blocking |= {
         query.execution_provider for query in queries
         if query.query_id in required_query_ids and query.execution_provider
@@ -1845,6 +1860,7 @@ def _search_is_incomplete(
     attempts: list[ReferenceRouteAttempt],
     queries: list[ReferenceSearchQuery],
     search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
+    required_web_providers: list[str] | None = None,
 ) -> bool:
     api_first = search_policy_version == API_FIRST_SEARCH_POLICY
     if any(a.unresolved or a.not_attempted or a.identity_established
@@ -1891,10 +1907,11 @@ def _search_is_incomplete(
     }
     if api_first:
         web_queries = [q for q in queries if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        if set(REQUIRED_API_PROVIDERS) - {q.execution_provider for q in web_queries}:
+        providers = _record_web_providers(required_web_providers)
+        if set(providers) - {q.execution_provider for q in web_queries}:
             return True
         # Optional SearXNG/Tavily cannot satisfy or invalidate required APIs.
-        required_query_ids -= {q.query_id for q in web_queries if q.execution_provider not in REQUIRED_API_PROVIDERS}
+        required_query_ids -= {q.query_id for q in web_queries if q.execution_provider not in providers}
     return any(
         query.query_id in required_query_ids
         and query.execution_provider is not None

@@ -302,7 +302,8 @@ is only a factual identifier error. Books/editions remain outside this rule.
     except (ValueError, TypeError):
         same, completion = False, None
     if not same or not completion.ready or completion.record.outcome != record.outcome or _search_is_incomplete(
-            record.required_route_categories, record.attempts, record.queries, record.search_policy_version):
+            record.required_route_categories, record.attempts, record.queries, record.search_policy_version,
+            record.required_web_providers):
         result['reason_code'] = 'compound_discrepancy_search_incomplete'
         return result
     if any(not _bound_candidate(record, c) or any(
@@ -368,7 +369,8 @@ def assess_reference_credibility(reference, discovery=None, trace=None):
             or not is_required_web_provider_set(parsed.required_web_providers)
             or not {'academic_adapter','bounded_web'} <= set(record.required_route_categories)):
         return result
-    if _search_is_incomplete(record.required_route_categories, record.attempts, record.queries, record.search_policy_version):
+    if _search_is_incomplete(record.required_route_categories, record.attempts, record.queries, record.search_policy_version,
+            record.required_web_providers):
         result['cumulative_reason_code'] = 'required_identity_search_incomplete'
         return result
     # No guess about missing fields, access failures or source completeness.

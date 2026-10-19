@@ -174,24 +174,6 @@ def get_report(
     )
 
 
-def _report_marks_released(session: Session, report_id: str, principal) -> bool:
-    """Whether the report's paper belongs to an assessment with marks released."""
-    from app.services.assessment_marks import job_marks_released
-    if not isinstance(session, Session):
-        return False  # only a database session can hold the record
-    try:
-        report = session.get(Report, uuid.UUID(str(report_id)))
-    except ValueError:
-        return False
-    if not isinstance(report, Report):
-        return False
-    job = session.get(Job, report.job_id)
-    if (not isinstance(job, Job) or job.scope_type != principal.scope_type
-            or job.scope_id != principal.scope_id):
-        return False
-    return job_marks_released(session, job)
-
-
 def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id: str, principal) -> dict | None:
     from app.services import judgment_runs as runs
     from app.services.judgment_layer import build_judgment_layer
@@ -442,8 +424,6 @@ def check_paper_again(
     job = _report_job(session, report_id, principal)
     if job is None:
         raise HTTPException(status_code=404, detail="Report not found")
-    if _report_marks_released(session, report_id, principal):
-        raise HTTPException(status_code=410, detail="Marks are released for this assessment")
     try:
         outcome, value = start_recheck(session, backend, job, scope_type=principal.scope_type,
                                        scope_id=principal.scope_id)

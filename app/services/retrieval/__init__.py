@@ -31,7 +31,6 @@ from app.services.retrieval.europe_pmc import EuropePmcRetriever
 from app.services.retrieval.web_search import WebSearchRetriever
 
 from app.config import settings
-from app.services.library_permissions import restrict
 from app.services.retrieval.provider_runtime import ProviderPolicy, provider_policy
 
 __all__ = [
@@ -107,6 +106,5 @@ def get_retrieval_sources() -> list[RetrievalSource]:
             )
         policy = provider_policy(name, getattr(cls, "default_policy", ProviderPolicy()))
         if policy.enabled:
-            # Each adapter answers under its library permissions.
-            sources.append(restrict(cls()))
+            sources.append(cls())
     return sources

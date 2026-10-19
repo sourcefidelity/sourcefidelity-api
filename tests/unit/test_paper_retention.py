@@ -21,10 +21,11 @@ def test_temporary_policy_deletes_after_extraction():
 
 
 @pytest.mark.parametrize("mode", ["assessment", "course", "institutional"])
-def test_future_retention_modes_fail_closed(mode):
+def test_removed_institutional_retention_modes_fail_closed(mode):
+    # Personal only (owner decision 2026-10-19): papers are temporary.
     with pytest.raises(PaperRetentionPolicyError) as captured:
         resolve_paper_retention_policy(mode)
-    assert captured.value.code == "paper_retention_mode_not_implemented"
+    assert captured.value.code == "paper_retention_mode_invalid"
 
 
 def test_unknown_retention_mode_fails_closed():

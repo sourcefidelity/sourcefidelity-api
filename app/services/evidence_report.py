@@ -23,6 +23,7 @@ from urllib.parse import quote, urlsplit
 from sqlalchemy.orm import Session
 import fitz
 
+from app.services.doi_links import doi_href, doi_link_base
 from app.models.job import Job
 from app.models.report import Report, ReportPaperArtifactRecord, VerificationReportRecord
 from app.services.report_paper_artifact import (
@@ -2791,7 +2792,7 @@ def _derived_doi_link_overlays(document, rectangles, raw, existing_hrefs):
     for match in _REFERENCE_DOI_TEXT_RE.finditer(raw or ""):
         label = match.group().rstrip(".,;)")
         identifier = match.group(1).rstrip(".,;)")
-        href = "https://doi.org/" + identifier
+        href = doi_link_base() + identifier
         if not _safe_reference_href(href):
             continue
         if any(identifier.casefold() in str(value).casefold() for value in existing_hrefs):
@@ -3945,7 +3946,7 @@ def _reference_source_action(reference) -> dict:
             "status": "canonical_landing_available",
             "label": "Open source record",
             "enabled": True,
-            "href": f"https://doi.org/{quote(decode_doi(reference.doi.strip()), safe='/():._-')}",
+            "href": doi_href(decode_doi(reference.doi.strip()), safe='/():._-'),
         }
     candidate = (reference.url or "").strip()
     try:
@@ -6107,7 +6108,7 @@ def _render_reference_panel_content(finding: dict, index: int, *, combined: bool
         from urllib.parse import quote
         doi = str(finding['verified_doi'])
         return frame('<h2>Required DOI Missing</h2>', f'<p>{escape(finding["finding"])}</p>'
-                     f'<p>Verified DOI: <a href="https://doi.org/{escape(quote(doi, safe="/"), quote=True)}" target="_blank" rel="noopener noreferrer">{escape(doi)}</a></p>'
+                     f'<p>Verified DOI: <a href="{escape(doi_href(doi), quote=True)}" target="_blank" rel="noopener noreferrer">{escape(doi)}</a></p>'
                      + own(f'<p class="full-reference own-reference">{escape(source["raw_reference"])}</p>'))
     fallback = ". ".join(
         value for value in (source["author"], source["year"], source["title"]) if value
@@ -6999,7 +7000,7 @@ def _link_reference_text(text: str, *, suppressed_dois: frozenset[str] = frozens
                 identifier = "10." + identifier
             if identifier.casefold() in suppressed_dois:
                 continue
-            href = "https://doi.org/" + identifier
+            href = doi_link_base() + identifier
         else:
             href = label
         chunks.append(escape(text[cursor:match.start()]))

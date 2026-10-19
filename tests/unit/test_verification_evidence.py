@@ -1805,8 +1805,8 @@ def test_exact_scope_is_required_even_when_same_bytes_exist_elsewhere(
         session,
         storage,
         _pdf("Authorized course evidence."),
-        scope_type="assessment",
-        scope_id="assessment-1",
+        scope_type="personal_owner",
+        scope_id="owner-1",
         expires_at=datetime.now(timezone.utc) + timedelta(days=30),
     )
 
@@ -1815,8 +1815,8 @@ def test_exact_scope_is_required_even_when_same_bytes_exist_elsewhere(
             session,
             storage,
             representation_id=record.id,
-            scope_type="assessment",
-            scope_id="assessment-2",
+            scope_type="personal_owner",
+            scope_id="owner-2",
         )
 
 
@@ -1826,8 +1826,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
         session,
         storage,
         _pdf("Expired evidence."),
-        scope_type="assessment",
-        scope_id="assessment-1",
+        scope_type="personal_owner",
+        scope_id="owner-1",
         expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
     )
     with pytest.raises(EvidenceAuthorizationError, match="expired"):
@@ -1835,8 +1835,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
             session,
             storage,
             representation_id=expired.id,
-            scope_type="assessment",
-            scope_id="assessment-1",
+            scope_type="personal_owner",
+            scope_id="owner-1",
         )
 
     expired.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
@@ -1847,8 +1847,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
             session,
             storage,
             representation_id=expired.id,
-            scope_type="assessment",
-            scope_id="assessment-1",
+            scope_type="personal_owner",
+            scope_id="owner-1",
         )
 
 

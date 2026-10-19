@@ -20,12 +20,6 @@ from app.services.reference_discovery import (
 from tests.unit.blocked_discovery import blocked_record
 
 
-@pytest.fixture(autouse=True)
-def _institutional_deployment(monkeypatch):
-    """Automatic re-searching happens only in an Institutional deployment
-    (owner decision 2026-09-29); these tests exercise that behaviour."""
-    import app.services.assessment_marks as marks
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
 
 
 

@@ -31,12 +31,6 @@ from app.tasks import incomplete_search_retry as task_module
 from test_report_export import export_store  # noqa: F401  (fixture)
 
 
-@pytest.fixture(autouse=True)
-def _institutional_deployment(monkeypatch):
-    """Automatic re-searching happens only in an Institutional deployment
-    (owner decision 2026-09-29); these tests exercise that behaviour."""
-    import app.services.assessment_marks as marks
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
 
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
@@ -285,10 +279,8 @@ def client(monkeypatch):
 
 def test_personal_deployment_also_completes_searches_on_its_own(monkeypatch):
     # Owner decision 2026-10-18 (was the user's choice in Personal, 2026-09-29).
-    import app.services.assessment_marks as marks
     from app.tasks.incomplete_search_retry import retry_incomplete_searches
     from app.tasks.provider_recovery import requeue_recovered_provider_work
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: False)
     monkeypatch.setattr("app.tasks.incomplete_search_retry.settings.PROVIDER_RECOVERY_REFRESH_ENABLED", False)
     monkeypatch.setattr("app.tasks.provider_recovery.settings.PROVIDER_RECOVERY_REFRESH_ENABLED", False)
     # Only the one deployment switch stops them now, never the profile.
@@ -300,24 +292,21 @@ def test_personal_automatic_searching_is_the_owners_setting(factory):
     from app.services.storage_policy import finishes_searches_automatically, set_policy
     with factory() as session:
         assert finishes_searches_automatically(session, "personal_owner", "owner-1") is False
-        assert finishes_searches_automatically(session, "assessment", "A1") is True
         set_policy(session, "personal_owner", "owner-1", {"searches": {"finish_incomplete_automatically": True}})
         session.commit()
         assert finishes_searches_automatically(session, "personal_owner", "owner-1") is True
 
 
-def test_the_settings_page_offers_the_search_line_only_in_personal():
+def test_the_settings_page_offers_the_search_line():
     from app.routers.storage_settings import _changes, _page
     from app.services.storage_policy import deployment_defaults
-    personal = _page(deployment_defaults("personal"), personal=True).body.decode()
-    assert "<legend>Searches</legend>" in personal and "Finish incomplete searches automatically" in personal
-    assert 'value="off" checked' in personal.split("Finish incomplete searches automatically")[1]
-    assert "Searches" not in _page(deployment_defaults("institutional")).body.decode()
-    form = {"keep_public_copies": "all", "keep_licensed_copies": "off", "keep_submitted_file": "off",
-            "public_copy_days_until_deleted": "true", "licensed_copy_days_until_deleted": "true",
+    page = _page(deployment_defaults()).body.decode()
+    assert "<legend>Searches</legend>" in page and "Finish incomplete searches automatically" in page
+    assert 'value="off" checked' in page.split("Finish incomplete searches automatically")[1]
+    form = {"keep_copies": "all", "keep_months": "0", "keep_submitted_file": "off",
             "paper_copy_days": "7", "report_days_until_deleted": "true", "finish_incomplete_automatically": "on"}
-    assert _changes(form, personal=True)["searches"] == {"finish_incomplete_automatically": True}
-    assert "searches" not in _changes(form)
+    assert _changes(form)["searches"] == {"finish_incomplete_automatically": True}
+    assert "searches" not in _changes({k: v for k, v in form.items() if k != "finish_incomplete_automatically"})
 
 
 @pytest.fixture(autouse=True)

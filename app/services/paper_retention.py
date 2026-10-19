@@ -1,9 +1,5 @@
-"""Student-paper retention policy boundary.
-
-Only temporary processing is operational in the prototype. The wider modes
-are named now so later paper-corpus work can extend this boundary without
-silently turning temporary workflow storage into a plagiarism repository.
-"""
+"""Paper retention policy boundary: papers are temporary processing input,
+never a comparison corpus (Personal only, owner decision 2026-10-19)."""
 
 from __future__ import annotations
 
@@ -14,9 +10,6 @@ from typing import Callable, Protocol
 
 class PaperRetentionMode(str, Enum):
     TEMPORARY = "temporary"
-    ASSESSMENT = "assessment"
-    COURSE = "course"
-    INSTITUTIONAL = "institutional"
 
 
 class PaperRetentionPolicyError(RuntimeError):
@@ -64,12 +57,4 @@ def resolve_paper_retention_policy(value: str) -> PaperRetentionPolicy:
             "paper_retention_mode_invalid",
             "Paper retention mode is not recognized",
         ) from exc
-    if mode is PaperRetentionMode.TEMPORARY:
-        return TemporaryPaperRetentionPolicy()
-    raise PaperRetentionPolicyError(
-        "paper_retention_mode_not_implemented",
-        (
-            f"Paper retention mode '{mode.value}' requires the separate "
-            "student-submission repository, authorization, and lifecycle service"
-        ),
-    )
+    return TemporaryPaperRetentionPolicy()
