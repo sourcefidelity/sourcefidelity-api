@@ -1,4 +1,4 @@
-"""Storage settings page (owner decisions 2026-10-13 and 2026-10-19: approved wording; who may change it)."""
+"""Storage settings page (owner decisions 2026-10-13, 2026-10-19 and 2026-10-20: approved wording; who may change it)."""
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -54,13 +54,15 @@ def test_the_page_shows_only_the_approved_wording_and_current_values(database):
                  "<legend>Finish incomplete searches automatically</legend>",
                  "<legend>Papers</legend>", "Keep the paper beside its report for", "<legend>Reports</legend>",
                  "Keep reports for", "Until deleted", "Open access only", ">Save</button>",
-                 "<legend>Keep the submitted file</legend>", "Keep the submitted file for"):
+                 "<legend>Keep the submitted file</legend>", "Keep the submitted file for",
+                 "<legend>Keep only the latest report</legend>"):
         assert text in page.text
     # Defaults: all sources permanently, reports until deleted, the paper copy for 7 days.
     assert 'name="keep_copies" value="all" checked' in page.text
     assert 'name="keep_months" value="0" checked' in page.text
     assert 'name="report_days_until_deleted" value="true" checked' in page.text
     assert 'name="paper_copy_days" min="1" step="1" value="7"' in page.text
+    assert 'name="keep_latest_only" value="on" checked' in page.text
 
 
 def test_a_save_stores_the_owners_settings(database):
@@ -71,6 +73,16 @@ def test_a_save_stores_the_owners_settings(database):
         policy = policy_for(db, "personal_owner", _personal_principal().scope_id)
     assert policy.sources.keep_copies == "all" and policy.sources.keep_months == 6
     assert policy.papers.paper_copy_days == 14 and policy.reports.report_days == 365
+    assert policy.reports.keep_latest_only        # absent from the form: the stored choice stays
+
+
+def test_keep_only_the_latest_report_can_be_turned_off(database):
+    client = _client(_personal_principal())
+    assert client.post("/settings/storage", data={**FORM, "keep_latest_only": "off"},
+                       follow_redirects=False).status_code == 303
+    with database() as db:
+        assert not policy_for(db, "personal_owner", _personal_principal().scope_id).reports.keep_latest_only
+    assert 'name="keep_latest_only" value="off" checked' in client.get("/settings/storage").text
 
 
 def test_a_paper_kept_longer_than_its_report_is_refused_with_the_approved_message(database):

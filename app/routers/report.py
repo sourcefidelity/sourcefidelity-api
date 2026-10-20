@@ -147,6 +147,9 @@ def get_report(
 ):
     """Return the evidence-led HTML projection in the resolved viewer scope."""
     principal.require(REPORT_VIEW_CAPABILITY)
+    moved = _moved_to(session, report_id, principal)
+    if moved:
+        return RedirectResponse(f"/report/{moved}", status_code=303)
     view, artifact, paper_content = _load_bundle(session, backend, report_id, principal)
     nonce = secrets.token_urlsafe(24)
     view = enable_authenticated_paper_actions(view, report_id=report_id)
@@ -255,6 +258,10 @@ def get_report_successor_status(
 ):
     """Return text-free lineage status for a report awaiting reanalysis."""
     principal.require(REPORT_VIEW_CAPABILITY)
+    moved = _moved_to(session, report_id, principal)
+    if moved:
+        status = get_report_successor_status(moved, principal, session, backend)
+        return {**status, "requested_report_id": report_id, "successor_available": True}
     _load_bundle(session, backend, report_id, principal)
     try:
         requested_id = uuid.UUID(report_id)
@@ -302,6 +309,20 @@ def get_report_successor_status(
         "queued_uploads": len((job.upload_evidence or {}).get("queued_source_uploads") or []),
         "last_reanalysis_failure": failure or None,
     }
+
+
+def _moved_to(session: Session, report_id: str, principal) -> str | None:
+    """The latest report a deleted older report's address opens, in the
+    viewer's scope (owner decision 2026-10-20); None for any other address."""
+    from app.services.record_expiry import current_report_id
+    try:
+        parsed = uuid.UUID(str(report_id))
+    except ValueError:
+        return None
+    if session.get(Report, parsed) is not None:
+        return None
+    target = current_report_id(session, parsed)
+    return str(target) if target and _report_job(session, str(target), principal) else None
 
 
 def _report_job(session: Session, report_id: str, principal) -> Job | None:

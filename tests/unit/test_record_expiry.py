@@ -103,3 +103,96 @@ def test_a_paper_copy_that_cannot_be_deleted_keeps_the_whole_record(session):
     _paper(session, "stuck")
     assert expire_paper_records(session, _backend(deletes=False), now=NOW) == {"expired": 1, "deleted": 0}
     assert _count(session, Job) == 1 and _count(session, Report) == 1
+
+
+# --- Only the latest report (owner decision 2026-10-20) ----------------------
+from app.models.report import ReportRedirect  # noqa: E402
+from app.services.record_expiry import current_report_id, keep_latest_reports  # noqa: E402
+
+
+def _version(session, job_id, number, *, judged=True):
+    report = Report(job_id=job_id, report_json={}, report_version=number, created_at=NOW - timedelta(days=10 - number))
+    session.add(report)
+    session.flush()
+    if judged:
+        session.add(JudgmentRun(report_id=report.id, scope_type="personal_owner", scope_id="owner-1",
+                                requested_by="t", notice_version="n", panel_version="p", status="completed"))
+    session.commit()
+    return report.id
+
+
+def _judged(session):
+    """The fixture's Judgment runs finished (a queued run keeps every version)."""
+    for run in session.scalars(select(JudgmentRun).where(JudgmentRun.status != "running")):
+        run.status = "completed"
+    session.commit()
+
+
+def _reports(session, job_id):
+    return set(session.scalars(select(Report.id).where(Report.job_id == job_id)))
+
+
+def test_older_versions_go_and_their_addresses_open_the_latest(session):
+    job = _paper(session, "p")
+    first = next(iter(_reports(session, job)))
+    second = _version(session, job, 2)
+    third = _version(session, job, 3)
+    _judged(session)
+    assert keep_latest_reports(session, _backend(), dry_run=True) == {"older_versions_deleted": 2,
+                                                                      "replaced_runs_deleted": 0}
+    assert _count(session, Report) == 3
+    assert keep_latest_reports(session, _backend())["older_versions_deleted"] == 2
+    assert _reports(session, job) == {third}
+    assert {r.report_id for r in session.scalars(select(JudgmentRun))} == {third}
+    assert session.scalar(select(ReportPaperArtifactRecord.report_id)) == third
+    assert current_report_id(session, first) == current_report_id(session, second) == third
+    assert keep_latest_reports(session, _backend())["older_versions_deleted"] == 0
+
+
+def test_nothing_goes_while_a_judgment_runs_or_when_the_user_keeps_every_version(session):
+    job = _paper(session, "p")
+    newest = _version(session, job, 2, judged=False)
+    _judged(session)
+    session.add(JudgmentRun(report_id=newest, scope_type="personal_owner", scope_id="owner-1", requested_by="t",
+                            notice_version="n", panel_version="p", status="running"))
+    session.commit()
+    assert keep_latest_reports(session, _backend())["older_versions_deleted"] == 0
+    session.scalars(select(JudgmentRun).where(JudgmentRun.report_id == newest)).one().status = "completed"
+    set_policy(session, "personal_owner", "owner-1", {"reports": {"keep_latest_only": False}})
+    session.commit()
+    assert keep_latest_reports(session, _backend())["older_versions_deleted"] == 0
+    assert len(_reports(session, job)) == 2
+
+
+def test_a_finished_check_again_replaces_the_earlier_run(session):
+    earlier = _paper(session, "first")
+    later = _paper(session, "again", age_days=1)
+    old_report = next(iter(_reports(session, earlier)))
+    new_report = next(iter(_reports(session, later)))
+    first_job, second_job = session.get(Job, earlier), session.get(Job, later)
+    first_job.upload_evidence = {"recheck_job_id": str(later)}
+    second_job.status = JobStatus.RUNNING
+    session.commit()
+    _judged(session)
+    assert keep_latest_reports(session, _backend())["replaced_runs_deleted"] == 0   # still checking
+    second_job.status = JobStatus.COMPLETED
+    session.commit()
+    assert keep_latest_reports(session, _backend())["replaced_runs_deleted"] == 1
+    assert session.get(Job, earlier) is None and session.get(Job, later) is not None
+    assert current_report_id(session, old_report) == new_report
+    assert _count(session, VerificationReportRecord) == 1
+
+
+def test_an_address_already_moved_follows_the_next_replacement(session):
+    job = _paper(session, "p")
+    first = next(iter(_reports(session, job)))
+    _version(session, job, 2)
+    _judged(session)
+    keep_latest_reports(session, _backend())
+    later = _paper(session, "again", age_days=1)
+    _judged(session)
+    session.get(Job, job).upload_evidence = {"recheck_job_id": str(later)}
+    session.commit()
+    keep_latest_reports(session, _backend())
+    assert current_report_id(session, first) == next(iter(_reports(session, later)))
+    assert _count(session, ReportRedirect) == 2

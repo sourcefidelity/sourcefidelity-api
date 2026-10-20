@@ -9,6 +9,7 @@ from app.models.report import (  # noqa: E402, F401
     PaperAnnotationRecord,
     Report,
     ReportPaperArtifactRecord,
+    ReportRedirect,
     VerificationReportRecord,
 )
 # The unused legacy StoredDocument sketch is deliberately not registered in

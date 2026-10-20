@@ -1,4 +1,4 @@
-"""Storage settings page (owner decisions 2026-10-13 and 2026-10-19; wording owner-approved).
+"""Storage settings page (owner decisions 2026-10-13, 2026-10-19 and 2026-10-20; wording owner-approved).
 
 The deployment's owner sets them. Only the approved text is shown: no helper
 sentences, no confirmation line after a save. Tightening which sources are
@@ -95,6 +95,8 @@ def _page(policy: StoragePolicy, error: str | None = None) -> HTMLResponse:
                 until_deleted=True)
         + '</fieldset><fieldset><legend>Reports</legend>'
         + _days("report_days", "Keep reports for", reports.report_days, until_deleted=True)
+        + '<fieldset><legend>Keep only the latest report</legend>'
+        + _radios("keep_latest_only", on_off, "on" if reports.keep_latest_only else "off") + '</fieldset>'
         + '</fieldset><fieldset><legend>Searches</legend><fieldset><legend>Finish incomplete searches automatically'
         '</legend>' + _radios("finish_incomplete_automatically", on_off,
                               "on" if policy.searches.finish_incomplete_automatically else "off")
@@ -152,11 +154,18 @@ def _changes(form) -> dict:
         if finish not in {"on", "off"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
         searches = {"finish_incomplete_automatically": finish == "on"}
+    reports = {"report_days": days("report_days", until_deleted=True)}
+    latest_only = form.get("keep_latest_only")
+    if latest_only is not None:
+        # Absent (an older page): the stored choice stays.
+        if latest_only not in {"on", "off"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST)
+        reports["keep_latest_only"] = latest_only == "on"
     return {
         **({"searches": searches} if searches else {}),
         "sources": {"keep_copies": keep, "keep_months": int(months)},
         "papers": papers,
-        "reports": {"report_days": days("report_days", until_deleted=True)},
+        "reports": reports,
     }
 
 

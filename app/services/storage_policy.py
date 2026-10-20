@@ -7,7 +7,7 @@ keep each copy 3, 6, 9 or 12 months after its last use in a check, or
 permanently (`keep_months` 0). The default is all articles, permanently.
 Papers: the copy shown beside the report is kept for
 `FORMATIVE_REPORT_PAPER_RETENTION_DAYS` after the report was last built or
-returned again. Reports: kept until deleted (0 days).
+returned again. Reports: kept until deleted (0 days); only the latest report of a paper is kept.
 A day count of 0 means "until deleted". The row holds only the differences
 from the defaults; anything invalid fails closed to the defaults. Rows written
 under storage-policy-v1 are read with their source fields translated.
@@ -54,6 +54,9 @@ class ReportStorage(BaseModel):
     # The whole paper record (report versions, checks, judgments) is deleted
     # this many days after its report was last built or returned again.
     report_days: int = Field(default=0, ge=0)
+    # Older versions of a paper's report, and the runs a Check Again replaced,
+    # are deleted once the newer report is finished (owner decision 2026-10-20).
+    keep_latest_only: bool = True
 
 
 class SearchSettings(BaseModel):

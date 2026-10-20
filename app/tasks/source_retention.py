@@ -60,10 +60,12 @@ def cleanup_expired_source_representations() -> dict[str, int | str]:
 def expire_paper_records_task() -> dict[str, int]:
     """Delete paper records whose scope's report period has ended (owner
     decision 2026-10-09); scopes without a report period are never touched.
-    Remembered model answers older than the reuse window go too."""
+    Remembered model answers older than the reuse window go too, and so do
+    older report versions where only the latest is kept (2026-10-20)."""
     from app.services import llm_cache
-    from app.services.record_expiry import expire_paper_records
+    from app.services.record_expiry import expire_paper_records, keep_latest_reports
     with SessionLocal() as session:
         result = expire_paper_records(session, get_storage_backend())
+        result.update(keep_latest_reports(session, get_storage_backend()))
         result["model_answers_expired"] = llm_cache.expire(session)
         return result
