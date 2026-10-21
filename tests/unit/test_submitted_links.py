@@ -200,7 +200,7 @@ def test_connected_peer_failure_preserves_status_not_body(monkeypatch, ref):
     ('yes', 'differs', 'not_assessed'), ('unsure', 'not_shown', 'not_assessed'), ('no', 'differs', 'not_assessed'),
 ])
 def test_a_cross_script_judgment_is_kept_on_the_link_and_a_same_work_answer_verifies_the_page(
-        monkeypatch, same_work, author, identity):
+        monkeypatch, page_judge, same_work, author, identity):
     """Owner decision 2026-10-12: the model's judgment of the student's own
     link was discarded, so a page it named stayed "not telling"."""
     from app.services.reference_verification import assess_reference_verification
@@ -214,7 +214,7 @@ def test_a_cross_script_judgment_is_kept_on_the_link_and_a_same_work_answer_veri
               'returned_model': 'model-x', 'returned_provider': 'provider-x', 'total_tokens': 12,
               'reported_cost_usd': 0.0001, 'same_work': same_work, 'author': author,
               'page_authors': ['林青'], 'call': 'answered'}
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', lambda *a, **k: judged)
+    page_judge.answer = judged
     reference = ParsedReference(reference_id='r1', url='https://pages.example/rivers/42', source_kind='webpage',
                                 title='Rivers of the northern plain', author='Lin, Q.', year='2021')
 
@@ -239,6 +239,25 @@ def test_a_cross_script_judgment_is_kept_on_the_link_and_a_same_work_answer_veri
         assert 'could not be resolved across writing systems' not in render_link_checks(rows)
     else:
         assert verdict['status'] == 'not_assessed' and verdict['reason_code'] == 'web_page_link_not_telling'
+
+
+def test_an_organisation_named_differently_still_confirms_the_link(monkeypatch, page_judge):
+    """web-page-identity-v1: the link record and page admission use one rule; an
+    organisation's name in another language is a translation, not a difference."""
+    from app.services.source_resolver import SourceResolver
+    body = '<html><head><title>北方平原的河流</title></head><body><p>北方水利局</p></body></html>'
+    fixture_transport(monkeypatch, lambda req: httpx.Response(200, text=body, headers={'content-type': 'text/html'},
+                                                              request=req))
+    page_judge.answer = {'same_work': 'yes', 'author': 'differs', 'page_authors': ['北方水利局']}
+    reference = ParsedReference(reference_id='r1', url='https://pages.example/rivers/43', source_kind='webpage',
+                                title='Rivers of the northern plain', author='Northfield Water Office', year='2021')
+
+    @observe_reference
+    def check(self, reference):
+        return SourceResolver.__new__(SourceResolver)._try_web_fetch(
+            reference.url, reference.title, expected_author='Northfield Water Office', expected_year='2021')
+    rows = check(None, reference).metadata['submitted_link_observations']
+    assert SubmittedLink.model_validate(rows[0]).requests[0].destination_identity == 'confirmed'
 
 
 def test_a_cross_script_judgment_needs_the_exact_response():

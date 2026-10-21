@@ -140,6 +140,24 @@ def qualify_supplied_html(
         include_tables=False,
         favor_recall=True,
     )
+    # The same page rules as a fetched page (web-page-identity-v1): a Han
+    # title read as the cited romanised title, and the model's comparison for
+    # a title only in another writing system or a near reading.
+    from app.services.bibliographic_scripts import cross_script_comparison_unresolved
+    from app.services.source_resolver import _densest_text_block, _extract_html_titles, _romanised_page_title_outcome
+    from app.services.web_page_identity import ask_model, model_admits
+    page_titles = _extract_html_titles(page_html) if expected_title else []
+    romanised_page = _romanised_page_title_outcome(expected_title, page_titles) if page_titles else None
+    cross_script = bool(page_titles) and romanised_page is None and all(
+        cross_script_comparison_unresolved(expected_title, value) for value in page_titles)
+    judged = (ask_model(title=expected_title, author=expected_author, year=expected_year, page_titles=page_titles,
+                        page_date=observed.get("year"), page_text=page_text)
+              if cross_script or romanised_page == "minor_difference" else None)
+    same_work = judged if cross_script and model_admits(judged, expected_author) else None
+    if (not page_text or len(page_text) < 100) and (same_work or romanised_page):
+        # A page in the work's own language whose body the extractor took for
+        # boilerplate: the densest leaf text block is the work's text.
+        page_text = _densest_text_block(page_html) or page_text
     if not page_text or len(page_text) < 100:
         raise SuppliedHtmlRejected(
             "readable_text_unavailable",
@@ -169,27 +187,30 @@ def qualify_supplied_html(
             },
         )
 
-    # The shared identity standard, unchanged: a supplied file earns no
-    # weaker comparison than a fetched page.
-    from app.services.source_resolver import _web_identity_comparison
+    # The shared identity standard and page rules: a supplied file earns no
+    # weaker, and no stronger, comparison than a fetched page.
+    from app.services.web_page_identity import confirm_page, nearby_publication_year
 
     probe = RetrievalResult(
         source_name="supplied_html",
         success=True,
-        title=observed["title"],
+        title=observed["title"] or (page_titles[0] if same_work and page_titles else None),
         authors=observed["authors"],
         year=observed["year"],
         doi=observed["doi"],
+        metadata={"web_identity": observed, **({"cross_script_judgment": judged} if judged else {})},
     )
-    identity, comparisons, confirmed = _web_identity_comparison(
-        probe,
-        title=expected_title,
-        author=expected_author,
-        year=expected_year,
-        doi=expected_doi,
+    verdict = confirm_page(
+        probe, title=expected_title, author=expected_author, year=expected_year, doi=expected_doi,
+        page_text=page_text, html=page_html, page_titles=page_titles, romanised_page=romanised_page,
+        judged=same_work,
     )
+    identity, comparisons, confirmed = verdict.identity, verdict.comparisons, verdict.confirmed
+    near_year = nearby_publication_year(
+        comparisons, expected_kind=expected_source_kind.kind, observed_kind=observed_kind,
+        expected_year=expected_year, observed_year=observed["year"])
     comparison_records = [c.model_dump(mode="json") for c in comparisons]
-    if identity.has_material_conflict:
+    if identity.has_material_conflict and not near_year:
         raise SuppliedHtmlRejected(
             "bibliographic_fields_conflict",
             "Supplied page bibliographic fields conflict with the citation",
@@ -202,7 +223,7 @@ def qualify_supplied_html(
                 ],
             },
         )
-    if not confirmed:
+    if not confirmed and not near_year:
         raise SuppliedHtmlRejected(
             "bibliographic_identity_unconfirmed",
             "Supplied page bibliographic identity remains unconfirmed",
@@ -211,6 +232,12 @@ def qualify_supplied_html(
                 "identity_comparisons": comparison_records,
             },
         )
+    if completeness["verdict"] != "complete" and confirmed and not identity.has_material_conflict:
+        # A confirmed cited web page is the work itself, not a host of it.
+        from app.services.web_completeness import confirmed_page_completeness
+        page_coverage = confirmed_page_completeness(page_text, expected_source_kind.kind)
+        if page_coverage["verdict"] == "complete":
+            completeness = {**page_coverage, "article_coverage": completeness}
     if completeness["verdict"] != "complete":
         raise SuppliedHtmlRejected(
             "article_body_incomplete",

@@ -937,29 +937,23 @@ _CROSS_SCRIPT_JUDGMENT_FIELDS = ("version", "same_work", "author", "call", "payl
 
 
 def _cross_script_page_judgment(response, page_titles, *, expected_title, expected_author,
-                                expected_year) -> dict | None:
-    """The model's comparison of a fetched page titled only in another writing
-    system (CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED), bounded per reference.
+                                expected_year, page_date=None) -> dict | None:
+    """The model's comparison of a fetched web-search page titled only in
+    another writing system, through the one allowance (web-page-identity-v1).
 
     Spelling cannot compare such titles, so without it the page stays an
     uncompared candidate that holds the reference not assessed. Page names
     are not kept; the answer and its provenance are."""
-    if (not settings.CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED or not expected_title or not page_titles
+    if (not expected_title or not page_titles
             or not all(cross_script_comparison_unresolved(expected_title, title) for title in page_titles)):
         return None
-    trace = _ACTIVE_DISCOVERY_TRACE.get()
-    used = trace.setdefault("cross_script_page_judgments", 0) if trace is not None else 0
-    if used >= settings.CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE:
-        return None
-    if trace is not None:
-        trace["cross_script_page_judgments"] = used + 1
     import trafilatura
-    from app.services.cross_script_identity import judge_cross_script_identity
-    text = trafilatura.extract(response.text, include_comments=False, include_links=False,
-                               include_tables=False) or ""
-    judged = judge_cross_script_identity(
-        {"title": expected_title, "author": expected_author or "", "year": expected_year or ""},
-        {"titles": page_titles, "date": "", "text": text})
+    from app.services.web_page_identity import ask_model
+    judged = ask_model(title=expected_title, author=expected_author, year=expected_year, page_titles=page_titles,
+                       page_date=page_date, page_text=trafilatura.extract(
+                           response.text, include_comments=False, include_links=False, include_tables=False))
+    if judged is None:
+        return None
     return {key: judged.get(key) for key in _CROSS_SCRIPT_JUDGMENT_FIELDS if judged.get(key) is not None}
 
 
@@ -1397,18 +1391,6 @@ def _densest_text_block(html: str, *, minimum: int = 300) -> str:
         return ""
     lines = [line.strip() for line in best.text_content().splitlines() if line.strip()]
     return "\n".join(lines)
-
-
-def _cross_script_admits(judged: dict, cited_author: str | None) -> bool:
-    """The model judged a page in another writing system the cited work, and
-    did not find a cited person missing from it (an organisation's name is a
-    translation and never counts against it)."""
-    if (judged or {}).get("same_work") != "yes":
-        return False
-    if judged.get("author") != "differs":
-        return True
-    from app.services.source_validator import _cited_personal_surnames
-    return bool(cited_author) and not _cited_personal_surnames(cited_author)
 
 
 def _romanised_author_near_title(html: str, page_titles: list[str], cited_author: str | None,
@@ -2390,12 +2372,10 @@ class SourceResolver:
             _ACTIVE_DISCOVERY_TRACE.reset(token)
 
     # native-script-route-v1 (owner decision 2026-10-12). The free adapters
-    # asked in a work's own script, the book catalogues for book kinds, at most
-    # this many model comparisons for records the romanisation cannot decide.
+    # asked in a work's own script and the book catalogues for book kinds.
     _NATIVE_ADAPTERS = ("openalex", "crossref")
     _NATIVE_BOOK_ADAPTERS = ("open_library",)
     _NATIVE_BOOK_KINDS = frozenset({"monograph", "edited_collection", "book_section", "unknown"})
-    _NATIVE_MODEL_IDENTITY_CALLS = 2
 
     def _native_script_route(self, reference, *, identity_only: bool) -> RetrievalResult | None:
         """The native-script route under its own elapsed allowance."""
@@ -2417,8 +2397,8 @@ class SourceResolver:
         title within the existing per-provider query and run caps. Every
         returned record is compared with the CITED fields: a Han-script record
         by romanisation (`cross-language-identity-v1`), anything that cannot
-        be decided that way by the existing model comparison, at most
-        `_NATIVE_MODEL_IDENTITY_CALLS` times. The proposal itself never agrees
+        be decided that way by the existing model comparison, within the
+        reference's one model allowance (web-page-identity-v1). The proposal itself never agrees
         with anything. The route record (`native_script_route`) says whether
         the route completed: an adapter title search and a Brave or Exa search
         both finished, and no web provider was skipped by a budget.
@@ -2513,17 +2493,18 @@ class SourceResolver:
     def _native_model_fallback(self, result: RetrievalResult, expected, route: dict) -> None:
         """The existing model comparison for a record romanisation cannot decide."""
         from app.services.cross_language_identity import compare_titles
-        from app.services.cross_script_identity import judge_cross_script_identity
+        from app.services.web_page_identity import ask_model
         if (not result.success or not result.title
-                or route["model_identity_calls"] >= self._NATIVE_MODEL_IDENTITY_CALLS
                 or not cross_script_comparison_unresolved(expected.title, result.title)
                 or compare_titles(expected.title, result.title) is not None):
             return
+        # The reference's one model allowance (web-page-identity-v1).
+        judged = ask_model(title=expected.title, author=expected.authors[0] if expected.authors else "",
+                           year=expected.year, container_title=expected.container_title,
+                           page_titles=[result.title], page_date=result.year, page_text=result.abstract)
+        if judged is None:
+            return
         route["model_identity_calls"] += 1
-        judged = judge_cross_script_identity(
-            {"title": expected.title, "author": expected.authors[0] if expected.authors else "",
-             "year": expected.year, "container_title": expected.container_title},
-            {"titles": [result.title], "date": result.year or "", "text": result.abstract or ""})
         result.metadata = {**(result.metadata or {}), "cross_script_judgment": judged}
 
     def _native_admit_metadata_record(self, found, expected, expected_kind) -> RetrievalResult | None:
@@ -5470,12 +5451,25 @@ class SourceResolver:
                         if expected_title and page_titles
                         else None
                     )
+                    if page_title_match is False and _romanised_page_title_outcome(expected_title, page_titles):
+                        # A Han title that reads as the cited romanised title
+                        # goes on like a student's link (web-page-identity-v1).
+                        page_title_match = None
+                    judged = None
                     if page_title_match is False:
                         judged = _cross_script_page_judgment(
                             response, page_titles, expected_title=expected_title,
-                            expected_author=expected_author, expected_year=expected_year)
+                            expected_author=expected_author, expected_year=expected_year,
+                            page_date=observed_page.get("year"))
                         if judged is not None:
                             attempt["cross_script_judgment"] = judged
+                            # The answer is about this page's own titles, so the
+                            # candidate compares those, not the search listing's.
+                            attempt["landing_page_observation"] = self._landing_metadata_observation(response)
+                    # A page the model judged the cited work goes on like a
+                    # student's link (2026-10-13 rule, web-page-identity-v1).
+                    from app.services.web_page_identity import model_admits
+                    if page_title_match is False and not model_admits(judged, expected_author):
                         # A generic application/login/results title describes
                         # the interface, not necessarily the requested work.
                         # Require independent bibliographic corroboration before
@@ -6228,25 +6222,28 @@ class SourceResolver:
                     private_value_id("url", url),
                 )
                 cross_script = all(cross_script_comparison_unresolved(title, value) for value in page_titles)
+                judged = None
                 if cross_script and not homepage:
                     # Owner decision 2026-10-06 (Xu & Luo): the configured model
-                    # compares titles across writing systems.
+                    # compares titles across writing systems (web-page-identity-v1).
                     import trafilatura
-                    from app.services.cross_script_identity import judge_cross_script_identity
-                    judged = judge_cross_script_identity(
-                        {'title': title, 'author': expected_author, 'year': expected_year},
-                        {'titles': page_titles, 'date': observed.get('year'),
-                         'text': trafilatura.extract(resp.text, include_comments=False, include_links=False,
-                                                     include_tables=False) or ''})
+                    from app.services.web_page_identity import ask_model
+                    judged = ask_model(
+                        title=title, author=expected_author, year=expected_year, page_titles=page_titles,
+                        page_date=observed.get('year'),
+                        page_text=trafilatura.extract(resp.text, include_comments=False, include_links=False,
+                                                      include_tables=False))
+                if judged is not None:
                     page = RetrievalResult(
                         source_name="web_fetch", success=False, title=observed.get('title') or page_titles[0],
-                        authors=judged['page_authors'] or observed.get('authors') or [],
+                        authors=judged.get('page_authors') or observed.get('authors') or [],
                         year=observed.get('year'), doi=observed.get('doi'),
                         error="Page title is in another writing system; its text is not admitted",
                         metadata={'web_identity': observed, 'cross_script_judgment': judged,
                                   **diagnostic('cross_script_title_unresolved')})
-                    cross_script_observed(url, hashlib.sha256(resp.content).hexdigest(), judged)
-                    if not _cross_script_admits(judged, expected_author):
+                    cross_script_observed(url, hashlib.sha256(resp.content).hexdigest(), judged, expected_author or "")
+                    from app.services.web_page_identity import model_admits
+                    if not model_admits(judged, expected_author):
                         return page
                     cross_script_same_work = judged
                 if cross_script_same_work is None:
@@ -6401,10 +6398,11 @@ class SourceResolver:
                 if cross_script_same_work:
                     named.metadata["cross_script_judgment"] = cross_script_same_work
                 elif romanised_page == "minor_difference":
-                    from app.services.cross_script_identity import judge_cross_script_identity
-                    named.metadata["cross_script_judgment"] = judge_cross_script_identity(
-                        {'title': title, 'author': expected_author, 'year': expected_year},
-                        {'titles': page_titles, 'date': observed.get('year'), 'text': page_text})
+                    from app.services.web_page_identity import ask_model
+                    near = ask_model(title=title, author=expected_author, year=expected_year,
+                                     page_titles=page_titles, page_date=observed.get('year'), page_text=page_text)
+                    if near is not None:
+                        named.metadata["cross_script_judgment"] = near
                 judged = named.metadata.get("cross_script_judgment") or {}
                 if cross_script_same_work or romanised_page == "agreement" or judged.get("same_work") == "yes":
                     _attach_linked_abstract(named, resp, expected_doi)
@@ -6505,31 +6503,20 @@ class SourceResolver:
             # The page title reads nearly as the cited romanised title (a
             # one-syllable slip, a prefix): the existing model comparison may
             # settle it (cross-language-identity-v1 with cross-script-identity-v1).
-            from app.services.cross_script_identity import judge_cross_script_identity
-            result.metadata["cross_script_judgment"] = judge_cross_script_identity(
-                {'title': title, 'author': expected_author, 'year': expected_year},
-                {'titles': page_titles, 'date': observed.get('year'), 'text': page_text})
-        identity, comparisons, confirmed = _web_identity_comparison(result,
-            title=title, author=expected_author, year=expected_year, doi=expected_doi)
-        if not confirmed and _organisation_author_in_page(expected_author, comparisons, page_text):
-            # "Presented by the UCLA Film & Television Archive": an organisation
-            # author is named in the page text, not as a byline (2026-10-01).
-            confirmed = True
-            result.metadata['work_identity_basis'] = 'web-organisation-author-in-page-v1'
-        if not confirmed and cross_script_same_work and not identity.has_material_conflict:
-            confirmed = True
-            result.metadata['work_identity_basis'] = 'cross-script-identity-v1'
-        fields_seen = {c.field_name: c.outcome for c in comparisons}
-        if (not confirmed and romanised_page is not None and not identity.has_material_conflict
-                and fields_seen.get('title') in {'agreement', 'minor_difference'}
-                and fields_seen.get('author') == 'unknown'):
-            # A page in the work's own language names its author beside the
-            # title, outside its metadata ("潘越" for "Pan, Y.", 2026-10-12).
-            people = _romanised_author_near_title(resp.text, page_titles, expected_author)
-            if people:
-                confirmed = True
-                result.authors = people
-                result.metadata['work_identity_basis'] = 'cross-language-identity-v1'
+            from app.services.web_page_identity import ask_model
+            judged = ask_model(title=title, author=expected_author, year=expected_year, page_titles=page_titles,
+                               page_date=observed.get('year'), page_text=page_text)
+            if judged is not None:
+                result.metadata["cross_script_judgment"] = judged
+        from app.services.web_page_identity import confirm_page
+        verdict = confirm_page(result, title=title, author=expected_author, year=expected_year, doi=expected_doi,
+                               page_text=page_text, html=resp.text, page_titles=page_titles,
+                               romanised_page=romanised_page, judged=cross_script_same_work)
+        identity, comparisons, confirmed = verdict.identity, verdict.comparisons, verdict.confirmed
+        if verdict.basis:
+            result.metadata['work_identity_basis'] = verdict.basis
+        if verdict.authors:
+            result.authors = verdict.authors
         if confirmed and web_coverage.get('verdict') != 'complete' and not identity.has_material_conflict:
             # A confirmed cited web page is the work itself, not a host of it
             # (paper 5 reference 13 read as limited text, 2026-10-03).
@@ -6544,17 +6531,10 @@ class SourceResolver:
         # A one-year bibliographic error must not make a clearly identified
         # journal article unreadable. Keep the year conflict in discovery/link
         # evidence; this is work-level acquisition, not reference correctness.
-        fields = {c.field_name: c.outcome for c in comparisons}
-        nearby_publication_year = (
-            expected_source_kind.kind == 'journal_article'
-            and observed_kind.kind == 'journal_article' and observed_kind.confidence == 'high'
-            and fields.get('title') == fields.get('author') == 'agreement'
-            and {c.field_name for c in comparisons if c.outcome == 'material_conflict'} == {'year'}
-            and re.fullmatch(r'\d{4}', str(expected_year or ''))
-            and re.fullmatch(r'\d{4}', str(result.year or ''))
-            and abs(int(expected_year) - int(result.year)) == 1
-            and all(c.outcome in {'agreement', 'minor_difference'} for c in comparisons if c.field_name != 'year')
-        )
+        from app.services.web_page_identity import nearby_publication_year as _near_year
+        nearby_publication_year = _near_year(comparisons, expected_kind=expected_source_kind.kind,
+                                             observed_kind=observed_kind, expected_year=expected_year,
+                                             observed_year=result.year)
         if not confirmed and not identity.has_material_conflict:
             # Use independently retrieved page content, never search snippets.
             inspected = self._inspect_candidate(result.full_text, title=title,

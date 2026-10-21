@@ -347,13 +347,16 @@ def page_observed(url, content_sha256, reason):
                 request.page_evidence_sha256 = content_sha256
 
 
-def cross_script_observed(url, content_sha256, judged):
+def cross_script_observed(url, content_sha256, judged, cited_author=None):
     """Keep the model's cross-script judgment on the response it compared.
 
     Owner decision 2026-10-12: a page in another writing system that the model
     judged to be the cited work (and whose people it did not judge to differ)
-    confirms the destination, as a confirmed identity comparison would.
+    confirms the destination, as a confirmed identity comparison would. With
+    the cited author known, the page-admission rule decides (web-page-identity-v1:
+    an organisation's name in another language is a translation, never a difference).
     """
+    from app.services.web_page_identity import model_admits
     try:
         judgment = CrossScriptLinkJudgment.model_validate(
             {k: v for k, v in (judged or {}).items() if k in CrossScriptLinkJudgment.model_fields})
@@ -367,8 +370,9 @@ def cross_script_observed(url, content_sha256, judged):
                 continue
             request.cross_script_judgment = judgment
             request.cross_script_evidence_sha256 = content_sha256
-            if (judgment.same_work == 'yes' and judgment.author != 'differs'
-                    and request.destination_identity == 'not_assessed'):
+            admits = (model_admits(judged, cited_author) if cited_author is not None
+                      else judgment.same_work == 'yes' and judgment.author != 'differs')
+            if admits and request.destination_identity == 'not_assessed':
                 request.destination_identity = 'confirmed'
                 request.identity_evidence_sha256 = content_sha256
 

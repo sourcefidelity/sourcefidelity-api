@@ -13,17 +13,11 @@ HAN_TITLE = "冻结的档案与记忆政治"
 
 
 @pytest.fixture
-def judge(monkeypatch):
-    calls = []
-
-    def fake(reference, page, **kwargs):
-        calls.append((reference, page))
-        return {"version": "cross-script-identity-v1", "same_work": "no", "author": "not_shown",
-                "page_authors": ["Name On Page"], "call": "answered", "payload_sha256": "a" * 64}
-
-    monkeypatch.setattr("app.services.cross_script_identity.judge_cross_script_identity", fake)
+def judge(monkeypatch, page_judge):
+    page_judge.answer = {"version": "cross-script-identity-v1", "same_work": "no", "author": "not_shown",
+                         "page_authors": ["Name On Page"], "payload_sha256": "a" * 64}
     monkeypatch.setattr("trafilatura.extract", lambda *a, **k: "page text")
-    return calls
+    return page_judge.calls
 
 
 def _judgment(**kwargs):
@@ -58,10 +52,13 @@ def test_bounded_per_reference(judge, monkeypatch):
     monkeypatch.setattr(settings, "CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE", 2)
     token = source_resolver._ACTIVE_DISCOVERY_TRACE.set({})
     try:
-        results = [_judgment() for _ in range(3)]
+        results = [_judgment(titles=[HAN_TITLE + "一二三"[i]]) for i in range(3)]
+        again = _judgment(titles=[HAN_TITLE + "一"])
     finally:
         source_resolver._ACTIVE_DISCOVERY_TRACE.reset(token)
     assert [r is not None for r in results] == [True, True, False]
+    # A page already asked about gets its first answer, with no new call.
+    assert again == results[0] and len(judge) == 2
 
 
 @pytest.mark.parametrize("same_work,outcome,reason", [

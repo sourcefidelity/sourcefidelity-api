@@ -20,6 +20,15 @@ def _fresh_authorized_pages():
     clear_cache()
 
 
+@pytest.fixture
+def page_judge():
+    """The fixed-answer model at the web page identity seam (web-page-identity-v1).
+    Set `page_judge.answer`; `page_judge.calls` lists (reference, page) asked."""
+    from app.services.web_page_identity import FixedAnswerJudge, use_judge
+    with use_judge(FixedAnswerJudge()) as judge:
+        yield judge
+
+
 @pytest.fixture(autouse=True)
 def _code_default_web_fallback(monkeypatch):
     """Tests see the code default, not the local deployment's fallback choice."""

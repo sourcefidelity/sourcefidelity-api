@@ -679,40 +679,31 @@ def _link_page(title):
             + '</article></body></html>')
 
 
-def test_a_student_link_titled_as_the_romanised_citation_is_read_without_a_model_call(monkeypatch):
+def test_a_student_link_titled_as_the_romanised_citation_is_read_without_a_model_call(monkeypatch, page_judge):
     from app.services.source_resolver import SourceResolver
     _link_transport(monkeypatch, _link_page(NATIVE))
-
-    def never(*args, **kwargs):
-        raise AssertionError('no model call expected for an exact reading')
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', never)
     result = SourceResolver.__new__(SourceResolver)._try_web_fetch(
         'https://pages.example/rights/1', ROMANISED, expected_author='Pan, Y., & Lin, Q', expected_year='2016')
     # The page in its own language is read, identified and admitted as the source's text.
     assert result.success and result.representation is not None and '个人数据' in result.representation.content.decode()
     assert result.metadata['web_fetch_diagnostic']['reason'] == 'bibliographic_identity_confirmed'
     assert result.metadata['identity_confidence'] == 'high'
+    assert page_judge.calls == []    # no model call for an exact reading
 
 
-def test_a_student_link_with_a_near_reading_asks_the_model_once(monkeypatch):
+def test_a_student_link_with_a_near_reading_asks_the_model_once(monkeypatch, page_judge):
     from app.services.source_resolver import SourceResolver
     near = '数据权利与法律保护制度研究'
     _link_transport(monkeypatch, _link_page(near))
-    calls = []
-
-    def judged(reference, page, **kwargs):
-        calls.append(page['titles'])
-        return {'version': 'cross-script-identity-v1', 'same_work': 'yes', 'author': 'agrees',
-                'page_authors': ['潘越'], 'call': 'answered'}
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', judged)
+    page_judge.answer = {'same_work': 'yes', 'author': 'agrees', 'page_authors': ['潘越']}
     result = SourceResolver.__new__(SourceResolver)._try_web_fetch(
         'https://pages.example/rights/2', 'Shuju quanli yu falv baohu zhidu yanjiou (Research on data rights)',
         expected_author='Pan, Y., & Lin, Q', expected_year='2016')
-    assert len(calls) == 1
+    assert len(page_judge.calls) == 1
     assert (result.metadata or {}).get('cross_script_judgment', {}).get('same_work') == 'yes'
 
 
-def test_a_journal_abstract_page_in_its_own_language_stays_a_candidate(monkeypatch):
+def test_a_journal_abstract_page_in_its_own_language_stays_a_candidate(monkeypatch, page_judge):
     # 2026-10-12 rerun: a journal article's link reached its abstract page in
     # Han script; the page type cannot be confirmed, but its title still names
     # the work and must stay a candidate rather than vanish.
@@ -721,20 +712,14 @@ def test_a_journal_abstract_page_in_its_own_language_stays_a_candidate(monkeypat
     from app.services.source_type import SourceKindAssessment
     near = '数据权利与法律保护制度研究'
     _link_transport(monkeypatch, _link_page(near))
-    calls = []
-
-    def judged(reference, page, **kwargs):
-        calls.append(page['titles'])
-        return {'version': 'cross-script-identity-v1', 'same_work': 'yes', 'author': 'agrees',
-                'page_authors': ['潘越'], 'call': 'answered'}
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', judged)
+    page_judge.answer = {'same_work': 'yes', 'author': 'agrees', 'page_authors': ['潘越']}
     cited = 'Shuju quanli yu falv baohu zhidu yanjiou (Research on data rights)'
     result = SourceResolver.__new__(SourceResolver)._try_web_fetch(
         'https://pages.example/rights/3', cited,
         expected_source_kind=SourceKindAssessment(kind='journal_article', confidence='high'),
         expected_author='Pan, Y., & Lin, Q', expected_year='2016')
     assert not result.success and result.representation is None
-    assert result.title == near and len(calls) == 1
+    assert result.title == near and len(page_judge.calls) == 1
     assert result.metadata['work_identity_basis'] == 'cross-language-identity-v1'
     candidate = build_reference_discovery_candidate(
         attempt_id='attempt-1', provider='web_fetch', expected=_expected(title=cited), result=result)
@@ -748,18 +733,12 @@ def _page_with_byline_outside_metadata(title, byline):
             '<article>' + ''.join(f'<p>{paragraph}</p>' for _ in range(4)) + '</article></body></html>')
 
 
-def test_a_han_byline_beside_the_page_title_credits_the_cited_author(monkeypatch):
+def test_a_han_byline_beside_the_page_title_credits_the_cited_author(monkeypatch, page_judge):
     # 2026-10-12 rerun: a ministry page named its writer only in a span
     # beside the title ("潘越" for "Pan, Y.").
     from app.services.source_resolver import SourceResolver
     near = '数据权利与法律保护制度研究'
-    calls = []
-
-    def judged(reference, page, **kwargs):
-        calls.append(1)
-        return {'version': 'cross-script-identity-v1', 'same_work': 'yes', 'author': 'not_shown',
-                'page_authors': [], 'call': 'answered'}
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', judged)
+    page_judge.answer = {'same_work': 'yes', 'author': 'not_shown', 'page_authors': []}
     cited = 'Shuju quanli yu falv baohu zhidu yanjiou (Research on data rights)'
     _link_transport(monkeypatch, _page_with_byline_outside_metadata(near, '潘越'))
     result = SourceResolver.__new__(SourceResolver)._try_web_fetch(
@@ -784,7 +763,7 @@ def test_a_han_byline_beside_the_page_title_credits_the_cited_author(monkeypatch
     ('differs', 'Northfield Ministry of Media', True),   # an organisation's name is a translation
     ('differs', 'Pan, Y.', False),                        # a cited person the page does not show
 ])
-def test_a_page_the_model_judged_the_same_work_is_admitted(monkeypatch, author, cited, admitted):
+def test_a_page_the_model_judged_the_same_work_is_admitted(monkeypatch, page_judge, author, cited, admitted):
     # Owner decision 2026-10-13: the model's same-work answer is enough to
     # admit a page in another writing system cited by its English title.
     from app.services.source_resolver import SourceResolver
@@ -794,9 +773,7 @@ def test_a_page_the_model_judged_the_same_work_is_admitted(monkeypatch, author, 
         page = page.replace('<meta name="citation_author" content="潘越"><meta name="citation_author" content="林青">', '')
         page = page.replace('<p>潘越 林青</p>', '')
     _link_transport(monkeypatch, page)
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity',
-                        lambda *a, **k: {'version': 'cross-script-identity-v1', 'same_work': 'yes',
-                                         'author': author, 'page_authors': [], 'call': 'answered'})
+    page_judge.answer = {'same_work': 'yes', 'author': author, 'page_authors': []}
     result = SourceResolver.__new__(SourceResolver)._try_web_fetch(
         'https://pages.example/rules/7', 'Measures for the governance of online services',
         expected_author=cited, expected_year='2016')

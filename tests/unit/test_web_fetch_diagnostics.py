@@ -26,12 +26,10 @@ def fetch(monkeypatch, body, *, title='History of cinema', author=None, content_
     ('<title>Unrelated chemistry methods</title>', 'page_title_mismatch_unconfirmed'),
     ('<title>电影史</title>', 'cross_script_title_unresolved'),
 ])
-def test_wrong_page_is_not_automatically_wrong_work(monkeypatch, body, reason):
+def test_wrong_page_is_not_automatically_wrong_work(monkeypatch, page_judge, body, reason):
     # The model is unsure across writing systems; a same-work answer would go
     # on to the page's content checks (owner decision 2026-10-13).
-    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity',
-                        lambda *a, **k: {'same_work': 'unsure', 'author': 'not_shown', 'page_authors': [],
-                                         'call': 'answered'})
+    page_judge.answer = {'same_work': 'unsure'}
     result, diagnostic = fetch(monkeypatch, body)
     assert not result.success
     assert diagnostic.reason == reason
