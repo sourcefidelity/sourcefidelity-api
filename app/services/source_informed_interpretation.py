@@ -16,10 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from app.services.evidence_package import build_evidence_package
 from app.services.verification_evidence import (
-    EXTRACTION_VERSION, AuthorizedRepresentation, SourcePassageEvidence,
-    VerificationEvidenceArtifact, _extract_pages, _extracted_pages_sha256,
-    _passage_evidence, _passage_matches_source, _retrieve_candidates,
-    _source_matches_artifact, _validate_derivative_provenance,
+    AuthorizedRepresentation, EvidenceAuthorizationError, SourcePassageEvidence,
+    VerificationEvidenceArtifact, _passage_evidence, _passage_matches_source,
+    _retrieve_candidates,
 )
 
 VERSION = "source-informed-retrieval-v1"
@@ -149,15 +148,15 @@ class _PartReadings(BaseModel):
 
 def _validate_source(source, artifact):
     """Same source/extraction gate for proposal exposure and supplementary search."""
-    _validate_derivative_provenance(source)
-    if (not _source_matches_artifact(source, artifact)
-            or hashlib.sha256(source.content).hexdigest() != source.content_sha256):
-        raise ValueError("authorized_source_mismatch")
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source, artifact)
+    if isinstance(opened, PagesUnavailable):
+        if opened.reason_code == "derivative_provenance_invalid":
+            raise EvidenceAuthorizationError(opened.detail)
+        raise ValueError(opened.reason_code)
     package = build_evidence_package(artifact)
-    if artifact.coverage.extraction_version != EXTRACTION_VERSION:
-        raise ValueError("stale_source_extraction")
-    pages, limits = _extract_pages(source)
-    if not pages or _extracted_pages_sha256(pages) != package.extracted_text_sha256:
+    pages, limits = list(opened.pages), list(opened.limitations)
+    if not pages or opened.extracted_text_sha256 != package.extracted_text_sha256:
         raise ValueError("source_extraction_mismatch")
     page_map = {p.index: p for p in pages}
     for passage in artifact.passages:

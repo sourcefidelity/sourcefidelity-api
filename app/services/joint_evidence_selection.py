@@ -25,7 +25,7 @@ from app.services.passage_relevance import (
 from app.services.sentence_splitter import split_sentences
 from app.services.verification_evidence import (
     ClaimEvidence, JointEvidenceCandidate, JointEvidenceSelectedPassage,
-    JointEvidenceSelection, _passage_boundary_status,
+    JointEvidenceSelection, passage_boundary_status,
 )
 
 VERSION = "joint-evidence-selection-v4"
@@ -132,7 +132,7 @@ def _sentence_span(text, span):
     positions = [m.start() for m in re.finditer(re.escape(span), text)]
     return bool(span and len(positions) == 1 and positions[0] in starts
                 and positions[0] + len(span) in ends
-                and _passage_boundary_status(span) == "sentence_complete")
+                and passage_boundary_status(span) == "sentence_complete")
 
 
 def _sentences(text):

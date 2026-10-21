@@ -108,8 +108,12 @@ def _read_in_full(source, artifact) -> list[str]:
     """Candidates whose judge was given every sentence of the source: the
     retrieved passages hold all of its body text and the candidate's
     foundation holds all of their sentences (owner decision 2026-10-14)."""
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
     from app.services.cross_language_whole_source import build_plan, whole_source_passages
-    plan = build_plan(artifact, whole_source_passages(source))
+    opened = open_authorized_pages(source, artifact)
+    if isinstance(opened, PagesUnavailable):
+        return []
+    plan = build_plan(artifact, whole_source_passages(opened))
     if not plan.entries or any(not entry.retrieved for entry in plan.entries):
         return []
     foundation = artifact.facet_evidence_foundation

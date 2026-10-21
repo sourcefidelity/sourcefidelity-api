@@ -71,16 +71,16 @@ def _excluded_roles() -> frozenset:
     return NON_EVIDENCE_ROLES | SELECTION_EXCLUDED_ROLES
 
 
-def whole_source_passages(source) -> list:
-    """The source's body blocks as passages, as retrieval reads them, excluded roles left out."""
+def whole_source_passages(opened) -> list:
+    """The body blocks of a source's authorized pages as passages, as retrieval
+    reads them, excluded roles left out."""
     from app.services.verification_evidence import (
         _PassageCandidate,
-        _extract_pages,
         _passage_evidence,
         _source_blocks,
         _stable_id,
     )
-    pages, _limitations = _extract_pages(source)
+    source, pages = opened.source, list(opened.pages)
     excluded = _excluded_roles()
     passages = []
     for page, start, end, text, role in _source_blocks(pages):
@@ -165,14 +165,15 @@ def attach_whole_source(source, artifact, *, max_input_tokens: int | None = None
         return artifact
     from app.services.evidence_sentence_selection import MAX_INPUT_TOKENS, SYSTEM_PROMPT, numbered_prompt
     from app.services.llm_input_boundary import estimate_prompt_tokens
-    from app.services.verification_evidence import _source_matches_artifact
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
     budget = MAX_INPUT_TOKENS if max_input_tokens is None else max_input_tokens
     record = {"version": VERSION, "max_input_tokens": budget}
     try:
-        if not _source_matches_artifact(source, artifact):
+        opened = open_authorized_pages(source, artifact)
+        if isinstance(opened, PagesUnavailable):
             return _with_record(artifact, {**record, "status": "not_available",
-                                           "reason": "authorized_source_mismatch"})
-        plan = build_plan(artifact, whole_source_passages(source))
+                                           "reason": opened.reason_code})
+        plan = build_plan(artifact, whole_source_passages(opened))
     except Exception as exc:  # noqa: BLE001 - one optional record degrades, never the run
         logger.info("Whole source not prepared (type=%s)", type(exc).__name__)
         return _with_record(artifact, {**record, "status": "not_available", "reason": "source_not_split"})

@@ -33,11 +33,16 @@ def _claim(text=STATEMENT, reference_id="ref-1"):
 
 
 def _source(text=SOURCE_TEXT, representation_id="rep-1"):
+    from datetime import datetime, timezone
+    from app.services.verification_evidence import AuthorizedRepresentation
     content = text.encode()
-    return SimpleNamespace(
-        representation_id=representation_id, representation_kind="plain_text", content=content,
-        content_sha256=hashlib.sha256(content).hexdigest(), page_labels=None, derivation_method=None,
-        completeness_verdict="complete",
+    return AuthorizedRepresentation(
+        representation_id=representation_id, canonical_work_id="work-1", content_object_id="object-1",
+        content_sha256=hashlib.sha256(content).hexdigest(), content=content,
+        representation_kind="plain_text", media_type="text/plain", provenance="test",
+        scope_type="personal_owner", scope_id="personal-default", identity_verdict="verified",
+        identity_confidence=0.9, completeness_verdict="complete", text_quality="digital",
+        edition_or_version=None, created_at=datetime(2026, 10, 21, tzinfo=timezone.utc), admitted_at=None,
     )
 
 

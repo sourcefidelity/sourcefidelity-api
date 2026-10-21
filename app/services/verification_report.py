@@ -45,7 +45,7 @@ from app.services.verification_evidence import (
     VerificationEvidenceArtifact,
     passage_role_from_text,
     document_metadata_member_admissible,
-    _passage_boundary_status,
+    passage_boundary_status,
     passage_matches_page_locator,
     _is_explanatory_note,
 )
@@ -1054,12 +1054,12 @@ def _validate_candidate_passage_retrieval(artifact, supplied_ids):
                     f"method={passage.retrieval_method}"
                 ),
             )
-        if passage.boundary_status != _passage_boundary_status(passage.text):
+        if passage.boundary_status != passage_boundary_status(passage.text):
             raise ReportAuthorizationError(
                 "Candidate passage boundary status is not application-derived",
                 detail=(
                     f"stored={passage.boundary_status}; "
-                    f"derived={_passage_boundary_status(passage.text)}; "
+                    f"derived={passage_boundary_status(passage.text)}; "
                     f"role={passage.passage_role}"
                 ),
             )

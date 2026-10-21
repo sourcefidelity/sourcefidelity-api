@@ -35,7 +35,7 @@ from app.services.verification_evidence import (
     _visible_pdf_page_label,
     _pdf_structural_spans,
     _page_text_blocks,
-    _passage_boundary_status,
+    passage_boundary_status,
     _passage_overlap_ratio,
     _retrieve_candidates,
     _SourcePage,
@@ -464,13 +464,13 @@ def test_pdf_block_boundary_inside_sentence_is_merged_before_windowing():
 
 
 def test_passage_boundary_status_exposes_fragment_or_nonprose_output():
-    assert _passage_boundary_status("A complete sentence.") == "sentence_complete"
+    assert passage_boundary_status("A complete sentence.") == "sentence_complete"
     assert (
-        _passage_boundary_status("continuation from a prior column. A full sentence.")
+        passage_boundary_status("continuation from a prior column. A full sentence.")
         == "bounded_fragment_or_nonprose"
     )
     assert (
-        _passage_boundary_status("a bounded continuation without terminal punctuation")
+        passage_boundary_status("a bounded continuation without terminal punctuation")
         == "bounded_fragment_or_nonprose"
     )
 

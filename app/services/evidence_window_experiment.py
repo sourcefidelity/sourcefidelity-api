@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.services import passage_relevance as relevance
 from app.services.llm_input_boundary import enforce_complete_prompt_budget, json_data_envelope
-from app.services.verification_evidence import _passage_boundary_status
+from app.services.verification_evidence import passage_boundary_status
 
 VERSION = "evidence-window-interface-experiment-v1"
 COMPACT_VERSION = "evidence-window-interface-experiment-v3-compact"
@@ -74,7 +74,7 @@ def _windows(passage):
             if start + count > len(chunks):
                 continue
             span = ''.join(chunks[start:start+count]).rstrip()
-            if 0 < len(span) <= 1400 and _passage_boundary_status(span) == "sentence_complete":
+            if 0 < len(span) <= 1400 and passage_boundary_status(span) == "sentence_complete":
                 windows[f"w{start:03d}{'a' if count == 1 else 'b'}"] = ids[start:start+count]
     return windows
 

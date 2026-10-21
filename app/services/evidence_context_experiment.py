@@ -21,7 +21,7 @@ from app.services.llm_input_boundary import (
 from app.services.passage_relevance import _source_attributed_relevance_text
 from app.services.verification_evidence import (
     _EXCLUDED_RETRIEVAL_ROLES, _exact_sentence_spans, _lexical_score,
-    _meaningful_tokens, _passage_boundary_status, _source_blocks,
+    _meaningful_tokens, passage_boundary_status, _source_blocks,
 )
 
 VERSION = "source-local-context-inspection-experiment-v1"
@@ -473,7 +473,7 @@ def _prepare_comparison(*, claim, source_title, regions, pages, source_binding,
         labelled = redact_direct_identifiers(r.text).text
         fragments = []
         for s in reversed(sentences):
-            if _passage_boundary_status(r.text[s['start']:s['end']]) != "sentence_complete":
+            if passage_boundary_status(r.text[s['start']:s['end']]) != "sentence_complete":
                 fragments.append(s['sentence_id'])
             labelled = labelled[:s['start']] + '['+s['sentence_id']+'] ' + labelled[s['start']:]
         rid = f"r{i:03d}"
@@ -579,7 +579,7 @@ def bind_comparison(request, raw, *, pages, claim, source_binding):
         if len(text) > 1400:
             raise _extract_boundary_error("extract_length_exceeded")
         if not _sentence_span(r['text'], text):
-            status = _passage_boundary_status(text)
+            status = passage_boundary_status(text)
             raise _extract_boundary_error(
                 "fragment_boundary" if status != "sentence_complete"
                 else "nonunique_or_non_sentence_span")

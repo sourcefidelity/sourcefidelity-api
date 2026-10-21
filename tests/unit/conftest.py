@@ -12,6 +12,15 @@ def _process_local_provider_pacing(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_authorized_pages():
+    """Each test extracts its own pages (some replace the extractor)."""
+    from app.services.authorized_pages import clear_cache
+    clear_cache()
+    yield
+    clear_cache()
+
+
+@pytest.fixture(autouse=True)
 def _code_default_web_fallback(monkeypatch):
     """Tests see the code default, not the local deployment's fallback choice."""
     from app.config import settings

@@ -1896,14 +1896,19 @@ def build_passage_evidence(
     """
     if source.identity_verdict == 'possible_match' and not source.verification_run_id:
         raise EvidenceAuthorizationError('Possible matches require a submission-scoped verification run')
-    _validate_derivative_provenance(source)
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source)
+    if isinstance(opened, PagesUnavailable):
+        # The first build creates the source identity, so it fails closed; the
+        # paper workflow opens the source first and drops only its reference.
+        raise EvidenceAuthorizationError(opened.detail)
     source_binding = _source_binding(
         claim,
         active_reference_id=active_reference_id,
         cited_author_label=cited_author_label,
     )
     bounded_top_k = max(1, min(top_k, MAX_CANDIDATES))
-    pages, extraction_limitations = _extract_pages(source)
+    pages, extraction_limitations = list(opened.pages), list(opened.limitations)
     candidates = _retrieve_candidates(
         pages,
         claim_text=_retrieval_claim_text(claim),
@@ -2123,11 +2128,10 @@ def _marker_author_label(marker_text: str) -> str:
     return value[:200]
 
 
-def _attach_evidence_only_fallback(source, artifact, *, top_k):
+def _attach_evidence_only_fallback(opened, artifact, *, top_k):
     """Retrieve exact citation context without authorizing candidate judgment."""
-    if not _source_matches_artifact(source, artifact):
-        return artifact
-    pages, limitations = _extract_pages(source)
+    source = opened.source
+    pages, limitations = list(opened.pages), list(opened.limitations)
     query = artifact.claim.text
     broad = [p for p in artifact.passages if _passage_matches_source(source, p)]
     ranked, _, _ = _candidate_union_candidates(
@@ -2180,7 +2184,6 @@ def attach_candidate_passage_retrieval(
     selection whose IDs are later used by the one-candidate relationship judge.
     No search result changes a verdict.
     """
-    _validate_derivative_provenance(source)
     if translated_queries is None:
         translated_queries = list(getattr(artifact, "_translated_queries", None) or [])
     from app.services.citation_use_router import (
@@ -2204,16 +2207,16 @@ def attach_candidate_passage_retrieval(
                 )
             }
         )
-    if not _source_matches_artifact(source, artifact):
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source, artifact)
+    if isinstance(opened, PagesUnavailable):
         return artifact.model_copy(
             update={
                 "candidate_passage_retrieval": CandidatePassageRetrievalEvidence(
                     status="not_assessed",
-                    method="authorized_source_mismatch",
+                    method=opened.reason_code,
                     retrieval_version=CANDIDATE_RETRIEVAL_VERSION,
-                    limitations=[
-                        "The supplied source did not match the artifact representation, hash, scope, and verification run."
-                    ],
+                    limitations=_unavailable_limitations(opened),
                 )
             }
         )
@@ -2234,7 +2237,7 @@ def attach_candidate_passage_retrieval(
         )
         binding = artifact.source_binding
         if redundant_only and binding and binding.status == "exact" and len(artifact.claim.reference_ids) == 1:
-            return _attach_evidence_only_fallback(source, artifact, top_k=top_k)
+            return _attach_evidence_only_fallback(opened, artifact, top_k=top_k)
         return artifact.model_copy(
             update={
                 "candidate_passage_retrieval": CandidatePassageRetrievalEvidence(
@@ -2249,7 +2252,7 @@ def attach_candidate_passage_retrieval(
         )
 
     bounded_top_k = max(1, min(top_k, MAX_CANDIDATE_PASSAGES))
-    pages, extraction_limitations = _extract_pages(source)
+    pages, extraction_limitations = list(opened.pages), list(opened.limitations)
     if not any(page.text.strip() for page in pages):
         return artifact.model_copy(
             update={
@@ -2430,7 +2433,10 @@ def attach_local_semantic_retrieval_rescue(
     retrieval = artifact.candidate_passage_retrieval
     if retrieval.status not in {"complete", "incomplete"} or not retrieval.selections:
         return artifact
-    if not _source_matches_artifact(source, artifact):
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source, artifact)
+    if isinstance(opened, PagesUnavailable):
+        mismatch = opened.reason_code == "authorized_source_mismatch"
         return artifact.model_copy(
             update={
                 "candidate_passage_retrieval": retrieval.model_copy(
@@ -2439,7 +2445,8 @@ def attach_local_semantic_retrieval_rescue(
                         "semantic_rescue_version": SEMANTIC_RETRIEVAL_RESCUE_VERSION,
                         "limitations": [
                             *retrieval.limitations,
-                            "Local semantic rescue did not run because the supplied source did not match the authorized artifact.",
+                            *(["Local semantic rescue did not run because the supplied source did not match the authorized artifact."]
+                              if mismatch else []),
                         ],
                     }
                 )
@@ -2474,7 +2481,7 @@ def attach_local_semantic_retrieval_rescue(
         device=settings.RELATIONSHIP_MODEL_DEVICE,
         batch_size=settings.EVIDENCE_RETRIEVAL_SEMANTIC_BATCH_SIZE,
     )
-    pages, extraction_limitations = _extract_pages(source)
+    pages, extraction_limitations = list(opened.pages), list(opened.limitations)
     candidates_by_id = {
         candidate.candidate_id: candidate
         for candidate in artifact.verification_candidates.candidates
@@ -2723,6 +2730,20 @@ def _source_matches_artifact(
         and source.derivation_method == identity.derivation_method
         and source.derivation_manifest_sha256 == identity.derivation_manifest_sha256
     )
+
+
+def _authorized_page_list(source: AuthorizedRepresentation) -> list:
+    """The source's authorized pages; empty when its text may not be used."""
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source)
+    return [] if isinstance(opened, PagesUnavailable) else list(opened.pages)
+
+
+def _unavailable_limitations(opened) -> list[str]:
+    """The existing mismatch sentence; any other refusal is recorded by its code alone."""
+    if opened.reason_code != "authorized_source_mismatch":
+        return []
+    return ["The supplied source did not match the artifact representation, hash, scope, and verification run."]
 
 
 def _ocr_tolerant(source: AuthorizedRepresentation) -> bool:
@@ -4013,7 +4034,7 @@ def _following_body_context(pages, ranked, *, query_text):
     for page, start, end, text, role in _source_blocks(pages):
         if role != "body_prose" or len(text) > MAX_PASSAGE_CHARACTERS:
             continue
-        if _passage_boundary_status(text) != "sentence_complete":
+        if passage_boundary_status(text) != "sentence_complete":
             continue
         if _NUMBERED_SECTION_HEADING_LINE.search(text):
             continue
@@ -4678,11 +4699,11 @@ def _passage_evidence(
             if candidate.passage_role != "unknown"
             else passage_role_from_text(candidate.text)
         ),
-        boundary_status=_passage_boundary_status(candidate.text),
+        boundary_status=passage_boundary_status(candidate.text),
     )
 
 
-def _passage_boundary_status(
+def passage_boundary_status(
     text: str,
 ) -> Literal["sentence_complete", "bounded_fragment_or_nonprose", "unknown"]:
     """Expose when a bounded passage is not visibly sentence-complete."""
@@ -6163,7 +6184,7 @@ def leading_source_excerpt(
     needs. Extraction failures return an empty string, which is abstention.
     """
     try:
-        pages, _ = _extract_pages(source)
+        pages = _authorized_page_list(source)
     except Exception:  # extraction failure is abstention, never a judgment
         return ""
     collected: list[str] = []
@@ -6229,7 +6250,7 @@ def claim_terms_present_in_source(
     if not terms:
         return 0, 0
     try:
-        pages, _ = _extract_pages(source)
+        pages = _authorized_page_list(source)
     except Exception:
         # A total of zero reads as not measured, and the gate abstains.
         # Returning "none of them present" would turn an extraction

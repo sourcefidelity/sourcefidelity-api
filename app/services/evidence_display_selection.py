@@ -25,9 +25,9 @@ def bound_observation(passage, assessment, claim_text):
             or not claims or any(not s.strip() or s not in claim_text for s in claims)
             or hashlib.sha256(assessed.encode()).hexdigest() != assessment.get("assessed_text_sha256")):
         return {}
-    from app.services.verification_evidence import _passage_boundary_status
+    from app.services.verification_evidence import passage_boundary_status
     from app.services.evidence_report import _closed_display_delimiters, _display_prose_blocks, _normalize_display_text
-    if _passage_boundary_status(span) != "sentence_complete" or not _closed_display_delimiters(span):
+    if passage_boundary_status(span) != "sentence_complete" or not _closed_display_delimiters(span):
         return {}
     if not any(_normalize_display_text(span) in block for block in _display_prose_blocks(text)):
         return {}

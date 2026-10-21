@@ -37,6 +37,17 @@ class TestClaimTerms:
         assert len(terms) <= 12 and len(terms) == len(set(terms))
 
 
+def _serve_pages(monkeypatch, pages=None, error=None):
+    """Stand in for the authorized pages reader (authorized-pages-v1)."""
+    import app.services.authorized_pages as ap
+
+    def open_pages(source, artifact=None):
+        if error is not None:
+            raise error
+        return ap.AuthorizedPages(source=source, pages=tuple(pages or ()), limitations=(), extracted_text_sha256="")
+    monkeypatch.setattr(ap, "open_authorized_pages", open_pages)
+
+
 class TestUnmeasurableAbstains:
     """A total of zero means not measured, never "the source lacks it"."""
 
@@ -47,22 +58,17 @@ class TestUnmeasurableAbstains:
         assert claim_terms_present_in_source(object(), None) == (0, 0)
 
     def test_extraction_failure_abstains(self, monkeypatch):
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages",
-                            lambda s: (_ for _ in ()).throw(RuntimeError("unreadable")))
+        _serve_pages(monkeypatch, error=RuntimeError("unreadable"))
         assert claim_terms_present_in_source(object(), "telecommunications policy markets") == (0, 0)
 
     def test_an_empty_document_abstains(self, monkeypatch):
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages", lambda s: ([], []))
+        _serve_pages(monkeypatch, [])
         assert claim_terms_present_in_source(object(), "telecommunications policy markets") == (0, 0)
 
 
 class TestPresenceCounting:
     def _pages(self, monkeypatch, text):
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages",
-                            lambda s: ([type("P", (), {"text": text})()], []))
+        _serve_pages(monkeypatch, [type("P", (), {"text": text})()])
 
     def test_a_discussed_topic_is_found_beyond_the_opening(self, monkeypatch):
         self._pages(monkeypatch, "Opening about formalism, with no other topic named. " * 20 +

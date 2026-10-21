@@ -906,6 +906,13 @@ def verify_paper_sources(
                     # used, and only this reference loses its source.
                     failures.append({"reference_id": reference_id, "reason_code": "source_text_unusable"})
                     continue
+                unavailable = _unavailable_source_reason(source)
+                if unavailable:
+                    # authorized-pages-v1 (owner decision 2026-10-21): only this
+                    # reference loses its source; the paper continues.
+                    failures.append({"reference_id": reference_id, "reason_code": "source_text_unusable",
+                                     "unavailable_reason": unavailable})
+                    continue
                 # Extracted once for the source, not once for each claim.
                 scope_excerpt = leading_source_excerpt(source) if allow_llm else ""
                 patchwriting.run(source, reference_id)
@@ -945,6 +952,11 @@ def verify_paper_sources(
                     continue
 
             def processor(_session, source, _run_id):
+                unavailable = _unavailable_source_reason(source)
+                if unavailable:
+                    error = TransientSourceTextUnusable("Transient source text may not be used")
+                    error.unavailable_reason = unavailable
+                    raise error
                 scope_excerpt = leading_source_excerpt(source) if allow_llm else ""
                 patchwriting.run(source, reference_id)
                 return [
@@ -994,8 +1006,11 @@ def verify_paper_sources(
                     report_ids.extend(str(record.id) for record in retained)
                     report_members.extend(_report_member(record) for record in retained)
                 continue
-            except TransientSourceTextUnusable:
-                failures.append({"reference_id": reference_id, "reason_code": "source_text_unusable"})
+            except TransientSourceTextUnusable as exc:
+                failure = {"reference_id": reference_id, "reason_code": "source_text_unusable"}
+                if getattr(exc, "unavailable_reason", None):
+                    failure["unavailable_reason"] = exc.unavailable_reason
+                failures.append(failure)
                 continue
             except VerificationRunError as exc:
                 # An acquired source whose run can no longer be checked is an
@@ -1666,6 +1681,14 @@ def fail_paper_job(session: Session, backend: StorageBackend, job_id, exc: BaseE
     if artifact is not None:
         cleanup_report_paper_artifact(session, backend, artifact)
     cleanup_paper_job_input(session, backend, job.id)
+
+
+def _unavailable_source_reason(source) -> str | None:
+    """Why a source's text may not be used (authorized-pages-v1), or None.
+    Opening it here also extracts its pages once for every later reader."""
+    from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
+    opened = open_authorized_pages(source)
+    return opened.reason_code if isinstance(opened, PagesUnavailable) else None
 
 
 def _shadow_artifact(

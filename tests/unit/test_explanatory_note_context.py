@@ -13,12 +13,12 @@ from types import SimpleNamespace
 ])
 def test_explanatory_note_persistence_contract(monkeypatch, mutation, accepted):
     from app.services import verification_report as report
-    from app.services.verification_evidence import _passage_boundary_status
+    from app.services.verification_evidence import passage_boundary_status
     text = '1 Earlier animated series were broadcast in France during the preceding decade. This history was documented independently.'
     if mutation == 'bibliographic':
         text = 'References\nSmith, A. (2001). Television was created for the younger generation. London: Press.'
     passage = SimpleNamespace(passage_id='p1', text=text, passage_role='citation_notes',
-        boundary_status=_passage_boundary_status(text),
+        boundary_status=passage_boundary_status(text),
         retrieval_method='lexical_overlap' if mutation == 'method' else 'explanatory_note_context')
     item = SimpleNamespace(passage_id='p1', rank=1,
         channels=['candidate_lexical'] if mutation == 'channel' else ['candidate_explanatory_note_context'])

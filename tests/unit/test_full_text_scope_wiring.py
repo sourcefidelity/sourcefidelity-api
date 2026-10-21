@@ -30,26 +30,31 @@ class _Page:
         self.text = text
 
 
+def _serve_pages(monkeypatch, pages=None, error=None):
+    """Stand in for the authorized pages reader (authorized-pages-v1)."""
+    import app.services.authorized_pages as ap
+
+    def open_pages(source, artifact=None):
+        if error is not None:
+            raise error
+        return ap.AuthorizedPages(source=source, pages=tuple(pages or ()), limitations=(), extracted_text_sha256="")
+    monkeypatch.setattr(ap, "open_authorized_pages", open_pages)
+
+
 class TestLeadingExcerpt:
     def test_opening_pages_are_joined_and_bounded(self, monkeypatch):
         monkeypatch.setattr(paper_workflow, "leading_source_excerpt", leading_source_excerpt)
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages",
-                            lambda s: ([_Page("A" * 2000), _Page("B" * 2000)], []))
+        _serve_pages(monkeypatch, [_Page("A" * 2000), _Page("B" * 2000)])
         excerpt = leading_source_excerpt(Mock(), limit=3_500)
         assert len(excerpt) == 3_500
         assert excerpt.startswith("A")
 
     def test_extraction_failure_abstains(self, monkeypatch):
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages",
-                            Mock(side_effect=RuntimeError("unreadable")))
+        _serve_pages(monkeypatch, error=RuntimeError("unreadable"))
         assert leading_source_excerpt(Mock()) == ""
 
     def test_whitespace_is_normalised(self, monkeypatch):
-        import app.services.verification_evidence as ve
-        monkeypatch.setattr(ve, "_extract_pages",
-                            lambda s: ([_Page("two\n\n  words")], []))
+        _serve_pages(monkeypatch, [_Page("two\n\n  words")])
         assert leading_source_excerpt(Mock()) == "two words"
 
 

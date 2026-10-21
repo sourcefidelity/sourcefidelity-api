@@ -4590,7 +4590,7 @@ def _prioritize_display_passages(
     applies_framework = bool(re.search(
         r'\b(?:appl\w*|using|draw\w* on|through)\b.{0,90}\b(?:theor\w*|framework|concept|model)\b',
         claim_text, re.I))
-    from app.services.verification_evidence import _passage_boundary_status
+    from app.services.verification_evidence import passage_boundary_status
 
     def key(item: tuple[int, dict]) -> tuple[float, ...]:
         index, passage = item
@@ -4622,7 +4622,7 @@ def _prioritize_display_passages(
             # complete. Keep conservative parent/continuation status as well.
             float(
                 passage.get("boundary_status") == "sentence_complete"
-                and _passage_boundary_status(str(passage.get("excerpt") or ""))
+                and passage_boundary_status(str(passage.get("excerpt") or ""))
                 == "sentence_complete"
             ),
             float(display_tier),

@@ -238,5 +238,7 @@ def test_unusable_text_is_its_own_refusal_so_the_paper_continues():
     import inspect
     from app.services import paper_workflow
     source = inspect.getsource(paper_workflow)
-    assert source.count('reason_code": "source_text_unusable"') == 2
+    # Durable and transient damaged text, plus a source the authorized pages
+    # reader refuses (authorized-pages-v1, 2026-10-21).
+    assert source.count('reason_code": "source_text_unusable"') == 3
     assert 'reason_code="source_text_unusable"' in source

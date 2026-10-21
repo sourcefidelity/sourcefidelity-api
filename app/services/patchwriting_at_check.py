@@ -179,15 +179,20 @@ class PatchwritingAtCheck:
                 self.sources[reference_id] = {"policy_version": pw.POLICY_VERSION,
                                               "status": "not_assessed", "reason": body.status}
                 return
-            from app.services.verification_evidence import _extract_pages, _extracted_pages_sha256
+            from app.services.authorized_pages import PagesUnavailable, open_authorized_pages
 
-            pages, extraction_limits = _extract_pages(source)
+            opened = open_authorized_pages(source)
+            if isinstance(opened, PagesUnavailable):
+                self.sources[reference_id] = {"policy_version": pw.POLICY_VERSION, "status": "not_assessed",
+                                              "reason": opened.reason_code}
+                return
+            pages, extraction_limits = list(opened.pages), list(opened.limitations)
             index = pw.build_source_index(
                 pw.source_sentences_from_pages(pages),
                 comparison_scope="full_text",
                 representation_id=str(source.representation_id),
                 content_sha256=source.content_sha256,
-                extracted_text_sha256=_extracted_pages_sha256(pages) if pages else None,
+                extracted_text_sha256=opened.extracted_text_sha256 if pages else None,
             )
             statements = [
                 pw.CitationStatement(
