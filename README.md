@@ -6,7 +6,7 @@ SourceFidelity identifies, verifies and retrieves the sources a paper cites, the
 
 It produces evidence for an instructor's own judgment and feedback to help students improve their writing. It does not detect AI-written text, determine intent or misconduct, assign grades or sanctions, or replace an institution's academic-integrity process.
 
-> **Status:** Working prototype. The full pipeline — paper upload to evidence package to live and exported report — runs end to end on real student papers. Prototype acceptance is still in progress; reference-verification accuracy is the current focus. Moodle and library integrations are planned, not built. See [Roadmap](#roadmap).
+> **Status:** Working prototype. The full pipeline — paper upload to evidence package to live and exported report — runs end to end on real student papers. Prototype acceptance is still in progress; reference-verification accuracy is the current focus. See [Roadmap](#roadmap).
 
 ---
 
@@ -17,7 +17,7 @@ Generative AI has made it easy to submit work that cites sources the writer has 
 - **Similarity reports** (e.g., Turnitin originality reports) find copied text. They do not check whether a cited source exists or whether it supports the sentence that cites it.
 - **AI-text detectors** flag writing, not source use, and cannot distinguish inappropriate AI use from acceptable or encouraged use.
 
-SourceFidelity targets source use directly. It does not try to detect AI use, but checking whether sources exist and are used accurately can discourage inappropriate reliance on AI, save instructors time spent locating and reading sources, and give institutions more control over where student data goes.
+SourceFidelity targets source use directly. It does not try to detect AI use, but checking whether sources exist and are used accurately can discourage inappropriate reliance on AI, save instructors time spent locating and reading sources, and give users more control over where student data goes.
 
 ---
 
@@ -29,16 +29,14 @@ SourceFidelity targets source use directly. It does not try to detect AI use, bu
 - **Citation–source relationship judgment** — runs automatically on every checked paper. Each citation is compared with evidence sentences selected from the retrieved source and labelled **Supports**, **Qualified or Mixed**, **Contradicts** or **Not Supported**; when the model cannot decide, the citation is labelled **LLM Undecided**. Every judgment links to the source sentences it is based on, so students can see how they used a source and instructors can see where a source may have been used incorrectly.
 - **Academic-practice flags** — misquotation, patchwriting, secondary citation and related practices, with the student's wording shown above the source wording and copied words in bold.
 - **APA citation and referencing style checks** — for example, incorrect title formatting, missing quotation locators, missing DOIs or URLs for references that should have them, parenthetical citations placed after a sentence's final punctuation, and references that are not cited in the paper.
-- **Source upload** — in Personal deployments, users can upload sources the application could not retrieve.
-- **Source storage that respects copyright** — verified open-access academic sources are stored permanently; all other sources are stored temporarily. Stored sources do not need to be searched for again, so later papers citing them process faster and cost less.
-- **Reports** — a live report with source viewing and upload, and portable HTML/PDF exports.
+- **Source upload** — users can upload sources the application could not retrieve.
+- **Source storage** — retrieved and uploaded sources can be kept, so later papers citing them do not need to search for them again, process faster and cost less. A storage setting chooses which copies are kept (all, open access only, or none) and for how long (3, 6, 9 or 12 months after their last use, or permanently); by default all copies are kept permanently.
+- **Reports** — a live report with source viewing and upload, and portable HTML exports.
 
 ### Planned
 
-- **Cross-assessment comparison** and an **authorized student-paper repository**.
+- **Cross-assessment comparison** — comparing a paper with other papers the user has checked, across their own assessments and courses.
 - **Wikipedia similarity scoring**.
-- **Moodle plugin** — institutional sign-in, formative student self-checks with near-instant feedback, reports in the assessment marking area, batch reports that flag papers needing review, and upload of course texts and other course sources.
-- **Library platform integration** — links to library holdings in reports, metadata from services the institution already licenses, and full-text access where database providers' terms permit. Each library capability is enabled separately.
 - **Additional referencing systems** used in other disciplines.
 
 ---
@@ -62,21 +60,14 @@ The rest of the paper, including the student's name and other identifying detail
 
 ## Deployment
 
-SourceFidelity has one shared core with two deployment profiles.
+SourceFidelity is a Personal application: one user, an instructor or a student, runs their own copy on their own computer or a rented server. No LMS or other integration is required. Each user decides what to upload and is responsible for the licences of the sources they upload.
 
-| | Personal | Institutional |
-|---|---|---|
-| Who | An individual instructor or student | A university or department |
-| Where | Your own computer (or a rented server) | University servers |
-| Integration | None required | Moodle, institutional sign-in, library platform (planned) |
-| Main use | Checking individual papers | Formative student checking, deterrence, instructor review at scale |
-
-Personal deployment works on its own but takes some setup, because the application relies on several external services:
+It works on its own but takes some setup, because the application relies on several external services:
 
 - **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, ERIC, Europe PMC, Unpaywall, Elsevier (optional)
 - **Books, archives and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource, Wayback Machine (archived copies of cited web pages)
-- **Web search:** Brave Search and Exa, both used for every web search; Tavily can be configured as an optional backup
-- **LLMs:** DeepSeek, GLM (Z.ai); other providers can be configured behind the same interface
+- **Web search:** Brave Search and DeepSeek's Search API, both used for every web search; Exa can be configured in place of DeepSeek's Search API, and Tavily as an optional backup
+- **LLMs:** DeepSeek, GLM (Zhipu or Z.ai); other providers can be configured behind the same interface
 
 ---
 
@@ -105,8 +96,8 @@ cp .env.example .env
 In `.env`:
 
 - Set `POSTGRES_PASSWORD` and `MINIO_ROOT_PASSWORD`, and use the same database password in `DATABASE_URL`.
-- Add `LLM_API_KEY` (DeepSeek), `OPENALEX_API_KEY`, `CORE_API_KEY`, `BRAVE_SEARCH_API_KEY` and `EXA_API_KEY` (web searches stay incomplete without both), and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `TAVILY_API_KEY` only if Tavily is configured as the backup search.
-- For relationship judgment, add `ZAI_API_KEY` (GLM) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
+- Add `LLM_API_KEY` (DeepSeek; the same key is used for DeepSeek's Search API), `BRAVE_SEARCH_API_KEY` (web searches stay incomplete without Brave and DeepSeek's Search API), `OPENALEX_API_KEY`, `CORE_API_KEY` and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `EXA_API_KEY` only if `SEARCH_SECOND_REQUIRED_PROVIDER=exa`, and `TAVILY_API_KEY` only if Tavily is configured as the backup search.
+- For relationship judgment and evidence selection, add `ZAI_API_KEY` (GLM; `ZAI_BASE_URL` chooses Zhipu or Z.ai) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
 - For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
 
 **2. Start the stack**
@@ -128,7 +119,7 @@ docker compose exec api alembic upgrade head
 - Health check: <http://localhost:8000/health/ready>
 - Swagger UI: <http://localhost:8000/docs> — submit a PDF or DOCX to `POST /check/`, follow progress at `GET /status/{job_id}`, and open the report at `http://localhost:8000/report/{report_id}`.
 
-The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_local` has no password. Use `personal_bearer` or an institutional sign-in for any shared deployment. See [`.env.example`](./.env.example) for all settings.
+The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_local` has no password. Use `personal_bearer` if the API is reached from another computer. See [`.env.example`](./.env.example) for all settings.
 
 ---
 
@@ -139,9 +130,7 @@ The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_lo
 - ✅ Evidence packages and live/exported reports
 - ✅ Citation–source relationship judgment
 - ✅ Academic-practice flags and APA style checks
-- 📝 Moodle plugin (`sourcefidelity-moodle`, GPLv3)
-- 📝 Library platform integration
-- 📝 Cross-assessment comparison, student-paper repository, Wikipedia similarity scoring
+- 📝 Cross-assessment comparison, Wikipedia similarity scoring
 - 📝 Additional referencing systems
 
 ---
@@ -149,5 +138,3 @@ The API binds to `127.0.0.1` only, and the default `REPORT_AUTH_MODE=personal_lo
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).
-
-The planned Moodle plugin (`sourcefidelity-moodle`) will be GPLv3 to match Moodle's licensing requirements.
