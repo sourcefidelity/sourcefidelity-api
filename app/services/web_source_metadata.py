@@ -314,7 +314,15 @@ _CJK_AUTHOR_LABELS = frozenset({"作者", "作者简介", "作者介绍", "作�
                                 "著者", "编者", "作者简历"})
 
 
+# A search provider's own library page names the provider as its author
+# ("Exa Labs" on exa.ai copies of papers, 106 stored web results, 2026-10-21):
+# the provider is never the cited work's author.
+_SEARCH_PROVIDER_BYLINES = frozenset({"exa labs"})
+
+
 def _label_only_author(value: str) -> bool:
+    if " ".join(value.casefold().split()) in _SEARCH_PROVIDER_BYLINES:
+        return True
     if re.sub(r"[\s:：·•,，、]+", "", value) in _CJK_AUTHOR_LABELS:
         return True
     words = re.findall(r"[a-z]+", value.casefold())

@@ -303,12 +303,13 @@ def build_evidence_report_view(
     }
     book_text_ids = {item.get("reference_id") for item in (job.source_results or [])
                      if item.get("held_as_book_of_cited_part")}
-    from app.services.reference_discovery import qualify_legacy_catalog_dates, qualify_book_edition_years
+    from app.services.reference_discovery import (
+        qualify_book_edition_years, qualify_legacy_catalog_dates, qualify_title_alone_web_conflicts)
     original_discoveries = discovery_by_reference
     discovery_by_reference = {
-        reference_id: qualify_book_edition_years(
+        reference_id: qualify_title_alone_web_conflicts(qualify_book_edition_years(
             qualify_legacy_catalog_dates(discovery, getattr(references.get(reference_id), "url", None)),
-            getattr(references.get(reference_id), "raw_ref", ""))
+            getattr(references.get(reference_id), "raw_ref", "")))
         for reference_id, discovery in discovery_by_reference.items()
     }
     identity_corrections = [
@@ -4949,6 +4950,7 @@ def _same_people_other_name_order(difference: dict) -> bool:
 def _reference_identity_conflict_view(discovery: dict) -> dict:
     """Expose only the located candidate fields needed to inspect a conflict."""
     from app.services.web_source_metadata import _label_only_author
+    from app.services.reference_discovery import title_alone_web_match
     # A record whose byline is interface text ("Author Notes Loading Author
     # Notes") is page furniture, including records stored before that check
     # existed or reused from an earlier run (2026-10-01).
@@ -4961,7 +4963,7 @@ def _reference_identity_conflict_view(discovery: dict) -> dict:
             if (item.get("plausible_identity_match") or item.get("authoritative_identifier_match")) and any(
                 comparison.get("outcome") == "material_conflict"
                 for comparison in item.get("comparisons") or []
-            )
+            ) and not title_alone_web_match(item)
         ),
         {},
     )

@@ -543,3 +543,47 @@ def test_a_bookseller_format_after_the_title_is_page_furniture():
     page = "Lanterns at Sea - A Biography of Orla Quillby - Softcover"
     assert _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=True)
     assert not _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=False)
+
+
+def _web_candidate(*comparisons, provider="web_search", **flags):
+    return ReferenceDiscoveryCandidate(
+        candidate_id="candidate-web", attempt_id="attempt-bounded_web", provider=provider,
+        plausible_identity_match=True, comparisons=[_comparison(f, o) for f, o in comparisons], **flags)
+
+
+def _web_record(candidate):
+    attempts = [_attempt("academic_adapter", "no_match"),
+                _attempt("bounded_web", "candidate_found").model_copy(update={"provider": candidate.provider})]
+    queries = [_query("academic_adapter"), _query("bounded_web").model_copy(update={"provider": candidate.provider})]
+    return derive_reference_discovery_record(
+        reference_id="ref-0001", expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]),
+        required_route_categories=["academic_adapter"], queries=queries, attempts=attempts,
+        candidates=[candidate], created_at=NOW)
+
+
+@pytest.mark.parametrize("candidate,blocked", [
+    # A film's sales page against a review of the film: the title is all they share.
+    (_web_candidate(("title", "minor_difference"), ("author", "unknown"), ("year", "material_conflict")), True),
+    (_web_candidate(("title", "agreement"), ("author", "agreement"), ("year", "material_conflict")), False),
+    (_web_candidate(("title", "agreement"), ("year", "material_conflict"),
+                    validated_identity_content_sha256="a" * 64), False),
+    # The student's own link is the cited page, not a search result.
+    (_web_candidate(("title", "agreement"), ("year", "material_conflict"), provider="student_url_html"), False),
+])
+def test_a_web_result_matching_only_on_title_cannot_raise_a_conflict(candidate, blocked):
+    from app.services.reference_discovery import title_alone_web_match
+    assert not title_alone_web_match(candidate, enabled=False)
+    assert title_alone_web_match(candidate, enabled=True) is blocked
+    assert (_web_record(candidate).outcome != "bibliographic_conflict") is blocked  # on by default
+
+
+def test_the_rule_reaches_the_outcome_and_the_reports_conflict_view(monkeypatch):
+    from app import config
+    from app.services.evidence_report import _reference_identity_conflict_view
+    monkeypatch.setattr(config.settings, "WEB_TITLE_ALONE_CONFLICT_BLOCKED", True)
+    sales_page = _web_candidate(("title", "minor_difference"), ("author", "unknown"), ("year", "material_conflict"))
+    assert _web_record(sales_page).outcome != "bibliographic_conflict"
+    view = _reference_identity_conflict_view({"expected": {"title": "x", "year": "1988"},
+                                              "candidates": [sales_page.model_dump(mode="json")]})
+    assert view["located_record"]["title"] == "" and view["conflicting_fields"] == []

@@ -483,8 +483,10 @@ def same_title_author_difference(reference, discovery: dict | None) -> dict | No
                 candidate.get('provider') == 'web_search'
                 and _page_title_matches({'title': getattr(reference, 'title', '')}, observed.get('title'))):
             continue
+        from app.services.web_source_metadata import _label_only_author
         authors = [re.sub(r'^[\W_]+', '', str(a)).strip() for a in observed.get('authors') or []]
-        authors = [a for a in authors if a]
+        # Interface text or a search provider's name is no author (2026-10-21).
+        authors = [a for a in authors if a and not _label_only_author(a)]
         surnames = frozenset(s.casefold() for a in authors for s in extract_surnames(a))
         if not surnames:
             continue

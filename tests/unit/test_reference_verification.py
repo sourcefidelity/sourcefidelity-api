@@ -368,6 +368,20 @@ def test_a_same_titled_work_by_someone_else_is_an_author_difference():
     assert split['provider'] == 'google_books' and split['located_value'] == 'Mary River'
 
 
+def test_a_search_providers_own_name_is_no_author():
+    # Exa's library pages on exa.ai name "Exa Labs" as their author (2026-10-21).
+    from types import SimpleNamespace
+    from app.services.reference_verification import same_title_author_difference
+    from app.services.web_source_metadata import _label_only_author, extract_web_source_metadata
+    ref = SimpleNamespace(title='A study of rivers in the northern plains', author='Stone, B')
+    assert same_title_author_difference(ref, _record(
+        ('web_search', 'A Study of Rivers in the Northern Plains', ['Exa Labs']))) is None
+    assert _label_only_author('Exa  Labs') and not _label_only_author('Exa Lab Smith')
+    page = ('<html><head><meta property="og:title" content="A Study of Rivers in the Northern Plains">'
+            '<meta name="author" content="Exa Labs"></head><body><h1>A Study of Rivers</h1></body></html>')
+    assert not extract_web_source_metadata(page, 'https://exa.ai/library/rivers').get('authors')
+
+
 def test_a_same_titled_record_with_another_publisher_names_the_publisher_too():
     # Singer, 2026-09-30: Palgrave Macmillan against the record's Greenwood.
     from types import SimpleNamespace

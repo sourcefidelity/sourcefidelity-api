@@ -1503,6 +1503,26 @@ def qualify_legacy_catalog_dates(discovery: dict | None, reference_url: str | No
         "The catalog webpage year was not verified as the work's publication year; that date comparison is not assessed."]}
 
 
+def qualify_title_alone_web_conflicts(discovery: dict | None) -> dict | None:
+    """A stored conflict that rests only on a web result matching the title is
+    re-derived under the title-alone rule (owner decision 2026-10-21)."""
+    if (not discovery or discovery.get("outcome") != "bibliographic_conflict"
+            or not any(title_alone_web_match(c) for c in discovery.get("candidates") or [])):
+        return discovery
+    record = ReferenceDiscoveryRecord.model_validate(discovery)
+    result = derive_reference_discovery_record(
+        reference_id=record.reference_id, expected=record.expected,
+        required_route_categories=record.required_route_categories, queries=record.queries,
+        attempts=record.attempts, candidates=record.candidates, created_at=record.created_at,
+        search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
+        search_retention_policy=record.search_retention_policy)
+    if result.outcome == discovery.get("outcome"):
+        return discovery
+    return {**result.model_dump(mode="json"), "limitations": list(dict.fromkeys([
+        *record.limitations, *result.limitations]))[:16]}
+
+
 def qualify_book_edition_years(discovery: dict | None, raw_reference: str = "") -> dict | None:
     """Withhold unbound edition-year conflicts, retaining observed values/provenance."""
     if not discovery or not any(
@@ -1569,6 +1589,25 @@ def credible_field_candidates(record: ReferenceDiscoveryRecord, fields=("title",
             yield candidate
 
 
+def title_alone_web_match(candidate, *, enabled: bool | None = None) -> bool:
+    """A web-search result that agrees with the reference only on its title:
+    no identifier, no identity read from its content and no other agreeing
+    field. It may identify a work but cannot raise a conflict (owner decision
+    2026-10-21; a film's sales page against a review of the film). A student's
+    own link is not a search result and is not covered."""
+    from app.config import settings
+    if not (settings.WEB_TITLE_ALONE_CONFLICT_BLOCKED if enabled is None else enabled):
+        return False
+    get = candidate.get if isinstance(candidate, dict) else (lambda key: getattr(candidate, key, None))
+    if get("provider") != "web_search" or get("authoritative_identifier_match") or get("validated_identity_content_sha256"):
+        return False
+    for comparison in get("comparisons") or []:
+        cget = comparison.get if isinstance(comparison, dict) else (lambda key, c=comparison: getattr(c, key, None))
+        if cget("field_name") != "title" and cget("outcome") in {"agreement", "minor_difference"}:
+            return False
+    return True
+
+
 def _record_web_providers(required_web_providers) -> tuple[str, ...]:
     """The pair a record names, so a stored record is judged by the providers it
     searched; the current setting only for a new search that names none."""
@@ -1607,7 +1646,8 @@ def derive_reference_discovery_record(
     else:
         credible = [candidate for candidate in candidates if candidate.is_credible]
         compatible = [candidate for candidate in credible if not candidate.has_material_conflict]
-        conflicts = [candidate for candidate in credible if candidate.has_material_conflict]
+        conflicts = [candidate for candidate in credible if candidate.has_material_conflict
+                     and not title_alone_web_match(candidate)]
         exact = [
             candidate
             for candidate in compatible

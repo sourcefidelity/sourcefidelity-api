@@ -177,6 +177,10 @@ class Settings(BaseSettings):
     # holds the reference as an uncompared candidate; "unsure" and unfetched
     # pages still do. On by default since 2026-10-19 (owner decision, measured).
     CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED: bool = True
+    # A web-search result that agrees with the reference on its title alone
+    # cannot raise a bibliographic conflict (owner decision 2026-10-21;
+    # replay in STATE).
+    WEB_TITLE_ALONE_CONFLICT_BLOCKED: bool = True
     CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE: int = Field(default=3, ge=0)
     # Your Tavily plan's price per credit, for Technical details; unset means
     # "no price on record", never zero.
