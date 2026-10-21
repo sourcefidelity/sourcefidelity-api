@@ -160,3 +160,47 @@ def test_a_provider_the_setting_leaves_out_keeps_its_default_ceiling(monkeypatch
     monkeypatch.setattr(settings, "PROVIDER_REQUESTS_PER_SECOND", "brave:1")
     assert provider_gate.configured_rate("deepseek") == 4
     assert provider_gate.configured_rate("brave") == 1
+
+
+def test_deepseek_alone_is_an_option_off_by_default(monkeypatch):
+    # deepseek-only-search-v1 (owner decision 2026-10-21): no Brave account needed.
+    from app.config import Settings
+    from app.services.retrieval import web_search
+    from app.services.search.policy import API_FIRST_SEARCH_POLICY, required_api_providers
+    assert Settings.model_fields["SEARCH_DEEPSEEK_ONLY"].default is False
+    monkeypatch.setattr(settings, "SEARCH_SECOND_REQUIRED_PROVIDER", "deepseek")
+    assert required_api_providers() == ("brave", "deepseek")
+    monkeypatch.setattr(settings, "SEARCH_DEEPSEEK_ONLY", True)
+    assert required_api_providers() == ("deepseek",)
+    assert is_required_web_provider_set(["deepseek"])
+    assert not is_required_web_provider_set(["brave"])
+    assert not is_required_web_provider_set(["exa"])
+    monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
+    monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "none")
+    built = []
+    monkeypatch.setattr(web_search, "get_search_provider", lambda name=None: built.append(name) or Mock(name=name))
+    retriever = web_search.WebSearchRetriever()
+    assert built == ["deepseek"]
+    assert retriever._search is retriever._policy_providers["deepseek"]
+
+
+def test_a_deepseek_only_record_keeps_its_meaning_when_the_setting_changes(monkeypatch):
+    from app.services.search_completion import assess_record
+    from app.services.search.policy import API_FIRST_SEARCH_POLICY
+
+    def record(engines, names):
+        queries = [{"query_id": f"q-{e}", "route_category": "bounded_web", "provider": e, "execution_provider": e,
+                    "execution_outcome": "no_results", "normalized_query": '"A title" Writer 2020'} for e in engines]
+        attempts = [{"attempt_id": "a-web", "provider": "web_search", "route_category": "bounded_web",
+                     "query_ids": [q["query_id"] for q in queries], "outcome": "no_match", "permitted": True,
+                     "required": True, "completed_at": "2026-10-21T10:00:00+00:00"}]
+        return {"expected": {"title": "A title"}, "required_route_categories": ["bounded_web"],
+                "search_policy_version": API_FIRST_SEARCH_POLICY, "attempts": attempts,
+                "queries": queries, "required_web_providers": names}
+    monkeypatch.setattr(settings, "SEARCH_DEEPSEEK_ONLY", False)
+    assert assess_record(record(["deepseek"], ["deepseek"])).complete
+    monkeypatch.setattr(settings, "SEARCH_DEEPSEEK_ONLY", True)
+    assert assess_record(record(["deepseek"], None)).complete
+    # Under the option, a Brave answer is not a required provider's answer.
+    brave_only = assess_record(record(["brave"], None))
+    assert not brave_only.complete and brave_only.blocking_providers == ("deepseek",)

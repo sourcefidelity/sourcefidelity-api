@@ -170,6 +170,11 @@ class Settings(BaseSettings):
     # when LLM_BASE_URL is DeepSeek's. Default since 2026-10-19 (owner
     # decision, measured in STATE §6); "exa" remains available.
     SEARCH_SECOND_REQUIRED_PROVIDER: Literal["exa", "deepseek"] = "deepseek"
+    # DeepSeek's Search API as the only web provider, without Brave
+    # (deepseek-only-search-v1, owner decision 2026-10-21: an option, off by
+    # default, so a deployment needs no Brave account). Its records name only
+    # deepseek and stay judged by it after the setting changes.
+    SEARCH_DEEPSEEK_ONLY: bool = False
     # A fetched web-search page whose titles are all in another writing
     # system gets the configured model's cross-script comparison
     # (cross-script-identity-v1), at most CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE

@@ -225,7 +225,8 @@ class WebSearchRetriever(RetrievalSource):
             if fallback == "tavily":
                 names.append("tavily")
             self._policy_providers = {name: get_search_provider(name) for name in names}
-        self._search = search_provider or (self._policy_providers.get("brave") if self._policy_providers else get_search_provider())
+        self._search = search_provider or (next(iter(self._policy_providers.values()))
+                                           if self._policy_providers else get_search_provider())
         self._escalation: list[SearchProvider] = []
         for name in ([] if self._policy_providers else settings.SEARCH_ESCALATION_PROVIDERS.split(",")):
             name = name.strip().lower()

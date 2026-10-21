@@ -66,7 +66,7 @@ It works on its own but takes some setup, because the application relies on seve
 
 - **Academic metadata and full text:** Crossref, OpenAlex, CORE, Semantic Scholar, DataCite, ERIC, Europe PMC, Unpaywall, Elsevier (optional)
 - **Books, archives and public-domain texts:** Google Books, Open Library, Internet Archive, Project Gutenberg, Wikisource, Wayback Machine (archived copies of cited web pages)
-- **Web search:** Brave Search and DeepSeek's Search API, both used for every web search; Exa can be configured in place of DeepSeek's Search API, and Tavily as an optional backup
+- **Web search:** DeepSeek's Search API with Brave Search (recommended), or DeepSeek's Search API alone; alongside Brave, Exa can be configured in place of DeepSeek's Search API, and Tavily as an optional backup
 - **LLMs:** DeepSeek, GLM (Zhipu or Z.ai); other providers can be configured behind the same interface
 
 ---
@@ -96,7 +96,12 @@ cp .env.example .env
 In `.env`:
 
 - Set `POSTGRES_PASSWORD` and `MINIO_ROOT_PASSWORD`, and use the same database password in `DATABASE_URL`.
-- Add `LLM_API_KEY` (DeepSeek; the same key is used for DeepSeek's Search API), `BRAVE_SEARCH_API_KEY` (web searches stay incomplete without Brave and DeepSeek's Search API), `OPENALEX_API_KEY`, `CORE_API_KEY` and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `EXA_API_KEY` only if `SEARCH_SECOND_REQUIRED_PROVIDER=exa`, and `TAVILY_API_KEY` only if Tavily is configured as the backup search.
+- Add `LLM_API_KEY` (DeepSeek; the same key is used for DeepSeek's Search API), `OPENALEX_API_KEY`, `CORE_API_KEY` and `GOOGLE_BOOKS_API_KEY` (Google Books and Open Library are both required for book searches, and Google Books' anonymous limit is too low for regular use). Add `EXA_API_KEY` only if `SEARCH_SECOND_REQUIRED_PROVIDER=exa`, and `TAVILY_API_KEY` only if Tavily is configured as the backup search.
+- Choose the web search:
+  - **DeepSeek and Brave (recommended):** add `BRAVE_SEARCH_API_KEY`.
+  - **DeepSeek only:** set `SEARCH_DEEPSEEK_ONLY=true` and leave out the Brave key.
+
+  Two search providers produce better results.
 - For relationship judgment and evidence selection, add `ZAI_API_KEY` (GLM; `ZAI_BASE_URL` chooses Zhipu or Z.ai) and set `ZAI_TERMS_VERIFIED_ON` to the date you reviewed the provider's data-use terms (`YYYY-MM-DD`). Judgment does not run until both are set.
 - For access over plain `http://localhost`, set `REPORT_SESSION_COOKIE_SECURE=false`.
 
