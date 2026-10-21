@@ -45,8 +45,13 @@ def refresh_evidence_report_projection(
     submitted_link_updates: list[dict] | None = None,
     verification_replacements: dict[str, str] | None = None,
     reassess_reference_formatting: bool = False,
+    evidence_translations: dict | None = None,
 ) -> dict:
-    """Refresh only the report-facing projection; Evidence Packages stay immutable."""
+    """Refresh only the report-facing projection; Evidence Packages stay immutable.
+
+    `evidence_translations` (evidence-translation-v1) is the translation store
+    to keep with the new projection; it replaces the aggregate's own.
+    """
     parsed_id = report_id if isinstance(report_id, uuid.UUID) else uuid.UUID(str(report_id))
     report = session.get(Report, parsed_id)
     if report is None:
@@ -119,6 +124,8 @@ def refresh_evidence_report_projection(
             updates[key] = row.model_dump(mode='json')
         aggregate['submitted_link_observations'] = [r for r in aggregate.get('submitted_link_observations', [])
             if (r.get('reference_id'), r.get('kind')) not in updates] + list(updates.values())
+    if evidence_translations is not None:
+        aggregate["evidence_translations"] = deepcopy(evidence_translations)
     citation_groups = list(aggregate.get("citation_groups") or [])
     abstract_assessments = 0
     if assess_abstracts:
@@ -248,7 +255,8 @@ def refresh_evidence_report_projection(
             "bounded_evidence_reassessment" if verification_replacements else
             "reference_formatting_reassessment" if reassess_reference_formatting else
             "citation_projection_correction" if reextract_citations else
-            "abstract_relevance_assessment" if assess_abstracts else "submitted_link_recheck" if submitted_link_updates else "projection_refresh"
+            "abstract_relevance_assessment" if assess_abstracts else "submitted_link_recheck" if submitted_link_updates else
+            "evidence_translation" if evidence_translations is not None else "projection_refresh"
         ),
     )
     session.add(successor)
@@ -353,8 +361,11 @@ def _correct_citation_projection(backend, job, paper_artifact, previous, records
 
 
 def _validate_retained_claims(previous, corrected, records):
-    old = {c.claim_id: c.model_dump(mode="json") for c in previous.citation_claims}
-    new = {c.claim_id: c.model_dump(mode="json") for c in corrected.citation_claims}
+    # The quotation form is derived from the claim's own text, not an evidence
+    # target; a claim extracted before it existed is otherwise unchanged.
+    derived = {"quotation_form", "quotation_form_version"}
+    old = {c.claim_id: c.model_dump(mode="json", exclude=derived) for c in previous.citation_claims}
+    new = {c.claim_id: c.model_dump(mode="json", exclude=derived) for c in corrected.citation_claims}
     for record in records:
         package = record.report_payload.get("authoritative_evidence_package") or {}
         claim_id = package.get("claim_id")

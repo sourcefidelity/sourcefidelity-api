@@ -1,6 +1,7 @@
 """Prospective, bounded human-review threshold, separate from source existence."""
 import hashlib
 
+from app.services.search.policy import REQUIRED_WEB_PROVIDER_NAMES, is_required_web_provider_set
 from app.services.reference_review_scope import scope_for, input_hash, text_key
 from app.services.source_type import (
     BOOK_CATALOGUE_KINDS,
@@ -78,7 +79,7 @@ def assess(reference, discovery, trace):
         if _search_title_boundary_unresolved(reference):
             return stop('search_title_boundary_unresolved')
         if (parsed.search_policy_version != 'api-first-search-v2'
-                or set(parsed.required_web_providers) != {'brave','exa'}
+                or not is_required_web_provider_set(parsed.required_web_providers)
                 or not {'academic_adapter','bounded_web'} <= set(parsed.required_route_categories)):
             return stop('required_review_policy_missing')
         if discovery is not None:
@@ -196,7 +197,7 @@ def assess(reference, discovery, trace):
                 return stop('transient_scope_policy_mismatch')
         for q in bound_queries:
             success = succeeded and q.execution_outcome in {'results','no_results'}
-            if attempt.route_category == 'bounded_web' and q.execution_provider in {'brave','exa'}:
+            if attempt.route_category == 'bounded_web' and q.execution_provider in REQUIRED_WEB_PROVIDER_NAMES:
                 if q.execution_outcome == 'no_results' and q.result_count != 0:
                     return stop('web_empty_response_uncertified')
                 if not success and q.required is not False:

@@ -20,6 +20,10 @@ _OUTCOMES = {
     'bibliographic_identity_confirmed': 'acquired',
     'bibliographic_identity_unconfirmed': 'identity_unconfirmed',
     'diagnostic_unavailable': 'unknown',
+    # The link answered 404 or 410: the page or file is gone (2026-10-14).
+    'link_not_found': 'not_found',
+    # A PDF link answered with a web page, which the web route then checks.
+    'link_not_pdf': 'type_unconfirmed',
 }
 
 
@@ -33,7 +37,7 @@ class WebFetchDiagnostic(BaseModel):
         'page_title_mismatch_unconfirmed', 'readable_text_unavailable', 'site_homepage', 'access_wall',
         'source_kind_unconfirmed', 'bibliographic_fields_conflict',
         'bibliographic_identity_confirmed', 'bibliographic_identity_unconfirmed',
-        'diagnostic_unavailable',
+        'diagnostic_unavailable', 'link_not_found', 'link_not_pdf',
     ]
     observed_content_sha256: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
 

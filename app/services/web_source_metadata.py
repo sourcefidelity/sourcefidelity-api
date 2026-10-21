@@ -15,6 +15,16 @@ _ISSUE_LABEL_RE = re.compile(
 )
 
 
+# Video hosts where the uploader writes the page title and the page date is the
+# upload date; neither is the work's title or publication year (2026-10-16).
+_VIDEO_HOSTS = ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")
+
+
+def is_video_host(url: str | None) -> bool:
+    host = (urlsplit(str(url or "")).hostname or "").casefold()
+    return any(host == item or host.endswith("." + item) for item in _VIDEO_HOSTS)
+
+
 def _strip_declared_site_suffix(title: str, declared_names: list[str]) -> str:
     """Remove a trailing site/journal name the page declares about itself.
 
@@ -131,7 +141,11 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
                 authors = [bylines[0]]
                 author_method = 'visible_journal_header_byline'
     if not authors and fields.get("author"):
-        authors = re.split(r"\s*;\s*", fields["author"])
+        # "François Dupuis, Vice-President and Chief Economist • Francis
+        # Généreux, Senior Economist" (Desjardins, 2026-10-14) comes back as
+        # four names; a bullet separates people and a title-only part is none.
+        authors = [part for part in re.split(r"\s*[;•]\s*", fields["author"])
+                   if part and not _TITLE_ONLY.fullmatch(part)]
         author_method = "trafilatura_metadata"
     # Some article headers use an ordinary visible byline, not author metadata.
     # Restrict fallback to a short explicit byline near the article heading;
@@ -165,6 +179,8 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
             author_method = "interface_label_rejected"
         if generic_date:
             date, date_method = None, "page_furniture_date_rejected"
+    if is_video_host(page_url):
+        date, date_method = None, "video_upload_date_rejected"
     if archive_item:
         # The item webpage's date is often its upload/scan date, not the
         # publication year of the described book. Require the labelled field.
@@ -179,7 +195,7 @@ def extract_web_source_metadata(page_html: str, page_url: str) -> dict:
         if len(set(publication_values)) == 1 and re.fullmatch(r"(?:18|19|20)\d{2}(?:-\d{2}(?:-\d{2})?)?", publication_values[0]):
             date = publication_values[0]
             date_method = "catalog_publication_date"
-    if not date and not archive_item:
+    if not date and not archive_item and not is_video_host(page_url):
         for node in header_nodes:
             value = node.get_text(" ", strip=True)
             value = re.sub(r"^(?:Published|Posted)(?: on)?\s+", "", value, flags=re.I)
@@ -273,6 +289,14 @@ _JOB_TITLE = re.compile(
     re.IGNORECASE)
 
 
+# A byline part made only of position words: "Vice-President", "Chief
+# Economist", "Senior Economist".
+_TITLE_ONLY = re.compile(
+    r"(?:(?:vice-president|president|vice|chief|senior|junior|principal|lead|head|deputy|associate|"
+    r"assistant|executive|managing|economist|economists|director|editor|professor|analyst|strategist|"
+    r"manager|officer|researcher|fellow|partner|ceo|cfo|cto|and|&|of)[\s,]*)+", re.IGNORECASE)
+
+
 def _without_job_title(author: str) -> str:
     """The name without a trailing job title; unchanged when none is present."""
     match = _JOB_TITLE.match(author)
@@ -284,6 +308,22 @@ _AUTHOR_LABEL_WORDS = frozenset({"author", "authors", "note", "notes", "loading"
                                  "by", "unknown", "details", "more", "information", "info"})
 
 
+# The same interface labels in Chinese ("作者简介", about the author, read as
+# a byline on a database record page, 2026-10-14).
+_CJK_AUTHOR_LABELS = frozenset({"作者", "作者简介", "作者介绍", "作者信息", "作者单位", "作者姓名", "责任者",
+                                "著者", "编者", "作者简历"})
+
+
+# A search provider's own library page names the provider as its author
+# ("Exa Labs" on exa.ai copies of papers, 106 stored web results, 2026-10-21):
+# the provider is never the cited work's author.
+_SEARCH_PROVIDER_BYLINES = frozenset({"exa labs"})
+
+
 def _label_only_author(value: str) -> bool:
+    if " ".join(value.casefold().split()) in _SEARCH_PROVIDER_BYLINES:
+        return True
+    if re.sub(r"[\s:：·•,，、]+", "", value) in _CJK_AUTHOR_LABELS:
+        return True
     words = re.findall(r"[a-z]+", value.casefold())
     return bool(words) and all(word in _AUTHOR_LABEL_WORDS for word in words)

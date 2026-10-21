@@ -14,9 +14,6 @@ authorized source. A completed search is never retried here: it may hold a
 completed-search memo (search-reuse-memo-v1), and retrying it would only
 repeat paid work. Both routes record what they started in the job's
 ``upload_evidence``.
-
-Neither route runs for a paper whose assessment has marks released
-(assessment_marks.py): further searching can no longer affect it.
 """
 
 from __future__ import annotations
@@ -31,7 +28,6 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.job import Job, JobStatus
 from app.models.report import Report, ReportPaperArtifactRecord
-from app.services.assessment_marks import job_marks_released
 from app.services.paper_workflow import (
     TARGETED_SOURCE_REFRESH_KEY,
     PaperWorkflowError,
@@ -39,19 +35,9 @@ from app.services.paper_workflow import (
 )
 
 AUTO_RETRY_KEY = "incomplete_search_retry"
-SEARCH_AGAIN_KEY = "search_again_requests"
 AUTO_RETRY_REASON = "incomplete_search_retry"
-SEARCH_AGAIN_REASON = "user_search_again"
-SEARCH_AGAIN_INTERVAL = timedelta(days=1)
 _AUTHORIZED_STATUSES = frozenset({"durable_authorized", "transient_authorized"})
 _KEPT_RUNS = 50
-_KEPT_REQUESTS = 10
-
-
-class SearchAgainRateLimited(Exception):
-    def __init__(self, retry_after_seconds: int) -> None:
-        super().__init__("This reference was already searched again within the last day")
-        self.retry_after_seconds = max(1, int(retry_after_seconds))
 
 
 def source_result_search_incomplete(item: dict) -> bool:
@@ -104,8 +90,6 @@ def job_accepts_search_refresh(session: Session, job: Job, *, now: datetime) -> 
     ):
         return False
     if session.scalar(select(Report.id).where(Report.job_id == job.id).limit(1)) is None:
-        return False
-    if job_marks_released(session, job):
         return False
     artifact = session.scalar(
         select(ReportPaperArtifactRecord).where(ReportPaperArtifactRecord.job_id == job.id)
@@ -194,109 +178,6 @@ def prepare_incomplete_search_retry(
     job.upload_evidence = upload_evidence
     session.flush()
     return due
-
-
-def prepare_search_again_refresh(
-    session: Session,
-    *,
-    report_id: str | uuid.UUID,
-    reference_id: str,
-    scope_type: str,
-    scope_id: str,
-    now: datetime | None = None,
-    commit: bool = True,
-) -> dict:
-    """Start a forced search of one reference the reader asked to search again."""
-    current = _as_utc(now or datetime.now(timezone.utc))
-    try:
-        parsed_report_id = (
-            report_id if isinstance(report_id, uuid.UUID) else uuid.UUID(str(report_id))
-        )
-    except (TypeError, ValueError) as exc:
-        raise PaperWorkflowError("report_missing", "Report does not exist") from exc
-    requested_report = session.get(Report, parsed_report_id)
-    if requested_report is None:
-        raise PaperWorkflowError("report_missing", "Report does not exist")
-    job = session.scalar(
-        select(Job).where(Job.id == requested_report.job_id).with_for_update()
-        .execution_options(populate_existing=True)   # the current row, not the request's copy
-    )
-    if job is None or job.scope_type != scope_type or job.scope_id != scope_id:
-        raise PaperWorkflowError("report_missing", "Report does not exist")
-    if job_marks_released(session, job):
-        raise PaperWorkflowError(
-            "assessment_marks_released", "Marks have been released for this assessment"
-        )
-    if job.store_only or not job.extraction_payload:
-        raise PaperWorkflowError(
-            "report_dependencies_unavailable",
-            "Report dependencies are unavailable for a new search",
-        )
-    requests = list(((job.upload_evidence or {}).get(SEARCH_AGAIN_KEY) or {}).get(reference_id) or [])
-    last = max(
-        (parsed for parsed in (_parse_time(item.get("requested_at")) for item in requests) if parsed),
-        default=None,
-    )
-    if last is not None and current - last < SEARCH_AGAIN_INTERVAL:
-        raise SearchAgainRateLimited((last + SEARCH_AGAIN_INTERVAL - current).total_seconds())
-    if job.status != JobStatus.COMPLETED or (job.upload_evidence or {}).get(
-        TARGETED_SOURCE_REFRESH_KEY
-    ):
-        raise PaperWorkflowError(
-            "report_reanalysis_busy", "Another report reanalysis is already in progress"
-        )
-    if not job_accepts_search_refresh(session, job, now=current):
-        raise PaperWorkflowError(
-            "report_dependencies_unavailable",
-            "Report dependencies are unavailable for a new search",
-        )
-    result = next(
-        (item for item in job.source_results or [] if item.get("reference_id") == reference_id),
-        None,
-    )
-    if result is None or not source_result_search_incomplete(result):
-        raise PaperWorkflowError(
-            "search_not_incomplete", "This reference has no incomplete search"
-        )
-    latest_report = session.scalar(
-        select(Report)
-        .where(Report.job_id == job.id)
-        .order_by(Report.report_version.desc(), Report.created_at.desc())
-        .limit(1)
-    )
-    attempt_id = begin_reference_search_refresh(
-        job,
-        [reference_id],
-        reason=SEARCH_AGAIN_REASON,
-        force_search=True,
-        extra={
-            "requested_report_id": str(requested_report.id),
-            "base_report_id": str(latest_report.id),
-            "base_report_version": latest_report.report_version,
-        },
-    )
-    upload_evidence = deepcopy(dict(job.upload_evidence or {}))
-    recorded = dict(upload_evidence.get(SEARCH_AGAIN_KEY) or {})
-    recorded[reference_id] = [
-        *requests,
-        {
-            "requested_at": current.isoformat(),
-            "attempt_id": attempt_id,
-            "requested_report_id": str(requested_report.id),
-        },
-    ][-_KEPT_REQUESTS:]
-    upload_evidence[SEARCH_AGAIN_KEY] = recorded
-    job.upload_evidence = upload_evidence
-    if commit:
-        session.commit()
-    else:
-        session.flush()
-    return {
-        "job_id": str(job.id),
-        "attempt_id": attempt_id,
-        "report_id": str(latest_report.id),
-        "reference_id": reference_id,
-    }
 
 
 def _parse_time(value) -> datetime | None:

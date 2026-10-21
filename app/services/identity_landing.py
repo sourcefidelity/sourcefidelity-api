@@ -69,7 +69,7 @@ def inspect(location, expected):
                              for c in candidate.comparisons)
         different = title_conflict and scope(expected.title, fields['title']) == 'outside_bound'
         confirmed = (not expected.reference_parse_review and candidate.plausible_identity_match
-            and not candidate.has_material_conflict and not candidate.has_unresolved_supplied_identity_fields
+            and not candidate.has_material_conflict and not candidate.has_unresolved_supplied_identifying_fields
             and (candidate.authoritative_identifier_match or sum(c.outcome in {'agreement', 'minor_difference'}
                  for c in candidate.comparisons if c.field_name in {'title', 'author', 'year', 'doi', 'isbn'}) >= 2))
         observation = dict(observed=fields, content_sha256=hashlib.sha256(response.content).hexdigest(),

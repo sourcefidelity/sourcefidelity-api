@@ -247,6 +247,95 @@ def test_title_case_and_missing_publication_details():
     assert found == {('0', TITLE_CASE_TEXT), ('0', PUBLICATION_MISSING_TEXT)}
 
 
+# The mixed-case rule reads the English word lists the image installs; tests
+# use a fixed list so they do not depend on the machine.
+_TEST_COMMON_WORDS = frozenset('''interim provisions administration rules management online services
+commentary ports commerce northern trade relations united provinces regulating everyday life power press
+broadcasting may film industry speaking plainly benjamin pierce warner family corporate transcending time narrative decline actress encyclopedia'''.split())
+
+
+@pytest.fixture(autouse=True)
+def _english_word_list(monkeypatch):
+    from app.services import reference_formatting
+    monkeypatch.setattr(reference_formatting, '_common_words', lambda: _TEST_COMMON_WORDS)
+
+
+def test_mixed_title_and_sentence_case_is_the_same_title_finding():
+    # Owner decision 2026-10-12: counted and shown as the existing title finding.
+    from app.services.reference_formatting import (MIXED_CASE_TEXT, mixed_case_title,
+                                                   reference_entry_findings)
+    assert mixed_case_title('Interim Rules on the Management of Internet publishing')
+    assert mixed_case_title('Rules for the Management of Online services: A commentary')
+    # Sentence case: "Internet" and proper nouns are not title case.
+    assert not mixed_case_title('Regulating the Internet in everyday life')
+    assert not mixed_case_title('Trade relations between Avonia and the United Provinces')
+    assert not mixed_case_title('Trade relations between Avonia and the United Provinces in the nineteenth century')
+    assert not mixed_case_title('The Washington Post and the New York Times coverage of Iraq')
+    assert not mixed_case_title('Power without responsibility: Press, broadcasting and the internet in Britain')
+    # A bracketed translation is ignored.
+    assert not mixed_case_title('Wangluo guanli banfa (Measures on the Governance of Online information)')
+    # Names a located sentence-case record capitalises do not count.
+    assert mixed_case_title('Ports of Commerce and the Northern trade')
+    assert not mixed_case_title('Ports of Commerce and the Northern trade',
+                                ['Ports of Commerce and the Northern trade in grain'])
+    # A located record in title case says nothing about names.
+    assert mixed_case_title('Ports of Commerce and the Northern trade',
+                            ['Ports of Commerce and the Northern Trade'])
+    refs = {}
+    for i, raw in enumerate(['Office, S. (2021). Interim Rules on the Management of Internet publishing. Office Press.',
+                             'Adams, A. (2021). Trade relations between Avonia and the United Provinces. Journal Name, 4(2), 11-19.',
+                             'Lee, B. (2020). Regulating the Internet in everyday life. University Press.']):
+        ref = extract_fields_apa(raw); ref.reference_id = str(i); refs[str(i)] = ref
+    found = [(f['reference_id'], f['finding'], f['rule_id']) for f in reference_entry_findings(refs)
+             if f['finding_type'] == 'reference_title_style']
+    assert found == [('0', MIXED_CASE_TEXT, 'apa7_title_mixed_case_v1')]
+    # Names the word lists only spell capitalised never count (2026-10-12 corpus check).
+    assert not mixed_case_title('Ella May Thorvald and the British film industry')
+    assert not mixed_case_title("Enduring time: Jean Okafor and Hollywood's narrative of decline")
+    assert not mixed_case_title('Vivien Okonkwo | British actress | Encyclopedia')
+    assert not mixed_case_title('Speaking plainly: Ella May Thorvald, Walter Benjamin, and the possibilities of film')
+    assert not mixed_case_title('Hildred Pierce, Warner Bros., and the corporate family')
+    with pytest.MonkeyPatch.context() as patch:
+        # No installed word list: the rule abstains.
+        from app.services import reference_formatting
+        patch.setattr(reference_formatting, '_common_words', lambda: frozenset())
+        assert not mixed_case_title('Interim Rules on the Management of Internet publishing')
+    refs['0'].needs_review = True
+    assert not [f for f in reference_entry_findings(refs) if f['finding_type'] == 'reference_title_style']
+
+
+def test_mixed_case_uses_the_located_records_capitalisation():
+    from datetime import datetime, timezone
+    from app.services.reference_discovery import (ExpectedBibliographicFields, ReferenceRouteAttempt,
+                                                  build_reference_discovery_candidate,
+                                                  derive_reference_discovery_record)
+    from app.services.reference_formatting import located_titles, reference_entry_findings
+    from app.services.retrieval.base import RetrievalResult
+    ref = extract_fields_apa('Adams, A. (2021). Ports of Commerce and the Northern trade. Office Press.')
+    ref.reference_id = 'r'
+
+    def discovery(located):
+        expected = ExpectedBibliographicFields(title=ref.title, year=ref.year, author=ref.author)
+        candidate = build_reference_discovery_candidate(
+            attempt_id='a', provider='crossref', expected=expected,
+            result=RetrievalResult(source_name='crossref', success=True, title=located,
+                                   year=ref.year, authors=['A. Adams']))
+        now = datetime.now(timezone.utc)
+        attempt = ReferenceRouteAttempt(attempt_id='a', provider='crossref', route_category='academic_adapter',
+            required=True, permitted=True, outcome='candidate_found', started_at=now, completed_at=now)
+        record = derive_reference_discovery_record(reference_id='r', expected=expected,
+            required_route_categories=['academic_adapter'], queries=[], attempts=[attempt],
+            candidates=[candidate])
+        return record.model_dump(mode='json')
+
+    titled = lambda d: [f for f in reference_entry_findings({'r': ref}, {'r': d})
+                        if f['finding_type'] == 'reference_title_style']
+    assert titled(None)
+    sentence = discovery('Ports of Commerce and the Northern trade')
+    assert located_titles(ref, sentence) == ['Ports of Commerce and the Northern trade']
+    assert not titled(sentence)
+
+
 def test_title_case_and_publication_checks_are_apa_only():
     # Owner request 2026-10-04: other styles capitalise titles differently.
     from app.services.reference_formatting import reference_style_findings
@@ -263,3 +352,48 @@ def test_a_joined_reference_is_flagged_as_split():
     ref.reference_id = 's'
     ref.split_parts = ['Santillana, M. (2023). Freedom of the press', 'under pressure. In Media (pp. 1-2). Springer.']
     assert ('s', SPLIT_ENTRY_TEXT) in {(f['reference_id'], f['finding']) for f in reference_entry_findings({'s': ref})}
+
+
+def test_a_lower_case_word_inside_a_name_keeps_title_case():
+    from app.services.reference_formatting import title_case_title
+    assert title_case_title("Harbours without Frontiers: The European Union’s Continuing Struggle for Cultural Survival")
+    assert not title_case_title("The Washington Post and the New York Times coverage of Iraq")
+
+
+def test_citation_form_differences():
+    from app.services.evidence_report import citation_form_issues
+    assert citation_form_issues({"citation_marker": "(Lane 2004)", "student_text": "Ports grew (Lane 2004)."}, "apa") == [
+        "citation_comma_missing"]
+    assert citation_form_issues({"citation_marker": "(Lane 2004)", "student_text": "Ports grew (Lane 2004)."}, "mla") == []
+    assert citation_form_issues({"citation_marker": "(Lane, 2004, p.17)", "student_text": "x (Lane, 2004, p.17)."},
+                                "apa") == ["citation_page_space_missing"]
+    assert citation_form_issues({"citation_marker": "(Lane, 2004)", "student_text": "harbours(Lane, 2004)."},
+                                "apa") == ["citation_space_before_parenthesis_missing"]
+
+
+def test_reference_detail_findings():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import reference_detail_findings
+    old = SimpleNamespace(reference_id="r1", source_kind="journal_article", pages="1-9", container_title="Ports",
+                          raw_ref="Lane, A. (2004). Harbours. Ports, 3(1), 1-9. doi:10.1234/abc")
+    bad = SimpleNamespace(reference_id="r2", source_kind="book_section", pages="", container_title="",
+                          raw_ref="Kay, B. (2017). Cranes. In Harbour eBooks. doi:1007/978-3-00000-000-0_2")
+    record = {"candidates": [{"plausible_identity_match": True, "observed": {"pages": "195-230"},
+                              "comparisons": [{"field_name": "title", "outcome": "agreement"},
+                                              {"field_name": "author", "outcome": "agreement"}]}]}
+    first = SimpleNamespace(reference_id="r3", source_kind="journal_article", pages="195", container_title="Law Review",
+                            raw_ref="Wil, K. (1991). Frontiers. Law Review, 14(1), 195.")
+    online = SimpleNamespace(reference_id="r4", source_kind="journal_article", pages="", container_title="Online",
+                             raw_ref="Ola, P. (2020). Streams. Online, 5, e102.")
+    kinds = {(f["reference_id"], f["finding_type"]) for f in reference_detail_findings(
+        [old, bad, first, online], "apa", {"r3": record, "r4": {"candidates": []}})}
+    assert kinds == {("r1", "doi_old_form"), ("r2", "doi_prefix_missing"), ("r3", "article_pages_missing")}
+
+
+def test_a_landing_page_that_is_mainly_its_abstract():
+    from app.services.abstract_only_pages import mainly_abstract_page
+    summary = " ".join(["This article studies harbour regulation across member states and its effects."] * 4)
+    html = f'<html><head><meta name="description" content="{summary}"></head></html>'
+    assert mainly_abstract_page("Harbour Rules\nA. Lane\n" + summary + "\nReferences\nB. Kay (2001). Ports.", html)
+    long_page = "Harbour Rules\n" + " ".join(["The body of the article continues at length here."] * 80)
+    assert mainly_abstract_page(long_page, html) is None

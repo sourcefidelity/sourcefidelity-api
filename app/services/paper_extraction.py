@@ -19,6 +19,7 @@ from app.services.body_title_formatting import BodyTitleAssessment, assess_body_
 from app.services.citation_extractor import SignalConfig, extract_citations
 from app.services.antecedent_resolver import resolve_claim_antecedents
 from app.services.discourse_context import resolve_claim_discourse_dependencies
+from app.services.quotation_form import QUOTATION_FORM_VERSION, claim_quotation_form, claim_type_for
 from app.services.claim_atomizer import (
     AtomizationArtifact,
     atomize_claim_unit,
@@ -47,6 +48,56 @@ from app.services.verification_evidence import (
     ClaimEvidence,
     claim_evidence_from_citation,
 )
+
+
+OWN_ESSAY_STATEMENT = "own_essay_statement"
+# The writer's own work named as such ("this essay", "my paper").
+_OWN_WORK = r"(?:this|my|our|the\s+present)\s+(?:essay|paper|article|study|analysis|research|assignment|report)"
+# That work as the subject of a statement of its aims ("This essay endeavors
+# to take the 'Regulations…' (2016) as an example…", owner decision 2026-10-14).
+_OWN_ESSAY_AIMS = re.compile(
+    r"\s*(?:this|my|the\s+present)\s+(?:essay|paper|assignment|report|dissertation|thesis)\b"
+    r"(?P<between>.{0,40}?)\b(?:aims?|endeavou?rs?|seeks?|attempts?|intends?|sets?\s+out|will|tries|wishes|"
+    r"is\s+going\s+to)\b", re.IGNORECASE | re.DOTALL)
+
+
+# A statement that also attributes a proposition to the source ("based on
+# Bordwell's (2006) argument that…", Stardom 1) stays a citation.
+_ATTRIBUTES_PROPOSITION = re.compile(
+    r"\b(?:argument|claim|view|finding|contention|observation|suggestion|thesis|assertion|idea|notion|point|"
+    r"position|conclusion)s?\s+that\b|\b(?:argues?|argued|claims?|claimed|suggests?|suggested|finds|found|"
+    r"shows?|showed|states?|stated|notes?|noted|contends?|contended|maintains?|maintained)\s+that\b",
+    re.IGNORECASE)
+
+
+CITED_WORK_EFFECTS_STATEMENT = "cited_work_effects_statement"
+# The writer's assessment of what a cited, titled work brought about ("The
+# results of the 'Regulations…' (2016) largely confirm…"): judging it would mean
+# evaluating the writer's analysis of the work, not the work's own statements
+# (owner decision 2026-10-14).
+_CITED_WORK_EFFECTS = re.compile(
+    r"\b(?:results?|effects?|impacts?|outcomes?|consequences?|implementation|success|failure|influence)\s+of\s+"
+    r"(?:the\s+)?[\"'‘“][^\"'’”]{3,200}[\"'’”]\s*\((?:19|20)\d{2}\)", re.IGNORECASE)
+
+
+def not_a_claim_about_the_source(text: str | None, marker: str | None = None) -> str | None:
+    """Why a citation unit is no claim about its source, or None: it states
+    the writer's own essay's aims, or the writer's assessment of a cited
+    work's effects. Such units are not shown or judged as citations."""
+    if states_own_essay_aims(text, marker):
+        return OWN_ESSAY_STATEMENT
+    if _CITED_WORK_EFFECTS.search(text or ""):
+        return CITED_WORK_EFFECTS_STATEMENT
+    return None
+
+
+def states_own_essay_aims(text: str | None, marker: str | None = None) -> bool:
+    """The citation unit opens by stating the writer's own essay's aims and
+    attributes nothing to the source. A marker between the subject and its
+    verb ("This paper (Smith, 2019) aims") names the cited paper instead."""
+    match = _OWN_ESSAY_AIMS.match(text or "")
+    return (bool(match) and "(" not in match.group("between")
+            and not _ATTRIBUTES_PROPOSITION.search(text or ""))
 
 
 class PaperExtractionError(ValueError):
@@ -208,10 +259,14 @@ def extract_paper_evidence(
     if not references:
         raise PaperExtractionError("Reference section contained no parseable references")
 
-    if reference_layout_text:
+    # A Word file has no physical lines; its reference section is the text the
+    # repair reads, so a query split by a space is joined there too
+    # (2026-10-14). Line-wrap joins need a whole following line of address.
+    repair_text = reference_layout_text or reference_section
+    if repair_text:
         from app.services.reference_url_repair import repair_reference_urls
 
-        references = repair_reference_urls(references, reference_layout_text, link_targets=link_targets)
+        references = repair_reference_urls(references, repair_text, link_targets=link_targets)
 
     structural_detections = extract_citations(
         body_text,
@@ -258,7 +313,19 @@ def extract_paper_evidence(
     atomizations: list[AtomizationArtifact] = []
     eligible_atomic_claims: list[ClaimEvidence] = []
     claim_boundary_rejections: list[ClaimBoundaryRejection] = []
+    own_essay_units: list[tuple[int, int]] = []
     for citation in accepted:
+        not_a_claim = not_a_claim_about_the_source(citation.text, citation.citation_marker)
+        if not_a_claim:
+            # The writer stating their own essay's aims, or assessing a cited
+            # work's effects, is no claim about that source (owner decisions
+            # 2026-10-14). Not judged and not shown as a citation; its marker
+            # stays linked to the reference for the reference checks.
+            claim_boundary_rejections.append(ClaimBoundaryRejection(
+                passage_start=citation.passage_start, passage_end=citation.passage_end,
+                citation_marker=citation.citation_marker, reason=not_a_claim))
+            own_essay_units.append((citation.passage_start, citation.passage_end))
+            continue
         try:
             parent_claim = claim_evidence_from_citation(
                 citation,
@@ -270,6 +337,13 @@ def extract_paper_evidence(
             )
             parent_claim = resolve_claim_antecedents(body_text, parent_claim)
             parent_claim = resolve_claim_discourse_dependencies(parent_claim)
+            form = claim_quotation_form(parent_claim, references)
+            parent_claim = parent_claim.model_copy(update={
+                "quotation_form": form,
+                "quotation_form_version": QUOTATION_FORM_VERSION,
+                # One reading of "is this a quotation" (`quotation_form`).
+                "claim_type": claim_type_for(parent_claim, references),
+            })
         except ValueError as exc:
             claim_boundary_rejections.append(
                 ClaimBoundaryRejection(
@@ -303,6 +377,12 @@ def extract_paper_evidence(
         )
 
     marker_census = _bind_marker_census(marker_census, citation_claims)
+    marker_census = [
+        marker.model_copy(update={"coverage_status": OWN_ESSAY_STATEMENT, "reason_code": OWN_ESSAY_STATEMENT})
+        if marker.coverage_status != "covered" and any(
+            start <= marker.passage_start < end for start, end in own_essay_units) else marker
+        for marker in marker_census
+    ]
     reference_consistency = assess_reference_consistency(
         paper_version_id=version_id,
         citation_format=citation_format,
@@ -413,6 +493,13 @@ def _build_marker_census(
                 report_passage_start=(report_span[0] if report_span else None),
                 report_passage_end=(report_span[1] if report_span else None),
                 report_text=(report_span[2] if report_span else None),
+                # A tolerant link's differences stay with its marker, so grouping
+                # the sentence with another citation never hides them.
+                link_differences=(
+                    list(dict.fromkeys(d for citation in members for d in citation.link_differences))
+                    if link_status == "linked" and len(member_labels) == 1
+                    else []
+                ),
             )
         )
     broad_parenthetical = re.compile(
@@ -1221,8 +1308,7 @@ def yearless_author_mentions(
             if (any(start <= m.passage_start < stop for m in census)
                     or any(c.drop_reason is None and c.passage_start < stop and start < c.passage_end for c in result)
                     # The student describing their own essay is not the source's claim.
-                    or re.search(r"\b(?:this|my|our|the present)\s+(?:essay|paper|article|study|analysis|research)\b"
-                                 r"|\b(?:I|we)\b", sentence)):
+                    or re.search(rf"\b{_OWN_WORK}\b|\b(?:I|we)\b", sentence)):
                 continue
             for name, reference in names.items():
                 n = re.escape(name)
@@ -1416,7 +1502,7 @@ def unresolved_marker_report_groups(
     """
     groups: dict[tuple[int, int, str, int], list[CitationMarkerCensusEntry]] = {}
     for marker in census:
-        if marker.coverage_status == "covered":
+        if marker.coverage_status in {"covered", OWN_ESSAY_STATEMENT}:
             continue
         start = marker.report_passage_start
         end = marker.report_passage_end

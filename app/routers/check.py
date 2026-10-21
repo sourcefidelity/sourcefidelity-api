@@ -19,6 +19,7 @@ from app.services.paper_upload import (
     PaperUploadError,
     create_paper_job,
 )
+from app.services.recheck_copy import retention_at_upload as recheck_retention_at_upload
 from app.services.storage.backend import StorageBackend, get_storage_backend
 from app.tasks.check_paper import check_paper_task
 from app.services.paper_dispatch import attempt_id_for
@@ -69,6 +70,24 @@ def check_paper(
         raise HTTPException(status_code=400, detail="Unsupported paper type; use PDF or DOCX")
     maximum = settings.MAX_FILE_SIZE_MB * 1024 * 1024
     content = file.file.read(maximum + 1)
+    reused = None
+    if not store_only and len(content) <= maximum:
+        reused = _existing_report(session, content=content, filename=file.filename or "paper",
+                                  require_reference_links=require_reference_links,
+                                  assessment_id=assessment_id, principal=principal)
+    if reused is not None:
+        job, report = reused
+        return {
+            "job_id": str(job.id),
+            "paper_version_id": job.paper_version_id,
+            "status": job.status,
+            "stage": job.stage,
+            "store_only": job.store_only,
+            "assessment_configuration": job.upload_evidence.get('assessment_configuration'),
+            "publication_pending": False,
+            "report_id": str(report.id),
+            "reused_existing_report": True,
+        }
     try:
         job = create_paper_job(
             session,
@@ -82,6 +101,8 @@ def check_paper(
             assessment_id=assessment_id,
             scope_type=principal.scope_type,
             scope_id=principal.scope_id,
+            recheck_copy=None if store_only else recheck_retention_at_upload(
+                session, principal.scope_type, principal.scope_id),
         )
     except PaperUploadError as exc:
         code = 503 if exc.code in {"storage_unavailable", "malware_scan_unavailable"} else 422
@@ -106,3 +127,24 @@ def check_paper(
         "assessment_configuration": job.upload_evidence.get('assessment_configuration'),
         "publication_pending": publication_pending,
     }
+
+
+def _existing_report(session, *, content, filename, require_reference_links, assessment_id, principal):
+    """The report this exact submission already has (owner decision 2026-10-09), or None."""
+    from app.services.assessment_configuration import AssessmentConfiguration
+    from app.services.assessments import normalize_assessment_id
+    from app.services.paper_reuse import find_reusable_report, record_reuse
+    from app.services.paper_upload import _safe_filename
+    try:
+        configuration = AssessmentConfiguration(require_reference_links=require_reference_links).model_dump(mode='json')
+        found = find_reusable_report(session, content=content, filename=_safe_filename(filename),
+                                     scope_type=principal.scope_type, scope_id=principal.scope_id,
+                                     assessment_configuration=configuration,
+                                     assessment_id=normalize_assessment_id(assessment_id))
+        if found is not None:
+            record_reuse(session, *found)
+        return found
+    except Exception:
+        # Reuse only saves work; any doubt checks the paper as usual.
+        session.rollback()
+        return None

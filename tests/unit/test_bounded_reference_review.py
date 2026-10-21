@@ -106,7 +106,9 @@ def test_failed_redundant_metadata_route_does_not_erase_completed_quorum():
     result=assess_reference_credibility(ref,None,trace)
     assert kinds(result)==['potentially_fabricated_reference']
     assert result['findings'][0]['search_evidence']['uncounted_failure_query_ids']==['core']
-    assert assess_reference_discovery_trace(trace).record.outcome=='search_incomplete'
+    # A failed index the kind does not require no longer holds discovery open:
+    # search-completion-v1, owner decision 2026-10-19.
+    assert assess_reference_discovery_trace(trace).record.outcome=='unlocated_after_search'
 
 
 @pytest.mark.parametrize('provider_index',[0,1])

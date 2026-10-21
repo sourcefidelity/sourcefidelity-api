@@ -118,9 +118,18 @@ def json_data_envelope(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+_DENSE_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]")
+
+
 def estimate_prompt_tokens(system_prompt: str, user_prompt: str) -> int:
-    """Conservative dependency-free estimate used for pre-call batching."""
-    return math.ceil((len(system_prompt) + len(user_prompt)) / 4)
+    """Conservative dependency-free estimate used for pre-call batching.
+
+    About four characters a token for alphabetic text; Han, kana and Hangul
+    run near one token a character, so each counts as one (2026-10-13).
+    """
+    text = system_prompt + user_prompt
+    dense = len(_DENSE_SCRIPT.findall(text))
+    return math.ceil((len(text) - dense) / 4 + dense)
 
 
 def enforce_complete_prompt_budget(

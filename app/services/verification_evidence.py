@@ -9,7 +9,7 @@ relationship signal runs is ``inconclusive`` or ``not_assessed``.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -17,10 +17,10 @@ import math
 import re
 import unicodedata
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 import fitz
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_serializer, model_validator
 
 from app.services.schemas import (
     BoundedFieldsMixin,
@@ -39,7 +39,10 @@ from app.services.storage.backend import StorageBackend
 
 ARTIFACT_VERSION = "phase3.8-evidence-v40"
 EXTRACTION_VERSION = "source-text-extraction-v6-narrow-columns"
-RETRIEVAL_RULE_VERSION = "all-channel-section-boundary-v14"
+# v15, 2026-10-18: a part's quoted words are located exactly (candidate_exact_quotation);
+# exact quotation and phrase routes read the one reference-section rule;
+# contents, index, standalone headings and titles are excluded; a glued heading line is split off.
+RETRIEVAL_RULE_VERSION = "all-channel-section-boundary-v15"
 CANDIDATE_RETRIEVAL_VERSION = "candidate-specific-union-v19"
 SEMANTIC_RETRIEVAL_RESCUE_VERSION = "bm25-prefilter-local-nli-v1"
 MAX_SOURCE_PAGES = 2_000
@@ -240,6 +243,13 @@ class ClaimEvidence(BoundedFieldsMixin):
     paper_version_id: str = Field(min_length=1, max_length=255)
     text: str = Field(min_length=1, max_length=50_000)
     claim_type: Literal["quotation", "paraphrase"] = "paraphrase"
+    # Quotation only, or quoted words in the student's own claim (owner rule
+    # 2026-10-12, `quotation_form.py`). Omitted when unset, so a claim
+    # extracted before it dumps and hashes exactly as it did.
+    quotation_form: Literal["quotation_only", "embedded", "title", "none"] | None = Field(
+        default=None, exclude_if=lambda value: value is None)
+    quotation_form_version: str | None = Field(
+        default=None, max_length=64, exclude_if=lambda value: value is None)
     granularity: Literal["citation_unit", "atomic_claim"] = "citation_unit"
     atomization_method: str = "not_run"
     parent_claim_id: str | None = Field(default=None, max_length=128)
@@ -884,6 +894,8 @@ class ExcludedSourceBlockEvidence(BaseModel):
         "publication_metadata",
         "page_furniture",
         "author_biography",
+        "document_navigation",
+        "heading",
     ]
 
 
@@ -905,6 +917,8 @@ class CandidatePassageRetrievalEvidence(BaseModel):
             "publication_metadata",
             "page_furniture",
             "author_biography",
+            "document_navigation",
+            "heading",
         ],
         int,
     ] = Field(default_factory=dict)
@@ -1443,6 +1457,13 @@ class VerificationEvidenceArtifact(BaseModel):
     # serialized, never part of the Evidence Package or its digest; persisted
     # beside the verification report only when Judgment is enabled.
     _judgment_reserve: dict | None = PrivateAttr(default=None)
+    # Translation-derived retrieval queries (cross-language-evidence-v1).
+    # Private: never serialized; only their hashes are kept in `cross_language`.
+    _translated_queries: list[str] = PrivateAttr(default_factory=list)
+    # The whole source's sentences for a claim in another writing system
+    # (cross-language-whole-source-v1). Private: never serialized; the
+    # `cross_language` record keeps its coordinates and hashes only.
+    _whole_source: Any = PrivateAttr(default=None)
 
     artifact_version: str = ARTIFACT_VERSION
     verification_id: str
@@ -1517,6 +1538,18 @@ class VerificationEvidenceArtifact(BaseModel):
     verdict: VerificationVerdict
     reason_codes: list[str] = Field(default_factory=list)
     retrieval_route: str
+    # The source is written in another writing system than the statement
+    # (cross-language-evidence-v1): scripts, and the provenance of any
+    # translation-derived retrieval queries. Data only; never serialized when
+    # absent, so earlier artifacts and their digests are unchanged.
+    cross_language: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_cross_language(self, handler):
+        payload = handler(self)
+        if self.cross_language is None and isinstance(payload, dict):
+            payload.pop("cross_language", None)
+        return payload
 
     def report_payload(self) -> dict:
         """Return the inspectable JSON-safe payload without source binaries."""
@@ -1699,6 +1732,13 @@ def authorize_representation(
                 "OCR derivative immutable parent is unavailable or inconsistent"
             )
     page_labels = derivative_evidence.get("page_labels")
+    printed = validation_evidence.get("printed_page_labels") or {}
+    if (not derivative_evidence and record.representation_kind == "plain_text"
+            and printed.get("content_sha256") == digest and isinstance(printed.get("labels"), list)
+            and len(printed["labels"]) == content.count(b"\f") + 1):
+        # A scanned magazine's printed page numbers, bound to this exact text
+        # (lantern-pages-v1, owner decision 2026-10-14).
+        page_labels = printed["labels"]
     repairs = None
     from app.config import settings as _settings
     if record.representation_kind == "pdf" and _settings.SOURCE_TEXT_QUALITY_CHECK_ENABLED:
@@ -1716,6 +1756,16 @@ def authorize_representation(
         repairs = validated_repairs(receipt, digest)
         if receipt.get("status") == "repaired" and repairs is None:
             raise EvidenceAuthorizationError("Page repair receipt does not validate")
+    completeness_verdict = record.completeness_verdict
+    if record.representation_kind == "plain_text":
+        # Copies stored before 2026-10-13 are read again wherever they are
+        # used: an index record is not the work, and a page of notes or
+        # listings is never its whole text.
+        from app.services.source_reuse import stored_text_today
+        decision, completeness_verdict = stored_text_today(
+            content.decode("utf-8", "replace"), title=None, completeness=completeness_verdict)
+        if not decision.reusable:
+            raise SourceTextUnusable("Representation is a listing, not the cited work")
     return AuthorizedRepresentation(
         representation_id=str(record.id),
         canonical_work_id=str(record.canonical_work_id),
@@ -1729,7 +1779,7 @@ def authorize_representation(
         scope_id=record.scope_id,
         identity_verdict=record.identity_verdict,
         identity_confidence=record.identity_confidence,
-        completeness_verdict=record.completeness_verdict,
+        completeness_verdict=completeness_verdict,
         text_quality=record.text_quality or "unknown",
         edition_or_version=record.edition_or_version,
         created_at=record.created_at,
@@ -1833,8 +1883,17 @@ def build_passage_evidence(
     top_k: int = 3,
     active_reference_id: str | None = None,
     cited_author_label: str | None = None,
+    cross_language: dict | None = None,
+    translated_queries: list[str] | None = None,
 ) -> VerificationEvidenceArtifact:
-    """Retrieve bounded inspectable passages and safely abstain from judgment."""
+    """Retrieve bounded inspectable passages and safely abstain from judgment.
+
+    ``cross_language`` (cross-language-evidence-v1) records that the source is
+    written in another writing system than the statement; then the quotation
+    check is not assessable, and ``translated_queries`` (translation-derived,
+    never evidence) are searched in addition to the unchanged ordinary
+    channels, their passages labelled ``translated_query_lexical``.
+    """
     if source.identity_verdict == 'possible_match' and not source.verification_run_id:
         raise EvidenceAuthorizationError('Possible matches require a submission-scoped verification run')
     _validate_derivative_provenance(source)
@@ -1852,9 +1911,19 @@ def build_passage_evidence(
         page_locator=claim.page_locator,
         top_k=bounded_top_k,
         allow_ocr_token_sequence=bool(
-            source.text_quality == "scan_ocr" and source.derivation_method
+            _ocr_tolerant(source)
         ),
     )
+    if translated_queries and len(candidates) < bounded_top_k:
+        seen = {(c.page_index, c.start, c.end) for c in candidates}
+        for query in translated_queries:
+            for candidate in _retrieve_candidates(pages, claim_text=query, claim_type="paraphrase",
+                                                  page_locator=claim.page_locator, top_k=bounded_top_k):
+                key = (candidate.page_index, candidate.start, candidate.end)
+                if key in seen or len(candidates) >= bounded_top_k:
+                    continue
+                seen.add(key)
+                candidates.append(replace(candidate, method="translated_query_lexical"))
     passages = [
         _passage_evidence(source, candidate) for candidate in candidates
     ]
@@ -1915,6 +1984,18 @@ def build_passage_evidence(
         pages=pages,
         passages=passages,
     )
+    if cross_language and cross_language.get("differs") and claim.quotation_form == "quotation_only":
+        # A quotation of a source in another language is a translation, so a
+        # paraphrase, and is judged as one (owner decision 2026-10-13).
+        claim = claim.model_copy(update={"quotation_form": "embedded"})
+    if cross_language and cross_language.get("differs") and claim.claim_type == "quotation":
+        # Quoted wording in one language cannot be located word for word in a
+        # source written in another; not a located difference.
+        quotation_check = AcademicPracticeCheckEvidence(
+            status="not_assessable", outcome="source_language_differs")
+        if claim.page_locator:
+            locator_check = AcademicPracticeCheckEvidence(
+                status="not_assessable", outcome="quotation_not_located")
     if source.identity_verdict == 'possible_match':
         identity.limitations.insert(0, 'Possible source match—identity not confirmed')
         quotation_check = AcademicPracticeCheckEvidence(status='not_assessable',
@@ -1931,7 +2012,7 @@ def build_passage_evidence(
         source.representation_id,
         source.content_sha256,
     )
-    return VerificationEvidenceArtifact(
+    artifact = VerificationEvidenceArtifact(
         verification_id=verification_id,
         created_at=datetime.now(timezone.utc),
         claim=claim,
@@ -1945,7 +2026,11 @@ def build_passage_evidence(
         verdict=verdict,
         reason_codes=reason_codes,
         retrieval_route=source.provenance,
+        **({"cross_language": dict(cross_language)} if cross_language and cross_language.get("differs") else {}),
     )
+    if translated_queries:
+        artifact._translated_queries = list(translated_queries)
+    return artifact
 
 
 def _source_binding(
@@ -2079,8 +2164,13 @@ def attach_candidate_passage_retrieval(
     top_k: int = MAX_CANDIDATE_PASSAGES,
     accepted_facet_queries_by_candidate: dict[str, list[str]] | None = None,
     excluded_passage_ids_by_candidate: dict[str, set[str]] | None = None,
+    translated_queries: list[str] | None = None,
 ) -> VerificationEvidenceArtifact:
     """Search the complete authorized source separately for each fixed candidate.
+
+    ``translated_queries`` (cross-language-evidence-v1) are the statement in
+    the source's language: translation-derived retrieval text, searched as
+    extra facet channels labelled ``translated`` beside the unchanged ones.
 
     ``excluded_passage_ids_by_candidate`` (Judgment wider-search reserve only)
     skips passages already selected, so the same ranking yields the next ones.
@@ -2091,6 +2181,8 @@ def attach_candidate_passage_retrieval(
     No search result changes a verdict.
     """
     _validate_derivative_provenance(source)
+    if translated_queries is None:
+        translated_queries = list(getattr(artifact, "_translated_queries", None) or [])
     from app.services.citation_use_router import (
         attach_citation_use_routes,
         routed_relationship_candidate_ids,
@@ -2219,6 +2311,7 @@ def attach_candidate_passage_retrieval(
             accepted_facet_queries=(accepted_facet_queries_by_candidate or {}).get(
                 candidate.candidate_id, []
             ),
+            translated_queries=translated_queries,
         )
         items: list[CandidatePassageSelectionItem] = []
         rank = 0
@@ -2632,6 +2725,14 @@ def _source_matches_artifact(
     )
 
 
+def _ocr_tolerant(source: AuthorizedRepresentation) -> bool:
+    """Scanned text where OCR slips must not read as misquotes: a locally OCR'd
+    upload, or the OCR pages of a Media History Digital Library article
+    (`lantern-pages-v1`, 2026-10-14)."""
+    return bool(source.text_quality == "scan_ocr"
+                and (source.derivation_method or source.provenance == "lantern"))
+
+
 def _validate_derivative_provenance(source: AuthorizedRepresentation) -> None:
     values = (
         source.parent_content_sha256,
@@ -2639,7 +2740,11 @@ def _validate_derivative_provenance(source: AuthorizedRepresentation) -> None:
         source.derivation_manifest_sha256,
         source.page_labels,
     )
-    if not any(value is not None for value in values):
+    if not any(value is not None for value in values[:3]):
+        # Printed page labels alone (a scanned magazine's page numbers, owner
+        # decision 2026-10-14) belong to plain text, one label per page.
+        if values[3] is not None and source.representation_kind != "plain_text":
+            raise EvidenceAuthorizationError("Page labels without a derivative belong to plain text only")
         return
     if any(value is None for value in values):
         raise EvidenceAuthorizationError(
@@ -3525,7 +3630,7 @@ def _extract_pages(
                 _SourcePage(
                     index=(
                         index
-                        if len(raw_pages) > 1 or source.derivation_method
+                        if len(raw_pages) > 1 or source.derivation_method or supplied_labels is not None
                         else None
                     ),
                     label=label,
@@ -3555,9 +3660,7 @@ def _retrieve_candidates(
     exact_targets = _quotation_targets(claim_text) if claim_type == "quotation" else []
     exact: list[_PassageCandidate] = []
     if exact_targets:
-        reference_section_started = False
-        for page in pages:
-            reference_heading = _REFERENCE_HEADING.search(page.text)
+        for page, section in zip(pages, _reference_sections(pages)):
             for exact_target in exact_targets:
                 quotation_match = _quotation_match(
                     page.text,
@@ -3572,8 +3675,7 @@ def _retrieve_candidates(
                 structural_role = _structural_role_for_range(page, *match)
                 role = structural_role or (
                     "reference_list"
-                    if reference_section_started
-                    or (reference_heading is not None and start >= reference_heading.start())
+                    if _in_reference_section(section, start)
                     else passage_role_from_text(exact_text)
                 )
                 if role in _EXCLUDED_RETRIEVAL_ROLES:
@@ -3594,9 +3696,6 @@ def _retrieve_candidates(
                         passage_role=role,
                     )
                 )
-            reference_section_started = bool(
-                reference_section_started or reference_heading
-            )
     if exact:
         return _deduplicate_candidates(exact)[:top_k]
 
@@ -3640,8 +3739,13 @@ def _candidate_union_candidates(
     top_k: int,
     include_document_metadata: bool = False,
     accepted_facet_queries: list[str] | None = None,
+    translated_queries: list[str] | None = None,
 ) -> tuple[list[tuple[_PassageCandidate, list[str]]], bool, list[str]]:
-    """Union bounded channels and preserve distinct material-facet evidence."""
+    """Union bounded channels and preserve distinct material-facet evidence.
+
+    Translated queries (cross-language-evidence-v1) follow the ordinary facet
+    queries as their own facet slots, channels ``candidate_facet_N_translated_*``.
+    """
     entries: dict[
         tuple[int | None, int, int], tuple[_PassageCandidate, set[str]]
     ] = {}
@@ -3671,6 +3775,15 @@ def _candidate_union_candidates(
 
     for candidate in _exact_phrase_candidates(pages, query_text):
         add(candidate, "candidate_exact_phrase")
+    # A quotation inside this part is located exactly, as the whole citation's
+    # quotation is: the judge reads where the quoted words occur (Synthetic
+    # Embrace citation 4, 2026-10-18: the quote check found "SF worlds" but
+    # the part's own retrieval searched it as a paraphrase and never did).
+    if _quotation_targets(query_text):
+        for candidate in _retrieve_candidates(pages, claim_text=query_text, claim_type="quotation",
+                                              page_locator=page_locator, top_k=top_k):
+            if candidate.method in {"exact_quotation", "ocr_token_sequence"}:
+                add(candidate, "candidate_exact_quotation")
     for candidate in _equivalent_phrase_candidates(pages, query_text):
         add(candidate, "candidate_equivalent_phrase")
     if include_document_metadata:
@@ -3721,6 +3834,18 @@ def _candidate_union_candidates(
             if query and query.strip() and query.strip() != query_text.strip()
         )
     )[:4]
+    translated = [query for query in dict.fromkeys(q.strip() for q in translated_queries or [] if q and q.strip())
+                  if query not in facet_queries][:3]
+    for offset, translated_query in enumerate(translated, start=len(facet_queries) + 1):
+        for candidate in _retrieve_candidates(
+            pages, claim_text=translated_query, claim_type="paraphrase",
+            page_locator=page_locator, top_k=max(top_k * 2, top_k),
+        ):
+            add(candidate, f"candidate_facet_{offset}_translated_lexical")
+        for candidate in _bm25_concept_candidates(
+            pages, query_text=translated_query, page_locator=page_locator, top_k=top_k,
+        ):
+            add(candidate, f"candidate_facet_{offset}_translated_bm25")
     for index, facet_query in enumerate(facet_queries, start=1):
         for candidate in _retrieve_candidates(
             pages,
@@ -3832,6 +3957,7 @@ def _candidate_union_candidates(
         list(entries.values()),
         page_text_by_index={page.index: page.text for page in pages},
     )
+    facet_queries = facet_queries + translated
     ranked = _select_diverse_candidate_entries(
         consolidated,
         query_text=query_text,
@@ -4021,6 +4147,7 @@ def _is_explanatory_note(text: str) -> bool:
 def _candidate_entry_rank_key(item: tuple[_PassageCandidate, set[str]]):
     candidate, channels = item
     return (
+        "candidate_exact_quotation" in channels,
         "candidate_exact_phrase" in channels,
         "candidate_equivalent_phrase" in channels,
         "candidate_document_metadata" in channels,
@@ -4054,6 +4181,9 @@ def _select_diverse_candidate_entries(
         selected_keys.add(key)
         selected.append(item)
 
+    # Where the part's quoted words occur keeps its slots (at most two).
+    for item in [item for item in ordered if "candidate_exact_quotation" in item[1]][:2]:
+        add(item)
     exact = next(
         (
             item
@@ -4296,25 +4426,18 @@ def _exact_phrase_candidates(
     if len(_meaningful_tokens(query_text)) < 3:
         return []
     candidates: list[_PassageCandidate] = []
-    reference_section_started = False
-    for page in pages:
-        reference_heading = _REFERENCE_HEADING.search(page.text)
+    for page, section in zip(pages, _reference_sections(pages)):
         match = _normalized_find(page.text, query_text)
         if match is None:
-            reference_section_started = bool(
-                reference_section_started or reference_heading
-            )
             continue
         start, end = _context_bounds_on_page(page, *match)
         text = page.text[start:end].strip()
         structural_role = _structural_role_for_range(page, *match)
         role = structural_role or (
             "reference_list"
-            if reference_section_started
-            or (reference_heading is not None and start >= reference_heading.start())
+            if _in_reference_section(section, start)
             else passage_role_from_text(text)
         )
-        reference_section_started = bool(reference_section_started or reference_heading)
         if role in _EXCLUDED_RETRIEVAL_ROLES:
             continue
         candidates.append(
@@ -4679,12 +4802,27 @@ _STOPWORDS = frozenset(
 )
 
 
+# Han, kana and Hangul runs. These scripts are written without spaces between
+# words (Hangul with spaces between phrases), so a run is one regex "word";
+# overlapping character pairs stand in for words in retrieval
+# (`cjk-bigram-retrieval-tokens-v1`, cross-language-evidence-v1). Other text
+# is tokenized exactly as before.
+_CJK_RUN = re.compile("[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]+")
+
+
 def _meaningful_tokens(value: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[\w]+", unicodedata.normalize("NFKC", value).casefold())
-        if len(token) >= 3 and token not in _STOPWORDS
-    ]
+    tokens: list[str] = []
+    for token in re.findall(r"[\w]+", unicodedata.normalize("NFKC", value).casefold()):
+        if not _CJK_RUN.search(token):
+            if len(token) >= 3 and token not in _STOPWORDS:
+                tokens.append(token)
+            continue
+        for piece in _CJK_RUN.split(token):
+            if len(piece) >= 3 and piece not in _STOPWORDS:
+                tokens.append(piece)
+        for run in _CJK_RUN.findall(token):
+            tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
+    return tokens
 
 
 _CONCEPT_EQUIVALENTS = {
@@ -4756,6 +4894,13 @@ _METADATA_NOISE_MARKERS = (
     re.compile(r"\b(?:downloaded from|journal homepage|copyright|all rights reserved)\b", re.IGNORECASE),
 )
 
+_CATALOGUE_RECORD_FIELDS = (
+    re.compile(r"(?m)^\s*Names:\s+[^\n]{2,120},\s*(?:author|editor)"),
+    re.compile(r"(?m)^\s*Title:\s+[^\n]{3,200}(?:\n[^\n]{0,200}){0,2}\s/\s"),
+    re.compile(r"(?m)^\s*Description:\s+[^\n:]{2,60}\s:\s[^\n,]{2,80},\s*(?:18|19|20)\d{2}"),
+    re.compile(r"(?m)^\s*Identifiers:\s+(?:LCCN|ISBN)"),
+    re.compile(r"(?m)^\s*(?:Subjects:\s+LCSH|Classification:\s+LCC)\b"),
+)
 _REFERENCE_HEADING = re.compile(
     r"(?im)^\s*(?:references|bibliography|works\s+cited)\s*$"
 )
@@ -4778,13 +4923,8 @@ _LEGAL_CITATION_CUE = re.compile(
     r"L\.\s*(?:Ed\.|Rev\.))\s+\d+\b|\b(?:18|19|20)\d{2}\s+WL\s+\d+\b)",
     re.IGNORECASE,
 )
-_EXCLUDED_RETRIEVAL_ROLES = {
-    "reference_list",
-    "citation_notes",
-    "publication_metadata",
-    "page_furniture",
-    "author_biography",
-}
+# The one table of non-evidence roles (`source_roles`).
+from app.services.source_roles import NON_EVIDENCE_ROLES as _EXCLUDED_RETRIEVAL_ROLES
 
 _PAGE_FURNITURE_MARKERS = (
     re.compile(r"\bjournal homepage\b", re.IGNORECASE),
@@ -4832,6 +4972,12 @@ def _is_metadata_noise_block(text: str) -> bool:
             and re.search(r"\bISBN(?:-1[03])?\s*:?[\s-]*[0-9][0-9Xx\s-]{8,20}", normalized)
             and re.search(r"(?:©\s*(?:18|19|20)\d{2}|\bcopyright\b|\ball rights reserved\b)", normalized, re.I)):
         return True
+    # A library catalogue record's labelled fields, which page layout often
+    # splits across blocks ("Names: …", "Title: … / author", "Description:
+    # place : publisher, year", "Identifiers: LCCN …"; a 241-page book's record
+    # was listed as evidence, 2026-10-18).
+    if any(pattern.search(text) for pattern in _CATALOGUE_RECORD_FIELDS):
+        return True
     marker_count = sum(bool(pattern.search(normalized)) for pattern in _METADATA_NOISE_MARKERS)
     sentence_count = len(re.findall(r"[.!?](?:\s|$)", normalized))
     word_count = len(re.findall(r"\b\w+\b", normalized))
@@ -4846,6 +4992,8 @@ def passage_role_from_text(text: str) -> Literal[
     "reference_list",
     "citation_notes",
     "publication_metadata",
+    "document_navigation",
+    "heading",
     "unknown",
 ]:
     """Classify only high-confidence retrieval roles from exact source text.
@@ -4880,9 +5028,38 @@ def passage_role_from_text(text: str) -> Literal[
 
     word_count = len(re.findall(r"\b\w+\b", normalized))
     sentence_count = len(re.findall(r"[.!?](?:\s|$)", normalized))
+    if _navigation_block(text, sentence_count):
+        return "document_navigation"
+    if sentence_count == 0 and _title_block(normalized):
+        return "heading"
     if word_count >= 8 and sentence_count >= 2:
         return "body_prose"
     return "unknown"
+
+
+# A contents or index line ends in a page number or range ("The Cycles 39",
+# "creatures cycle (SF bodies square) 6–7, 21,"); a bare number line is a
+# chapter or page number.
+_NAVIGATION_LINE = re.compile(r"(?:^|[\s.\t])\d{1,4}(?:\s*[–-]\s*\d{1,4})?(?:,\s*\d{1,4}(?:\s*[–-]\s*\d{1,4})?)*,?\s*$")
+
+
+def _navigation_block(text: str, sentence_count: int) -> bool:
+    """Most lines of a block end in page numbers and it states no sentences."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    numbered = sum(bool(_NAVIGATION_LINE.search(line)) for line in lines)
+    return len(lines) >= 3 and numbered >= max(3, 0.5 * len(lines)) and sentence_count <= 1
+
+
+def _title_block(normalized: str) -> bool:
+    """A heading or title with no sentence in it: at most 25 words, its longer
+    words capitalised (the paper's heading rule, `pdf_heading_line`)."""
+    words = re.findall(r"[A-Za-z][\w'’-]*", normalized)
+    long_words = [w for w in words if len(w) >= 4]
+    opening = normalized.lstrip("\"'“‘([")[:1]
+    if not 1 <= len(words) <= 25 or not opening.isupper() and not opening.isdigit():
+        return False
+    capitalised = long_words or words
+    return sum(w[0].isupper() for w in capitalised) >= 0.75 * len(capitalised)
 
 
 DOCUMENT_METADATA_MEMBER_PAGE_LIMIT = 3
@@ -4894,7 +5071,7 @@ DOCUMENT_METADATA_MEMBER_PAGE_LIMIT = 3
 # is established by the producing method and retrieval channel, which only this
 # module sets.
 _DOCUMENT_METADATA_MEMBER_TEXT_ROLES = frozenset(
-    {"unknown", "body_prose", "publication_metadata"}
+    {"unknown", "body_prose", "publication_metadata", "heading"}
 )
 
 
@@ -4944,7 +5121,10 @@ def _quotation_target(claim_text: str) -> str:
 
 
 def _quotation_targets(claim_text: str) -> list[str]:
-    """Return every complete double-quoted span in paper order."""
+    """Return every complete quoted span in paper order: double-quoted, and
+    single-quoted as `quotation_form.quoted_spans` reads them (owner decision
+    2026-10-18)."""
+    from app.services.quotation_form import quoted_spans
     matches = []
     for pattern in (r'"([^"]{2,})"', r"“([^”]{2,})”"):
         matches.extend(
@@ -4952,6 +5132,9 @@ def _quotation_targets(claim_text: str) -> list[str]:
             for match in re.finditer(pattern, claim_text)
             if match.group(1).strip()
         )
+    for start, end in quoted_spans(claim_text):
+        if claim_text[start] in "‘'" and len(claim_text[start + 1:end - 1].strip()) >= 2:
+            matches.append((start, claim_text[start + 1:end - 1].strip()))
     return [value for _start, value in sorted(matches)]
 
 
@@ -5256,11 +5439,16 @@ def _academic_practice_checks(
     missing = 0
     missing_editorial = 0
     allow_ocr_token_sequence = bool(
-        source.text_quality == "scan_ocr" and source.derivation_method
+        _ocr_tolerant(source)
     )
+    # A quoted term found on the cited pages is located there before anywhere
+    # else: a common word ("tariff") also occurs on earlier pages, and taking
+    # its first occurrence put a correctly cited quote outside its locator
+    # (Demir & Sepli, p. 140, 2026-10-14).
+    search_pages = _cited_pages_first(pages, claim.page_locator, source)
     for target in targets:
         found = _quotation_location(
-            pages,
+            search_pages,
             target,
             allow_ocr_token_sequence=allow_ocr_token_sequence,
         )
@@ -5369,17 +5557,20 @@ def _academic_practice_checks(
             for page_index, _start, _end in match.fragments
             if page_index is not None
         }
-        page_labels = {
-            page.index: {
-                int(value) for value in re.findall(r"\d+", page.label or "")
-            }
-            for page in pages
-        }
+        printed = {page.index: _printed_page_numbers(page, source) for page in pages}
         derivative_label_missing = bool(source.derivation_method) and any(
-            not page_labels.get(page_index)
+            not printed.get(page_index)
             for page_index in matched_pages
             if page_index is not None
         )
+        # A matched span with no page, or on a page with no number, cannot be
+        # compared with the locator: not assessed, never "outside" (owner
+        # review 2026-10-14; webpages and unpaginated texts).
+        unpaginated = any(
+            page_index is None
+            for match in target_matches
+            for page_index, _start, _end in match.fragments
+        ) or any(not printed.get(page_index) for page_index in matched_pages)
         if derivative_label_missing:
             locator = AcademicPracticeCheckEvidence(
                 status="not_assessable",
@@ -5389,13 +5580,16 @@ def _academic_practice_checks(
                     "The OCR derivative did not preserve a reliable printed-page label for every matched span."
                 ],
             )
+        elif unpaginated:
+            locator = AcademicPracticeCheckEvidence(
+                status="not_assessable",
+                outcome="page_label_unavailable",
+                evidence_passage_ids=evidence_ids,
+                limitations=["The matched source text carries no page number to compare with the locator."],
+            )
         else:
             consistent = bool(matched_pages) and all(
-                (
-                    page_labels.get(page_index)
-                    or ({page_index + 1} if not source.derivation_method else set())
-                )
-                & locator_pages
+                (printed.get(page_index) or set()) & locator_pages
                 for page_index in matched_pages
                 if page_index is not None
             )
@@ -5541,6 +5735,21 @@ def _context_bounds_on_page(
         bounded_start = max(bounded_start, max(prior_headings))
     if following_headings:
         bounded_end = min(bounded_end, min(following_headings))
+    # The same boundaries the blocks have (rules audit 2026-10-18): an
+    # unnumbered heading line glued between sentences, and a References
+    # heading that starts a reference list.
+    for heading_start, heading_end in _glued_heading_lines(page.text, 0, len(page.text)):
+        if heading_end <= start:
+            bounded_start = max(bounded_start, heading_end)
+        elif heading_start >= end:
+            bounded_end = min(bounded_end, heading_start)
+    _is_section, starts_section, reference_heading = _reference_sections([page])[0]
+    if starts_section and reference_heading is not None and reference_heading.start() >= end:
+        bounded_end = min(bounded_end, reference_heading.start())
+    while bounded_end > bounded_start and page.text[bounded_end - 1].isspace():
+        bounded_end -= 1
+    while bounded_start < bounded_end and page.text[bounded_start].isspace():
+        bounded_start += 1
     return bounded_start, bounded_end
 
 
@@ -5637,6 +5846,18 @@ def _text_blocks(text: str) -> list[tuple[int, int, str]]:
             if heading.start() > 0
         ]
         cursor = start
+        for heading_start, heading_end in _glued_heading_lines(text, start, end):
+            # The heading becomes its own block, the text around it others.
+            boundary = heading_start
+            while boundary > cursor and text[boundary - 1].isspace():
+                boundary -= 1
+            if boundary > cursor:
+                raw_blocks.append((cursor, boundary))
+            raw_blocks.append((heading_start, heading_end))
+            cursor = heading_end
+            while cursor < end and text[cursor].isspace():
+                cursor += 1
+        section_starts = [value for value in section_starts if value > cursor]
         for section_start in section_starts:
             boundary = section_start
             while boundary > cursor and text[boundary - 1].isspace():
@@ -5682,6 +5903,29 @@ def _text_blocks(text: str) -> list[tuple[int, int, str]]:
     return blocks
 
 
+def _glued_heading_lines(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Heading lines inside a block that run straight into the next sentence
+    ("... disclose the deep structure." / "First Semiotic Square: SF Bodies" /
+    "The majority of ...", a 241-page book, 2026-10-18), by the paper's
+    heading rule (`pdf_heading_line`). A block's first line counts as after a
+    finished sentence. Exact coordinates; nothing is rewritten."""
+    from app.services.text_extractor import pdf_heading_line
+    lines = []
+    for match in re.finditer(r"[^\n]+", text[start:end]):
+        if match.group().strip():
+            lines.append((start + match.start(), start + match.end(), match.group()))
+    found = []
+    for index in range(len(lines) - 1):
+        line_start, line_end, line = lines[index]
+        before = lines[index - 1][2] if index else "."
+        if _NUMBERED_SECTION_HEADING_LINE.match(line):
+            continue  # a numbered heading opens its section's passage (section rule)
+        if pdf_heading_line(line, before, lines[index + 1][2]) and re.search(
+                r"[.!?]", text[lines[index + 1][0]:end]):
+            found.append((line_start + len(line) - len(line.lstrip()), line_start + len(line.rstrip())))
+    return found
+
+
 def _page_text_blocks(
     page: _SourcePage,
 ) -> list[tuple[int, int, str, str | None]]:
@@ -5704,10 +5948,8 @@ def _page_text_blocks(
     return output
 
 
-def _source_blocks(
-    pages: list[_SourcePage],
-) -> list[tuple[_SourcePage, int, int, str, str]]:
-    """Return exact blocks with document-aware structural roles.
+def _reference_sections(pages: list[_SourcePage]) -> list[tuple[bool, bool, "re.Match | None"]]:
+    """Per page: (page is reference section, heading starts it, the heading).
 
     A reference heading starts a reference section only when at least one
     entry-shaped line follows it on the same page. This prevents a table of
@@ -5720,15 +5962,40 @@ def _source_blocks(
     reference_section_started = False
     for page in pages:
         reference_heading = _REFERENCE_HEADING.search(page.text)
-        reference_entries = len(_REFERENCE_ENTRY_LINE.findall(page.text))
         heading_starts_section = bool(
             reference_heading is not None
             and _REFERENCE_ENTRY_LINE.search(page.text[reference_heading.end() :])
         )
         reference_continuation = bool(
-            reference_section_started and reference_entries >= 1
+            reference_section_started and _REFERENCE_ENTRY_LINE.search(page.text)
         )
         page_is_reference_section = heading_starts_section or reference_continuation
+        output.append((page_is_reference_section, heading_starts_section, reference_heading))
+        reference_section_started = page_is_reference_section
+    return output
+
+
+def _in_reference_section(section: tuple, start: int) -> bool:
+    """A position on a page lies in its reference section (`_reference_sections`).
+
+    The exact-quotation and exact-phrase routes read this too: their own
+    "any heading so far" rule let a contents entry reading "References" drop
+    every later match as a reference entry (a 241-page book, 2026-10-18).
+    """
+    page_is_reference_section, _starts, heading = section
+    return bool(page_is_reference_section and (heading is None or start >= heading.start()))
+
+
+def _source_blocks(
+    pages: list[_SourcePage],
+) -> list[tuple[_SourcePage, int, int, str, str]]:
+    """Return exact blocks with document-aware structural roles.
+
+    Reference sections follow `_reference_sections`.
+    """
+    output = []
+    for page, section in zip(pages, _reference_sections(pages)):
+        page_is_reference_section, heading_starts_section, reference_heading = section
         for start, end, block_text, structural_role in _page_text_blocks(page):
             if structural_role is not None:
                 output.append((page, start, end, block_text, structural_role))
@@ -5766,7 +6033,6 @@ def _source_blocks(
             else:
                 role = passage_role_from_text(block_text)
             output.append((page, start, end, block_text, role))
-        reference_section_started = page_is_reference_section
     return output
 
 
@@ -5788,6 +6054,25 @@ def _lexical_score(claim_tokens: list[str], claim_text: str, passage: str) -> fl
     )
     length_penalty = min(1.0, math.sqrt(len(claim_tokens) / max(len(passage_tokens), 1)))
     return (0.72 * coverage + 0.20 * bigram + 0.08 * length_penalty)
+
+
+def _cited_pages_first(pages: list, locator: str | None, source) -> list:
+    """The source's pages with those matching the supplied locator first, by
+    the same page-label rule the locator check applies; order otherwise kept."""
+    wanted = _page_locator_values(locator) if locator else set()
+    if not wanted:
+        return pages
+    cited = [page for page in pages if _printed_page_numbers(page, source) & wanted]
+    return cited + [page for page in pages if page not in cited]
+
+
+def _printed_page_numbers(page, source) -> set[int]:
+    """The page numbers a source page stands for: its printed label, else its
+    position (never for an OCR derivative, whose positions are not pages)."""
+    labels = {int(value) for value in re.findall(r"\d+", page.label or "")}
+    if labels or source.derivation_method or page.index is None:
+        return labels
+    return {page.index + 1}
 
 
 def _page_locator_values(locator: str) -> set[int]:
@@ -5953,6 +6238,11 @@ def claim_terms_present_in_source(
     document = " ".join(
         str(getattr(page, "text", "") or "") for page in pages).lower()
     if not document:
+        return 0, 0
+    from app.services.cross_language_evidence import language_profile
+    if language_profile(document, claim_text)["differs"]:
+        # A source in another writing system cannot contain the statement's
+        # words; their absence is not measured (cross-language-evidence-v1).
         return 0, 0
     present = 0
     for term in terms:

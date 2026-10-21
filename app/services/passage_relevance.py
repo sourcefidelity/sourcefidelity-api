@@ -582,6 +582,24 @@ def _scope_prompt_envelope(claim, source_text: str, source_title: str, *,
     )
 
 
+# The note a reader sees names things as the reader knows them (owner
+# decision 2026-10-18: "Both the abstract and the attributed statement ..."
+# said "abstract" for limited text and "attributed statement" for the
+# student's sentence). Wording only; the questions are unchanged.
+_STATEMENT_NAMING = """
+In subject_comparison and rationale, call the student's text "the student's
+statement", never "the attributed statement" or "the attributed text".
+"""
+_SOURCE_TEXT_NAMING = """
+The supplied passage is a bounded excerpt of a retrieved document, not an
+abstract. Wherever these instructions say "abstract", read "the source text";
+field names such as abstract_span are unchanged. In subject_comparison and
+rationale, call it "the source text", never "the abstract".
+"""
+_ABSTRACT_SCOPE_PROMPT_V8 = _ABSTRACT_SCOPE_PROMPT_V5 + _STATEMENT_NAMING
+_FULL_TEXT_SCOPE_PROMPT_V2 = _ABSTRACT_SCOPE_PROMPT_V6 + _SOURCE_TEXT_NAMING + _STATEMENT_NAMING
+
+
 def _scope_prompt(policy_version: str) -> str:
     """The prompt text a stored policy version names.
 
@@ -592,6 +610,10 @@ def _scope_prompt(policy_version: str) -> str:
         return _ABSTRACT_SCOPE_PROMPT_V5
     if policy_version == "abstract-topic-v7":
         return _ABSTRACT_SCOPE_PROMPT_V7
+    if policy_version == "abstract-topic-v8":
+        return _ABSTRACT_SCOPE_PROMPT_V8
+    if policy_version == "fulltext-topic-v2":
+        return _FULL_TEXT_SCOPE_PROMPT_V2
     return _ABSTRACT_SCOPE_PROMPT_V6
 
 
@@ -1023,6 +1045,13 @@ def _complete_abstract_excerpt(text: str, excerpt: str) -> bool:
     ))
 
 
+def scope_bound_text(value) -> str:
+    """The form of a text a scope assessment is bound to: whitespace collapsed.
+    The report compares the same form (2026-10-15: line breaks in stored
+    excerpts had failed 944 of 1,030 retrieved-text bindings)."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def _assess_scope(
     claim,
     abstract_text: str,
@@ -1040,7 +1069,7 @@ def _assess_scope(
     own subject or stated scope exclude what the citation attributes to it —
     does not change with the route that produced the text.
     """
-    text = re.sub(r"\s+", " ", str(abstract_text or "")).strip()
+    text = scope_bound_text(abstract_text)
     if not text:
         return {"status": "not_assessed", "outcome": "abstract_unavailable"}
     masked_claim = redact_direct_identifiers(claim.text)
@@ -1175,7 +1204,8 @@ def _assess_scope(
 # The leading stretch of a retrieved document is where a work states what it is
 # about and what it limits itself to, which is the material the scope gate
 # needs. A later passage answers "what was cited", not "what is this work".
-FULL_TEXT_SCOPE_POLICY_VERSION = "fulltext-topic-v1"
+# v2, 2026-10-18: the note calls it "the source text" and "the student's statement".
+FULL_TEXT_SCOPE_POLICY_VERSION = "fulltext-topic-v2"
 
 
 def assess_abstract_relevance(claim, abstract_text: str, *, source_title: str = "") -> dict:

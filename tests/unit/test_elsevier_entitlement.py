@@ -64,16 +64,9 @@ class TestStillAvailableWhereEntitled:
         if "elsevier" in settings.RETRIEVAL_SOURCES:
             assert "elsevier" in [s.name for s in get_retrieval_sources()]
 
-    def test_an_institutional_token_is_sent_when_configured(self, monkeypatch):
-        from app.config import settings
-        monkeypatch.setattr(settings, "ELSEVIER_INST_TOKEN", SecretStr("token-value"))
-        headers = ElsevierRetriever()._headers()
-        assert headers["X-ELS-Insttoken"] == "token-value"
-
-    def test_no_token_header_when_none_is_configured(self, monkeypatch):
-        from app.config import settings
-        monkeypatch.setattr(settings, "ELSEVIER_INST_TOKEN", None)
-        assert "X-ELS-Insttoken" not in ElsevierRetriever()._headers()
+    def test_no_institutional_token_header_is_ever_sent(self):
+        # The institutional-token path was removed (owner decision 2026-10-19).
+        assert not any("insttoken" in name.casefold() for name in ElsevierRetriever()._headers())
 
 
 class TestDeferralIsNotAFailure:
@@ -106,3 +99,8 @@ class TestDeferralIsNotAFailure:
         from app.services import source_resolver
         source = inspect.getsource(source_resolver.SourceResolver._record_discovery_attempt)
         assert "route_not_applicable" in source
+
+
+def test_settings_no_longer_carry_an_institutional_token():
+    from app.config import Settings
+    assert "ELSEVIER_INST_TOKEN" not in Settings.model_fields

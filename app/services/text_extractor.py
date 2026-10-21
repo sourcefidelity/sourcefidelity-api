@@ -470,17 +470,25 @@ def isolate_pdf_headings(text: str, *, bold_lines: frozenset[str] = frozenset())
             if (re.fullmatch(r"(?:\d+\.?\s+)?[A-Z][A-Za-z'’-]{3,}", line) and after[:1].isupper()):
                 out[i] = "\n" + lines[i] + "\n"
                 continue
-        words = re.findall(r"[A-Za-z][\w'’-]*", line)
-        long_words = [w for w in words if len(w) >= 4]
         # A line set wholly in bold is a heading in any case ("Performance and
         # influencing factors", Franchise 2, 2026-10-07); otherwise title case.
         bold = " ".join(line.split()) in bold_lines
-        if (not 2 <= len(words) <= (15 if bold else 12) or len(long_words) < 2 or re.search(r"[.!?:;,]$", line)
-                or not re.search(r"[.!?][\"”’')]*$", before) or not after[:1].isupper()
-                or (not bold and sum(w[0].isupper() for w in long_words) < 0.75 * len(long_words))):
+        if not pdf_heading_line(line, before, after, bold=bold):
             continue
         out[i] = "\n" + lines[i] + "\n"
     return "\n".join(out) + text[end:]
+
+
+def pdf_heading_line(line: str, before: str, after: str, *, bold: bool = False) -> bool:
+    """A short, title-cased line with no closing punctuation, after a finished
+    sentence and before a capitalised line (`isolate_pdf_headings`). Source
+    passages read the same rule (verification_evidence, 2026-10-18)."""
+    line, before, after = line.strip(), before.strip(), after.strip()
+    words = re.findall(r"[A-Za-z][\w'’-]*", line)
+    long_words = [w for w in words if len(w) >= 4]
+    return not (not 2 <= len(words) <= (15 if bold else 12) or len(long_words) < 2 or re.search(r"[.!?:;,]$", line)
+                or not re.search(r"[.!?][\"”’')]*$", before) or not after[:1].isupper()
+                or (not bold and sum(w[0].isupper() for w in long_words) < 0.75 * len(long_words)))
 
 
 # A publication footer: a licence statement, a bare address, or a journal

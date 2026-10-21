@@ -132,3 +132,10 @@ def test_paper_view_slides_the_window_away_and_sources_restores_it():
     assert result['thenOnly'] == ['then']
     assert result['judgment'] == {'judgment': True, 'sources': False, 'hidden': False, 'focus': False,
                                   'pressed': 'true', 'sourcesPressed': 'false'}
+
+
+def test_an_older_version_follows_the_newest_and_a_dropped_connection_keeps_watching():
+    assert "awaitSuccessor(url,document.createElement('span'))" in SCRIPT
+    assert "if(data.successor_available||data.processing||data.queued_uploads)" in SCRIPT
+    handler = SCRIPT[SCRIPT.index('async function awaitSuccessor'):SCRIPT.index("document.addEventListener('click', event => {\n    const choose")]
+    assert "message.textContent=error.message;setTimeout(()=>awaitSuccessor(url,message,attemptId,failureText),5000);" in handler

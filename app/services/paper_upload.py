@@ -11,12 +11,12 @@ import re
 import uuid
 import zipfile
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.services.assessment_configuration import AssessmentConfiguration
-from app.services.assessment_marks import AssessmentMarksError, normalize_assessment_id
+from app.services.assessments import AssessmentIdError, normalize_assessment_id
 from app.models.job import Job, JobStage, JobStatus
 from app.services.paper_dispatch import prepare_dispatch, job_execution_lock, WorkflowBusy
 from app.services.file_safety import (
@@ -144,8 +144,12 @@ def create_paper_job(
     scope_type: str = "personal_owner",
     scope_id: str,
     now: datetime | None = None,
+    recheck_copy: dict | None = None,
 ) -> Job:
-    """Commit a recoverable locator before uploading immutable paper bytes."""
+    """Commit a recoverable locator before uploading immutable paper bytes.
+
+    `recheck_copy` (from `recheck_copy.retention_at_upload`) keeps the
+    submitted file after the check so the paper can be checked again."""
     safe_name = _safe_filename(filename)
     try:
         configuration = AssessmentConfiguration(require_reference_links=require_reference_links)
@@ -153,7 +157,7 @@ def create_paper_job(
         raise PaperUploadError('assessment_configuration_invalid', 'Reference-link requirement must be a boolean.') from exc
     try:
         normalized_assessment = normalize_assessment_id(assessment_id)
-    except AssessmentMarksError as exc:
+    except AssessmentIdError as exc:
         raise PaperUploadError(exc.code, str(exc)) from exc
     evidence = inspect_paper_upload(content, filename=safe_name, media_type=media_type)
     requested_retention = paper_retention_mode or settings.PAPER_RETENTION_MODE
@@ -165,12 +169,12 @@ def create_paper_job(
     evidence['assessment_configuration'] = configuration.model_dump(mode='json')
     evidence["paper_retention_policy_version"] = "paper-retention-v1"
     evidence["paper_input_upload_state"] = "pending"
+    if recheck_copy:
+        evidence["recheck_copy"] = dict(recheck_copy)
     evidence["input_upload_confirmed"] = False
     normalized_scope = scope_type.strip().casefold()
     normalized_id = scope_id.strip()
-    if normalized_scope not in {
-        "personal_owner", "assessment", "course_offering", "institution"
-    } or not normalized_id:
+    if normalized_scope != "personal_owner" or not normalized_id:
         raise PaperUploadError("scope_invalid", "Paper upload authorization scope is invalid")
     current = _as_utc(now or datetime.now(timezone.utc))
     job_id = uuid.uuid4()
@@ -283,7 +287,10 @@ def cleanup_stale_paper_job_inputs(
     eligible = (
         Job.input_storage_key.is_not(None),
         Job.input_deleted_at.is_(None),
-        or_(Job.status.in_({JobStatus.COMPLETED, JobStatus.FAILED}), Job.input_expires_at <= current),
+        # A file kept for checking again (`recheck-copy-v1`) waits for its period.
+        or_(and_(Job.status.in_({JobStatus.COMPLETED, JobStatus.FAILED}),
+                 Job.upload_evidence["recheck_copy_kept"].as_string().is_(None)),
+            Job.input_expires_at <= current),
         due_clause(Job.upload_evidence["input_cleanup_next_check_at"], current),
     )
     job_ids = session.scalars(

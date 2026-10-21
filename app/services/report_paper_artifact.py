@@ -220,8 +220,9 @@ def attach_report_paper_artifact(
     if record.report_id is None:
         record.report_id = report.id
     current = _as_utc(now or datetime.now(timezone.utc))
+    from app.services.storage_policy import policy_for
     record.expires_at = current + timedelta(
-        days=max(1, settings.FORMATIVE_REPORT_PAPER_RETENTION_DAYS)
+        days=policy_for(session, job.scope_type, job.scope_id).papers.paper_copy_days
     )
     session.flush()
     return record

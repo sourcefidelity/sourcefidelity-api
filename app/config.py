@@ -14,19 +14,15 @@ class Settings(BaseSettings):
     APP_NAME: str = "SourceFidelity API"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
-    # Report delivery fails closed unless a deployment authentication adapter
-    # is explicitly enabled. The personal bearer is a prototype/operator
-    # credential; Institutional deployments replace it with their identity/LMS
-    # adapter while producing the same scoped principal contract.
-    REPORT_AUTH_MODE: Literal[
-        "disabled", "personal_local", "personal_bearer", "institutional_adapter"
-    ] = "disabled"
+    # Report delivery fails closed unless a Personal authentication mode is
+    # explicitly enabled.
+    REPORT_AUTH_MODE: Literal["disabled", "personal_local", "personal_bearer"] = "disabled"
     REPORT_PERSONAL_ACCESS_TOKEN: SecretStr | None = None
     REPORT_SESSION_TTL_SECONDS: int = 900
     REPORT_SESSION_COOKIE_SECURE: bool = True
     API_BIND_HOST: Literal["127.0.0.1", "::1", "localhost"] = "127.0.0.1"
     # Comma-separated exact origins. Empty disables cross-origin browser API
-    # access; Moodle deep links do not require CORS.
+    # access.
     CORS_ALLOWED_ORIGINS: str = ""
     CORS_ALLOW_CREDENTIALS: bool = False
 
@@ -146,6 +142,11 @@ class Settings(BaseSettings):
     # the lowest effort keeps the answer inside the output allowance.
     ZAI_REASONING_EFFORT: str = "low"
     ZAI_TERMS_VERIFIED_ON: str | None = None
+    # GLM requests in flight across every worker process. Zhipu limits them
+    # per account by spending tier; the account's console showed 50 for
+    # glm-5.3-flash on 2026-10-11. 45 leaves room for other use of the
+    # account. 0 = no cap.
+    ZAI_MAX_IN_FLIGHT: int = 45
     ZAI_MAX_PROMPT_USD_PER_MILLION: float = 0.15
     ZAI_MAX_COMPLETION_USD_PER_MILLION: float = 0.50
     # Spend limits for Judgment runs, in USD. Unset until measured spend lets
@@ -153,20 +154,34 @@ class Settings(BaseSettings):
     JUDGMENT_MAX_USD_PER_REPORT: float | None = None
     JUDGMENT_MAX_USD_PER_DAY: float | None = None
     # Wider-search sentence reserve (owner decision 13). "paper_retention":
-    # kept with the verification report and deleted with it (Personal default);
-    # "until_grades_released": Institutional, kept until marks are released for
-    # the paper's assessment (assessment_marks.py: set by an instructor now, by
-    # the planned Moodle signal later); a paper without an assessment keeps it
-    # with the verification report;
+    # kept with the verification report and deleted with it;
     # "off": not built, so an agreed "no evidence" stays not judged.
-    JUDGMENT_RESERVE_RETENTION: Literal["paper_retention", "until_grades_released", "off"] = "paper_retention"
+    JUDGMENT_RESERVE_RETENTION: Literal["paper_retention", "off"] = "paper_retention"
     # Pace rate-limited providers (Semantic Scholar, CORE) across every worker
     # process through Redis; falls back to per-process pacing when unavailable.
     RETRIEVAL_SHARED_PACING_ENABLED: bool = True
-    # The web fallback after Brave and Exa: "none" (default), "searxng" or "tavily".
-    # Neither fallback retrieved a source in production (STATE provider table), so
+    # The web fallback after the required providers: "none" (default) or "tavily".
+    # No fallback retrieved a source in production (STATE provider table), so
     # none runs unless configured (owner decisions 2026-10-01 and 2026-10-09).
-    SEARCH_WEB_FALLBACK_PROVIDER: Literal["searxng", "tavily", "none"] = "none"
+    SEARCH_WEB_FALLBACK_PROVIDER: Literal["tavily", "none"] = "none"
+    # The required web provider after Brave. "deepseek" is DeepSeek's Search
+    # API (api-docs.deepseek.com/guides/search, US$0.75 per 1,000 successful
+    # searches, 5/s per account, checked 2026-10-18), called with LLM_API_KEY
+    # when LLM_BASE_URL is DeepSeek's. Default since 2026-10-19 (owner
+    # decision, measured in STATE §6); "exa" remains available.
+    SEARCH_SECOND_REQUIRED_PROVIDER: Literal["exa", "deepseek"] = "deepseek"
+    # A fetched web-search page whose titles are all in another writing
+    # system gets the configured model's cross-script comparison
+    # (cross-script-identity-v1), at most CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE
+    # pages per reference. "no" makes its title a conflict, so it no longer
+    # holds the reference as an uncompared candidate; "unsure" and unfetched
+    # pages still do. On by default since 2026-10-19 (owner decision, measured).
+    CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED: bool = True
+    # A web-search result that agrees with the reference on its title alone
+    # cannot raise a bibliographic conflict (owner decision 2026-10-21;
+    # replay in STATE).
+    WEB_TITLE_ALONE_CONFLICT_BLOCKED: bool = True
+    CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE: int = Field(default=3, ge=0)
     # Your Tavily plan's price per credit, for Technical details; unset means
     # "no price on record", never zero.
     TAVILY_USD_PER_CREDIT: float | None = None
@@ -174,9 +189,6 @@ class Settings(BaseSettings):
     # $5.00 per 1,000 requests on 2026-09-25 (api-dashboard.search.brave.com,
     # before the $5 monthly free credit); recorded per request Brave served.
     BRAVE_USD_PER_REQUEST: float | None = 0.005
-    # Bright Data bills successful SERP requests only, at a plan-dependent
-    # price not shown publicly; unset means "no price on record", never zero.
-    BRIGHTDATA_USD_PER_REQUEST: float | None = None
     PAPER_EXPERIMENTAL_JOINT_SELECTION_ENABLED: bool = False
     VERIFICATION_JUDGMENT_MODE: Literal["shadow", "adjudicate"] = "shadow"
     VERIFICATION_JUDGMENT_MAX_PASSAGES: int = 3
@@ -191,6 +203,12 @@ class Settings(BaseSettings):
     # transient source alive for the bounded paper workflow without weakening
     # the shorter default lease used by individual verification operations.
     PAPER_SOURCE_RETRIEVAL_LEASE_SECONDS: int = 86_400
+    # References whose sources are searched for at the same time in one paper
+    # (owner decision 2026-10-09). 1 searches them one after another. Four
+    # (owner decision 2026-10-13): measured 2026-10-11, source finding 5.8 times
+    # faster than one at a time with identical results and the same cost;
+    # provider pacing is shared across every worker.
+    PAPER_SOURCE_RETRIEVAL_WORKERS: int = 4
     # Student-paper uploads are temporary workflow inputs, not source-repository
     # objects. The locator is committed before upload and stale cleanup removes
     # an object after this recovery window even if a worker exits hard.
@@ -209,12 +227,8 @@ class Settings(BaseSettings):
     DOCX_PRESENTATION_RENDERER_EXECUTABLE: str = "soffice"
     DOCX_PRESENTATION_RENDER_TIMEOUT_SECONDS: int = 120
     DOCX_PRESENTATION_RENDER_MAX_MB: int = 100
-    # Only temporary is operational. The remaining recognized values reserve
-    # the policy boundary for a later, separately authorized student-paper
-    # comparison corpus; selecting one now fails closed at upload.
-    PAPER_RETENTION_MODE: Literal[
-        "temporary", "assessment", "course", "institutional"
-    ] = "temporary"
+    # Papers are temporary processing input (Personal only, 2026-10-19).
+    PAPER_RETENTION_MODE: Literal["temporary"] = "temporary"
     # Remote citation/relevance judgment, on by default (owner decision
     # 2026-09-29). When false, the workflow still extracts, retrieves, persists
     # candidates, and reports visible not-assessed model stages without sending
@@ -284,7 +298,7 @@ class Settings(BaseSettings):
     # deployed app keeps no search-result links, and SEARCH_CANDIDATE_AUDIT_URLS
     # below is the only development audit of web-search candidates.
     DEVELOPMENT_RETAIN_DISCOVERY_LEAD_URLS: bool = False
-    # Development audit only. Records each Exa, Tavily and SearXNG web-search
+    # Development audit only. Records each Exa and Tavily web-search
     # candidate's URL, query id, rank and disposition under `candidate_audit`
     # on the bounded-web discovery attempt. Must stay False in any deployed
     # profile. Brave is never recorded (Brave API terms §3.2(i)).
@@ -324,9 +338,6 @@ class Settings(BaseSettings):
 
     # Storage Backend: "s3" | "seafile"
     STORAGE_BACKEND: str = "s3"
-
-    # Campus access content retention (days). 0 = keep indefinitely.
-    CAMPUS_ACCESS_TTL_DAYS: int = 90
 
     # Retrieval Sources (comma-separated priority list).
     # Order matters: sources are tried left-to-right, stopping at the first
@@ -375,11 +386,9 @@ class Settings(BaseSettings):
     # that was blocking them recovers. On by default: a reference left
     # unfinished by a temporary outage is finished without resubmission,
     # and each re-run writes a new report version with the earlier one
-    # preserved. Set false to stop all automatic re-runs; provider health
-    # probing continues either way, since live searches rely on it.
+    # preserved. Set false to stop all automatic re-runs.
     PROVIDER_RECOVERY_REFRESH_ENABLED: bool = True
     PROVIDER_RECOVERY_MAX_JOBS: int = 25
-    PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS: int = 60
     # Automatic retries of a completed paper's incomplete searches (owner
     # decision 2026-09-29). Each retry is a targeted refresh of the affected
     # references and writes a new report version. Retry n runs the n-th delay
@@ -408,12 +417,9 @@ class Settings(BaseSettings):
     # Semantic Scholar API
     S2_API_KEY: SecretStr | None = None
 
-    # Elsevier API (Article Retrieval — OA full text + metadata/abstract for paywalled)
-    # API key alone: OA articles + metadata/abstract for all.
-    # Insttoken (optional, via institutional email to apisupport@elsevier.com):
-    #   unlocks paywalled full text if your institution subscribes.
+    # Elsevier API: metadata and abstracts for all articles, full text for
+    # open-access articles only (owner decision 2026-10-19).
     ELSEVIER_API_KEY: SecretStr | None = None
-    ELSEVIER_INST_TOKEN: SecretStr | None = None
 
     # Crossref polite email (uses OPENALEX_EMAIL as fallback)
     CROSSREF_EMAIL: str | None = None
@@ -437,18 +443,15 @@ class Settings(BaseSettings):
     # stated_scope_conflict=absent. It is kept selectable, but it costs 439
     # characters of abstract budget for no measured gain, so it is not the
     # default. Set ABSTRACT_SCOPE_POLICY_VERSION=abstract-topic-v6 to use it.
+    # v8 (default since 2026-10-18) = v5 with the note naming "the student's
+    # statement" rather than "the attributed statement"; wording only.
     ABSTRACT_SCOPE_POLICY_VERSION: Literal[
-        "abstract-topic-v5", "abstract-topic-v6"
-    ] = "abstract-topic-v5"
-    SEARCH_PROVIDER: str | None = None  # "google"|"searxng"|"brave"|"brightdata"|"tavily"|"exa"|None
+        "abstract-topic-v5", "abstract-topic-v6", "abstract-topic-v8"
+    ] = "abstract-topic-v8"
+    SEARCH_PROVIDER: str | None = None  # "google"|"brave"|"tavily"|"exa"|"deepseek"|None
     # New resolutions use the versioned API-first policy. Legacy configuration
     # remains selectable; stored traces never inherit a new policy implicitly.
     SEARCH_POLICY_VERSION: Literal["configured-search-v1", "api-first-search-v2"] = "api-first-search-v2"
-    # A self-hosted metasearch fallback behind the two paid APIs. Enabled
-    # 2026-09-21 after measuring 11-20 results in 0.5-1.5s from this network,
-    # against a 59-69s mean per paid search call, and after an Exa outage
-    # removed six findings from a single paper.
-    SEARCH_SEARXNG_FALLBACK_ENABLED: bool = True
     # Required API routes fail closed until account-specific retention rights
     # are confirmed. Credits alone are not a storage/evaluation permission.
     BRAVE_SEARCH_RETENTION_PERMITTED: bool = False
@@ -465,77 +468,53 @@ class Settings(BaseSettings):
     # Results are stored under the verification summary and shown in the report
     # (yellow Academic Practice marks and window lines).
     PATCHWRITING_AT_CHECK_ENABLED: bool = True
+    # Whole other-language source to the GLM selector and Judgment foundation
+    # when it fits (cross-language-whole-source-v1, owner decision 2026-10-13).
+    # On since the owner extended the GLM payload row in AGENTS.md (2026-10-13).
+    CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED: bool = True
     SEARCH_REUSE_PAUSE_DAYS: int = Field(default=30, ge=0)
     # A re-run of a paper reuses an earlier run's completed result for each
     # unchanged reference within this many days (paper-search-reuse-v4,
     # owner decision 2026-10-01). 0 disables reuse.
     SEARCH_RERUN_REUSE_DAYS: int = Field(default=30, ge=0)
+    # Comma-separated job ids whose results and reports are never reused, for
+    # runs spoiled by a local fault (2026-10-11: three runs made while name
+    # lookups returned reserved addresses and no source could download).
+    SEARCH_REUSE_EXCLUDED_JOBS: str = ""
     # Comma-separated paid/bounded fallbacks, tried only when the primary
     # provider returns no usable candidates. Exact queries are cached per run.
     SEARCH_ESCALATION_PROVIDERS: str = "tavily,exa"
     # Per-process request ceilings for escalation providers. These are safety
     # limits, not targets. Format: comma-separated provider:count pairs.
-    SEARCH_ESCALATION_MAX_CALLS: str = "tavily:50,exa:25"
+    SEARCH_ESCALATION_MAX_CALLS: str = "tavily:50,exa:25,deepseek:25"
     # Calls to each required API provider every reference keeps after the
     # job-wide ceiling above is spent, so a paper's later references are not
     # left with a skipped required search. Brave's ladder is at most three
     # queries (DOI, title, title PDF); Exa's two (no filetype operator).
     # provider:count pairs, bounded by the hard cap below.
-    WEB_SEARCH_PER_REFERENCE_FLOOR: str = "brave:3,exa:2"
+    WEB_SEARCH_PER_REFERENCE_FLOOR: str = "brave:3,exa:2,deepseek:2"
     # Absolute per-run ceiling on required API calls, including floor calls;
     # never below SEARCH_ESCALATION_MAX_CALLS. Worst case about $1.16 per
     # paper run at list prices (see WebSearchRetriever._policy_call_permitted).
     # Lowered from brave:200,exa:150 on 2026-09-29: the spend audit
     # (tmp/search_spend_audit_v1) found no run above brave 91 / exa 51 calls.
-    WEB_SEARCH_HARD_MAX_CALLS: str = "brave:120,exa:80"
+    WEB_SEARCH_HARD_MAX_CALLS: str = "brave:120,exa:80,deepseek:80"
+    # Paid searches per UTC day for the whole deployment and for each checking
+    # scope (search-daily-budget-v1), e.g. "brave:5000,exa:3000"; empty means
+    # no cap. A refused call leaves the search incomplete, never "not found".
+    WEB_SEARCH_DAILY_MAX_CALLS: str = ""
+    WEB_SEARCH_SCOPE_DAILY_MAX_CALLS: str = ""
+    # Request starts per second shared by every worker process
+    # (provider-gate-v1), below each provider's documented limit (checked
+    # 2026-10-11): Exa 10/s per team (exa.ai/docs/admin/billing), DeepSeek
+    # Search 5/s per account (checked 2026-10-18), OpenAlex
+    # 100/s (help.openalex.org rate limits). Brave's limit depends on the plan
+    # and is read from its X-RateLimit headers once seen; 1/s until then.
+    # Crossref follows its pool (crossref.py).
+    PROVIDER_REQUESTS_PER_SECOND: str = "brave:1,exa:8,deepseek:4,openalex:50"
+    PROVIDER_GATE_ENABLED: bool = True
     GOOGLE_SEARCH_API_KEY: SecretStr | None = None
     GOOGLE_SEARCH_CSE_ID: str | None = None  # Custom Search Engine ID
-    # SearXNG (self-hosted meta-search — recommended for institutions)
-    SEARXNG_URL: str | None = None  # e.g., "http://localhost:8080"
-    # Ordered semicolon-separated engine groups. Each group may contain a
-    # comma-separated SearXNG engine list. The next group runs only when the
-    # earlier group yields no results. These defaults were live-checked from
-    # the project Compose deployment; operators may replace them for their
-    # regional network without changing application code.
-    # Live-checked 2026-09-21 against the project Compose deployment by reading
-    # the engine credited on each result, not the result count: SearXNG falls
-    # back to its default engines when a name is unrecognised, which makes an
-    # unavailable engine look like a working one. Verified answering: google
-    # cse (20), google scholar (10), bing (10), openairepublications (10).
-    # "brave" is dropped: it times out on every call here, and the application
-    # already queries the Brave API directly. DuckDuckGo and Startpage return
-    # CAPTCHAs from this address and are not configured.
-    # Verified engine by engine against the per-result `engines` field, because
-    # Verify an engine by the relevance of its results, never by their count.
-    # SearXNG silently answers an unrecognised name with its default engine
-    # set, and `bing` answers a phrase query with results for its first word:
-    # a quoted book title returned dictionary entries for "The". Measured over
-    # five real reference titles, `google cse` is the only general engine that
-    # works from here (5/5 relevant, 20 results, 0.44s) and it needs no
-    # credentials; `bing` scored 0/5 while returning 10 results every time.
-    # This engine is a scraper: Google suspends it with "too many requests"
-    # under sustained load, which is why SearXNG stays an unrequired fallback.
-    SEARXNG_ENGINE_GROUPS: str = "google cse"
-    # Optional retries apply only to upstream timeouts. CAPTCHA/access/rate
-    # failures open the circuit immediately. Retries remain off until a
-    # controlled source-admission experiment demonstrates benefit.
-    SEARXNG_TIMEOUT_RETRIES: int = 0
-    SEARXNG_TIMEOUT_CIRCUIT_THRESHOLD: int = 3
-    # First cooldown after an engine answers "too many requests". Each further
-    # consecutive failure multiplies it by four (health store); success resets.
-    SEARXNG_RATE_LIMIT_COOLDOWN_SECONDS: int = 30
-    SEARXNG_REQUEST_TIMEOUT_SECONDS: float = 15.0
-    # Per-request ceiling forwarded to SearXNG for its upstream engines. This
-    # remains at the current three-second baseline until a controlled corpus
-    # experiment establishes that a larger value improves admitted sources.
-    # Above the measured 2.9-8.0s engine latency from this network, and below
-    # the container's 20s max_request_timeout ceiling.
-    SEARXNG_ENGINE_TIMEOUT_SECONDS: float = 12.0
-    # SearXNG requests also honor RETRIEVAL_PROVIDER_CONFIG's existing
-    # min_interval_seconds (default 1s), shared across local worker processes.
-    # Increasing the engine limit requires the instance max_request_timeout
-    # to permit it; the Compose template permits at most 6s, not an automatic
-    # six-second production default.
     # Brave Search API; account credits and retention rights are independent.
     BRAVE_SEARCH_API_KEY: SecretStr | None = None
     # Tavily (AI-focused search, free tier 1000/month)
@@ -546,43 +525,20 @@ class Settings(BaseSettings):
     # The key travels in the query string, so callers must keep request URLs
     # out of logs and exception text.
     MOJEEK_API_KEY: SecretStr | None = None
-    # Bright Data SERP API: a contracted service returning parsed engine
-    # results. Both the token and a SERP zone name are required; the zone is
-    # created in the Bright Data console and names the product being billed.
-    # Unset by default — an absent token is a provider that is not configured,
-    # never an empty search.
-    BRIGHTDATA_API_TOKEN: SecretStr | None = None
-    BRIGHTDATA_SERP_ZONE: str | None = None
-    # Which engine the SERP zone queries. Verified by relevance on real
-    # reference titles before any reliance, as with every other provider.
-    BRIGHTDATA_SERP_ENGINE: Literal["google", "bing"] = "google"
-    # Measured 2026-09-22 from this network: median 6-31s across runs with
-    # maxima near 80s, so 30s produced spurious timeouts. The retrieval
-    # deadline still caps this, so a slow provider cannot extend a run.
-    # Budget for one search in total, retries and their pauses included.
-    BRIGHTDATA_TIMEOUT_SECONDS: float = 60.0
-    # Interface language and result region sent with every query, and the
-    # collection region pinned in the request body. Without them the
-    # engine and the zone each infer one, so identical queries can return
-    # different result sets between calls.
-    BRIGHTDATA_SEARCH_LANGUAGE: str = "en"
-    BRIGHTDATA_SEARCH_REGION: str = "us"
 
-    # DOI Resolver / Campus Proxy (institutional deployment).
-    # When set, the app constructs {DOI_RESOLVER_URL}{doi} to access papers
-    # through the institution's library proxy/subscription. This dramatically
-    # improves full-text retrieval for paywalled content — the proxy handles
-    # authentication, the app gets the PDF.
-    # Examples:
-    #   EZproxy:   "https://proxy.university.edu:2048/login?url=https://doi.org/"
-    #   OpenURL:   "https://resolver.university.edu/sfx?rft_id=info:doi/"
-    #   Custom:    "https://library.university.edu/fulltext/"
-    # The DOI is appended directly: {DOI_RESOLVER_URL}10.1234/foo
+    # The user's DOI resolver address, used only to build each reference's DOI
+    # link (owner decision 2026-10-19); the application itself follows public
+    # DOIs through doi.org. The DOI is appended: {DOI_RESOLVER_URL}10.1234/foo.
+    # Unset: links go to https://doi.org/.
     DOI_RESOLVER_URL: str | None = None
 
     # Student URL download limits (R9)
     STUDENT_URL_MAX_SIZE_MB: int = 50
     STUDENT_URL_TIMEOUT_SECONDS: int = 30
+    # Seconds one model request may wait for its answer before it fails as a
+    # timeout (2026-10-08: a GLM request that never answered held a Judgment
+    # run for hours under the client's 600-second default and its retries).
+    LLM_CALL_TIMEOUT_SECONDS: float = Field(default=240.0, gt=0)
 
     # ── Completeness / Strictness (Phase 3.5 hardening) ──────
     # Strictness for instructor uploads:
@@ -600,22 +556,12 @@ class Settings(BaseSettings):
     # Google Books API key (optional; for page-count lookup). Free key.
     GOOGLE_BOOKS_API_KEY: SecretStr | None = None
 
-    # Whether to persist paywalled (campus-access) PDFs to S3.
-    # When True: paywalled PDFs downloaded via campus IP are cached to S3
-    #   for reuse across checks (efficient, but creates a persistent copy
-    #   of copyrighted content on the institution's server).
-    # When False (default): paywalled PDFs are verified in-memory and
-    #   discarded immediately (like website content). No copyrighted
-    #   paywalled content persists in S3. Re-checking the same article
-    #   requires re-downloading.
-    # Institutions should set this based on their interpretation of publisher
-    # terms and their own copyright policy.
-    CACHE_PAYWALLED_PDFS: bool = False
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Unknown keys in the env file are ignored, so a setting removed from the
+    # code (for example the Institutional ones, 2026-10-19) cannot stop startup.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
-    @field_validator("TAVILY_USD_PER_CREDIT", "BRAVE_USD_PER_REQUEST", "BRIGHTDATA_USD_PER_REQUEST",
-                     mode="before")
+    @field_validator("TAVILY_USD_PER_CREDIT", "BRAVE_USD_PER_REQUEST", mode="before")
     @classmethod
     def _plain_price(cls, value):
         """Accept a price written as "$0.008" or "0.008 USD"; a stray currency

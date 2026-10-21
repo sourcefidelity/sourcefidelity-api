@@ -12,9 +12,11 @@ import unicodedata
 from html import escape
 from urllib.parse import quote
 
+from app.services.search_completion import assess_record
+from app.services.search.policy import is_required_web_provider_set
 from app.services.reference_discovery import (
     ReferenceDiscoveryRecord, ReferenceDiscoveryTrace, assess_reference_discovery_trace,
-    _normalize_doi, _normalize_text, _value_hash, _search_is_incomplete,
+    _normalize_doi, _normalize_text, _value_hash,
     is_edition_sensitive_reference, build_reference_discovery_candidate,
 )
 from app.services.retrieval.base import RetrievalResult
@@ -285,7 +287,7 @@ is only a factual identifier error. Books/editions remain outside this rule.
               and c.registration_record_sha256 != first.registration_record_sha256]
     if not titles:
         return result
-    if record.search_policy_version != 'api-first-search-v2' or set(record.required_web_providers) != {'brave', 'exa'}:
+    if record.search_policy_version != 'api-first-search-v2' or not is_required_web_provider_set(record.required_web_providers):
         result['reason_code'] = 'current_required_route_policy_missing'
         return result
     # The strong label must not bypass missing routes or unresolved candidates.
@@ -300,8 +302,7 @@ is only a factual identifier error. Books/editions remain outside this rule.
                 and parsed.required_route_categories == record.required_route_categories)
     except (ValueError, TypeError):
         same, completion = False, None
-    if not same or not completion.ready or completion.record.outcome != record.outcome or _search_is_incomplete(
-            record.required_route_categories, record.attempts, record.queries, record.search_policy_version):
+    if not same or not completion.ready or completion.record.outcome != record.outcome or not assess_record(record, completed_negative=True).complete:
         result['reason_code'] = 'compound_discrepancy_search_incomplete'
         return result
     if any(not _bound_candidate(record, c) or any(
@@ -364,10 +365,10 @@ def assess_reference_credibility(reference, discovery=None, trace=None):
     if not is_book and is_edition_sensitive_reference(record.expected, reference.raw_ref):
         return result
     if (record.search_policy_version != 'api-first-search-v2'
-            or set(parsed.required_web_providers) != {'brave','exa'}
+            or not is_required_web_provider_set(parsed.required_web_providers)
             or not {'academic_adapter','bounded_web'} <= set(record.required_route_categories)):
         return result
-    if _search_is_incomplete(record.required_route_categories, record.attempts, record.queries, record.search_policy_version):
+    if not assess_record(record, completed_negative=True).complete:
         result['cumulative_reason_code'] = 'required_identity_search_incomplete'
         return result
     # No guess about missing fields, access failures or source completeness.
@@ -431,10 +432,10 @@ def assess_reference_credibility(reference, discovery=None, trace=None):
             continue
         for qid in attempt.query_ids:
             q = queries[qid]
-            if (q.execution_outcome in {'results','no_results'} and q.execution_provider in {'brave','exa'}
+            if (q.execution_outcome in {'results','no_results'} and q.execution_provider in set(record.required_web_providers)
                     and _normalize_text(reference.title) in _normalize_text(q.normalized_query)):
                 web.add(q.execution_provider)
-    if web != {'brave','exa'}:
+    if web != set(record.required_web_providers):
         result['cumulative_reason_code'] = 'title_led_web_checks_missing'
         return result
     records = [r for f in identifier_findings for r in f.get('records',[])]

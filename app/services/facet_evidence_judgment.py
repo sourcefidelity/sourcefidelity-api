@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import settings
 from app.services.citation_structure import (
+    describes_research_literature,
     interpretive_result_spans,
     shared_qualifier_coordination_spans,
     shared_predicate_component_spans,
@@ -54,13 +55,28 @@ from app.services.verification_evidence import (
 
 from app.services.text_quality import readable_text
 
-FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v12"
+# v13, 2026-10-18: sentences from the shared source splitter (abbreviations are not ends).
+FACET_FOUNDATION_VERSION = "exact-facet-evidence-foundation-v13"
 FACET_JUDGMENT_VERSION = "fixed-id-facet-mapping-v7"
 # Measured 2026-09-28 over 824 stored claims: a median of 114 real sentences
 # (p90 163) were merged into 24 paragraph-length units. 128 keeps most claims
 # at real sentences; longer ones are merged far less.
 MAX_EVIDENCE_SENTENCES_PER_CANDIDATE = 128
 MIN_EVIDENCE_SENTENCES_PER_CANDIDATE = 24
+_PROMPT_OVER_BUDGET = "The fixed facet prompt exceeded its configured budget."
+_SENTENCES_UNAVAILABLE = "Candidate or authorized evidence sentences were unavailable."
+_ANTECEDENT_NOT_UNIQUE = "Local document evidence did not resolve the candidate antecedent uniquely."
+_ANTECEDENT_NOT_EXACT = "The recorded local antecedent resolution lacked exact evidence."
+_ANTECEDENT_CONTEXT_MISSING = "Required bounded antecedent context was unavailable."
+# The Judgment reason each message that stops a claim before the judge means
+# (judgment_reasons, 2026-10-15); the run reads this, never the wording.
+PRE_CALL_REASONS = {
+    _PROMPT_OVER_BUDGET: "prompt_over_budget",
+    _SENTENCES_UNAVAILABLE: "evidence_unavailable",
+    _ANTECEDENT_NOT_UNIQUE: "antecedent_unresolved",
+    _ANTECEDENT_NOT_EXACT: "antecedent_unresolved",
+    _ANTECEDENT_CONTEXT_MISSING: "antecedent_unresolved",
+}
 MAX_FOUNDATION_SOURCE_SENTENCES = 1024
 
 _SYSTEM_PROMPT = """Map fixed student facet IDs to fixed source-sentence IDs.
@@ -136,6 +152,28 @@ supports, contradicts, qualifies, mixed, and evidence-related uncertain require
 supplied evidence IDs; none has none. Only unresolved/ambiguous student context may
 use uncertain without evidence IDs. Return no prose outside JSON. Rationale <=240
 characters; <=2 short limitations per mapping."""
+
+
+# Added only for a statement describing a body of research, so every other
+# prompt keeps its exact bytes (owner decision 2026-10-09).
+_EXAMPLE_OF_RESEARCH_PROMPT = _SYSTEM_PROMPT + """
+
+citation_function example_of_described_research: the student describes a body
+of research and cites this work as one example of it. For every facet, including
+source_attribution, judge whether the source is research of the kind described
+(its subject, population, setting and focus), using the source's own statements
+of its topic, aims, methods or findings. Words about the body of research as a
+whole (quantity, prevalence, scarcity, trend or recency, such as most, much
+less, few, growing, all, in the last few years) are the student's synthesis:
+never require the source to state them, and never use their absence for none or
+qualifies. supports: the source is such research; qualifies: it matches only
+part of the described subject or focus; none: it is research of another kind."""
+
+
+# The prompt names its one candidate by a fixed alias, not the run-specific
+# ID, so an identical request in a later run is answered from the model
+# answer cache (owner decision 2026-10-09).
+PROMPT_CANDIDATE_ID = "c1"
 
 
 class _MappingResponse(BaseModel):
@@ -258,11 +296,28 @@ class _EvidenceSentenceBudgetExceeded(ValueError):
     """An exact span cannot enter the bounded optional sentence contract."""
 
 
+def bounded_passage_sentences(passage) -> list[SourceEvidenceSentence] | None:
+    """A passage's sentences, or None when one exceeds the sentence bound, so a
+    caller skips that passage instead of failing the paper run."""
+    try:
+        return _passage_sentences(passage)
+    except _EvidenceSentenceBudgetExceeded:
+        return None
+
+
 def _build_facet_evidence_foundation(
     artifact: VerificationEvidenceArtifact,
     max_sentences: int | None = None,
+    retrieved_only: frozenset = frozenset(),
 ) -> VerificationEvidenceArtifact:
-    """Attach exact facets and sentence-like evidence spans without a model."""
+    """Attach exact facets and sentence-like evidence spans without a model.
+
+    For a source in another writing system whose whole text fit the evidence
+    selector (cross-language-whole-source-v1), a candidate's sentences come
+    from the whole source within the same cap; `retrieved_only` names the
+    candidates whose whole-source prompt would exceed the Judgment input
+    budget, which keep their retrieved sentences.
+    """
     if max_sentences is None:
         max_sentences = MAX_EVIDENCE_SENTENCES_PER_CANDIDATE
     candidate_set = artifact.verification_candidates
@@ -296,6 +351,8 @@ def _build_facet_evidence_foundation(
     bundles: list[CandidateFacetBundle] = []
     incomplete = bool(candidate_set.uncovered_segments)
     routed_ids = routed_relationship_candidate_ids(artifact)
+    whole_source = getattr(artifact, "_whole_source", None)
+    whole_source_counts: dict[str, dict] = {}
 
     for candidate in candidate_set.candidates:
         if (
@@ -312,19 +369,34 @@ def _build_facet_evidence_foundation(
                 if passage is None:
                     incomplete = True
                     continue
-                sentence_groups.append(
-                    (selected.rank, passage, _passage_sentences(passage))
-                )
+                sentences = bounded_passage_sentences(passage)
+                if sentences is None:
+                    # One over-long span (a table read as one "sentence") skips
+                    # its passage, never the statement's whole Judgment
+                    # (2026-10-18).
+                    incomplete = True
+                    continue
+                sentence_groups.append((selected.rank, passage, sentences))
         all_sentence_count = sum(len(group) for _, _, group in sentence_groups)
-        bounded_sentences = _annotate_source_discourse(
-            _bounded_evidence_sentences(
+        if whole_source is not None and candidate.candidate_id not in retrieved_only:
+            from app.services.cross_language_whole_source import foundation_sentences
+            chosen, counts = foundation_sentences(
+                whole_source, artifact, sentence_groups,
+                cap=max(1, max_sentences - len(document_scope_sentences)))
+            whole_source_counts[candidate.candidate_id] = counts
+            # Whole sentences are chosen, never coalesced.
+            all_sentence_count = len(chosen)
+        else:
+            chosen = _bounded_evidence_sentences(
                 sentence_groups,
                 max_sentences=max(
                     1,
                     max_sentences
                     - len(document_scope_sentences),
                 ),
-            ),
+            )
+        bounded_sentences = _annotate_source_discourse(
+            chosen,
             document_scope_sentences,
         )
         has_source_attribution_context = bool(document_scope_sentences) or any(
@@ -370,7 +442,7 @@ def _build_facet_evidence_foundation(
         # Too many distinct sentences across this claim's candidates: merge more
         # rather than fail the record (a long field never fails a paper run).
         return _build_facet_evidence_foundation(
-            artifact, max(MIN_EVIDENCE_SENTENCES_PER_CANDIDATE, max_sentences // 2))
+            artifact, max(MIN_EVIDENCE_SENTENCES_PER_CANDIDATE, max_sentences // 2), retrieved_only)
     if not bundles:
         return _foundation_not_assessed(
             artifact,
@@ -388,7 +460,31 @@ def _build_facet_evidence_foundation(
             "Material qualifier facets overlap the complete candidate intentionally and act as conservative aggregation gates.",
         ],
     )
-    return artifact.model_copy(update={"facet_evidence_foundation": foundation})
+    built = artifact.model_copy(update={"facet_evidence_foundation": foundation})
+    if whole_source is None:
+        return built
+    return _within_judgment_budget(built, max_sentences, retrieved_only, whole_source_counts)
+
+
+def _within_judgment_budget(artifact, max_sentences, retrieved_only, whole_source_counts):
+    """A whole-source candidate whose Judgment prompt would not fit keeps its retrieved sentences."""
+    from app.services.cross_language_whole_source import record_foundation
+    try:
+        prepared = prepare_candidate_prompts(artifact, max_input_tokens=settings.JUDGMENT_MAX_INPUT_TOKENS)
+    except Exception:  # noqa: BLE001 - unchecked: keep the retrieved sentences, never fail the run
+        return _build_facet_evidence_foundation(artifact, max_sentences,
+                                                retrieved_only | frozenset(whole_source_counts))
+    over = frozenset(
+        item.candidate_id for item in prepared.items
+        if isinstance(item, CandidateFacetFinding) and item.candidate_id in whole_source_counts
+        and _PROMPT_OVER_BUDGET in item.limitations
+    )
+    if over:
+        return _build_facet_evidence_foundation(artifact, max_sentences, retrieved_only | over)
+    record = {candidate_id: {**counts, "path": "whole_source"}
+              for candidate_id, counts in whole_source_counts.items()}
+    record.update({candidate_id: {"path": "retrieved_over_judgment_budget"} for candidate_id in retrieved_only})
+    return record_foundation(artifact, record)
 
 
 def apply_facet_evidence_judgment(
@@ -491,8 +587,9 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
     `artifact` needs only the claim, source binding, verification candidates,
     facet foundation and passages, so a stored report payload can be judged
     later through `judgment_context_from_payload` without the source file.
-    The input budget only decides whether a prompt may be sent; it never
-    changes the prompt, so every caller and judge gets the same bytes.
+    Over the input budget, the lowest-ranked evidence sentences are left out
+    until the prompt fits (2026-10-18); the same input always gives every
+    caller and judge the same bytes.
     """
     if max_input_tokens is None:
         max_input_tokens = settings.VERIFICATION_JUDGMENT_MAX_INPUT_TOKENS
@@ -531,6 +628,8 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             }
         )
 
+    example_of_research = describes_research_literature(artifact.claim.text)
+    system_prompt = _EXAMPLE_OF_RESEARCH_PROMPT if example_of_research else _SYSTEM_PROMPT
     items: list = []
     for bundle in foundation.candidate_bundles:
         candidate = candidates.get(bundle.candidate_id)
@@ -538,7 +637,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Candidate or authorized evidence sentences were unavailable.",
+                    _SENTENCES_UNAVAILABLE,
                     context_resolution=(
                         "unresolved"
                         if candidate is not None and candidate.requires_antecedent_context
@@ -556,7 +655,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Local document evidence did not resolve the candidate antecedent uniquely.",
+                    _ANTECEDENT_NOT_UNIQUE,
                     context_resolution=local_context_status,
                 )
             )
@@ -569,7 +668,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "The recorded local antecedent resolution lacked exact evidence.",
+                    _ANTECEDENT_NOT_EXACT,
                     context_resolution="unresolved",
                 )
             )
@@ -582,7 +681,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             items.append(
                 _failed_finding(
                     bundle,
-                    "Required bounded antecedent context was unavailable.",
+                    _ANTECEDENT_CONTEXT_MISSING,
                     context_resolution="unresolved",
                 )
             )
@@ -752,30 +851,51 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
             _active_cited_author_label(artifact)
         )
         redactions.update(masked_author.redaction_counts)
-        prompt = json_data_envelope(
-            {
-                "candidate_id": candidate.candidate_id,
-                "requires_antecedent_context": candidate.requires_antecedent_context,
-                "local_context_resolution": local_context_status,
-                "locally_resolved_antecedents": resolved_antecedent_payload,
-                "cited_author_label": masked_author.text,
-                "complete_citation_unit": masked_unit.text,
-                "student_context": context_payload,
-                "facets": masked_facets,
-                "evidence_sentences": sentence_payload,
-            }
-        )
-        try:
-            enforce_complete_prompt_budget(
-                _SYSTEM_PROMPT,
-                prompt,
-                max_input_tokens=max_input_tokens,
+        def build_prompt(evidence):
+            return json_data_envelope(
+                {
+                    "candidate_id": PROMPT_CANDIDATE_ID,
+                    "requires_antecedent_context": candidate.requires_antecedent_context,
+                    "local_context_resolution": local_context_status,
+                    "locally_resolved_antecedents": resolved_antecedent_payload,
+                    "cited_author_label": masked_author.text,
+                    "complete_citation_unit": masked_unit.text,
+                    **({"citation_function": "example_of_described_research"} if example_of_research else {}),
+                    "student_context": context_payload,
+                    "facets": masked_facets,
+                    "evidence_sentences": evidence,
+                }
             )
-        except LLMInputBudgetExceeded:
+
+        # Over the input budget, the lowest-ranked evidence sentences are left
+        # out until the prompt fits, so the statement is still judged
+        # (2026-10-18: it had been Not Judged). The same input always yields
+        # the same bytes.
+        evidence = list(sentence_payload)
+        prompt = build_prompt(evidence)
+        fits = False
+        while True:
+            try:
+                enforce_complete_prompt_budget(system_prompt, prompt, max_input_tokens=max_input_tokens)
+                fits = True
+                break
+            except LLMInputBudgetExceeded:
+                if len(evidence) <= 1:
+                    break
+                evidence = evidence[:len(evidence) - max(1, len(evidence) // 8)]
+                kept = {item["sentence_id"] for item in evidence}
+                evidence = [{**item, "source_discourse_scope": {
+                                **item["source_discourse_scope"],
+                                "scope_evidence_sentence_ids": [
+                                    sid for sid in item["source_discourse_scope"]["scope_evidence_sentence_ids"]
+                                    if sid in kept]}}
+                            if "source_discourse_scope" in item else item for item in evidence]
+                prompt = build_prompt(evidence)
+        if not fits:
             items.append(
                 _failed_finding(
                     bundle,
-                    "The fixed facet prompt exceeded its configured budget.",
+                    _PROMPT_OVER_BUDGET,
                     context_resolution=(
                         "unresolved" if candidate.requires_antecedent_context else "not_required"
                     ),
@@ -787,7 +907,7 @@ def prepare_candidate_prompts(artifact, *, max_input_tokens: int | None = None) 
                 bundle=bundle,
                 candidate=candidate,
                 local_context_status=local_context_status,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 facet_aliases=facet_aliases,
                 sentence_aliases=sentence_aliases,
@@ -1111,29 +1231,16 @@ _ABSTRACT_LABEL = re.compile(r"A\s?B\s?S\s?T\s?R\s?A\s?C\s?T|Abstract|ABSTRACT")
 
 
 def _passage_sentences(passage) -> list[SourceEvidenceSentence]:
-    spans = []
-    start = 0
     text = passage.text
-    boundary = re.compile(r"(?<=[.!?])(?:[\"'’”)]*)\s+(?=[A-Z0-9\"'‘“(])|\n{2,}")
+    # The one source splitter (`source_sentence_spans`, shared with
+    # patchwriting; Han, kana and Hangul ends, cross-language-evidence-v1).
     # A front-matter label line ("A B S T R A C T") ends what came before it and
     # is no sentence; the title, author and affiliation lines before an
     # abstract label are metadata, not evidence (the owner's article, 2026-10-07).
+    from app.services.sentence_splitter import source_sentence_spans
     labels = list(_FRONT_MATTER_LABEL.finditer(text))
     abstract_at = next((m.start() for m in labels if _ABSTRACT_LABEL.fullmatch(m.group(1))), None)
-    cuts = sorted([(m.start(), m.end(), "boundary") for m in boundary.finditer(text)]
-                  + [(m.start(), m.end(), "label") for m in labels])
-    for cut_start, cut_end, kind in cuts:
-        if cut_start < start:
-            continue
-        if kind == "boundary" and re.search(r"\b[A-Z]\.\s*$", text[:cut_start]):
-            # A single capital plus period is normally an author initial, not a
-            # sentence boundary (for example, "D. Ricardo").
-            continue
-        if trimmed := _trim_optional(text, start, cut_start):
-            spans.append(trimmed)
-        start = cut_end
-    if trimmed := _trim_optional(text, start, len(text)):
-        spans.append(trimmed)
+    spans = source_sentence_spans(text, [(m.start(), m.end()) for m in labels])
     if abstract_at is not None:
         spans = [span for span in spans if span[0] >= abstract_at]
     sentences = []
@@ -1197,12 +1304,16 @@ def _bounded_evidence_sentences(
     for (_, passage, sentences), target in zip(groups, targets):
         for start_index, end_index in _balanced_partitions(len(sentences), target):
             first = sentences[start_index]
+            # Too long to coalesce whole: the longest opening run that fits,
+            # so the cap holds and the statement is still judged (2026-10-18;
+            # it had withheld the whole Judgment).
+            while end_index - 1 > start_index and (
+                    sentences[end_index - 1].passage_end - first.passage_start > 2_000):
+                end_index -= 1
             last = sentences[end_index - 1]
             start = first.passage_start
             end = last.passage_end
             exact = passage.text[start:end]
-            if len(exact) > 2_000:
-                raise _EvidenceSentenceBudgetExceeded
             compacted.append(
                 SourceEvidenceSentence(
                     sentence_id=_stable_id(
@@ -1225,7 +1336,7 @@ def _document_reported_actor_scope_sentences(passages) -> list[SourceEvidenceSen
     """Find one exact document-purpose scope across authorized source passages."""
     declarations = []
     for passage in passages:
-        for sentence in _passage_sentences(passage):
+        for sentence in bounded_passage_sentences(passage) or []:
             for match in _DOCUMENT_REPORTED_ACTOR_SCOPE.finditer(sentence.text):
                 actor = re.sub(r"\s+", " ", match.group("actor")).strip()
                 if actor:

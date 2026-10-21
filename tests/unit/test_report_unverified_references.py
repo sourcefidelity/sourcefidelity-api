@@ -145,21 +145,6 @@ def test_a_citation_without_a_space_after_the_comma_is_still_highlighted():
     assert (target['x0'], target['x1']) == (142, 230)
 
 
-def test_the_identified_record_completes_the_doi_sentence_in_the_pdf():
-    import fitz
-    from app.services.report_export import _render_pdf
-    identifier = {'finding_type': 'reference_identifier_conflict', 'reference_id': rid(1), 'source': source(1),
-                  'finding': 'old text', 'rectangles': [entry_box(0, 100)],
-                  'records': [{'observed': {'title': 'Identified other work', 'authors': ['Someone, B.']}}]}
-    doc = fitz.open(); doc.new_page()
-    rendered, _ = _render_pdf(doc.tobytes(), citations=[], reference_practice=[identifier], 
-                              export_binding='synthetic-test', view=None)
-    with fitz.open(stream=rendered, filetype='pdf') as exported:
-        text = ' '.join(' '.join(page.get_text() for page in exported).split())
-    start = text.index('The submitted DOI identi')
-    assert text.index('other work', start) < text.index('Reference as submitted: Writer', start)
-
-
 def test_citation_window_heading_links_its_reference_in_the_reference_colour():
     soup = render([])
     template = BeautifulSoup(soup.find('template', id='citation-panel-1').decode_contents(), 'html.parser')
@@ -217,5 +202,23 @@ def test_a_possible_match_copy_of_an_unverifiable_reference_is_not_its_text():
     out = withdraw_unverified_possible_matches(view, [{'members': [member]}], {'r1'})
     assert member['coverage_level'] == 'unavailable' and member['best_evidence'] is None
     assert out['overview']['abstract_or_limited_sources'] == 0 and out['overview']['unavailable_sources'] == 7
-    kept = {'reference_id': 'r2', 'identity_status': 'possible_match', 'coverage_level': 'partial'}
-    assert withdraw_unverified_possible_matches(view, [{'members': [kept]}], {'r1'}) is view and kept['coverage_level'] == 'partial'
+    # Every possible-match copy is withdrawn, whatever its reference's search found
+    # (owner decision 2026-10-14: 4 of 8 reviewed were another work).
+    other = {'reference_id': 'r2', 'identity_status': 'possible_match', 'coverage_level': 'partial'}
+    withdraw_unverified_possible_matches(view, [{'members': [other]}], {'r1'})
+    assert other['coverage_level'] == 'unavailable' and other['identity_status'] == 'withdrawn_possible_match'
+    verified = {'reference_id': 'r3', 'identity_status': 'verified', 'coverage_level': 'full_text'}
+    assert withdraw_unverified_possible_matches(view, [{'members': [verified]}], set()) is view
+
+
+def test_monographs_cited_as_edited_collections_are_one_formatting_summary_line():
+    from app.services.evidence_report import broad_reference_summary
+    findings = [{'finding_type': 'contribution_author_is_volume_editor', 'reference_id': r, 'rectangles': [{}]}
+                for r in ('a', 'b')]
+    summary = broad_reference_summary({}, findings, {'a': 2, 'b': 4})
+    line, = summary['reference_formatting']
+    assert line['lead'] == '2 references format monographs as edited collections'
+    assert [i['number'] for i in line['instances']] == [2, 4]
+    assert not summary.get('academic_practice')
+    one = broad_reference_summary({}, findings[:1], {'a': 2})['reference_formatting'][0]
+    assert one['lead'] == '1 reference formats a monograph as an edited collection'

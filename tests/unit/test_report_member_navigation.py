@@ -84,37 +84,6 @@ def test_same_year_narrative_sources_keep_year_targets():
         (words[0][1][0],words[0][1][2]),(words[0][5][0],words[0][5][2])]
 
 
-def test_pdf_member_links_and_translucent_marks():
-    import fitz
-    from app.services.report_export import _render_pdf
-    document=fitz.open(); page=document.new_page()
-    text='A claim (Smith, 2020; Jones, 2021).'
-    page.insert_text((50,80),text)
-    words=page.get_text('words',sort=True)
-    citation,_=fixture(text,'(Smith, 2020; Jones, 2021)',[
-        ('Smith','2020','full_text'),('Jones','2021','unavailable')])
-    citation['student_text']=text
-    citation['paper_location']['rectangles']=[{'page_index':0,'x0':45,'y0':60,'x1':300,'y1':85}]
-    for member in citation['members']:
-        member['source']['raw_reference']=member['source']['author']+' reference'
-    content,counts=_render_pdf(document.tobytes(),citations=[citation],
-        reference_practice=[],export_binding='synthetic-member-links')
-    document.close()
-    assert counts['source_member_highlights']==2 and counts['citation_underlines']==1
-    with fitz.open(stream=content,filetype='pdf') as output:
-        links=output[0].get_links()
-        targets=member_targets(citation,{0:words})
-        for target in targets:
-            point=fitz.Point((target['x0']+target['x1'])/2,(target['y0']+target['y1'])/2)
-            matching=[link for link in links if point in link['from']]
-            assert len(matching)==1
-            link=matching[0]
-            heading=output[link['page']].get_text(clip=fitz.Rect(0,link['to'].y,612,link['to'].y+25))
-            assert f'source {target["member_index"]+1}' in heading
-        marks=[drawing for drawing in output[0].get_drawings() if drawing.get('fill')]
-        assert len(marks)==2 and all(abs(m['fill_opacity']-.23)<.01 for m in marks)
-
-
 def test_a_narrative_mention_does_not_hide_the_bracketed_marker():
     # Paper 6, 2026-10-04: "Onay (2024) argues … (Onay, 2024)." placed no target.
     citation,words=fixture('Onay (2024) argues a claim (Onay, 2024).','(Onay, 2024)',[('Onay','2024','unavailable')])

@@ -5,18 +5,18 @@ Article Retrieval API. This adapter solves the Elsevier gap: ScienceDirect
 uses PII (not DOI) in its web URLs, which blocked the publisher-PDF constructor.
 The Article Retrieval API accepts DOI directly.
 
-Access levels (entitlement model):
-  - API key alone:      full text for OA articles; metadata + abstract for all
-  - API key + insttoken: full text for paywalled articles (if institution subscribes)
+Access (owner decision 2026-10-19, Personal only): metadata and abstracts for
+all articles, full text for open-access articles only. The institutional-token
+path to paywalled text was removed with the Institutional profile.
 
 Two-step workflow for Elsevier-owned DOI prefixes only:
   1. Fetch view=META_ABS → metadata + abstract + openaccess flag
-  2. Fetch the native XML representation → complete article text when entitled
+  2. For an open-access article, fetch the native XML representation → complete text
 
 The API returns XML (JATS-style), not PDF. We strip the XML tags to get clean
 text, reusing the same _strip_jats_xml approach as the Crossref adapter.
 
-Auth: X-ELS-APIKey header (required) + X-ELS-Insttoken header (optional).
+Auth: X-ELS-APIKey header.
 Rate limits: per-API-key, ~weekly quota. Fine for per-article verification.
 """
 
@@ -84,8 +84,6 @@ class ElsevierRetriever(RetrievalSource):
             "Accept": "application/json",
             "User-Agent": "SourceFidelity/0.1.0 (source-verification-bot)",
         }
-        if settings.ELSEVIER_INST_TOKEN:
-            headers["X-ELS-Insttoken"] = secret_value(settings.ELSEVIER_INST_TOKEN)
         return headers
 
     def _unentitled(self) -> RetrievalResult:
@@ -164,20 +162,12 @@ class ElsevierRetriever(RetrievalSource):
             abstract_raw = coredata.get("dc:description") or coredata.get("abstract", "")
             abstract = _strip_xml_tags(abstract_raw) if abstract_raw else None
 
-            # Step 2: Attempt the native XML representation.
-            # - OA articles: always entitled (API key alone).
-            # - Paywalled articles: on a campus network, IP grants access
-            #   (no insttoken needed). Off-campus without insttoken, the API
-            #   returns 401/403 and we fall back to abstract.
-            # So we always try it and let the API decide entitlement. This key
-            # rejects an explicit FULL view, while the documented native XML
-            # representation works and includes article markup when entitled.
-            full_text = self._fetch_full_text(doi)
+            # Step 2: the native XML representation, for open-access articles
+            # only (this key rejects an explicit FULL view; the native XML
+            # works and includes article markup).
+            full_text = self._fetch_full_text(doi) if is_oa else None
             if full_text:
-                logger.info(
-                    "Retrieved Elsevier FULL text for %s (oa=%s, insttoken=%s)",
-                    doi, is_oa, bool(settings.ELSEVIER_INST_TOKEN),
-                )
+                logger.info("Retrieved Elsevier open-access text for %s", private_value_id("doi", doi))
 
             return RetrievalResult(
                 source_name=self.name,

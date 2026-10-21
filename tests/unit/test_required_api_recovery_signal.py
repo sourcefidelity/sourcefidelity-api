@@ -2,8 +2,8 @@
 
 Owner-directed, 2026-09-24. Automatic re-runs now fire only for providers
 that were blocking a search, and Brave and Exa are the required web APIs, so
-they are the main blockers. But only SearXNG and Bright Data could report a
-recovery: the API-first path kept no health record for Brave or Exa at all.
+they are the main blockers. But only the optional fallbacks of the time could
+report a recovery: the API-first path kept no health record for Brave or Exa at all.
 With the narrowed trigger, that meant nothing could ever trigger a re-run.
 
 The signal is passive. It watches requests a paper was already making and
@@ -26,7 +26,6 @@ def api_first(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", True)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:20,exa:20")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None,
                             last_reason_code=None)
@@ -158,10 +157,10 @@ def test_an_expired_reference_budget_is_not_a_provider_timeout(api_first, monkey
 
 def test_the_incident_outcomes_match_what_the_trigger_can_cure() -> None:
     """An incident opens exactly when the failure could hold a search incomplete."""
-    from app.services.reference_discovery import _PROVIDER_CURABLE_EXECUTION_OUTCOMES
     from app.services.retrieval.web_search import _REQUIRED_API_INCIDENT_OUTCOMES
+    from app.services.search_completion import PROVIDER_CURABLE
 
-    assert _REQUIRED_API_INCIDENT_OUTCOMES <= _PROVIDER_CURABLE_EXECUTION_OUTCOMES
+    assert _REQUIRED_API_INCIDENT_OUTCOMES <= PROVIDER_CURABLE
 
 
 def test_a_stub_store_cannot_fake_a_recovery(api_first, monkeypatch) -> None:

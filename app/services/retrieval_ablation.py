@@ -20,17 +20,15 @@ DEFAULT_SAFETY_WINDOW = 5
 
 PassageRole = Literal[
     "body_prose",
+    "abstract",
+    "document_metadata",
     "reference_list",
     "citation_notes",
     "publication_metadata",
     "unknown",
 ]
 
-_NOISE_ROLES = {
-    "reference_list",
-    "citation_notes",
-    "publication_metadata",
-}
+from app.services.source_roles import NON_EVIDENCE_ROLES as _NOISE_ROLES
 
 
 class RetrievalAblationError(ValueError):

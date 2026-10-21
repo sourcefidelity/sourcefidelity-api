@@ -1,6 +1,6 @@
 """Display-policy baseline controls, not semantic model acceptance.
 
-Use the real selector binding, saved payload and both renderers. The mocked
+Use the real selector binding, saved payload and the report renderer. The mocked
 choices test plumbing only; they do not certify the model's usefulness labels.
 """
 from copy import deepcopy
@@ -12,7 +12,6 @@ import pytest
 
 from app.services import joint_evidence_selection as joint
 from app.services.evidence_report import _available_member, _render_member
-from app.services.report_export import _portable_member_html
 from app.services.schemas import ParsedReference
 from app.services.verification_evidence import (
     CandidatePassageRelevanceEvidence, PassageRelevanceGateEvidence,
@@ -48,7 +47,7 @@ def project(artifact):
     return payload, view
 
 
-def test_valid_empty_survives_serialization_and_both_renderers(monkeypatch):
+def test_valid_empty_survives_serialization_and_the_renderer(monkeypatch):
     artifact = prepared()
     original_passages = deepcopy(artifact.passages)
     monkeypatch.setattr(joint, "chat_completion_json", lambda *a, **k: {"selected": []})
@@ -60,7 +59,7 @@ def test_valid_empty_survives_serialization_and_both_renderers(monkeypatch):
     assert view["evidence_extracts"] == view["additional_evidence"] == []
     assert len(payload["authoritative_evidence_package"]["passages"]) == len(original_passages)
     assert artifact.passages == original_passages
-    for html in (_render_member(view), _portable_member_html(view)):
+    for html in (_render_member(view),):
         assert "<blockquote" not in html
         assert "https://example.org/study" in html
         assert "Study" in html

@@ -55,17 +55,39 @@ def test_budget_exhaustion_keeps_a_required_route_incomplete() -> None:
     Naming the cause must not quietly promote a route we never ran into one
     that completed and found nothing.
     """
-    from app.services.reference_discovery import _search_is_incomplete, ReferenceRouteAttempt
-
+    import hashlib
     from datetime import datetime, timezone
 
+    from app.services.reference_discovery import ReferenceRouteAttempt, ReferenceSearchQuery
+    from app.services.search_completion import assess_search_completion
+
     now = datetime.now(timezone.utc)
+    title = "A synthetic budget title"
+    # Every other required search finished, so only the budget-exhausted
+    # index can hold the search open (search-completion-v1).
+    queries = [ReferenceSearchQuery(
+        query_id=f"q-{provider}", route_category=category, provider=provider,
+        execution_provider=provider, execution_outcome=outcome, normalized_query=text,
+        query_sha256=hashlib.sha256(text.encode()).hexdigest())
+        for provider, category, outcome, text in (
+            ("crossref", "academic_adapter", "no_results", f"title:{title}"),
+            ("openalex", "academic_adapter", "budget_skipped", f"title:{title}"),
+            ("brave", "bounded_web", "no_results", f'"{title}"'))]
+    finished = [ReferenceRouteAttempt(
+        attempt_id=f"attempt-{provider}", route_category=category, provider=provider,
+        required=True, permitted=True, query_ids=[f"q-{provider}"], outcome="no_match",
+        started_at=now, completed_at=now)
+        for provider, category in (("crossref", "academic_adapter"), ("brave", "bounded_web"))]
     attempt = ReferenceRouteAttempt(
         attempt_id="attempt-budget", route_category="academic_adapter",
-        provider="semantic_scholar", required=True, permitted=True,
+        provider="openalex", required=True, permitted=True, query_ids=["q-openalex"],
         outcome="unavailable", reason_code="route_elapsed_budget_exhausted",
         started_at=now, completed_at=now,
     )
+    record = {"expected": {"title": title, "source_kind": "journal_article"},
+              "required_web_providers": ["brave", "exa"],
+              "queries": queries, "attempts": [*finished, attempt]}
 
-    assert _search_is_incomplete(
-        ["academic_adapter"], [attempt], [], "api-first-search-v2") is True
+    result = assess_search_completion(record)
+    assert result.complete is False
+    assert result.incomplete_routes == ("openalex",)

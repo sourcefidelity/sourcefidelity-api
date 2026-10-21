@@ -315,19 +315,6 @@ def test_admission_rejects_identifier_collision_across_incompatible_types(
     assert storage.upload_count == 3  # Intent, source, and persisted completion.
 
 
-@pytest.mark.parametrize("scope_type", ["assessment", "course_offering"])
-def test_bounded_retention_requires_expiry(
-    session: Session,
-    scope_type: str,
-) -> None:
-    with pytest.raises(AdmissionError, match="requires an explicit expiry"):
-        admit_representation(
-            session,
-            MemoryStorage(),
-            _request(scope_type=scope_type, scope_id="bounded-1"),
-        )
-
-
 def test_verification_run_cannot_enter_durable_admission(session: Session) -> None:
     with pytest.raises(AdmissionError, match="must remain ephemeral"):
         admit_representation(
@@ -360,68 +347,27 @@ def test_unknown_scope_fails_closed(session: Session) -> None:
     ) is None
 
 
-def test_assessment_and_course_scopes_are_isolated(session: Session) -> None:
+def test_two_users_scopes_are_isolated(session: Session) -> None:
     storage = MemoryStorage()
     now = datetime.now(timezone.utc)
-    assessment = admit_representation(
-        session,
-        storage,
-        _request(
-            scope_type="assessment",
-            scope_id="assessment-1",
-            expires_at=now + timedelta(days=30),
-        ),
-    )
-    course = admit_representation(
-        session,
-        storage,
-        _request(
-            scope_type="course_offering",
-            scope_id="course-2026-fall",
-            expires_at=now + timedelta(days=120),
-        ),
-    )
+    first = admit_representation(session, storage, _request(
+        scope_type="personal_owner", scope_id="owner-1", expires_at=now + timedelta(days=30)))
+    second = admit_representation(session, storage, _request(
+        scope_type="personal_owner", scope_id="owner-2", expires_at=now + timedelta(days=120)))
     session.commit()
 
-    assert assessment.id != course.id
-    assert assessment.content_object_id == course.content_object_id
+    assert first.id != second.id
+    assert first.content_object_id == second.content_object_id
     assert storage.upload_count == 3  # Shared source, intent, and completion.
-    assert retention_mode_for_scope(assessment.scope_type).value == "assessment"
-    assert retention_mode_for_scope(course.scope_type).value == "course"
-    assert assessment.validation_evidence["retention_mode"] == "assessment"
-    assert course.validation_evidence["retention_mode"] == "course"
-
-    assert find_accepted_representation(
-        session,
-        scope_type="assessment",
-        scope_id="assessment-1",
-        doi="10.1234/example",
-        now=now,
-    ).id == assessment.id
-    assert find_accepted_representation(
-        session,
-        scope_type="course_offering",
-        scope_id="course-2026-fall",
-        doi="10.1234/example",
-        now=now,
-    ).id == course.id
-    assert find_accepted_representation(
-        session,
-        scope_type="course_offering",
-        scope_id="course-2027-spring",
-        doi="10.1234/example",
-        now=now,
-    ) is None
-    assert find_accepted_representation(
-        session,
-        scope_type="assessment",
-        scope_id="course-2026-fall",
-        doi="10.1234/example",
-        now=now,
-    ) is None
+    assert retention_mode_for_scope("personal_owner").value == "durable"
+    for scope_id, record in (("owner-1", first), ("owner-2", second)):
+        assert find_accepted_representation(session, scope_type="personal_owner", scope_id=scope_id,
+                                            doi="10.1234/example", now=now).id == record.id
+    assert find_accepted_representation(session, scope_type="personal_owner", scope_id="owner-3",
+                                        doi="10.1234/example", now=now) is None
 
 
-def test_expired_course_link_does_not_remove_live_assessment_object(
+def test_an_expired_link_does_not_remove_another_users_live_object(
     session: Session,
 ) -> None:
     storage = MemoryStorage()
@@ -430,8 +376,8 @@ def test_expired_course_link_does_not_remove_live_assessment_object(
         session,
         storage,
         _request(
-            scope_type="course_offering",
-            scope_id="course-2026-fall",
+            scope_type="personal_owner",
+            scope_id="owner-1",
             expires_at=now - timedelta(seconds=1),
         ),
     )
@@ -439,8 +385,8 @@ def test_expired_course_link_does_not_remove_live_assessment_object(
         session,
         storage,
         _request(
-            scope_type="assessment",
-            scope_id="assessment-2",
+            scope_type="personal_owner",
+            scope_id="owner-2",
             expires_at=now + timedelta(days=1),
         ),
     )
@@ -450,15 +396,15 @@ def test_expired_course_link_does_not_remove_live_assessment_object(
 
     assert find_accepted_representation(
         session,
-        scope_type="course_offering",
-        scope_id="course-2026-fall",
+        scope_type="personal_owner",
+        scope_id="owner-1",
         doi="10.1234/example",
         now=now,
     ) is None
     assert find_accepted_representation(
         session,
-        scope_type="assessment",
-        scope_id="assessment-2",
+        scope_type="personal_owner",
+        scope_id="owner-2",
         doi="10.1234/example",
         now=now,
     ).id == assessment.id
@@ -756,3 +702,20 @@ def test_abstract_cannot_enter_durable_content_store(session: Session) -> None:
 
     with pytest.raises(AdmissionError, match="not durable source content"):
         admit_representation(session, storage, request)
+
+
+def test_the_users_own_verified_upload_is_accepted_as_limited_text(session: Session) -> None:
+    from dataclasses import replace
+    from app.services.source_repository import UPLOADED_LIMITED_TEXT_KEY, find_accepted_representation
+    mark = {UPLOADED_LIMITED_TEXT_KEY: {"policy": "uploaded-limited-text-v1"}}
+    marked = replace(_request(completeness_verdict="uncertain"), validation_evidence=mark)
+    storage = MemoryStorage()
+    record = admit_representation(session, storage, marked)
+    assert record.admission_state == "accepted" and record.completeness_verdict == "uncertain"
+    assert find_accepted_representation(session, scope_type=record.scope_type, scope_id=record.scope_id,
+                                        doi="https://doi.org/10.1234/EXAMPLE") is not None
+    # An unmarked upload, or a retrieved copy with the mark, is still held.
+    for request in (_request(completeness_verdict="uncertain", scope_id="owner-2"),
+                    replace(_request(completeness_verdict="uncertain", scope_id="owner-3"),
+                            provenance="retrieval_pipeline", validation_evidence=mark)):
+        assert admit_representation(session, storage, request).admission_state == "needs_review"

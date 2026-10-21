@@ -203,17 +203,22 @@ def assess_reference_consistency(
 
     findings: list[ReferenceConsistencyFinding] = []
     observed_reference_ids: set[str] = set()
+    # A rejected low-confidence detection (a model span that failed validation)
+    # does not show that a reference is cited; a structural link set aside only
+    # to regroup its sentence still does (2026-10-12).
+    observing = [c for c in citations if c.drop_reason is None or c.confidence == "high"]
     # Recheck retained original citation text before turning a missed link into
     # an uncited-entry diagnostic. This does not mutate historical detections.
     from app.services.citation_extractor import extract_citations
-    for text in dict.fromkeys(c.text for c in citations):
+    for text in dict.fromkeys(c.text for c in observing):
         for recovered in extract_citations(text, references, format_hint=citation_format):
             observed_reference_ids.update(recovered.reference_ids)
             observed_reference_ids.update(recovered.candidate_reference_ids)
-    seen_citation_findings: set[tuple] = set()
-    for citation in citations:
+    for citation in observing:
         observed_reference_ids.update(citation.reference_ids)
         observed_reference_ids.update(citation.candidate_reference_ids)
+    seen_citation_findings: set[tuple] = set()
+    for citation in citations:
         if citation.link_status not in {"missing_reference", "ambiguous"}:
             continue
         finding_type: FindingType = (

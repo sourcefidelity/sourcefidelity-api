@@ -24,6 +24,13 @@ def linkless(kind='journal_article'):
             normalized_query=f'intitle:{ref.title} inauthor:{ref.author.split(",",1)[0]}'.casefold())
         q['query_sha256']=hashlib.sha256(q['normalized_query'].encode()).hexdigest()
         trace['attempts'][1].update(attempt_id='google_books',provider='google_books',query_ids=['google_books'],required=False)
+        # Open Library, the other index a book requires, finished empty
+        # (search-completion-v1 needs every required index to finish).
+        q=deepcopy(trace['queries'][0])
+        q.update(query_id='open_library',provider='open_library',execution_provider='open_library')
+        a=deepcopy(trace['attempts'][0])
+        a.update(attempt_id='open_library',provider='open_library',query_ids=['open_library'])
+        trace['queries'].append(q);trace['attempts'].append(a)
     return ref,trace
 
 

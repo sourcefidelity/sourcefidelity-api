@@ -61,6 +61,10 @@ celery_app.conf.update(
                 settings.SOURCE_RETENTION_CLEANUP_INTERVAL_SECONDS,
             ),
         },
+        "expire-paper-records": {
+            "task": "expire_paper_records",
+            "schedule": max(60, settings.SOURCE_RETENTION_CLEANUP_INTERVAL_SECONDS),
+        },
         "cleanup-stale-verification-runs": {
             "task": "cleanup_stale_verification_runs",
             "schedule": max(
@@ -72,13 +76,14 @@ celery_app.conf.update(
             "task": "cleanup_stale_paper_job_inputs",
             "schedule": max(60, settings.PAPER_UPLOAD_CLEANUP_INTERVAL_SECONDS),
         },
-        "probe-retrieval-provider-recovery": {
-            "task": "probe_retrieval_provider_recovery",
-            "schedule": max(60, settings.PROVIDER_HEALTH_PROBE_INTERVAL_SECONDS),
-        },
         "retry-incomplete-searches": {
             "task": "retry_incomplete_searches",
             "schedule": max(60, settings.INCOMPLETE_SEARCH_RETRY_SCAN_SECONDS),
+        },
+        # A failed judge is asked again (judgment_runs.auto_retry_failed_runs).
+        "retry-failed-judgments": {
+            "task": "retry_failed_judgments",
+            "schedule": 900,
         },
     },
 )

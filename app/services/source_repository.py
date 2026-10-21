@@ -63,21 +63,13 @@ class RetentionMode(str, Enum):
     """Policy modes for the lifecycle of a source representation."""
 
     VERIFICATION_RUN = "verification_run"
-    ASSESSMENT = "assessment"
-    COURSE = "course"
     DURABLE = "durable"
 
 
 SCOPE_RETENTION_MODES = {
     "verification_run": RetentionMode.VERIFICATION_RUN,
-    "assessment": RetentionMode.ASSESSMENT,
-    "course_offering": RetentionMode.COURSE,
     "personal_owner": RetentionMode.DURABLE,
-    "institution": RetentionMode.DURABLE,
 }
-EXPIRING_RETENTION_MODES = frozenset(
-    {RetentionMode.ASSESSMENT, RetentionMode.COURSE}
-)
 
 
 class AdmissionError(ValueError):
@@ -211,7 +203,7 @@ def find_accepted_representation(
             SourceRepresentationRecord.scope_type == normalized_scope_type,
             SourceRepresentationRecord.scope_id == scope_id.strip(),
             SourceRepresentationRecord.admission_state == "accepted",
-            SourceRepresentationRecord.completeness_verdict.in_((*ACCEPTABLE_COMPLETENESS, 'incomplete')),
+            SourceRepresentationRecord.completeness_verdict.in_((*ACCEPTABLE_COMPLETENESS, *UPLOADED_LIMITED_TEXT)),
             active_representation_clause(now=now),
         )
     )
@@ -235,7 +227,9 @@ def find_accepted_representation(
         r.identity_verdict in ACCEPTABLE_IDENTITY and r.cleanliness_verdict == 'clean'
         and r.representation_kind == 'pdf'
         and valid_preview_receipt((r.validation_evidence or {}).get('publisher_preview'),
-                                  r.content_object.content_sha256, r.source_url))]
+                                  r.content_object.content_sha256, r.source_url)) or (
+        # The user's own upload as limited text (owner decision 2026-10-18).
+        uploaded_limited_text(r) and r.identity_verdict in ACCEPTABLE_IDENTITY and r.cleanliness_verdict == 'clean')]
     if not eligible:
         return None
     # A complete copy remains preferable to a newer limited preview.
@@ -297,6 +291,17 @@ def recheck_accepted_pdf_completeness(
     return receipt
 
 
+UPLOADED_LIMITED_TEXT = frozenset({"uncertain", "incomplete"})
+UPLOADED_LIMITED_TEXT_KEY = "uploaded_limited_text"
+
+
+def uploaded_limited_text(record) -> bool:
+    """The user's own verified upload, accepted as limited text (owner decision 2026-10-18)."""
+    return bool(getattr(record, "provenance", None) == "instructor_upload"
+                and getattr(record, "completeness_verdict", None) in UPLOADED_LIMITED_TEXT
+                and (getattr(record, "validation_evidence", None) or {}).get(UPLOADED_LIMITED_TEXT_KEY))
+
+
 def _admission_state(request: AdmissionRequest) -> str:
     if not request.request_acceptance:
         return "needs_review"
@@ -306,9 +311,15 @@ def _admission_state(request: AdmissionRequest) -> str:
                and request.completeness_verdict.casefold() == 'incomplete'
                and valid_preview_receipt(request.validation_evidence.get('publisher_preview'),
                     hashlib.sha256(request.representation.content).hexdigest(), request.representation.source_url))
+    # The user's own upload of a verified work may be limited text (owner
+    # decision 2026-10-18); a retrieved copy must still be complete.
+    limited_upload = (request.provenance == "instructor_upload"
+                      and request.completeness_verdict.casefold() in UPLOADED_LIMITED_TEXT
+                      and bool((request.validation_evidence or {}).get(UPLOADED_LIMITED_TEXT_KEY)))
     if (
         request.identity_verdict.casefold() not in ACCEPTABLE_IDENTITY
-        or (request.completeness_verdict.casefold() not in ACCEPTABLE_COMPLETENESS and not preview)
+        or (request.completeness_verdict.casefold() not in ACCEPTABLE_COMPLETENESS
+            and not preview and not limited_upload)
         or request.cleanliness_verdict.casefold() not in ACCEPTABLE_CLEANLINESS
     ):
         return "needs_review"
@@ -329,8 +340,14 @@ def _canonical_work(session: Session, identity: WorkIdentity, *, separate_previe
     doi = _normalize_doi(identity.doi)
     isbn = _normalize_isbn(identity.isbn)
     normalized_title = _normalize_title(identity.title)
-    identity_key = doi or isbn or f"{normalized_title}\0{identity.author}\0{identity.year}"
-    _advisory_transaction_lock(session, "canonical-work", identity_key)
+    # One lock per identifier the work may be stored under, in a fixed order:
+    # a chapter admitted by its book's ISBN alone and another by DOI and ISBN
+    # at the same time would otherwise both create the ISBN's row.
+    identity_keys = sorted(key for key in (f"doi:{doi}" if doi else "", f"isbn:{isbn}" if isbn else "") if key)
+    if not identity_keys:
+        identity_keys = [f"{normalized_title}\0{identity.author}\0{identity.year}"]
+    for identity_key in identity_keys:
+        _advisory_transaction_lock(session, "canonical-work", identity_key)
     existing = None
     if doi:
         existing = session.scalar(
@@ -410,10 +427,6 @@ def admit_representation(
         raise AdmissionError(
             "Verification-run representations must remain ephemeral and cannot "
             "enter durable admission"
-        )
-    if retention_mode in EXPIRING_RETENTION_MODES and request.expires_at is None:
-        raise AdmissionError(
-            f"{retention_mode.value} retention requires an explicit expiry"
         )
 
     validation_evidence = dict(request.validation_evidence)

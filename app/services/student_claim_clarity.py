@@ -38,6 +38,12 @@ from app.services.verification_evidence import (
 )
 
 
+# The prompt names its one candidate by a fixed alias, not the run-specific
+# ID, so an identical request in a later run is answered from the model
+# answer cache (owner decision 2026-10-09).
+PROMPT_CANDIDATE_ID = "c1"
+
+
 CLAIM_CLARITY_GATE_VERSION = "bounded-student-claim-clarity-v1"
 MAX_OUTPUT_TOKENS = 500
 _TOKEN = re.compile(r"\S+")
@@ -392,7 +398,7 @@ def _prompt(artifact, candidate):
         )
     prompt = json_data_envelope(
         {
-            "candidate_id": candidate.candidate_id,
+            "candidate_id": PROMPT_CANDIDATE_ID,
             "candidate_tokens": masked_tokens,
             "complete_citation_unit": masked_unit.text,
             "bounded_preceding_context": context_rows,
@@ -429,7 +435,7 @@ def _candidate_tokens(candidate: VerificationCandidate) -> list[_CandidateToken]
 
 
 def _validated_finding(artifact, candidate, tokens, response):
-    if response.candidate_id != candidate.candidate_id:
+    if response.candidate_id != PROMPT_CANDIDATE_ID:
         raise ValueError("clarity response changed the candidate ID")
     token_map = {token.token_id: (index, token) for index, token in enumerate(tokens)}
     segments = []

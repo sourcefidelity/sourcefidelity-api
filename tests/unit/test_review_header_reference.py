@@ -240,6 +240,15 @@ def test_existing_url_addresses_are_unchanged():
     html = _link_reference_text('A work. https://doi.org/10.1/abc')
     assert html.count('<a ') == 1
     assert 'href="https://doi.org/10.1/abc"' in html
+    assert '<wbr>' not in html
+
+
+def test_an_address_glued_to_the_publisher_can_wrap_before_it():
+    # "Press.https://..." (Regulation reference 8) wrapped as one word.
+    from app.services.evidence_report import _link_reference_text
+
+    html = _link_reference_text('Social Sciences Academic Press.https://www.pishu.com.cn/a?b=1')
+    assert 'Press.<wbr><a ' in html
 
 
 @pytest.mark.parametrize('text', [

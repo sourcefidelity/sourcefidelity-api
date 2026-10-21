@@ -48,6 +48,34 @@ def _attempt(category="academic_adapter", outcome="no_match", *, required=True):
     )
 
 
+def _completed_routes(title="A sufficiently specific scholarly work",
+                      adapters=("openalex", "crossref", "datacite"), extra_attempts=()):
+    """Every index the kind requires and a web search, each finished on the title.
+
+    search-completion-v1 counts an index only through a title-led query and a
+    web search only through one containing the title, by a real provider.
+    """
+    queries, attempts = [], []
+    for provider, category, value in (
+        *((name, "academic_adapter", f"title:{title}") for name in adapters),
+        ("brave", "bounded_web", f'"{title}"'),
+    ):
+        queries.append(ReferenceSearchQuery(
+            query_id=f"query-{provider}", route_category=category, provider=provider,
+            execution_provider=provider, execution_outcome="no_results", result_count=0,
+            normalized_query=value, query_sha256=hashlib.sha256(value.encode()).hexdigest(),
+        ))
+        attempts.append(ReferenceRouteAttempt(
+            attempt_id=f"attempt-{provider}", route_category=category, provider=provider,
+            required=True, permitted=True, query_ids=[f"query-{provider}"],
+            outcome="no_match", started_at=NOW, completed_at=NOW,
+        ))
+    for attempt in extra_attempts:
+        queries.append(_query(attempt.route_category))
+        attempts.append(attempt)
+    return queries, attempts
+
+
 def _comparison(field, outcome):
     digest = hashlib.sha256(field.encode()).hexdigest()
     return BibliographicFieldComparison(
@@ -174,13 +202,14 @@ def test_material_field_conflict_is_neutral_bibliographic_conflict():
 
 
 def test_only_completed_required_routes_can_be_unlocated_after_search():
-    attempts = [
-        _attempt("academic_adapter"),
-        _attempt("bounded_web"),
-    ]
-    record = _record(
-        attempts=attempts,
-        required=["academic_adapter", "bounded_web"],
+    queries, attempts = _completed_routes()
+    record = derive_reference_discovery_record(
+        reference_id="ref-0001",
+        expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]
+        ),
+        required_route_categories=["academic_adapter", "bounded_web"],
+        queries=queries, attempts=attempts, candidates=[], created_at=NOW,
     )
     assert record.outcome == "unlocated_after_search"
     assert record.contributes_to_neutral_pattern is True
@@ -204,14 +233,15 @@ def test_failed_unattempted_or_forbidden_required_route_is_search_incomplete(
 
 
 def test_optional_unpermitted_library_route_does_not_block_completed_search():
-    attempts = [
-        _attempt("academic_adapter"),
-        _attempt("bounded_web"),
-        _attempt("library_metadata", "not_permitted", required=False),
-    ]
-    record = _record(
-        attempts=attempts,
-        required=["academic_adapter", "bounded_web"],
+    queries, attempts = _completed_routes(
+        extra_attempts=[_attempt("library_metadata", "not_permitted", required=False)])
+    record = derive_reference_discovery_record(
+        reference_id="ref-0001",
+        expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]
+        ),
+        required_route_categories=["academic_adapter", "bounded_web"],
+        queries=queries, attempts=attempts, candidates=[], created_at=NOW,
     )
     assert record.outcome == "unlocated_after_search"
 
@@ -330,14 +360,8 @@ def test_trace_completion_refuses_missing_route_policy():
 
 
 def test_trace_completion_accepts_complete_no_match_routes():
-    queries = [_query("academic_adapter"), _query("bounded_web")]
-    queries[1] = queries[1].model_copy(
-        update={
-            "execution_provider": "public-search",
-            "execution_outcome": "no_results",
-            "result_count": 0,
-        }
-    )
+    queries, attempts = _completed_routes(
+        "A Sufficiently Specific Scholarly Work", adapters=("crossref", "openalex"))
     completion = assess_reference_discovery_trace(
         ReferenceDiscoveryTrace(
             reference_id="ref-complete-miss",
@@ -347,7 +371,7 @@ def test_trace_completion_accepts_complete_no_match_routes():
             ),
             required_route_categories=["academic_adapter", "bounded_web"],
             queries=queries,
-            attempts=[_attempt("academic_adapter"), _attempt("bounded_web")],
+            attempts=attempts,
         ),
         created_at=NOW,
     )
@@ -477,3 +501,89 @@ def test_content_identity_rejection_overrides_plausible_search_title():
 
     assert candidate.plausible_identity_match is True
     assert candidate.is_credible is False
+
+
+def test_a_one_word_book_title_supports_a_search_with_its_author_and_publisher():
+    from app.services.reference_discovery import ExpectedBibliographicFields
+    book = ExpectedBibliographicFields(title="Lanterns", authors=["Quillby, O."],
+                                       publisher="Harbour Press", source_kind="monograph")
+    assert book.supports_identity_search()
+    assert not book.model_copy(update={"publisher": ""}).supports_identity_search()
+    assert not book.model_copy(update={"source_kind": "journal_article"}).supports_identity_search()
+
+
+def test_a_part_title_namesake_by_other_authors_outside_the_cited_book_is_another_work():
+    from app.services.reference_discovery import is_part_title_namesake
+    chapter = ExpectedBibliographicFields(title="Postwar changes", authors=["Quillby, O."],
+                                          container_title="Bright lights", source_kind="book_section")
+    namesake = ReferenceDiscoveryCandidate(
+        candidate_id="candidate-1", attempt_id="attempt-academic_adapter",
+        provider="provider-academic_adapter", plausible_identity_match=True,
+        comparisons=[_comparison("title", "agreement"), _comparison("author", "material_conflict"),
+                     _comparison("container_title", "unknown")])
+    assert is_part_title_namesake(chapter, namesake)
+    in_book = namesake.model_copy(update={"comparisons": [
+        *namesake.comparisons[:2], _comparison("container_title", "agreement")]})
+    assert not is_part_title_namesake(chapter, in_book)
+    assert not is_part_title_namesake(chapter.model_copy(update={"source_kind": "monograph"}), namesake)
+    assert not is_part_title_namesake(chapter, namesake.model_copy(update={"authoritative_identifier_match": True}))
+    assert is_part_title_namesake(chapter, namesake.model_copy(update={"validated_identity_content_sha256": "a" * 64}))
+
+
+def test_an_archive_item_page_title_is_the_book_title_with_matching_authors():
+    from app.services.reference_discovery import _web_title_furniture_only
+    page = "Being a star : labor, identity, and fame : Quillby, Orla : Free Download, Borrow, and Streaming : Internet Archive"
+    assert _web_title_furniture_only("Being a star labor, identity, and fame", page, author_match=True)
+    assert not _web_title_furniture_only("Being a star labor, identity, and fame", page, author_match=False)
+    assert not _web_title_furniture_only("Some other book entirely here", page, author_match=True)
+
+
+def test_a_bookseller_format_after_the_title_is_page_furniture():
+    from app.services.reference_discovery import _web_title_furniture_only
+    page = "Lanterns at Sea - A Biography of Orla Quillby - Softcover"
+    assert _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=True)
+    assert not _web_title_furniture_only("Lanterns at Sea: A Biography of Orla Quillby", page, author_match=False)
+
+
+def _web_candidate(*comparisons, provider="web_search", **flags):
+    return ReferenceDiscoveryCandidate(
+        candidate_id="candidate-web", attempt_id="attempt-bounded_web", provider=provider,
+        plausible_identity_match=True, comparisons=[_comparison(f, o) for f, o in comparisons], **flags)
+
+
+def _web_record(candidate):
+    attempts = [_attempt("academic_adapter", "no_match"),
+                _attempt("bounded_web", "candidate_found").model_copy(update={"provider": candidate.provider})]
+    queries = [_query("academic_adapter"), _query("bounded_web").model_copy(update={"provider": candidate.provider})]
+    return derive_reference_discovery_record(
+        reference_id="ref-0001", expected=ExpectedBibliographicFields(
+            title="A sufficiently specific scholarly work", authors=["Scholar"]),
+        required_route_categories=["academic_adapter"], queries=queries, attempts=attempts,
+        candidates=[candidate], created_at=NOW)
+
+
+@pytest.mark.parametrize("candidate,blocked", [
+    # A film's sales page against a review of the film: the title is all they share.
+    (_web_candidate(("title", "minor_difference"), ("author", "unknown"), ("year", "material_conflict")), True),
+    (_web_candidate(("title", "agreement"), ("author", "agreement"), ("year", "material_conflict")), False),
+    (_web_candidate(("title", "agreement"), ("year", "material_conflict"),
+                    validated_identity_content_sha256="a" * 64), False),
+    # The student's own link is the cited page, not a search result.
+    (_web_candidate(("title", "agreement"), ("year", "material_conflict"), provider="student_url_html"), False),
+])
+def test_a_web_result_matching_only_on_title_cannot_raise_a_conflict(candidate, blocked):
+    from app.services.reference_discovery import title_alone_web_match
+    assert not title_alone_web_match(candidate, enabled=False)
+    assert title_alone_web_match(candidate, enabled=True) is blocked
+    assert (_web_record(candidate).outcome != "bibliographic_conflict") is blocked  # on by default
+
+
+def test_the_rule_reaches_the_outcome_and_the_reports_conflict_view(monkeypatch):
+    from app import config
+    from app.services.evidence_report import _reference_identity_conflict_view
+    monkeypatch.setattr(config.settings, "WEB_TITLE_ALONE_CONFLICT_BLOCKED", True)
+    sales_page = _web_candidate(("title", "minor_difference"), ("author", "unknown"), ("year", "material_conflict"))
+    assert _web_record(sales_page).outcome != "bibliographic_conflict"
+    view = _reference_identity_conflict_view({"expected": {"title": "x", "year": "1988"},
+                                              "candidates": [sales_page.model_dump(mode="json")]})
+    assert view["located_record"]["title"] == "" and view["conflicting_fields"] == []

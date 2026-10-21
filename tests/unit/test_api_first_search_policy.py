@@ -24,15 +24,14 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", True)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:4,exa:4,tavily:4")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng", "tavily")}
+                 for name in ("brave", "exa", "tavily")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name or "tavily"))
     return WebSearchRetriever(health_store=Mock()), providers
 
 
@@ -49,7 +48,6 @@ def test_provider_order_is_tier_first_and_excludes_tavily(cascade):
     # Exa has no filetype operator, so it receives the exact query only.
     assert order == ["brave", "brave", "exa"]
     assert [a["provider"] for a in result.metadata["search_attempts"]] == order
-    providers["searxng"].search.assert_not_called()
     providers["tavily"].search.assert_not_called()
 
 
@@ -268,24 +266,6 @@ def test_budget_applies_to_primary_and_cache_does_not_spend_twice(cascade):
     assert all(a["provider_calls"] == 0 for a in second.metadata["search_attempts"])
 
 
-def test_optional_searxng_uses_existing_cooldowns_without_search_or_reset(cascade):
-    from app.services.search.searxng import SearXNGSearch
-    search, _ = cascade
-    searx = SearXNGSearch("https://search.example")
-    searx.search = Mock()
-    search._policy_providers["searxng"] = searx
-    search._health_store.cooldown_remaining.return_value = 180
-    result = run(search)
-    attempts = [a for a in result.metadata["search_attempts"] if a["provider"] == "searxng"]
-    assert attempts and all(a["outcome"] == "cooldown_skipped" and a["required"] is False for a in attempts)
-    searx.search.assert_not_called()
-    # SearXNG's health must not be reset while it is cooling down. Brave and
-    # Exa are now tracked (2026-09-24), so the store is consulted for them;
-    # this test's concern is SearXNG only.
-    assert "searxng" not in {c.args[0] for c in search._health_store.record_success.call_args_list}
-    search._health_store.claim_recovery_probe.assert_not_called()
-
-
 def test_ranked_out_candidates_keep_explicit_dispositions(cascade):
     search, providers = cascade
     providers["brave"].search.return_value = [SearchResult(f"https://example.org/{i}", "Frozen source control", "") for i in range(10)]
@@ -326,7 +306,9 @@ def test_transient_dispositions_and_traces_do_not_retain_failed_results(cascade,
                                                  "candidate_title": "BRAVE_TITLE_SENTINEL"}]
         return result
     resolver._download_and_cache = acquisition
-    result = resolver._try_source(search, None, "Frozen source control", "Writer", "2020")
+    # The seed's own title: a web query counts only when it searched the
+    # reference's title (search-completion-v1).
+    result = resolver._try_source(search, None, "Frozen bibliographic control", "Writer", "2020")
     seed = trace_for(COMPLETE[:1])
     token = _ACTIVE_DISCOVERY_TRACE.set({"reference_id": seed.reference_id, "expected": seed.expected,
         "search_policy_version": API_FIRST_SEARCH_POLICY, "search_retention_policy": "brave-operational-transient-v1",
@@ -495,33 +477,33 @@ def test_transient_cleanup_preserves_operation_only_cross_tier_deduplication(cas
     assert _ATTEMPTED_URLS.get() is None
 
 
-def test_disabled_optional_fallback_does_not_generate_background_probes(monkeypatch):
-    from app.tasks import provider_recovery
-    monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
-    health = Mock()
-    health.incident_providers.return_value = ["searxng:brave", "duckduckgo"]
-    monkeypatch.setattr(provider_recovery, "ProviderHealthStore", lambda: health)
-    assert provider_recovery.probe_retrieval_provider_recovery.run()["incidents_probed"] == 0
-    health.record_success.assert_not_called()
-    health.record_unavailable.assert_not_called()
-    health.claim_recovery_probe.assert_not_called()
-
-
 def trace_for(outcomes, *, version=API_FIRST_SEARCH_POLICY, candidate=None):
     now = datetime(2026, 9, 7, tzinfo=timezone.utc)
     queries, attempts = [], []
     for i, (provider, outcome) in enumerate(outcomes):
         category = "academic_adapter" if provider == "crossref" else "bounded_web"
         qid, aid = f"q-{i}", f"a-{i}"
-        query = "frozen bibliographic control"
+        # Indexes count only through a title-led query (search-completion-v1).
+        query = ("title:frozen bibliographic control" if category == "academic_adapter"
+                 else "frozen bibliographic control")
         queries.append(ReferenceSearchQuery(query_id=qid, route_category=category, provider=provider,
             execution_provider=provider, execution_outcome=outcome, normalized_query=query,
             query_sha256=hashlib.sha256(query.encode()).hexdigest()))
         attempts.append(ReferenceRouteAttempt(attempt_id=aid, route_category=category, provider=provider,
-            required=(provider != "searxng" or version == LEGACY_SEARCH_POLICY), permitted=True,
+            required=(provider != "tavily" or version == LEGACY_SEARCH_POLICY), permitted=True,
             query_ids=[qid], outcome="candidate_found" if candidate and i == 0 else "no_match",
             started_at=now, completed_at=now))
+    if any(provider == "crossref" for provider, _ in outcomes):
+        # The other indexes an unknown kind requires, finished with no match.
+        for provider in ("openalex", "datacite"):
+            qid, aid = f"q-{provider}", f"a-{provider}"
+            query = "title:frozen bibliographic control"
+            queries.append(ReferenceSearchQuery(query_id=qid, route_category="academic_adapter",
+                provider=provider, execution_provider=provider, execution_outcome="no_results",
+                normalized_query=query, query_sha256=hashlib.sha256(query.encode()).hexdigest()))
+            attempts.append(ReferenceRouteAttempt(attempt_id=aid, route_category="academic_adapter",
+                provider=provider, required=True, permitted=True, query_ids=[qid], outcome="no_match",
+                started_at=now, completed_at=now))
     candidates = []
     if candidate:
         candidates = [ReferenceDiscoveryCandidate(candidate_id="c-1", attempt_id="a-0", provider="crossref", **candidate)]
@@ -555,7 +537,7 @@ def test_completed_routes_cannot_exhaust_cross_script_candidate():
 
 
 def test_completed_negative_ignores_optional_failures_but_preserves_legacy():
-    outcomes = [*COMPLETE, ("searxng", "cooldown_skipped")]
+    outcomes = [*COMPLETE, ("tavily", "cooldown_skipped")]
     new = assess_reference_discovery_trace(trace_for(outcomes)).record
     old = assess_reference_discovery_trace(trace_for(outcomes, version=LEGACY_SEARCH_POLICY)).record
     assert new.outcome == "unlocated_after_search"
@@ -565,13 +547,32 @@ def test_completed_negative_ignores_optional_failures_but_preserves_legacy():
 
 @pytest.mark.parametrize("failure", ["timeout", "budget_skipped", "rate_limited", "access_restricted", "unknown"])
 def test_required_failure_controls_never_become_completed_negative(failure):
-    result = assess_reference_discovery_trace(trace_for([COMPLETE[0], ("brave", failure), COMPLETE[2]]))
+    # Both required web providers failing: with Exa finishing, a provider-side
+    # Brave failure alone no longer holds the search open (search-completion-v1,
+    # owner decision 2026-10-19).
+    result = assess_reference_discovery_trace(trace_for([COMPLETE[0], ("brave", failure), ("exa", failure)]))
     assert not result.ready or result.record.outcome == "search_incomplete"
 
 
-def test_unattempted_exa_cannot_be_satisfied_by_searxng():
-    result = assess_reference_discovery_trace(trace_for([*COMPLETE[:2], ("searxng", "no_results")]))
+@pytest.mark.parametrize("failure", ["timeout", "rate_limited", "access_restricted"])
+def test_one_web_providers_provider_side_failure_leaves_the_other_sufficient(failure):
+    # search-completion-v1, owner decision 2026-10-19.
+    result = assess_reference_discovery_trace(trace_for([COMPLETE[0], ("brave", failure), COMPLETE[2]]))
+    assert result.record.outcome == "unlocated_after_search"
+
+
+def test_a_web_provider_skipped_by_our_budget_keeps_the_search_incomplete():
+    result = assess_reference_discovery_trace(trace_for([COMPLETE[0], ("brave", "budget_skipped"), COMPLETE[2]]))
+    assert not result.ready or result.record.outcome == "search_incomplete"
+
+
+def test_unattempted_exa_cannot_be_satisfied_by_an_optional_fallback():
+    # Brave failing too: Brave finishing alone now suffices without Exa
+    # (search-completion-v1, owner decision 2026-10-19).
+    result = assess_reference_discovery_trace(trace_for([COMPLETE[0], ("brave", "timeout"), ("tavily", "no_results")]))
     assert result.record.outcome == "search_incomplete"
+    result = assess_reference_discovery_trace(trace_for([*COMPLETE[:2], ("tavily", "no_results")]))
+    assert result.record.outcome == "unlocated_after_search"
 
 
 @pytest.mark.parametrize('provider', ['crossref', 'brave', 'exa'])
@@ -579,7 +580,12 @@ def test_unattempted_exa_cannot_be_satisfied_by_searxng():
 def test_frozen_procedural_control_required_failures(provider, failure):
     outcomes = [(name, failure if name == provider else outcome) for name, outcome in COMPLETE]
     result = assess_reference_discovery_trace(trace_for(outcomes))
-    assert not result.ready or result.record.outcome == 'search_incomplete'
+    if provider != 'crossref' and failure != 'budget_skipped':
+        # A provider-side failure of one web provider leaves the other
+        # sufficient: search-completion-v1, owner decision 2026-10-19.
+        assert result.record.outcome == 'unlocated_after_search'
+    else:
+        assert not result.ready or result.record.outcome == 'search_incomplete'
 
 
 @pytest.mark.parametrize('disposition', [

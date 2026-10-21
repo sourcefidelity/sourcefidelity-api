@@ -125,8 +125,21 @@ def _core_request(
     in-flight request and the quota belongs to the key. Without Redis the
     process-local pacing alone applies, as before.
     """
+    # Wait for this process's turn only as long as the reference's elapsed
+    # budget allows; parallel references in one process queue here.
+    from app.services.retrieval_deadline import remaining_seconds
+    left = remaining_seconds()
+    if not _core_lock.acquire(timeout=_CORE_SHARED_WAIT_SECONDS if left is None else min(left, _CORE_SHARED_WAIT_SECONDS)):
+        raise CoreBusy("CORE busy in another worker")
+    try:
+        return _core_request_locked(url, params, timeout=timeout, headers=headers, min_interval=min_interval)
+    finally:
+        _core_lock.release()
+
+
+def _core_request_locked(url, params, *, timeout, headers, min_interval):
     global _core_last_request, _core_next_allowed_request, _core_quota_interval
-    with _core_lock, shared_pacing.exclusive(
+    with shared_pacing.exclusive(
             "core", hold_seconds=timeout + 10, wait_seconds=_CORE_SHARED_WAIT_SECONDS) as held:
         if held is False:
             raise CoreBusy("CORE busy in another worker")
@@ -269,7 +282,8 @@ class CoreRetriever(RetrievalSource):
             "rate_limit_remaining": None,
             "busy_skips": 0,
         }
-        self._last_skip: str | None = None
+        # Per thread: the caller reads it right after its own request.
+        self._skip_note = threading.local()
 
     def _record_rate_limit_headers(self, resp: httpx.Response) -> None:
         for header, metric in (
@@ -300,7 +314,7 @@ class CoreRetriever(RetrievalSource):
         except CoreBusy:
             # Not a CORE failure and not a timeout: our own workers were busy.
             self.provider_metrics["busy_skips"] += 1
-            self._last_skip = "busy"
+            self._skip_note.value = "busy"
             return None
         self._record_rate_limit_headers(resp)
         if resp.status_code == 429:
@@ -379,8 +393,8 @@ class CoreRetriever(RetrievalSource):
         classified as `cooldown_skipped`; the word "timeout" is deliberately
         absent, because the outcome classifier matches error text.
         """
-        if self._last_skip == "busy" and not (self._timeout_circuit_open or self._rate_limited):
-            self._last_skip = None
+        if getattr(self._skip_note, "value", None) == "busy" and not (self._timeout_circuit_open or self._rate_limited):
+            self._skip_note.value = None
             return f"{PROVIDER_SKIPPED_ERROR}: CORE busy in another worker"
         if self._timeout_circuit_open or self.provider_metrics["cooldown_skips"]:
             return f"{PROVIDER_SKIPPED_ERROR}: CORE circuit open after repeated slow responses"

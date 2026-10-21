@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import uuid
 
-import fitz
 import pytest
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
@@ -25,21 +24,12 @@ from app.services import search_retry
 from app.services.paper_workflow import TARGETED_SOURCE_REFRESH_KEY, PaperWorkflowError
 from app.services.search_retry import (
     AUTO_RETRY_KEY,
-    SEARCH_AGAIN_KEY,
-    SearchAgainRateLimited,
     due_retry_references,
-    prepare_search_again_refresh,
 )
 from app.tasks import incomplete_search_retry as task_module
 from test_report_export import export_store  # noqa: F401  (fixture)
 
 
-@pytest.fixture(autouse=True)
-def _institutional_deployment(monkeypatch):
-    """Automatic re-searching happens only in an Institutional deployment
-    (owner decision 2026-09-29); these tests exercise that behaviour."""
-    import app.services.assessment_marks as marks
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
 
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
@@ -213,58 +203,6 @@ def test_beat_schedule_runs_the_scan():
 # --- Search again: service -------------------------------------------------
 
 
-def test_search_again_starts_a_forced_refresh_once_per_day(factory):
-    job_id, report_id = _add_job(factory, [_full_text_incomplete("ref-1", NOW - timedelta(minutes=5)),
-                                           _completed("ref-2", NOW)])
-    with factory() as session:
-        prepared = prepare_search_again_refresh(session, report_id=report_id, reference_id="ref-1",
-                                                scope_type="personal_owner", scope_id="owner-1", now=NOW)
-    with factory() as session:
-        job = session.get(Job, job_id)
-        refresh = job.upload_evidence[TARGETED_SOURCE_REFRESH_KEY]
-        assert refresh["reference_ids"] == ["ref-1"] and refresh["force_search"] is True
-        assert refresh["reason"] == "user_search_again" and refresh["attempt_id"] == prepared["attempt_id"]
-        assert [item["reference_id"] for item in job.source_results] == ["ref-2"]
-        assert job.upload_evidence[SEARCH_AGAIN_KEY]["ref-1"][0]["requested_at"] == NOW.isoformat()
-        # The refresh finishes (or is rolled back) and the search is still incomplete.
-        evidence = dict(job.upload_evidence)
-        evidence.pop(TARGETED_SOURCE_REFRESH_KEY)
-        job.upload_evidence = evidence
-        job.status = JobStatus.COMPLETED
-        job.source_results = [_full_text_incomplete("ref-1", NOW + timedelta(minutes=5)), _completed("ref-2", NOW)]
-        session.commit()
-    with factory() as session, pytest.raises(SearchAgainRateLimited) as refused:
-        prepare_search_again_refresh(session, report_id=report_id, reference_id="ref-1",
-                                     scope_type="personal_owner", scope_id="owner-1",
-                                     now=NOW + timedelta(hours=23))
-    assert refused.value.retry_after_seconds == 3600
-    with factory() as session:
-        again = prepare_search_again_refresh(session, report_id=report_id, reference_id="ref-1",
-                                             scope_type="personal_owner", scope_id="owner-1",
-                                             now=NOW + timedelta(days=1, minutes=1))
-    assert again["attempt_id"] != prepared["attempt_id"]
-
-
-def test_search_again_refuses_other_scopes_completed_searches_and_busy_jobs(factory):
-    _, report_id = _add_job(factory, [_full_text_incomplete("ref-1", NOW), _completed("ref-2", NOW)])
-    call = dict(report_id=report_id, scope_type="personal_owner", now=NOW)
-    with factory() as session, pytest.raises(PaperWorkflowError) as other_scope:
-        prepare_search_again_refresh(session, reference_id="ref-1", scope_id="owner-2", **call)
-    assert other_scope.value.code == "report_missing"
-    with factory() as session, pytest.raises(PaperWorkflowError) as completed:
-        prepare_search_again_refresh(session, reference_id="ref-2", scope_id="owner-1", **call)
-    assert completed.value.code == "search_not_incomplete"
-    _, busy_report = _add_job(factory, [_full_text_incomplete("ref-1", NOW)], name="busy",
-                              status=JobStatus.RUNNING)
-    with factory() as session, pytest.raises(PaperWorkflowError) as busy:
-        prepare_search_again_refresh(session, reference_id="ref-1", scope_id="owner-1",
-                                     **{**call, "report_id": busy_report})
-    assert busy.value.code == "report_reanalysis_busy"
-
-
-# --- Search again: button and route ---------------------------------------
-
-
 def _member(reference_id, **extra):
     return {"reference_id": reference_id, "status": "source_unavailable", "coverage_level": "unavailable",
             "source": {"author": "Author", "year": "2020", "title": "Synthetic source", "raw_reference": "Author (2020). Synthetic source."},
@@ -282,38 +220,23 @@ def _citations():
     ]}]
 
 
-def test_button_is_offered_only_for_incomplete_members_in_the_connected_report():
+def test_no_search_again_button_is_offered():
+    # Owner decision 2026-10-18: searches complete on their own; no button.
     from app.services.evidence_report import (
-        _render_member, enable_authenticated_paper_actions, _render_search_again)
+        _render_member, enable_authenticated_paper_actions, _render_reference_window_template)
     view = {"paper_surface": {}, "citations": _citations()}
     members = enable_authenticated_paper_actions(view, report_id="report-1")["citations"][0]["members"]
-    actions = {m["reference_id"]: m.get("search_again_action") for m in members}
-    assert actions["ref-text"]["href"] == "/report/report-1/reference/ref-text/search-again"
-    assert actions["ref-identity"]["enabled"] is True
-    assert actions["ref-done"] is None and actions["ref-full"] is None
-    soup = BeautifulSoup(_render_member(members[0]), "html.parser")
-    form = soup.select_one("form.search-again")
-    assert form["method"] == "post" and form["action"].endswith("/ref-text/search-again")
-    assert form.button.get_text() == "Search Again" and form.button["type"] == "submit"
-    assert form.select_one(".upload-status").get_text() == ""
-    # The Reference N window showing the same member offers the same button.
-    from app.services.evidence_report import _render_reference_window_template
+    assert all(m.get("search_again_action") is None for m in members)
+    assert "search-again" not in _render_member(members[0])
     entry = {"number": 1, "template_id": "reference-entry-panel-1", "source": members[0]["source"],
              "member": members[0], "first_citation": (1, 0), "citation_numbers": [1]}
-    template = BeautifulSoup(_render_reference_window_template(entry, [], [{"members": members}]),
-                             "html.parser").template
-    window = BeautifulSoup(template.decode_contents(), "html.parser")
-    assert [b.get_text() for b in window.select("form.search-again button")] == ["Search Again"]
-    # The persisted (export) projection carries no action, so no button.
-    assert "search-again" not in _render_member(view["citations"][0]["members"][0])
-    assert _render_search_again({}) == ""
+    assert "search-again" not in _render_reference_window_template(entry, [], [{"members": members}])
 
 
-def test_exports_never_contain_the_button(export_store, monkeypatch):  # noqa: F811
+def test_exports_never_contain_the_button(export_store):  # noqa: F811
     import hashlib
     from app.services.interactive_report_export import build_interactive_report_html
-    from app.services.report_export import build_released_report_export
-    session, storage, report, _artifact, view, paper = export_store
+    _session, _storage, _report, _artifact, view, paper = export_store
     member = view["citations"][0]["members"][0]
     member.update(status="source_unavailable", coverage_level="unavailable",
                   reason_code="full_text_search_incomplete",
@@ -323,11 +246,6 @@ def test_exports_never_contain_the_button(export_store, monkeypatch):  # noqa: F
     portable["paper_surface"]["presentation_sha256"] = hashlib.sha256(paper).hexdigest()
     html = build_interactive_report_html(portable, paper).decode()
     assert "Search Again" not in html and "search-again\"" not in html
-    monkeypatch.setattr("app.services.report_export.project_reference_flags", lambda value, *a: value)
-    exported = build_released_report_export(session, storage, report_id=report.id,
-                                            scope_type="personal_owner", scope_id="owner-1")
-    with fitz.open(stream=exported.content, filetype="pdf") as document:
-        assert "Search Again" not in " ".join(page.get_text() for page in document)
 
 
 @pytest.fixture
@@ -352,85 +270,42 @@ def client(monkeypatch):
         app.dependency_overrides.clear()
 
 
-def test_route_starts_a_forced_refresh_and_follows_the_successor(monkeypatch, client):
-    test_client, headers = client
-    captured = {}
-
-    def prepare(_session, **kwargs):
-        captured.update(kwargs)
-        return {"job_id": "job-1", "attempt_id": "attempt-1", "report_id": "report-1", "reference_id": "ref-text"}
-
-    dispatched = Mock(return_value="task-1")
-    monkeypatch.setattr("app.routers.report.prepare_search_again_refresh", prepare)
-    monkeypatch.setattr("app.routers.report.dispatch_paper_workflow", dispatched)
-    response = test_client.post("/report/report-1/reference/ref-text/search-again", headers=headers)
-    assert response.status_code == 200
-    assert response.json() == {"reanalysis_status": "scheduled", "base_report_id": "report-1",
-                               "attempt_id": "attempt-1", "task_id": "task-1", "publication_pending": False,
-                               "status_url": "/report/report-1/successor"}
-    assert captured == {"report_id": "report-1", "reference_id": "ref-text",
-                        "scope_type": "personal_owner", "scope_id": "owner-1"}
-    dispatched.assert_called_once_with("job-1", "attempt-1")
-
-
-def test_route_refuses_repeat_cross_site_and_complete_searches(monkeypatch, client):
-    test_client, headers = client
-
-    def limited(_session, **_kwargs):
-        raise SearchAgainRateLimited(1800)
-
-    monkeypatch.setattr("app.routers.report.prepare_search_again_refresh", limited)
-    monkeypatch.setattr("app.routers.report.dispatch_paper_workflow", Mock())
-    repeat = test_client.post("/report/report-1/reference/ref-identity/search-again", headers=headers)
-    assert repeat.status_code == 429 and repeat.headers["retry-after"] == "1800"
-    cross = test_client.post("/report/report-1/reference/ref-text/search-again",
-                             headers={**headers, "Origin": "https://attacker.invalid",
-                                      "Sec-Fetch-Site": "cross-site"})
-    assert cross.status_code == 403
-    assert test_client.post("/report/report-1/reference/ref-done/search-again",
-                            headers=headers).status_code == 409
-    assert test_client.post("/report/report-1/reference/ref-missing/search-again",
-                            headers=headers).status_code == 404
-
-
-def test_route_refuses_a_report_outside_the_viewer_scope(monkeypatch, client):
-    from app.services.evidence_report import EvidenceReportAuthorizationError
-    test_client, headers = client
-
-    def outside(*_a, **_k):
-        raise EvidenceReportAuthorizationError("Report does not exist in the authorized scope")
-
-    prepare = Mock()
-    monkeypatch.setattr("app.routers.report.load_authorized_evidence_report_bundle", outside)
-    monkeypatch.setattr("app.routers.report.prepare_search_again_refresh", prepare)
-    response = test_client.post(f"/report/{uuid.uuid4()}/reference/ref-text/search-again", headers=headers)
-    assert response.status_code == 404
-    prepare.assert_not_called()
-
-
-def test_page_script_follows_only_its_own_search_attempt():
-    from pathlib import Path
-    script = Path("app/services/report_interactions.js").read_text()
-    handler = script[script.index("classList.contains('search-again')"):script.index("// view-state:start")]
-    # Only the owner-approved messages (2026-09-29) are written.
-    assert "Searching again…" in handler
-    assert "awaitSuccessor(data.status_url,message,String(data.attempt_id))" in handler
-    assert "failure.attempt_id===attemptId" in script
-
-
-def test_search_again_messages_use_the_owner_wording():
-    from pathlib import Path
-    script = Path("app/services/report_interactions.js").read_text()
-    for text in ("Searching again…", "This reference was already searched again today. Try again tomorrow.",
-                 "The new search could not update the report.", "The report is already being updated."):
-        assert text in script
-
-
-def test_personal_deployment_never_searches_again_automatically(monkeypatch):
-    # Owner decision 2026-09-29: in Personal, searching again is the user's choice.
-    import app.services.assessment_marks as marks
+def test_personal_deployment_also_completes_searches_on_its_own(monkeypatch):
+    # Owner decision 2026-10-18 (was the user's choice in Personal, 2026-09-29).
     from app.tasks.incomplete_search_retry import retry_incomplete_searches
     from app.tasks.provider_recovery import requeue_recovered_provider_work
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: False)
-    assert retry_incomplete_searches()["disabled"] == "personal_deployment"
-    assert requeue_recovered_provider_work("brave")["disabled"] == "personal_deployment"
+    monkeypatch.setattr("app.tasks.incomplete_search_retry.settings.PROVIDER_RECOVERY_REFRESH_ENABLED", False)
+    monkeypatch.setattr("app.tasks.provider_recovery.settings.PROVIDER_RECOVERY_REFRESH_ENABLED", False)
+    # Only the one deployment switch stops them now, never the profile.
+    assert retry_incomplete_searches()["disabled"] == "PROVIDER_RECOVERY_REFRESH_ENABLED"
+    assert requeue_recovered_provider_work("brave")["disabled"] == "PROVIDER_RECOVERY_REFRESH_ENABLED"
+
+
+def test_personal_automatic_searching_is_the_owners_setting(factory):
+    from app.services.storage_policy import finishes_searches_automatically, set_policy
+    with factory() as session:
+        assert finishes_searches_automatically(session, "personal_owner", "owner-1") is False
+        set_policy(session, "personal_owner", "owner-1", {"searches": {"finish_incomplete_automatically": True}})
+        session.commit()
+        assert finishes_searches_automatically(session, "personal_owner", "owner-1") is True
+
+
+def test_the_settings_page_offers_the_search_line():
+    from app.routers.storage_settings import _changes, _page
+    from app.services.storage_policy import deployment_defaults
+    page = _page(deployment_defaults()).body.decode()
+    assert "<legend>Searches</legend>" in page and "Finish incomplete searches automatically" in page
+    assert 'value="off" checked' in page.split("Finish incomplete searches automatically")[1]
+    form = {"keep_copies": "all", "keep_months": "0", "keep_submitted_file": "off",
+            "paper_copy_days": "7", "report_days_until_deleted": "true", "finish_incomplete_automatically": "on"}
+    assert _changes(form)["searches"] == {"finish_incomplete_automatically": True}
+    assert "searches" not in _changes({k: v for k, v in form.items() if k != "finish_incomplete_automatically"})
+
+
+@pytest.fixture(autouse=True)
+def _automatic_searching_on(monkeypatch, request):
+    # These papers' scopes finish searches on their own; the Personal default
+    # (off, owner decision 2026-10-18) is tested on its own.
+    if "owners_setting" not in request.node.name:
+        monkeypatch.setattr("app.services.storage_policy.finishes_searches_automatically",
+                            lambda session, scope_type, scope_id: True)

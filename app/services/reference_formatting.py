@@ -7,7 +7,9 @@ style verdict. Each rule remains independently assessed or not assessed.
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 import hashlib
+from pathlib import Path
 import re
 from typing import Literal
 
@@ -146,7 +148,9 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
         entry = entries.get(ref.reference_id)
         supported = (layout.citation_format == 'apa' and not ref.needs_review
                      and ref.source_kind_confidence == 'high'
-                     and ref.source_kind in {'monograph', 'edited_collection', 'journal_article', 'traditional_media'})
+                     and ref.source_kind in {'monograph', 'edited_collection', 'journal_article', 'traditional_media',
+                                             # A chapter title is in regular type (owner decision 2026-10-18).
+                                             'book_section'})
         if supported:
             reason = 'title_span_not_uniquely_observed'
             title = ref.title
@@ -170,6 +174,9 @@ def assess_title_styles(layout: ReferenceLayoutArtifact, references: list[Parsed
                     bool(_JOURNAL_STRUCTURE_RE.search(tail.replace('*', '')) or re.search(
                         r',\s*\d{1,4}\s*,\s*\d+\s*[-–—]\s*\d+', tail.replace('*','')))
                     if ref.source_kind == 'journal_article' else
+                    # A chapter is followed by "In" and the book it is part of.
+                    bool(re.match(r'In\b', tail.replace('*', ''), re.I))
+                    if ref.source_kind == 'book_section' else
                     film and bool(re.match(_FILM_LABEL, tail, re.I))
                 )
                 if not independent_kind:
@@ -399,7 +406,8 @@ def book_publication_year_discrepancy(reference: ParsedReference, discovery: dic
     )
 
 
-def reference_style_findings(assessment: dict, references: dict[str, ParsedReference]) -> list[dict]:
+def reference_style_findings(assessment: dict, references: dict[str, ParsedReference],
+                             discovery_by_reference: dict | None = None) -> list[dict]:
     """Project stored v2 results only; never upgrade historical assessments."""
     if assessment.get('assessment_version') != 'reference-formatting-v2':
         return []
@@ -423,6 +431,9 @@ def reference_style_findings(assessment: dict, references: dict[str, ParsedRefer
                      'The volume number is not italicized in this APA reference.'
                      if result.rule_id == 'apa7_periodical_volume_italics_v1' else
                      'The title is not italicized in this APA reference.' if result.expected_italic else
+                     # Owner wording 2026-10-18: a description, not a direction.
+                     'The chapter title is incorrectly italicized.'
+                     if result.source_kind == 'book_section' else
                      'Use regular type, rather than italics, for the article title in this APA reference.'),
             rule_id=result.rule_id, rule_source=APA_TITLE_RULE_SOURCE,
             # Where in the entry the field starts: a volume number such as "6"
@@ -448,12 +459,15 @@ def reference_style_findings(assessment: dict, references: dict[str, ParsedRefer
                     observed_reference_order=result.observed_order,
                     rectangles=[], localization_status='not_assessed'))
     if assessment.get('citation_format') == 'apa':
-        findings.extend(reference_entry_findings(references))
+        findings.extend(reference_entry_findings(references, discovery_by_reference))
     return findings
 
 
-# Owner wording 2026-10-04.
-TITLE_CASE_TEXT = 'This title uses title case; APA uses sentence case for article and book titles in the reference list.'
+# Owner wording 2026-10-04, revised 2026-10-13 (the check covers every kind of work).
+TITLE_CASE_TEXT = 'This title uses title case; APA uses sentence case for the titles of works in the reference list.'
+# Owner wording 2026-10-13, for a title that turns from title case to sentence case.
+MIXED_CASE_TEXT = ('This title mixes title case and sentence case; APA uses sentence case for the '
+                   'titles of works in the reference list.')
 PUBLICATION_MISSING_TEXT = 'This reference does not name a journal or publisher.'
 SPLIT_ENTRY_TEXT = 'This reference is split into two entries in the reference list.'
 _MEDIA_KINDS = frozenset({'traditional_media', 'video', 'podcast_episode'})
@@ -466,8 +480,18 @@ def title_case_title(title: str) -> bool:
     """A title written in title case: no ordinary lower-case word of four or
     more letters, and at least three capitalised ones besides the words that
     sentence case also capitalises (the first, and the first after a colon).
-    Proper nouns cannot be told apart, so a title of names alone may match."""
-    capitalised = 0
+    Proper nouns cannot be told apart, so a title of names alone may match.
+    One lower-case word among four or more capitalised ones is a name written
+    in its own case ("Television without Frontiers: The European Union's
+    Continuing Struggle", 2026-10-18), not sentence case."""
+    capitalised, lowercase = 0, 0
+    tokens = [re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', t) for t in title.split()]
+
+    def inside_name(position: int) -> bool:
+        # Between two capitalised words: part of a name ("Television without Frontiers").
+        before = tokens[position - 1] if position > 0 else ''
+        after = tokens[position + 1] if position + 1 < len(tokens) else ''
+        return bool(before[:1].isupper() and after[:1].isupper())
     for index, match in enumerate(re.finditer(r"[^\s]+", title)):
         token = match.group()
         word = re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', token)
@@ -481,14 +505,178 @@ def title_case_title(title: str) -> bool:
             continue
         if head[0].islower():
             if head.casefold() not in _LOWER_IN_TITLE_CASE:
-                return False
+                if not inside_name(index):
+                    return False
+                lowercase += 1
         else:
             capitalised += 1
-    return capitalised >= 3
+    return capitalised >= 3 and (lowercase == 0 or (lowercase == 1 and capitalised >= 4))
 
 
-def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dict]:
-    """Title capitalisation and missing publication details (owner decision 2026-10-04)."""
+# Capitalised mid-title in most titles whatever their style.
+_NEUTRAL_CAPITALISED = frozenset({'internet'})
+
+
+@lru_cache(maxsize=1)
+def _common_words() -> frozenset[str]:
+    """Words the installed English lists spell in lower case, so not names
+    ("administration" yes; "Okafor", "Thorvald", "British" no). Empty when no list
+    is installed, and the mixed-case rule then abstains."""
+    from app.services.text_quality import WORD_LIST_PATHS
+    words: set[str] = set()
+    for path in WORD_LIST_PATHS:
+        try:
+            lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        words.update(line.strip() for line in lines if line.strip().islower())
+    return frozenset(words)
+
+
+def _ordinary_word(head: str, common: frozenset[str]) -> bool:
+    word = re.sub(r"['’]s$", '', head).casefold()
+    return word in common
+_SENTENCE_CAPITAL_BREAK = (':', '?', '!', '—', '–')
+
+
+def _located_proper_nouns(located_titles) -> set[str]:
+    """Words a located record capitalises mid-title in a sentence-case title.
+
+    Only a located title that is itself in sentence case (an ordinary
+    lower-case word, and not title case) says anything about proper nouns: a
+    record in title case capitalises every word.
+    """
+    proper: set[str] = set()
+    for located in located_titles or ():
+        located = re.sub(r'[(\[][^)\]]*[)\]]', ' ', str(located or ''))
+        if not located.strip() or title_case_title(located):
+            continue
+        words = [m for m in re.finditer(r"[^\s]+", located)]
+        heads = [re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', m.group()).split('-')[0] for m in words]
+        if not any(len(h) >= 4 and h[:1].islower() and h.casefold() not in _LOWER_IN_TITLE_CASE
+                   for h in heads):
+            continue
+        for index, (match, head) in enumerate(zip(words, heads)):
+            if (index and head[:1].isupper()
+                    and not located[:match.start()].rstrip().endswith(_SENTENCE_CAPITAL_BREAK)):
+                proper.add(head.casefold())
+    return proper
+
+
+def mixed_case_title(title: str, located_titles=()) -> bool:
+    """A title that opens in title case and then turns to sentence case
+    (owner decision 2026-10-12): "Interim Rules on the Management of
+    Internet publishing".
+
+    Conservative. From the title's first word, or the first after a colon,
+    every word up to the first ordinary lower-case word of four or more
+    letters is capitalised or a short function word, and that run holds at
+    least two capitalised words, besides the first, in two places separated
+    by other words. A run of adjacent capitalised words after the first word
+    ("New York Times") is likely a name, so the title is not assessed; one
+    opening with "The", "A" or "An" ("The Washington Post") is not counted.
+    Text in parentheses or brackets (a translation) is ignored; "Internet",
+    acronyms, words a located sentence-case record capitalises and words the
+    English word lists only spell capitalised (names) neither count nor join
+    a run.
+    """
+    common = _common_words()
+    if not common:
+        return False
+    proper = _located_proper_nouns(located_titles)
+    text = re.sub(r'[(\[][^)\]]*[)\]]', ' ', title)
+    if re.search(r'[()\[\]]', text):
+        return False  # unbalanced brackets: abstain
+    for segment in re.split(r'[:?!—–]', text):
+        kinds: list[tuple[str, str]] = []
+        for token in segment.split():
+            word = re.sub(r"^[\"“‘'(\[]+|[\"”’'),.;:!?\]]+$", '', token)
+            if not word or any(ch.isdigit() for ch in word) or not word[0].isalpha():
+                kinds.append(('other', word))
+                continue
+            head = word.split('-')[0]
+            if not kinds or all(kind == 'other' for kind, _ in kinds):
+                kinds.append(('first', head))
+            elif head[:1].islower():
+                if len(head) >= 4 and head.casefold() not in _LOWER_IN_TITLE_CASE:
+                    kinds.append(('content', head))
+                    break
+                kinds.append(('minor', head))
+            elif ((head.isupper() and len(head) > 1) or len(head) < 2
+                    or head.casefold() in _NEUTRAL_CAPITALISED or head.casefold() in proper):
+                kinds.append(('other', head))
+            elif not _ordinary_word(head, common):
+                # A capitalised word no list spells in lower case is a name.
+                kinds.append(('name', head))
+            else:
+                kinds.append(('capital', head))
+        # A capitalised word beside a name belongs to it ("Ella May Thorvald",
+        # "Hildred Pierce"), even when a list also spells it in lower case.
+        named = [kind == 'name' or (kind == 'first' and not _ordinary_word(head, common))
+                 for kind, head in kinds]
+        kinds = [('other', head) if kind == 'name' or (
+                     kind == 'capital' and ((index and named[index - 1])
+                                            or (index + 1 < len(kinds) and named[index + 1])))
+                 else (kind, head) for index, (kind, head) in enumerate(kinds)]
+        if not kinds or kinds[-1][0] != 'content':
+            continue
+        # Adjacent capitalised words form one group.
+        groups: list[list[tuple[str, str]]] = []
+        previous = ''
+        for kind, head in kinds:
+            if kind in {'first', 'capital'}:
+                if previous in {'first', 'capital'}:
+                    groups[-1].append((kind, head))
+                else:
+                    groups.append([(kind, head)])
+            previous = kind
+        counted_groups = counted = 0
+        for group in groups:
+            capitals = [head for kind, head in group if kind == 'capital']
+            if group[0][0] == 'first':
+                if group[0][1].casefold() in {'the', 'a', 'an'}:
+                    continue
+            elif len(group) > 1:
+                return False  # likely a name
+            if capitals:
+                counted_groups += 1
+                counted += len(capitals)
+        if counted >= 2 and counted_groups >= 2:
+            return True
+    return False
+
+
+def located_titles(reference: ParsedReference, discovery: dict | None) -> list[str]:
+    """Titles of located records that agree with this reference's title as it
+    reads now; used only for their capitalisation."""
+    from app.services.reference_discovery import ReferenceDiscoveryRecord, _value_hash
+    if not discovery:
+        return []
+    try:
+        record = ReferenceDiscoveryRecord.model_validate(discovery)
+    except ValueError:
+        return []
+    if record.reference_id != reference.reference_id:
+        return []
+    titles = []
+    for candidate in record.candidates:
+        if not candidate.is_credible:
+            continue
+        title = next((c for c in candidate.comparisons if c.field_name == 'title'), None)
+        observed = str(getattr(candidate.observed, 'title', '') or '').strip()
+        if (title is not None and title.outcome == 'agreement' and observed
+                and title.expected_sha256 == _value_hash(reference.title)):
+            titles.append(observed)
+    return titles
+
+
+def reference_entry_findings(references: dict[str, ParsedReference],
+                             discovery_by_reference: dict | None = None) -> list[dict]:
+    """Title capitalisation and missing publication details (owner decision 2026-10-04).
+
+    A title in mixed title and sentence case is counted and shown as the same
+    title-formatting finding (owner decision 2026-10-12).
+    """
     findings = []
     for reference_id, ref in references.items():
         if len(getattr(ref, 'split_parts', None) or []) == 2:
@@ -500,9 +688,14 @@ def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dic
         if (ref.needs_review or ref.source_kind in _MEDIA_KINDS or len(title.split()) < 3
                 or ref.raw_ref.count(title) != 1):
             continue
-        if title_case_title(title):
+        rule_id = ('apa7_title_sentence_case_v1' if title_case_title(title) else
+                   'apa7_title_mixed_case_v1' if mixed_case_title(
+                       title, located_titles(ref, (discovery_by_reference or {}).get(reference_id)))
+                   else None)
+        if rule_id:
             findings.append(dict(finding_type='reference_title_style', reference_id=reference_id,
-                finding=TITLE_CASE_TEXT, rule_id='apa7_title_sentence_case_v1', rule_source=APA_TITLE_RULE_SOURCE,
+                finding=MIXED_CASE_TEXT if rule_id == 'apa7_title_mixed_case_v1' else TITLE_CASE_TEXT,
+                rule_id=rule_id, rule_source=APA_TITLE_RULE_SOURCE,
                 field_difference={'field_name': 'title', 'submitted_value': title},
                 rectangles=[], localization_status='not_assessed'))
         tail = ref.raw_ref[ref.raw_ref.index(title) + len(title):]
@@ -512,6 +705,8 @@ def reference_entry_findings(references: dict[str, ParsedReference]) -> list[dic
         if not re.search(r'\w', tail) and not (ref.url or ref.doi) and ref.raw_ref.index(title) > 0:
             findings.append(dict(finding_type='reference_publication_missing', reference_id=reference_id,
                 finding=PUBLICATION_MISSING_TEXT, rule_id='apa7_publication_details_present_v1',
+                # The title the details should follow is marked (owner request 2026-10-16).
+                locate_value=title,
                 rule_source=APA_TITLE_RULE_SOURCE,
                 field_difference={'field_name': 'entry', 'submitted_value': ref.raw_ref},
                 rectangles=[], localization_status='not_assessed'))
@@ -727,15 +922,19 @@ CHAPTER_EDITORS_MISSING_TEXT = 'This reference cites a chapter in the form used 
 CHAPTER_PAGES_MISSING_TEXT = 'This reference cites a chapter but gives no page range for it.'
 
 
-def chapter_form_findings(references, citation_format: str) -> list[dict]:
+def chapter_form_findings(references, citation_format: str,
+                          container_records: dict | None = None) -> list[dict]:
     """APA chapter references that omit the book's editors or the chapter's page range.
 
     Only references parsed as book sections in the "In <book>" form are
     assessed; the finding states what the reference lacks, without advice.
+    When the book was identified as single-authored there are no editors to
+    name, so the finding says that instead (owner decision 2026-10-16).
     """
     if citation_format != 'apa':
         return []
     findings = []
+    records = container_records or {}
     for reference in references:
         raw = getattr(reference, 'raw_ref', '') or ''
         # The checks read the entry itself, so a reference held for review
@@ -750,12 +949,107 @@ def chapter_form_findings(references, citation_format: str) -> list[dict]:
                 ('chapter_pages_missing', CHAPTER_PAGES_MISSING_TEXT, _CHAPTER_PAGES_RE.search(raw))):
             if present:
                 continue
+            record = records.get(getattr(reference, 'reference_id', '')) or {}
+            if finding_type == 'chapter_editors_missing' and record.get('is_monograph'):
+                findings.append(_monograph_part_finding(reference, record, ''))
+                continue
             findings.append(dict(
                 finding_type=finding_type, reference_id=reference.reference_id, finding=text,
+                # Marked where the missing element belongs, not the whole entry
+                # (owner request 2026-10-16).
+                **({'locate_value': place} if (place := _in_book_text(reference)) else {}),
                 rule_id='apa7_chapter_reference_elements_v1', rule_source=APA_CONTRIBUTION_RULE_SOURCE,
                 field_difference={'field_name': 'editors' if finding_type == 'chapter_editors_missing' else 'pages',
                                   'submitted_value': ''},
                 rectangles=[], localization_status='not_assessed'))
+    return findings
+
+
+# Reference details (owner decision 2026-10-18: descriptions, not directions).
+DOI_OLD_FORM_TEXT = 'The DOI is written in the older "doi:" form rather than as a https://doi.org/ link.'
+DOI_PREFIX_MISSING_TEXT = 'The DOI is missing its "10." prefix.'
+ARTICLE_PAGES_MISSING_TEXT = 'This reference gives no page range; the located record gives pages {pages}.'
+ARTICLE_FIRST_PAGE_ONLY_TEXT = 'This reference gives only the first page; the located record gives pages {pages}.'
+_DOI_OLD_FORM_RE = re.compile(r'\bdoi:\s*10\.\d{4,9}/\S+', re.I)
+_DOI_NO_PREFIX_RE = re.compile(r'\b(?:doi:\s*|doi\.org/)(?!10\.)\d{3,9}/\S+', re.I)
+
+
+def reference_detail_findings(references, citation_format: str, discoveries: dict | None = None) -> list[dict]:
+    """APA DOI form, a DOI missing its "10.", and a journal article without a
+    complete page range when its located record gives one (an online-only
+    article's record has no page range or only an article number, so it is
+    never flagged)."""
+    if citation_format != 'apa':
+        return []
+    findings = []
+    for reference in references:
+        raw = getattr(reference, 'raw_ref', '') or ''
+        rid = reference.reference_id
+
+        def finding(kind, text, locate, field):
+            return dict(finding_type=kind, reference_id=rid, finding=text,
+                        **({'locate_value': locate} if locate and raw.count(locate) == 1 else {}),
+                        rule_id='apa7_reference_details_v1', rule_source=APA_TITLE_RULE_SOURCE,
+                        field_difference={'field_name': field, 'submitted_value': locate or ''},
+                        rectangles=[], localization_status='not_assessed')
+        if (match := _DOI_NO_PREFIX_RE.search(raw)):
+            findings.append(finding('doi_prefix_missing', DOI_PREFIX_MISSING_TEXT, match.group().rstrip('.,;'), 'doi'))
+        elif (match := _DOI_OLD_FORM_RE.search(raw)):
+            findings.append(finding('doi_old_form', DOI_OLD_FORM_TEXT, match.group().rstrip('.,;'), 'doi'))
+        if getattr(reference, 'source_kind', '') != 'journal_article':
+            continue
+        given = str(getattr(reference, 'pages', '') or '').strip()
+        if re.search(r'\d\s*[-–—]\s*\d', given):
+            continue
+        recorded = _recorded_page_range((discoveries or {}).get(rid))
+        if not recorded:
+            continue
+        text = (ARTICLE_FIRST_PAGE_ONLY_TEXT if re.search(r'\d', given) else ARTICLE_PAGES_MISSING_TEXT)
+        findings.append(finding('article_pages_missing', text.format(pages=recorded),
+                                given or (getattr(reference, 'container_title', '') or ''), 'pages'))
+    return findings
+
+
+def _recorded_page_range(discovery: dict | None) -> str:
+    """The page range of a credible record agreeing on title and author."""
+    for candidate in (discovery or {}).get('candidates') or []:
+        if not (candidate.get('plausible_identity_match') or candidate.get('authoritative_identifier_match')):
+            continue
+        outcomes = {c.get('field_name'): c.get('outcome') for c in candidate.get('comparisons') or []}
+        if outcomes.get('title') != 'agreement' or outcomes.get('author') not in {'agreement', 'minor_difference'}:
+            continue
+        pages = str((candidate.get('observed') or {}).get('pages') or '').strip()
+        if re.fullmatch(r'\d{1,5}\s*[-–—]\s*\d{1,5}', pages):
+            return re.sub(r'\s*[-–—]\s*', '–', pages)
+    return ''
+
+
+# Owner wording (2026-10-18): students do not use entire collections.
+WHOLE_EDITED_BOOK_TEXT = 'This reference cites the whole edited book; specific chapters should be cited.'
+_EDITORS_ROLE_RE = re.compile(r'\((?:Eds?|Editors?)\.?\)', re.I)
+
+
+def whole_edited_book_findings(references, citation_format: str) -> list[dict]:
+    """An APA reference to a whole edited book, with editors and no chapter
+    ("In <book>") part (Television Without Frontiers reference 3, 2026-10-18).
+    The title is marked."""
+    if citation_format != 'apa':
+        return []
+    findings = []
+    for reference in references:
+        raw = getattr(reference, 'raw_ref', '') or ''
+        if (getattr(reference, 'source_kind', '') != 'edited_collection'
+                or getattr(reference, 'source_kind_confidence', '') != 'high'
+                or not _EDITORS_ROLE_RE.search(raw) or _CHAPTER_IN_RE.search(raw)):
+            continue
+        title = str(getattr(reference, 'title', '') or '')
+        findings.append(dict(
+            finding_type='whole_edited_book_cited', reference_id=reference.reference_id,
+            finding=WHOLE_EDITED_BOOK_TEXT,
+            **({'locate_value': title} if title and raw.count(title) == 1 else {}),
+            rule_id='apa7_edited_book_contribution_v1', rule_source=APA_CONTRIBUTION_RULE_SOURCE,
+            field_difference={'field_name': 'title', 'submitted_value': title},
+            rectangles=[], localization_status='not_assessed'))
     return findings
 
 
@@ -841,21 +1135,40 @@ def contribution_editor_findings(references, container_records: dict | None = No
         record = records.get(getattr(reference, 'reference_id', '')) or {}
         if not record.get('is_monograph'):
             continue  # unidentified, or a genuine edited collection
-        located = str(record.get('title') or '').strip()
-        findings.append(dict(
-            finding_type='contribution_author_is_volume_editor',
-            reference_id=reference.reference_id,
-            finding=(
-                f'The located work{" " + located if located else ""} is a single-authored '
-                'book, not an edited collection, so this reference cites a part of it as '
-                'though it were a chapter in an edited volume.'),  # no advice (owner decision 2026-10-01)
-            rule_id='apa7_contribution_author_is_editor_v1',
-            rule_source=APA_CONTRIBUTION_RULE_SOURCE,
-            located_record={**{k: record.get(k) for k in ('title', 'authors', 'provider')},
-                            'source_kind': record.get('located_source_kind') or record.get('source_kind')},
-            field_difference={'field_name': 'editor', 'submitted_value': editor},
-            rectangles=[], localization_status='not_assessed'))
+        findings.append(_monograph_part_finding(reference, record, editor))
     return findings
+
+
+def _in_book_text(reference) -> str:
+    """The entry's own "In <book>" text, where a chapter's editors and pages go."""
+    raw = getattr(reference, 'raw_ref', '') or ''
+    container = (getattr(reference, 'container_title', '') or '').strip()
+    if container and f'In {container}' in raw:
+        return f'In {container}'
+    return container if container and container in raw else ''
+
+
+def _monograph_part_finding(reference, record: dict, editor: str) -> dict:
+    """A part of an identified single-authored book cited as an edited-volume chapter."""
+    located = str(record.get('title') or '').strip()
+    title = (getattr(reference, 'title', '') or '').strip()
+    raw = getattr(reference, 'raw_ref', '') or ''
+    return dict(
+        # Only the part's title is marked: the rest of the entry is not wrong
+        # (owner request 2026-10-16).
+        **({'locate_value': title} if title and title in raw else {}),
+        finding_type='contribution_author_is_volume_editor',
+        reference_id=reference.reference_id,
+        finding=(
+            f'The located work{" " + located if located else ""} is a single-authored '
+            'book, not an edited collection, so this reference cites a part of it as '
+            'though it were a chapter in an edited volume.'),  # no advice (owner decision 2026-10-01)
+        rule_id='apa7_contribution_author_is_editor_v1',
+        rule_source=APA_CONTRIBUTION_RULE_SOURCE,
+        located_record={**{k: record.get(k) for k in ('title', 'authors', 'provider')},
+                        'source_kind': record.get('located_source_kind') or record.get('source_kind')},
+        field_difference={'field_name': 'editor', 'submitted_value': editor},
+        rectangles=[], localization_status='not_assessed')
 
 
 # Fields whose disagreement is a citation detail, not an identity question.
@@ -875,7 +1188,9 @@ def contribution_editor_findings(references, container_records: dict | None = No
 # Kept in step with `_MATERIAL_CONFLICT_FIELDS` in reference_discovery: pages
 # and publisher are excluded because their measured conflicts were input
 # defects, not reference errors. See the note there.
-_CONFLICT_REPORTABLE_FIELDS = ('volume', 'issue')
+# A book title conflicts only through the chapter rule
+# (reference_discovery._chapter_record_names_another_book, 2026-10-18).
+_CONFLICT_REPORTABLE_FIELDS = ('container_title', 'volume', 'issue')
 _CONFLICT_FIELD_LABELS = {
     'container_title': 'journal or book title', 'volume': 'volume',
     'issue': 'issue', 'pages': 'pages', 'publisher': 'publisher',
@@ -930,6 +1245,8 @@ def bibliographic_field_conflicts(reference: ParsedReference, discovery: dict) -
             submitted = str(getattr(reference, field, '') or '')
             observed = str(getattr(candidate.observed, field, '') or '')
             if (comparison is None or comparison.outcome != 'material_conflict'
+                    or (field == 'container_title'
+                        and comparison.reason_code != 'chapter_record_names_another_book')
                     or not submitted or not observed
                     or comparison.expected_sha256 != _value_hash(submitted)
                     or comparison.observed_sha256 != _value_hash(observed)):
@@ -962,6 +1279,12 @@ def bibliographic_field_conflicts(reference: ParsedReference, discovery: dict) -
                  f'{named}. {detail}. Check these details against the source; a record that '
                  f'agrees on the work may still index a different version of it.'),
         field_differences=differences,
+        # Where the finding is marked: its first differing field as written
+        # (without it the finding was never placed, so never shown; 2026-10-18).
+        field_difference={'field_name': differences[0]['field_name'],
+                          'submitted_value': differences[0]['submitted_value'],
+                          **({'raw_offset': reference.raw_ref.find(differences[0]['submitted_value'])}
+                             if reference.raw_ref.count(differences[0]['submitted_value']) == 1 else {})},
         located_record_providers=sorted(providers),
         exact_edition_established=False,
         rectangles=[], localization_status='not_assessed',

@@ -17,8 +17,13 @@ from app.services.schemas import bound_text_fields, declared_max_length, note_bo
 
 from app.services.relevance import extract_surnames, score_title_relevance, verify_authors
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
+from app.services.cross_language_identity import (
+    compare_authors as compare_romanised_authors,
+    compare_titles as compare_romanised_titles,
+    latin_title_part_match,
+)
 from app.services.retrieval.base import OBSERVED_AUTHOR_LIMIT, RetrievalResult
-from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, REQUIRED_API_PROVIDERS
+from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY, is_required_web_provider_set, required_api_providers
 from app.services.search.transient import TransientSearchAudit
 from app.services.search.candidate_audit import SearchCandidateAudit
 from app.services.journal_discovery import JournalCheck
@@ -29,9 +34,7 @@ SearchPolicyVersion = Literal["configured-search-v1", "api-first-search-v2"]
 
 # These observations preserve a successful HTTP lookup without inventing an
 # empty registry or completed identity adjudication of discarded records.
-INCOMPLETE_METADATA_SEARCH_REASONS = frozenset({
-    'metadata_candidates_filtered', 'metadata_empty_response_unqualified',
-})
+from app.services.search_completion import UNCERTIFIED_METADATA_REASONS as INCOMPLETE_METADATA_SEARCH_REASONS  # noqa: E402
 
 
 ReferenceDiscoveryOutcome = Literal[
@@ -125,7 +128,11 @@ CandidateAcquisitionOutcome = Literal[
 ]
 
 
-_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "tavily", "searxng", "bright_data", "mojeek"})
+_SEARCH_RESULT_PROVIDERS = frozenset({"web_search", "brave", "exa", "deepseek", "tavily", "mojeek"})
+# Optional web fallbacks, whose unresolved candidates never hold a search
+# incomplete. "searxng" was removed 2026-10-19 and stays named so stored
+# traces that record it are assessed as before.
+_OPTIONAL_WEB_FALLBACK_PROVIDERS = frozenset({"tavily", "searxng"})
 
 
 class ExpectedBibliographicFields(BaseModel):
@@ -194,7 +201,28 @@ class ExpectedBibliographicFields(BaseModel):
         significant_title_words = [
             value for value in self.title.split() if len(value.strip(".,:;!?")) >= 3
         ]
-        return len(significant_title_words) >= 2
+        # A one-word book title ("Stars") still names a book once its author
+        # and publisher come with it (2026-10-16).
+        book = (self.source_kind in {"monograph", "edited_collection"}
+                and any(a.strip() for a in self.authors) and self.publisher.strip())
+        return len(significant_title_words) >= (1 if book else 2)
+
+
+def is_part_title_namesake(expected: "ExpectedBibliographicFields", candidate: "ReferenceDiscoveryCandidate") -> bool:
+    """A record sharing only a cited chapter's title, by other authors and not
+    in the cited book, is another work (Hayworth reference 9, 2026-10-16).
+
+    Applied only once the cited book itself is identified, so the record
+    cannot be the book's own listing of the chapter.
+    """
+    # A page read and checked for its title is still another work when its
+    # author conflicts and it is not in the book (Hayworth reference 9).
+    if (expected.source_kind != "book_section" or not expected.container_title.strip()
+            or candidate.authoritative_identifier_match):
+        return False
+    outcomes = {item.field_name: item.outcome for item in candidate.comparisons}
+    return (outcomes.get("title") == "agreement" and outcomes.get("author") == "material_conflict"
+            and outcomes.get("container_title") != "agreement")
 
 
 def is_edition_sensitive_reference(expected: ExpectedBibliographicFields, raw_reference: str = "") -> bool:
@@ -369,6 +397,25 @@ class BibliographicFieldComparison(BaseModel):
     observed_sha256: str | None = Field(default=None, min_length=64, max_length=64)
     outcome: FieldComparisonOutcome
     reason_code: str = Field(min_length=1, max_length=100)
+    # The comparison procedure when it is not the ordinary spelling
+    # comparison (`cross-language-identity-v1`); never serialized when
+    # absent, so stored comparisons and their hashes are unchanged.
+    method: str | None = Field(default=None, max_length=60)
+
+    @model_serializer(mode='wrap')
+    def _omit_absent_method(self, handler):
+        payload = handler(self)
+        if self.method is None:
+            payload.pop('method', None)
+        return payload
+
+
+_ROMANISED_REASONS = frozenset({
+    "romanised_title_match", "romanised_main_title_match", "romanised_title_near_match",
+    "romanised_title_prefix_match", "romanised_near_match_model_same_work",
+    "romanised_title_conflict", "romanised_title_part_match", "cited_translation_title_match",
+    "romanised_author_match", "romanised_author_partial_match", "romanised_author_conflict",
+})
 
 
 class BookEditionMetadata(BaseModel):
@@ -448,7 +495,7 @@ class ReferenceDiscoveryCandidate(BaseModel):
                     or not self.location_sha256
                     or self.has_material_conflict
                     or not (self.authoritative_identifier_match or self.agreement_count >= 2)
-                    or self.has_unresolved_supplied_identity_fields):
+                    or self.has_unresolved_supplied_identifying_fields):
                 raise ValueError("Landing-page identity lacks independently bound bibliographic agreement")
         return self
 
@@ -458,15 +505,31 @@ class ReferenceDiscoveryCandidate(BaseModel):
 
         Keep its original hash and unknown comparison for audit; it supplies
         neither an agreement nor a conflict. Other missing fields stay closed.
+        Findings that accuse a reference (a missing required DOI) use this
+        strict form.
         """
+        return self.unresolved_supplied(frozenset())
+
+    @property
+    def has_unresolved_supplied_identifying_fields(self) -> bool:
+        """As above, except that a journal, volume, issue or page range the
+        page does not show neither confirms nor blocks identity; a shown one
+        that conflicts still does. The identity rule for acquired pages
+        (owner direction 2026-10-14: one rule for DOI and web pages)."""
+        return self.unresolved_supplied(DESCRIPTIVE_IDENTITY_FIELDS)
+
+    def unresolved_supplied(self, unshown_allowed: frozenset[str], ignored: frozenset[str] = frozenset()) -> bool:
+        """A supplied field, other than `ignored`, is neither agreeing nor (for
+        `unshown_allowed`) simply not shown on the page."""
         return any(
-            c.expected_sha256
+            c.expected_sha256 and c.field_name not in ignored
             and c.outcome not in {"agreement", "minor_difference"}
             and not (
                 c.field_name == "year"
                 and c.expected_sha256 == _value_hash("n.d.")
                 and c.outcome == "unknown"
             )
+            and not (c.field_name in unshown_allowed and c.outcome == "unknown" and not c.observed_sha256)
             for c in self.comparisons
         )
 
@@ -487,7 +550,7 @@ class ReferenceDiscoveryCandidate(BaseModel):
 
     @property
     def is_credible(self) -> bool:
-        if self.acquisition_outcome == "identity_rejected":
+        if self.acquisition_outcome == "identity_rejected" or self.disposition_reason_code == "part_title_namesake":
             return False
         return (
             bool(self.validated_identity_content_sha256)
@@ -689,6 +752,7 @@ def assess_reference_discovery_trace(
             attempts=parsed.attempts,
             candidates=parsed.candidates,
             search_policy_version=parsed.search_policy_version,
+            required_web_providers=parsed.required_web_providers,
             search_retention_policy=parsed.search_retention_policy,
             created_at=created_at,
         )
@@ -742,6 +806,12 @@ def _title_absence_reason(result, acquisition_outcome: str) -> str | None:
     return None
 
 
+def _organisation_author(authors) -> bool:
+    """A cited author that names an organisation, not people."""
+    from app.services.source_validator import _cited_personal_surnames
+    return bool(authors) and not _cited_personal_surnames(" & ".join(authors))
+
+
 def build_reference_discovery_candidate(
     *,
     attempt_id: str,
@@ -757,8 +827,12 @@ def build_reference_discovery_candidate(
     location_rank: int | None = None,
     origin_providers: list[str] | None = None,
     disposition_reason_code: str | None = None,
+    opened_page_url: str | None = None,
 ) -> ReferenceDiscoveryCandidate:
-    """Normalize one resolver candidate into inspectable field comparisons."""
+    """Normalize one resolver candidate into inspectable field comparisons.
+
+    `opened_page_url` is the final address of a page the application fetched
+    and read itself, never a search provider's result list."""
     if (result.metadata or {}).get("candidate_budget_skipped"):
         seed = f"{attempt_id}\x1f{provider}\x1f{candidate_key or ''}"
         return ReferenceDiscoveryCandidate(
@@ -820,7 +894,17 @@ def build_reference_discovery_candidate(
     cross_script_judgment = (result.metadata or {}).get("cross_script_judgment") or {}
     if expected.title or result.title:
         if expected.title and result.title:
-            if cross_script_comparison_unresolved(expected.title, result.title):
+            if cross_script_comparison_unresolved(expected.title, result.title) and (
+                    romanised := compare_romanised_titles(expected.title, result.title)):
+                # A Han-script title read as the cited romanised title
+                # (cross-language-identity-v1, owner decision 2026-10-12).
+                title_outcome = romanised["outcome"]
+                title_reason = romanised["reason_code"]
+                if title_outcome == "minor_difference" and cross_script_judgment.get("same_work") == "yes":
+                    # A near reading the model also judged the same work.
+                    title_outcome, title_reason = "agreement", "romanised_near_match_model_same_work"
+                title_relevant = title_outcome in {"agreement", "minor_difference"}
+            elif cross_script_comparison_unresolved(expected.title, result.title):
                 # The configured model's comparison across writing systems
                 # (cross-script-identity-v1, owner decision 2026-10-06).
                 same_work = cross_script_judgment.get("same_work")
@@ -828,6 +912,12 @@ def build_reference_discovery_candidate(
                 title_reason = {"yes": "cross_script_model_same_work", "no": "cross_script_model_different_work",
                                 "unsure": "cross_script_model_unsure"}.get(same_work, "cross_script_title_unresolved")
                 title_relevant = same_work == "yes"
+            elif part_match := latin_title_part_match(expected.title, result.title):
+                # The record carries only the cited romanised title or only
+                # its cited translation (cross-language-identity-v1).
+                title_outcome = part_match["outcome"]
+                title_reason = part_match["reason_code"]
+                title_relevant = True
             elif _normalize_text(expected.title) == _normalize_text(result.title):
                 title_outcome: FieldComparisonOutcome = "agreement"
                 title_reason = "normalized_title_match"
@@ -894,7 +984,25 @@ def build_reference_discovery_candidate(
 
     if expected.authors or result.authors:
         judged_author = cross_script_judgment.get("author")
-        if expected.authors and result.authors and judged_author in {"agrees", "differs"}:
+        romanised_author = (compare_romanised_authors(expected_author_names, observed_author_names)
+                            if expected.authors and result.authors else None)
+        if (romanised_author and romanised_author["outcome"] == "material_conflict"
+                and _organisation_author(expected.authors)):
+            # A cited organisation against people a page in another language
+            # names (its editor): a translation, not a conflict (2026-10-13).
+            author_outcome, author_reason = "unknown", "cross_script_organisation_author_unresolved"
+        elif romanised_author:
+            # Han-script names read as the cited romanised names
+            # (cross-language-identity-v1).
+            author_outcome = romanised_author["outcome"]
+            author_reason = romanised_author["reason_code"]
+        elif (expected.authors and result.authors and judged_author == "differs"
+                and _organisation_author(expected.authors)):
+            # An organisation named in another language is a translation, and
+            # translations vary ("Central Government" for two named ministries):
+            # no conflict either way (owner decision 2026-10-13).
+            author_outcome, author_reason = "unknown", "cross_script_organisation_author_unresolved"
+        elif expected.authors and result.authors and judged_author in {"agrees", "differs"}:
             author_outcome = "agreement" if judged_author == "agrees" else "material_conflict"
             author_reason = "cross_script_model_author_" + judged_author
         elif expected.authors and result.authors:
@@ -948,6 +1056,12 @@ def build_reference_discovery_candidate(
             year_reason = "year_missing_on_one_side"
         if (result.metadata or {}).get("web_identity", {}).get("date_method") == "catalog_publication_date" and observed_year:
             year_reason = "catalog_publication_year_" + year_outcome
+        if (year_outcome == "material_conflict" and cross_script_judgment.get("same_work") == "yes"
+                and int(observed_year) > int(expected_year)):
+            # A page in another writing system judged to be the cited work and
+            # dated later was posted or republished then (a regulation reposted
+            # years after it was issued, 2026-10-12); the date is not the work's.
+            year_outcome, year_reason = "unknown", "cross_script_page_dated_later"
         if year_outcome == "material_conflict" and is_edition_sensitive_reference(expected) and not edition_match:
             year_outcome, year_reason = "unknown", "book_edition_year_unresolved"
         comparisons.append(
@@ -962,7 +1076,10 @@ def build_reference_discovery_candidate(
 
     metadata = result.metadata or {}
     container = metadata.get('container_title') or ''
-    pages = metadata.get('pages') or metadata.get('page') or ''
+    # A publisher or repository page states its pages in its own metadata
+    # (citation_firstpage/lastpage), read into its web identity (2026-10-18).
+    web_identity = metadata.get('web_identity') if isinstance(metadata.get('web_identity'), dict) else {}
+    pages = metadata.get('pages') or metadata.get('page') or web_identity.get('pages') or ''
     # The imprint is one of the four identity fields, so the trace has to show
     # whether it agreed. Measured over 9,935 stored candidate records, not one
     # retained a publisher, which is why no merge could ever evidence it.
@@ -978,8 +1095,11 @@ def build_reference_discovery_candidate(
             container = titles[0]
     container = container if isinstance(container, str) and len(container) <= 1000 else ''
     pages = pages if isinstance(pages, str) and len(pages) <= 100 else ''
-    volume = metadata.get('volume') or ''
-    issue = metadata.get('issue') or ''
+    # Some adapters pass their provider's whole record as metadata; OpenAlex
+    # returned a structured `volume` on 2026-10-11 and the comparison below
+    # failed the paper run. Only a short text or whole number is a volume.
+    volume = _component_scalar(metadata.get('volume'))
+    issue = _component_scalar(metadata.get('issue'))
     for field, observed_value in [('container_title', container), ('pages', pages),
                                   ('volume', volume), ('issue', issue),
                                   ('publisher', observed_publisher)]:
@@ -993,6 +1113,9 @@ def build_reference_discovery_candidate(
                 # made `material_conflict` unreachable for these fields and
                 # the field-conflict finding unable to fire at all.
                 outcome, reason = 'material_conflict', 'component_field_values_disagree'
+            elif field == 'container_title' and _chapter_record_names_another_book(
+                    expected, comparisons, submitted_value, observed_value, pages):
+                outcome, reason = 'material_conflict', 'chapter_record_names_another_book'
             else:
                 outcome, reason = 'unknown', 'component_field_missing_or_unresolved'
             comparisons.append(_comparison(field, submitted_value, observed_value,
@@ -1075,8 +1198,12 @@ def build_reference_discovery_candidate(
         ),
         title_absence_reason=_title_absence_reason(result, acquisition_outcome),
         # A web-search result's address is never kept (provider terms,
-        # ARCHITECTURE retention rule), even for a page the application opened.
-        page_url=(location_url if location_url and location_url.lower().startswith(("http://", "https://"))
+        # ARCHITECTURE retention rule). The address of a page the application
+        # opened and read is the page's own and is kept (owner decision
+        # 2026-10-14), so a located record found through search has its link.
+        page_url=(opened_page_url if opened_page_url and opened_page_url.lower().startswith(("http://", "https://"))
+                  and len(opened_page_url) <= 2000 else
+                  location_url if location_url and location_url.lower().startswith(("http://", "https://"))
                   and acquisition_outcome not in {"metadata_only", "not_attempted", "transport_failure",
                                                   "access_restricted", "unavailable", "unknown"}
                   and not ({provider, discovery_provider or "", *(origin_providers or [])} & _SEARCH_RESULT_PROVIDERS)
@@ -1118,6 +1245,15 @@ def build_reference_discovery_candidate(
     return candidate
 
 
+def _component_scalar(value) -> str:
+    """A volume or issue as text, or '' when the provider gave anything else."""
+    if isinstance(value, bool):
+        return ''
+    if isinstance(value, int):
+        return str(value)
+    return value.strip() if isinstance(value, str) and len(value) <= 80 else ''
+
+
 def _comparison(
     field_name: str,
     expected: str,
@@ -1126,6 +1262,7 @@ def _comparison(
     reason_code: str,
 ) -> BibliographicFieldComparison:
     return BibliographicFieldComparison(
+        **({"method": "cross-language-identity-v1"} if reason_code in _ROMANISED_REASONS else {}),
         field_name=field_name,
         expected_sha256=_value_hash(expected) if expected else None,
         observed_sha256=_value_hash(observed) if observed else None,
@@ -1188,6 +1325,28 @@ def _abbreviation_compatible(left: str, right: str) -> bool:
     return True
 
 
+_BOOK_TITLE_FILLER = frozenset({"a", "an", "the", "of", "and", "in", "on", "for", "to", "ebook", "ebooks"})
+
+
+def _chapter_record_names_another_book(expected, comparisons, submitted: str, observed: str, observed_pages) -> bool:
+    """A chapter's record agrees on its title, author and pages but names a
+    book sharing no word with the one the student wrote ("Sringer eBooks" for
+    "Neoliberalism and Post-Soviet Transition"): the book title is wrong.
+    Owner decision 2026-10-18, narrower than the general container rule that
+    stays off (a translated journal title had fired it): chapters only, and
+    only with the record's title, author and pages in agreement."""
+    if expected.source_kind != "book_section" or not submitted or not observed:
+        return False
+    outcomes = {comparison.field_name: comparison.outcome for comparison in comparisons}
+    if outcomes.get("title") != "agreement" or outcomes.get("author") not in {"agreement", "minor_difference"}:
+        return False
+    numbers = lambda value: re.findall(r"\d+", str(value or ""))
+    if not numbers(expected.pages) or numbers(expected.pages) != numbers(observed_pages):
+        return False
+    words = lambda value: {t for t in _conflict_tokens(value) if t not in _BOOK_TITLE_FILLER}
+    return bool(words(submitted) and words(observed) and not words(submitted) & words(observed))
+
+
 def _field_materially_conflicts(field: str, submitted: str, observed: str) -> bool:
     """Whether two present values disagree in a way a reader could act on.
 
@@ -1223,12 +1382,33 @@ def _web_title_furniture_only(expected: str, observed: str, *, author_match: boo
         return False
     page = _BRACKET_DESCRIPTOR.sub(" ", observed or "")
     forms = {_normalize_text(page)}
+    archive = _ARCHIVE_ITEM_TITLE.match(page)
+    # Matching authors required: "The studio system : Free Download ..." alone
+    # would make a generic short title a match (measured 2026-10-16).
+    if archive and author_match:
+        # "Title : subtitle : Creator, A : Free Download, Borrow, and
+        # Streaming : Internet Archive" (Hayworth reference 12, 2026-10-16):
+        # the item page's own title; the creator segment counts only with
+        # matching authors.
+        forms.add(_normalize_text(archive.group("item")))
+        if " : " in archive.group("item"):
+            forms.add(_normalize_text(archive.group("item").rsplit(" : ", 1)[0]))
     match = _SITE_SUFFIX.search(page)
     if match and len(match.group(0).split()) <= 6 and (author_match or match.group(0).strip().startswith("|")):
         forms.add(_normalize_text(page[:match.start()]))
+    # A bookseller's format after the title ("... - A Biography of Rita
+    # Hayworth - Softcover", Hayworth reference 6, 2026-10-16).
+    fmt = _BOOK_FORMAT_SUFFIX.search(page)
+    if fmt and author_match:
+        forms.add(_normalize_text(page[:fmt.start()]))
     return cited in forms
 
 
+_BOOK_FORMAT_SUFFIX = re.compile(
+    r"\s*(?:\||-|–|—|:|,)\s*(?:soft\s*cover|hard\s*cover|hardback|paperback|mass market paperback|e-?book"
+    r"|kindle edition)\s*$", re.IGNORECASE)
+_ARCHIVE_ITEM_TITLE = re.compile(r"^(?P<item>.+?)\s*:\s*Free Download, Borrow, and Streaming\s*:\s*Internet Archive\s*$",
+                                 re.IGNORECASE)
 _VOLUME_NOTE = re.compile(r"\(\s*(?:(?:\d+(?:st|nd|rd|th)|rev(?:ised)?\.?|new|updated)\s*ed(?:ition|\.)?"
                           r"|vol(?:ume|\.)?\s*\d+)\s*\)\s*$", re.IGNORECASE)
 
@@ -1240,7 +1420,8 @@ def _without_volume_note(value: str) -> str:
 def _normalize_text(value: str) -> str:
     # Crossref deposits can carry HTML entities: "Media &amp; Policy" left the
     # journal unresolved and held back Chalaby's DOI finding (2026-09-29).
-    normalized = unicodedata.normalize("NFKC", html.unescape(value)).casefold()
+    from app.services.lookalike_letters import fold_lookalikes
+    normalized = unicodedata.normalize("NFKC", fold_lookalikes(html.unescape(value))).casefold()
     normalized = re.sub(r"[^\w]+", " ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()
 
@@ -1267,6 +1448,11 @@ def _normalize_doi(value: str) -> str:
 def _year(value: str) -> str:
     match = re.search(r"(?:19|20)\d{2}", value)
     return match.group() if match else ""
+
+
+# Fields that describe where a work appears rather than which work it is: a
+# page that does not show them is not held against the work (2026-10-14).
+DESCRIPTIVE_IDENTITY_FIELDS = frozenset({"container_title", "volume", "issue", "pages"})
 
 
 def _value_hash(value: str) -> str:
@@ -1307,6 +1493,7 @@ def qualify_legacy_catalog_dates(discovery: dict | None, reference_url: str | No
         required_route_categories=record.required_route_categories,queries=record.queries,
         attempts=record.attempts,candidates=corrected,created_at=record.created_at,
         search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
         search_retention_policy=record.search_retention_policy,
     )
     # Removing an unreliable year cannot establish a newly confirmed edition.
@@ -1314,6 +1501,26 @@ def qualify_legacy_catalog_dates(discovery: dict | None, reference_url: str | No
         result = result.model_copy(update={"outcome":"possible_match", "contributes_to_neutral_pattern":False})
     return {**result.model_dump(mode="json"), "limitations": [*result.limitations,
         "The catalog webpage year was not verified as the work's publication year; that date comparison is not assessed."]}
+
+
+def qualify_title_alone_web_conflicts(discovery: dict | None) -> dict | None:
+    """A stored conflict that rests only on a web result matching the title is
+    re-derived under the title-alone rule (owner decision 2026-10-21)."""
+    if (not discovery or discovery.get("outcome") != "bibliographic_conflict"
+            or not any(title_alone_web_match(c) for c in discovery.get("candidates") or [])):
+        return discovery
+    record = ReferenceDiscoveryRecord.model_validate(discovery)
+    result = derive_reference_discovery_record(
+        reference_id=record.reference_id, expected=record.expected,
+        required_route_categories=record.required_route_categories, queries=record.queries,
+        attempts=record.attempts, candidates=record.candidates, created_at=record.created_at,
+        search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
+        search_retention_policy=record.search_retention_policy)
+    if result.outcome == discovery.get("outcome"):
+        return discovery
+    return {**result.model_dump(mode="json"), "limitations": list(dict.fromkeys([
+        *record.limitations, *result.limitations]))[:16]}
 
 
 def qualify_book_edition_years(discovery: dict | None, raw_reference: str = "") -> dict | None:
@@ -1342,6 +1549,7 @@ def qualify_book_edition_years(discovery: dict | None, raw_reference: str = "") 
         required_route_categories=record.required_route_categories, queries=record.queries,
         attempts=record.attempts, candidates=candidates, created_at=record.created_at,
         search_policy_version=record.search_policy_version,
+        required_web_providers=record.required_web_providers,
         search_retention_policy=record.search_retention_policy)
     if result.outcome in {"confirmed", "confirmed_with_minor_differences", "unlocated_after_search"}:
         result = result.model_copy(update={"outcome": "possible_match", "contributes_to_neutral_pattern": False})
@@ -1381,6 +1589,33 @@ def credible_field_candidates(record: ReferenceDiscoveryRecord, fields=("title",
             yield candidate
 
 
+def title_alone_web_match(candidate, *, enabled: bool | None = None) -> bool:
+    """A web-search result that agrees with the reference only on its title:
+    no identifier, no identity read from its content and no other agreeing
+    field. It may identify a work but cannot raise a conflict (owner decision
+    2026-10-21; a film's sales page against a review of the film). A student's
+    own link is not a search result and is not covered."""
+    from app.config import settings
+    if not (settings.WEB_TITLE_ALONE_CONFLICT_BLOCKED if enabled is None else enabled):
+        return False
+    get = candidate.get if isinstance(candidate, dict) else (lambda key: getattr(candidate, key, None))
+    if get("provider") != "web_search" or get("authoritative_identifier_match") or get("validated_identity_content_sha256"):
+        return False
+    for comparison in get("comparisons") or []:
+        cget = comparison.get if isinstance(comparison, dict) else (lambda key, c=comparison: getattr(c, key, None))
+        if cget("field_name") != "title" and cget("outcome") in {"agreement", "minor_difference"}:
+            return False
+    return True
+
+
+def _record_web_providers(required_web_providers) -> tuple[str, ...]:
+    """The pair a record names, so a stored record is judged by the providers it
+    searched; the current setting only for a new search that names none."""
+    if is_required_web_provider_set(required_web_providers):
+        return tuple(required_web_providers)
+    return required_api_providers()
+
+
 def derive_reference_discovery_record(
     *,
     reference_id: str,
@@ -1392,6 +1627,7 @@ def derive_reference_discovery_record(
     search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
     search_retention_policy: Literal["brave-operational-transient-v1"] | None = None,
     created_at: datetime | None = None,
+    required_web_providers: list[str] | None = None,
 ) -> ReferenceDiscoveryRecord:
     """Derive exactly one outcome without treating failed search as absence."""
     _validate_bindings(required_route_categories, queries, attempts, candidates)
@@ -1410,7 +1646,8 @@ def derive_reference_discovery_record(
     else:
         credible = [candidate for candidate in candidates if candidate.is_credible]
         compatible = [candidate for candidate in credible if not candidate.has_material_conflict]
-        conflicts = [candidate for candidate in credible if candidate.has_material_conflict]
+        conflicts = [candidate for candidate in credible if candidate.has_material_conflict
+                     and not title_alone_web_match(candidate)]
         exact = [
             candidate
             for candidate in compatible
@@ -1445,7 +1682,8 @@ def derive_reference_discovery_record(
             limitations.append(
                 "The reference could not be parsed completely; source identity remains unresolved."
             )
-        elif _search_is_incomplete(required_route_categories, attempts, queries, search_policy_version):
+        elif not _search_completion(required_route_categories, attempts, queries, search_policy_version,
+                                    required_web_providers, expected).complete:
             outcome = "search_incomplete"
             limitations.append(
                 "At least one required search route failed, was unavailable, or did not complete."
@@ -1457,7 +1695,7 @@ def derive_reference_discovery_record(
              or (c.acquisition_outcome == "metadata_only" and not any(
                  comparison.field_name in {"title", "doi"} and comparison.outcome == "material_conflict"
                  for comparison in c.comparisons)))
-            and c.discovery_provider not in {"searxng", "tavily"}
+            and c.discovery_provider not in _OPTIONAL_WEB_FALLBACK_PROVIDERS
             for c in candidates
         ):
             outcome = "search_incomplete"
@@ -1470,7 +1708,7 @@ def derive_reference_discovery_record(
     return ReferenceDiscoveryRecord(
         search_retention_policy=search_retention_policy,
         search_policy_version=search_policy_version,
-        required_web_providers=list(REQUIRED_API_PROVIDERS) if search_policy_version == API_FIRST_SEARCH_POLICY else [],
+        required_web_providers=list(_record_web_providers(required_web_providers)) if search_policy_version == API_FIRST_SEARCH_POLICY else [],
         reference_id=reference_id,
         created_at=created_at or datetime.now(timezone.utc),
         expected=expected,
@@ -1527,71 +1765,18 @@ def _validate_bindings(
         raise ValueError("Candidate provider does not match its route attempt")
 
 
-# Query outcomes a provider recovering could plausibly cure. Excluded:
-# `budget_skipped` (our elapsed budget, not the provider), `internal_error`
-# (our own code), `unknown`, and the metadata reasons in
-# INCOMPLETE_METADATA_SEARCH_REASONS (the provider answered; what it returned
-# was not accepted as a certified empty result).
-_PROVIDER_CURABLE_EXECUTION_OUTCOMES = frozenset({
-    "timeout", "captcha", "operational_failure", "access_restricted",
-    "rate_limited", "response_invalid", "cooldown_skipped",
-    "recovery_probe_in_progress",
-})
-
-
-def search_blocking_providers(
-    required: list[RouteCategory],
-    attempts: list[ReferenceRouteAttempt],
-    queries: list[ReferenceSearchQuery],
-    search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
-) -> list[str]:
-    """Providers whose failure is what holds this search incomplete.
-
-    Mirrors the provider-attributable branches of `_search_is_incomplete`
-    directly below and must change with it: a required attempt that failed,
-    a required web API that never executed, and a required query that did
-    not complete. A provider named here is one whose recovery could let the
-    reference complete. Unresolved web leads and never-attempted categories
-    are not attributable to one provider and name none.
-
-    Until 2026-09-24 the recovery trigger listed every provider with any
-    incomplete query, required or not. All four re-run waves on 2026-09-23 --
-    192 reference re-runs -- were triggered by SearXNG, which cannot complete or
-    invalidate a search under `api-first-search-v2`, and they changed
-    potentially-fabricated-reference flags back and forth across report
-    versions without changing any completion gate.
-    """
-    api_first = search_policy_version == API_FIRST_SEARCH_POLICY
-    failure_outcomes = {"operational_failure", "access_restricted", "unavailable", "not_permitted"}
-    blocking = {
-        attempt.provider for attempt in attempts
-        if attempt.required and attempt.outcome in failure_outcomes
-        and not (api_first and attempt.route_category == "bounded_web")
-        # Our own budget ran out; the provider did nothing wrong.
-        and attempt.reason_code != "route_elapsed_budget_exhausted"
-    }
-    required_attempt_ids = {attempt.attempt_id for attempt in attempts if attempt.required}
-    required_query_ids = {
-        query_id for attempt in attempts
-        if attempt.attempt_id in required_attempt_ids
-        for query_id in attempt.query_ids
-    }
-    if api_first:
-        web_queries = [q for q in queries
-                       if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        blocking |= set(REQUIRED_API_PROVIDERS) - {q.execution_provider for q in web_queries}
-        required_query_ids -= {q.query_id for q in web_queries
-                               if q.execution_provider not in REQUIRED_API_PROVIDERS}
-    blocking |= {
-        query.execution_provider for query in queries
-        if query.query_id in required_query_ids and query.execution_provider
-        and query.execution_outcome in _PROVIDER_CURABLE_EXECUTION_OUTCOMES
-    }
-    return sorted(str(p).strip().casefold() for p in blocking if p)
+def _search_completion(required, attempts, queries, search_policy_version, required_web_providers, expected):
+    """The one completion rule (`search_completion.assess_record`) over a record's parts."""
+    from app.services.search_completion import assess_record
+    return assess_record(completed_negative=True, record={
+        "expected": expected, "required_route_categories": list(required), "attempts": attempts,
+        "queries": queries, "search_policy_version": search_policy_version,
+        "required_web_providers": list(_record_web_providers(required_web_providers))
+        if search_policy_version == API_FIRST_SEARCH_POLICY else list(required_web_providers or [])})
 
 
 # A required full-text search query that did not run to an answer. Unlike
-# `_PROVIDER_CURABLE_EXECUTION_OUTCOMES`, `budget_skipped` counts: a call
+# `search_completion.PROVIDER_CURABLE`, `budget_skipped` counts: a call
 # ceiling or elapsed budget left the search unfinished even though the
 # provider did nothing wrong, and "full text was not retrieved" must not read
 # as a completed search.
@@ -1631,7 +1816,7 @@ def full_text_search_incompleteness(discovery: dict | None) -> dict | None:
         return None
     api_first = discovery.get("search_policy_version") == API_FIRST_SEARCH_POLICY
     required_providers = [str(p).casefold() for p in (
-        discovery.get("required_web_providers") or REQUIRED_API_PROVIDERS)] if api_first else []
+        discovery.get("required_web_providers") or required_api_providers())] if api_first else []
     web_queries = [queries[qid] for attempt in web_attempts
                    for qid in attempt.get("query_ids") or [] if qid in queries]
     incomplete: set[str] = set()
@@ -1655,67 +1840,3 @@ def full_text_search_incompleteness(discovery: dict | None) -> dict | None:
     if incomplete or route_failed:
         return {"providers": sorted(incomplete)}
     return None
-
-
-def _search_is_incomplete(
-    required: list[RouteCategory],
-    attempts: list[ReferenceRouteAttempt],
-    queries: list[ReferenceSearchQuery],
-    search_policy_version: SearchPolicyVersion = LEGACY_SEARCH_POLICY,
-) -> bool:
-    api_first = search_policy_version == API_FIRST_SEARCH_POLICY
-    if any(a.unresolved or a.not_attempted or a.identity_established
-           for attempt in attempts for a in attempt.transient_search_audits):
-        # Affirmative independently bound candidates are selected before this
-        # negative gate. A count alone cannot establish or rule out identity.
-        return True
-    completed = {attempt.route_category for attempt in attempts if attempt.required}
-    if set(required) - completed:
-        return True
-    failure_outcomes = {
-        "operational_failure",
-        "access_restricted",
-        "unavailable",
-        "not_permitted",
-    }
-    if any(
-        attempt.required and attempt.outcome in failure_outcomes
-        and not (api_first and attempt.route_category == "bounded_web")
-        for attempt in attempts
-    ):
-        return True
-    incomplete_execution_outcomes = {
-        "timeout",
-        "captcha",
-        "operational_failure",
-        "access_restricted",
-        "rate_limited",
-        "response_invalid",
-        "budget_skipped",
-        "cooldown_skipped",
-        "recovery_probe_in_progress",
-        "internal_error",
-        "unknown",
-    }
-    required_attempt_ids = {
-        attempt.attempt_id for attempt in attempts if attempt.required
-    }
-    required_query_ids = {
-        query_id
-        for attempt in attempts
-        if attempt.attempt_id in required_attempt_ids
-        for query_id in attempt.query_ids
-    }
-    if api_first:
-        web_queries = [q for q in queries if q.route_category == "bounded_web" and q.query_id in required_query_ids]
-        if set(REQUIRED_API_PROVIDERS) - {q.execution_provider for q in web_queries}:
-            return True
-        # Optional SearXNG/Tavily cannot satisfy or invalidate required APIs.
-        required_query_ids -= {q.query_id for q in web_queries if q.execution_provider not in REQUIRED_API_PROVIDERS}
-    return any(
-        query.query_id in required_query_ids
-        and query.execution_provider is not None
-        and (query.execution_outcome in incomplete_execution_outcomes
-             or query.reason_code in INCOMPLETE_METADATA_SEARCH_REASONS)
-        for query in queries
-    )

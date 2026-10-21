@@ -1,10 +1,8 @@
 from bs4 import BeautifulSoup
-import fitz
 from app.services.evidence_report import _render_reference_panel_template,_render_formatted_reference,_render_continuous_paper
 from app.services.paper_extraction import _build_marker_census
 from app.services.citation_extractor import extract_citations
 from app.services.schemas import ParsedReference
-from app.services.report_export import _render_pdf
 
 
 def test_standalone_and_combined_formatting_categories_match():
@@ -73,16 +71,20 @@ def test_diamond_and_entry_open_the_reference_window_without_a_paper_link():
     assert entry.select_one('rect.reference-entry-hit')['width']=='200.000'
 
 
-def test_pdf_diamond_link_does_not_replace_original_url_target():
-    doc=fitz.open();p=doc.new_page();p.insert_text((50,70),'https://example.org/book')
-    rect=p.search_for('https://example.org/book')[0]
-    p.insert_link({'kind':fitz.LINK_URI,'from':rect,'uri':'https://example.org/book'})
-    raw=doc.tobytes();doc.close()
-    r={'page_index':0,'x0':rect.x0,'y0':rect.y0,'x1':rect.x1,'y1':rect.y1}
-    finding={'finding_type':'submitted_link_issue','rectangles':[r],'finding':'Submitted link returned a missing page.','source':{'raw_reference':'A reference.'}}
-    output,_=_render_pdf(raw,citations=[],reference_practice=[finding],export_binding='diamond-test')
-    with fitz.open(stream=output,filetype='pdf') as result:
-        links=result[0].get_links()
-        assert any(l.get('uri')=='https://example.org/book' for l in links)
-        center=fitz.Point(rect.x1+7,(rect.y0+rect.y1)/2)
-        assert any(l['kind']==fitz.LINK_GOTO and l['from'].contains(center) for l in links)
+def test_an_uncited_reference_is_marked_yellow_over_its_whole_entry():
+    r={'page_index':0,'x0':50,'y0':50,'x1':250,'y1':65}
+    surface={'page_dimensions':[{'page_index':0,'width':600,'height':800}],'page_href_template':'p-{page_index}',
+             'reference_locations':{'r':{'index':0,'rectangles':[r]}}}
+    catalog=[{'reference_id':'r','number':1,'template_id':'reference-entry-panel-1',
+              'location':surface['reference_locations']['r']}]
+    html,_=_render_continuous_paper(surface,[],[],numbers={'r':1},catalog=catalog,uncited_reference_ids=['r'])
+    mark=BeautifulSoup(html,'html.parser').select_one('rect.uncited-highlight')
+    assert mark is not None and mark['width']=='200.000'
+    assert mark.find_parent('a')['data-panel-template']=='reference-entry-panel-1'
+    cited,_=_render_continuous_paper(surface,[],[],numbers={'r':1},catalog=catalog,uncited_reference_ids=[])
+    assert 'uncited-highlight' not in cited
+    from app.services.highlight_priority import prioritize_svg_highlights
+    both = prioritize_svg_highlights('<rect class="uncited-highlight" x="0" y="0" width="100" height="10"/>'
+                                     '<rect class="reference-formatting-hit" x="40" y="0" width="20" height="10"/>')
+    # The finding's own orange mark stays whole over the yellow.
+    assert 'class="reference-formatting-hit" x="40" y="0" width="20" height="10"' in both

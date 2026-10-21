@@ -112,13 +112,21 @@ def assess_quotation_locators(*, body_text: str, citation_format: str,
         trailing=claim.text[quoted.end():].strip()
         marker=claim.citation_marker
         if narrative:
+            from app.services.quotation_form import NARRATIVE_REPORTING_VERBS
             lead = claim.text[:quotes[0].start()]
             according = bool(re.fullmatch(r'According\s+to\s+'+re.escape(marker)+r'\s*,[^.!?\n]{0,200}', lead, re.I))
+            verbs = '|'.join(sorted(map(re.escape, NARRATIVE_REPORTING_VERBS | {'points out', 'pointed out'}),
+                                    key=len, reverse=True))
+            # The sentence may go on after the quotation ("…,” underscoring the
+            # challenge"), but not to another citation (2026-10-18).
+            trailing_ok = bool(re.fullmatch(r'[.!?\s]*', trailing) or (
+                re.match(r'[,\s]*[a-z]+ing\b', trailing)
+                and not re.search(r'\((?:[^()]*?,\s*)?(?:19|20)\d{2}[a-z]?[^()]*\)', trailing)))
             if (len(quote.split()) >= 40 or member.local_start is None or member.local_end is None
                     or claim.text[member.local_start:member.local_end] != marker
                     or not (according or re.fullmatch(r'[^.!?\n]{0,100}?'+re.escape(marker)
-                        +r'\s+(?:writes|wrote|notes|noted|argues|argued|states|stated|reports|reported|explains|explained|says|said|points out|pointed out)\b[^.!?\n]{0,180}', lead, re.I)
-                    ) or (not according and not re.fullmatch(r'[.!?\s]*', trailing))):
+                        +r'\s+(?:'+verbs+r')\b[^.!?\n]{0,180}', lead, re.I)
+                    ) or (not according and not trailing_ok)):
                 record('not_assessed','narrative_quotation_scope_not_explicit');continue
         elif not re.match(r'(?:[A-Za-z’\x27-]+\s+){0,5}[.,;:!?\s]*'+re.escape(marker),trailing):
             record('not_assessed','quotation_marker_not_immediately_attached');continue

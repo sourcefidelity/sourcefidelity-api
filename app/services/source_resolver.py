@@ -8,21 +8,28 @@ import hashlib
 import html
 import logging
 import re
+import threading
 import unicodedata
 import time
-from copy import deepcopy
+from copy import copy as shallow_copy, deepcopy
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+import dataclasses
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from app.services.search.policy import REQUIRED_WEB_PROVIDER_NAMES, required_api_providers
 from app.services.retrieval_deadline import bounded_reference, expired, POLICY as ELAPSED_POLICY
 
 # Reference-local fallback only: never an accepted location or reusable cache hit.
 _PROVISIONAL_CANDIDATES: ContextVar = ContextVar("provisional_candidates", default=None)
+# The current reference's candidate graph. Kept per reference, not on the
+# resolver: a reference resolved before building its own graph read the
+# previous reference's rejected DOI as its own (2026-10-10).
+_LAST_GRAPH: ContextVar = ContextVar("last_canonical_work_graph", default=None)
 
 
 def _timed_retrieval(operation):
@@ -33,7 +40,8 @@ def _timed_retrieval(operation):
         tick = time.perf_counter()
         if expired() and operation.__name__ not in {"_download_and_cache", "_check_local_cache"}:
             result = RetrievalResult(source_name=operation.__name__, success=False,
-                                     error="reference_elapsed_budget_timeout")
+                                     error="reference_elapsed_budget_timeout",
+                                     metadata={"elapsed_budget_exhausted": True})
         else:
             result = operation(*args, **kwargs)
         if isinstance(result, RetrievalResult):
@@ -51,7 +59,7 @@ def _timed_retrieval(operation):
         return result
     return measured
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
-from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed
+from app.services.submitted_links import observe_reference, identity_observed, page_observed, link_not_visited, validated_response_identity, source_validation_observed, cross_script_observed, observed_outcome
 from app.services.bibliographic_scripts import cross_script_comparison_unresolved
 
 from app.log_safety import private_value_id, safe_exception_code
@@ -99,13 +107,17 @@ from app.services.source_type import (
     is_traditional_media,
     normalize_source_kind,
 )
-from app.services.source_validator import _detect_nonwork_listing, validate_retrieved_pdf
+from app.services.source_validator import (
+    OPENING_BYLINE_POLICY, _detect_nonwork_listing, validate_retrieved_pdf,
+)
 from app.services.web_source_metadata import extract_web_source_metadata
 from app.services.identity_landing import bounded_landing_inspection
 from app.services.identity_pdf import bounded_pdf_inspection
 from app.services.search.candidate_ranking import identity_candidate_ranking
 from app.services.pure_scan_ocr import prepare_pure_scan_ocr
+from app.services.lookalike_letters import fold_lookalikes
 from app.services.reference_discovery import (
+    DESCRIPTIVE_IDENTITY_FIELDS,
     INCOMPLETE_METADATA_SEARCH_REASONS,
     CandidateAcquisitionOutcome,
     ExpectedBibliographicFields,
@@ -116,6 +128,7 @@ from app.services.reference_discovery import (
     build_reference_discovery_candidate,
     required_reference_discovery_routes,
     is_edition_sensitive_reference,
+    is_part_title_namesake,
 )
 from app.services.source_repository import (
     LICENSE_CLASSES,
@@ -155,7 +168,10 @@ def _append_unique_candidate(trace: dict, candidate) -> None:
 
 
 def _search_execution_outcome(result: RetrievalResult) -> str:
-    if (result.metadata or {}).get("candidate_budget_skipped"):
+    # Our own limits (a candidate budget, the reference's elapsed budget) are
+    # never the provider's doing (2026-10-15: an elapsed budget read as a
+    # provider "timeout" named the provider as the cause).
+    if (result.metadata or {}).get("candidate_budget_skipped") or (result.metadata or {}).get("elapsed_budget_exhausted"):
         return "budget_skipped"
     if result.success:
         return "results"
@@ -190,6 +206,12 @@ _ANSWERED_LINK_REASONS = {
     'source_kind_unconfirmed': 'link_source_type_unconfirmed',
     'bibliographic_fields_conflict': 'link_details_conflict',
     'bibliographic_identity_unconfirmed': 'link_identity_unconfirmed',
+    # A dead link is an answered check, not a network failure, so the search
+    # completes and a re-run does not repeat it (2026-10-14).
+    'link_not_found': 'link_not_found',
+    # The PDF route was answered with a web page; the web route records its own
+    # check of that page, so this attempt is answered too (2026-10-14).
+    'link_not_pdf': 'link_not_pdf',
 }
 _ANSWERED_DOI_ERRORS = {
     'DOI resolver HTML title does not match cited source': 'doi_page_title_differs',
@@ -425,6 +447,25 @@ def _web_link_differences(comparisons, result, *, title, author, year, doi):
             and expected.get(c.field_name) and observed.get(c.field_name)]
 
 
+_CORE_IDENTITY_FIELDS = frozenset({'title', 'author', 'year', 'doi', 'isbn'})
+
+
+def identity_confirms_work(identity, *, kind_checked: bool = False) -> bool:
+    """The one page-identity rule for web pages and DOI/landing pages (owner
+    direction 2026-10-14): a plausible match with no material conflict, every
+    identifying detail the reference supplies (title, author, year, DOI, ISBN,
+    publisher, type) seen and agreeing, and at least two core details agreeing
+    or the identifier matching. A journal, volume, issue or page range the page
+    does not show neither confirms nor blocks (Springer's page shows no volume
+    or issue; the DOI route had rejected it while the web route accepted it)."""
+    agreeing = sum(c.outcome in {'agreement', 'minor_difference'} for c in identity.comparisons
+                   if c.field_name in _CORE_IDENTITY_FIELDS)
+    return bool(identity.plausible_identity_match and not identity.has_material_conflict
+                and not identity.unresolved_supplied(
+                    DESCRIPTIVE_IDENTITY_FIELDS, frozenset({'source_kind'}) if kind_checked else frozenset())
+                and (identity.authoritative_identifier_match or agreeing >= 2))
+
+
 def _web_identity_comparison(result, *, title=None, author=None, year=None, doi=None):
     """Shared existing identity standard for readable and metadata-only pages."""
     identity = build_reference_discovery_candidate(
@@ -432,10 +473,7 @@ def _web_identity_comparison(result, *, title=None, author=None, year=None, doi=
         expected=ExpectedBibliographicFields(title=title or '', authors=[author] if author else [],
             year=year or '', doi=doi or ''), result=result)
     comparisons = [c for c in identity.comparisons if c.field_name in {'title', 'author', 'year', 'doi'}]
-    confirmed = bool(identity.plausible_identity_match and not identity.has_material_conflict
-        and all(c.outcome in {'agreement', 'minor_difference'} for c in comparisons)
-        and (len(comparisons) >= 2 or identity.authoritative_identifier_match))
-    return identity, comparisons, confirmed
+    return identity, comparisons, identity_confirms_work(identity, kind_checked=True)
 
 
 def _cited_title_on_front_pages(content: bytes, title: str | None, pages: int = 3) -> bool:
@@ -470,6 +508,49 @@ def _record_link_title_conflict(url, resp, title, page_titles, *, expected_autho
     identity_observed(url, hashlib.sha256(resp.content).hexdigest(), 'bibliographic_fields_conflict', conflicts,
                       differences=_web_link_differences(comparisons, result, title=title, author=expected_author,
                                                         year=expected_year, doi=expected_doi))
+
+
+# Periodical kinds whose articles the magazine archive can hold; an unknown
+# kind still names a magazine when its container title is one the library holds.
+_PERIODICAL_ARCHIVE_KINDS = frozenset({"journal_article", "news_article", "unknown"})
+# Root elements of library metadata records: METS, MODS, Dublin Core (OAI),
+# MARCXML, DIDL and an OAI-PMH response wrapping any of them.
+_METADATA_RECORD_ROOT = re.compile(
+    rb"^\s*(?:<\?xml[^>]*>\s*)?(?:<!--.*?-->\s*)*<(?:[A-Za-z0-9_]+:)?"
+    rb"(?:mets|mods|modsCollection|dc|oai_dc|record|collection|DIDL|OAI-PMH)\b", re.S)
+
+
+def metadata_record_xml(content: bytes) -> bool:
+    """The response is a library metadata record, not a work's text."""
+    head = (content or b"")[:4096]
+    if not _METADATA_RECORD_ROOT.match(head):
+        return False
+    # "record"/"collection" are common words: also require a metadata namespace.
+    return bool(re.search(rb"loc\.gov/(?:METS|mods|MARC21)|openarchives\.org/OAI|purl\.org/dc/elements"
+                          rb"|mpeg21|xmlns:(?:mets|mods|dc|oai_dc|marc)=", head, re.I))
+
+
+_CATALOGUE_PROVIDERS = ("google_books", "open_library", "internet_archive", "openalex", "crossref")
+
+
+def _best_book_record(discovery: dict) -> dict:
+    """The catalogue record that best agrees with a looked-up book: credible,
+    without a material conflict, title agreeing; catalogues before web pages."""
+    best, rank = {}, None
+    for candidate in (discovery or {}).get("candidates") or []:
+        comparisons = {c.get("field_name"): c.get("outcome") for c in candidate.get("comparisons") or []}
+        if (not (candidate.get("plausible_identity_match") or candidate.get("authoritative_identifier_match"))
+                or "material_conflict" in comparisons.values()
+                or comparisons.get("title") not in {"agreement", "minor_difference"}):
+            continue
+        provider = str(candidate.get("provider") or "")
+        score = (provider in _CATALOGUE_PROVIDERS, sum(v == "agreement" for v in comparisons.values()))
+        if rank is None or score > rank:
+            observed = candidate.get("observed") or {}
+            best, rank = {"title": str(observed.get("title") or "")[:500],
+                          "authors": [str(a)[:200] for a in observed.get("authors") or []][:8],
+                          "year": str(observed.get("year") or ""), "provider": provider}, score
+    return best
 
 
 _WEB_TITLE_WORD = re.compile(r"[^\W\d_]{2,}")
@@ -515,6 +596,90 @@ def _record_registry_link_identity(url, resp, title, *, expected_author=None, ex
         identity_observed(url, hashlib.sha256(resp.content).hexdigest(), reason, conflicts,
                           differences=_web_link_differences(comparisons, record, title=title, author=expected_author,
                                                             year=expected_year, doi=expected_doi))
+
+
+_OBSERVED_IDENTITY_FIELDS = ("policy", "basis", "title", "authors", "year", "doi")
+
+
+def _admission_observed_identity(result, *, doi, title, author, year) -> dict | None:
+    """Identity fields the admitted representation itself showed.
+
+    PDF and OCR text keep the validator's observation; a web page keeps its own
+    page metadata; other text is read for the cited fields in its opening.
+    Never the citation's values on their own (opening-byline-identity-v1).
+    """
+    metadata = result.metadata or {}
+    representation = result.representation
+    observed = metadata.get("observed_identity")
+    if isinstance(observed, dict) and observed.get("policy") == OPENING_BYLINE_POLICY:
+        return {key: observed.get(key) for key in _OBSERVED_IDENTITY_FIELDS}
+    if representation is None or representation.kind is RepresentationKind.PDF:
+        return None
+    page = metadata.get("web_identity")
+    if isinstance(page, dict) and (page.get("title") or page.get("authors")):
+        return {"policy": OPENING_BYLINE_POLICY, "basis": "page_metadata",
+                "title": page.get("title"), "authors": list(page.get("authors") or []),
+                "year": page.get("year"), "doi": page.get("doi")}
+    from app.services.source_validator import observe_text_identity
+    observed = observe_text_identity(
+        representation.content.decode("utf-8", errors="replace"),
+        expected_doi=doi, expected_title=title, expected_author=author, expected_year=year)
+    return {key: observed.get(key) for key in _OBSERVED_IDENTITY_FIELDS}
+
+
+def _reuse_observed_identity(record, data, kind, *, doi, isbn, title, author, year,
+                             expected_source_kind) -> dict | None:
+    """Observed identity for reusing a retrieval-admitted representation.
+
+    Uses the observation stored at admission; otherwise reads the stored bytes
+    again. A PDF that no longer reaches high identity is not reused (None). A
+    text representation is never refused here; fields its opening does not
+    show stay empty, so reuse cannot confirm the reference on its own.
+    """
+    stored = (getattr(record, "validation_evidence", None) or {}).get("observed_identity")
+    if isinstance(stored, dict) and stored.get("policy") == OPENING_BYLINE_POLICY:
+        return stored
+    if kind is RepresentationKind.PDF:
+        validation = validate_retrieved_pdf(
+            data, expected_doi=doi, expected_title=title, expected_author=author,
+            expected_year=year, expected_isbn=isbn, skip_completeness=True,
+            document_kind=(document_kind_for_source_kind(expected_source_kind.kind)
+                           if expected_source_kind.is_known else "article" if doi else "unknown"),
+            expected_source_kind=expected_source_kind.kind,
+            expected_source_kind_confidence=expected_source_kind.confidence,
+            expected_source_kind_evidence=expected_source_kind.evidence,
+        )
+        observed = getattr(validation, "observed_identity", None)
+        if validation.identity_confidence != "high" or not isinstance(observed, dict):
+            return None
+        return observed
+    from app.services.source_validator import observe_text_identity
+    return observe_text_identity(data.decode("utf-8", errors="replace"), expected_doi=doi,
+                                 expected_title=title, expected_author=author, expected_year=year)
+
+
+def _pdf_byline_conflict_observation(result) -> dict | None:
+    """The identity-only envelope for a PDF whose own opening byline names
+    other people under the cited title (opening-byline-identity-v1).
+
+    Only the file's own byline qualifies; an author conflict inherited from a
+    landing page is already that page's own observation.
+    """
+    metadata = result.metadata or {}
+    conflict = metadata.get("author_conflict") or {}
+    observed = metadata.get("observed_identity") or {}
+    representation = result.representation
+    if (conflict.get("basis") in {None, "landing_page"} or not conflict.get("observed_authors")
+            or not observed.get("title") or representation is None
+            or representation.kind is not RepresentationKind.PDF or not representation.content):
+        return None
+    return {
+        "observed": {"title": observed["title"], "authors": list(conflict["observed_authors"]),
+                     "year": None, "doi": None, "metadata": {}},
+        "content_sha256": hashlib.sha256(representation.content).hexdigest(),
+        "source_url": representation.source_url,
+        "identity_evidence_kind": "pdf_front_matter_observation",
+    }
 
 
 def _organisation_author_in_page(author, comparisons, page_text) -> bool:
@@ -605,6 +770,71 @@ def _withhold_search_result_urls(location_attempts: list) -> list[dict]:
 # Marks page text kept because the page's own title, author and year confirm
 # the cited work; such a page is the work republished, whatever its site type.
 REPUBLISHED_WORK_EVIDENCE = "page bibliography confirms the cited work"
+# A landing page holding only an abstract and back matter
+# (landing-abstract-back-matter-v1): its abstract is kept, not its page text.
+LANDING_ABSTRACT_ONLY_ERROR = "landing page holds an abstract and back matter only"
+# The student-link handling a result was searched under. Bumped when a change
+# can find text or an abstract a link gave nothing for before (v2, 2026-10-14:
+# Media History Digital Library pages, dead-link answers, linked Chinese
+# abstract pages; v3, the same day: such abstracts by the cross-language
+# naming standard, the one page-identity rule for DOI pages; v4, Chinese
+# author-field labels are not names; v5, the model's same-work answer for a
+# page naming the work also keeps its abstract); an earlier
+# result without text, or with a search-found page's text, is searched again once.
+from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION  # noqa: E402,F401 (source_reuse.ROUTE_VERSIONS)
+
+# Reasons the source library's copy was not used, as the local copy has always reported them.
+_STORED_COPY_ERRORS = {
+    "limited_preview_not_revalidated": "Limited preview binding could not be revalidated",
+    "edition_candidate_not_pdf": None,
+    "edition_candidate_not_revalidated": "Edition-qualified library candidate could not be revalidated",
+    "stored_text_is_a_listing": "Stored copy is a listing, not the cited work",
+}
+# Result metadata a displaced page carried that would authorize its text.
+_ACQUISITION_ONLY_METADATA = frozenset({
+    "durable_admission", "repository_representation_id", "publisher_preview",
+    "provisional_source", "stated_page_completeness",
+})
+
+
+def _attach_linked_abstract(result: RetrievalResult, response, doi: str | None) -> bool:
+    """A page naming the cited work that is a Chinese-language abstract page
+    (cjk-abstract-page-v1): the result keeps only its abstract, as abstract-only
+    evidence. Page text a web result carries in its abstract field is not an
+    abstract; one with recorded provenance is kept. A page holding much more
+    text than its abstract (a full article opening with 摘要) is left as it is.
+    Returns whether the result now holds the page's abstract."""
+    from app.services.abstract_only_pages import (
+        cjk_abstract_provenance, cjk_page_abstract, is_mainly_abstract)
+    if result.abstract and (result.metadata or {}).get("abstract_provenance"):
+        return False
+    observation = cjk_page_abstract(getattr(response, "text", "") or "")
+    page_text = (result.full_text or b"").decode("utf-8", "replace") if isinstance(result.full_text, bytes) else ""
+    if observation is None or not is_mainly_abstract(page_text, observation["abstract"]):
+        return False
+    result.representation = None
+    result.full_text = None
+    result.abstract = observation["abstract"]
+    result.metadata = {key: value for key, value in (result.metadata or {}).items()
+                       if key not in {"accepted_representation_sha256", "web_completeness"}}
+    result.metadata["abstract_provenance"] = cjk_abstract_provenance(
+        observation, provider=result.source_name,
+        content_sha256=hashlib.sha256(getattr(response, "content", b"") or b"").hexdigest(),
+        doi=doi or result.doi)
+    return True
+
+
+def _landing_abstract_holder(result: RetrievalResult | None) -> RetrievalResult | None:
+    """An abstract-only result for an abstract kept from a landing page."""
+    from app.services.abstract_only_pages import LINKED_ABSTRACT_BASIS
+    metadata = (result.metadata or {}) if result is not None else {}
+    if (result is None or not result.abstract or result.full_text
+            or (metadata.get("abstract_provenance") or {}).get("basis")
+            not in {"publisher_landing_page", LINKED_ABSTRACT_BASIS}):
+        return None
+    return RetrievalResult(source_name=result.source_name, success=True, metadata=dict(metadata),
+                           abstract=result.abstract, doi=result.doi, title=result.title,
+                           year=result.year, authors=list(result.authors))
 STATED_COMPLETE_EVIDENCE = "whole stated work on the page"
 
 
@@ -696,6 +926,43 @@ def _mdpi_file_server_locations(location, exc: BaseException, doi: str | None) -
     ]
 
 
+def _link_gone(url: str) -> bool:
+    """The link checker found the page or file missing or removed (its own
+    `not_found`/`removed` outcomes); this record does not classify responses."""
+    return observed_outcome(url) in {"not_found", "removed"}
+
+
+_CROSS_SCRIPT_JUDGMENT_FIELDS = ("version", "same_work", "author", "call", "payload_sha256",
+                                 "configured_model", "returned_model")
+
+
+def _cross_script_page_judgment(response, page_titles, *, expected_title, expected_author,
+                                expected_year) -> dict | None:
+    """The model's comparison of a fetched page titled only in another writing
+    system (CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED), bounded per reference.
+
+    Spelling cannot compare such titles, so without it the page stays an
+    uncompared candidate that holds the reference not assessed. Page names
+    are not kept; the answer and its provenance are."""
+    if (not settings.CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED or not expected_title or not page_titles
+            or not all(cross_script_comparison_unresolved(expected_title, title) for title in page_titles)):
+        return None
+    trace = _ACTIVE_DISCOVERY_TRACE.get()
+    used = trace.setdefault("cross_script_page_judgments", 0) if trace is not None else 0
+    if used >= settings.CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE:
+        return None
+    if trace is not None:
+        trace["cross_script_page_judgments"] = used + 1
+    import trafilatura
+    from app.services.cross_script_identity import judge_cross_script_identity
+    text = trafilatura.extract(response.text, include_comments=False, include_links=False,
+                               include_tables=False) or ""
+    judged = judge_cross_script_identity(
+        {"title": expected_title, "author": expected_author or "", "year": expected_year or ""},
+        {"titles": page_titles, "date": "", "text": text})
+    return {key: judged.get(key) for key in _CROSS_SCRIPT_JUDGMENT_FIELDS if judged.get(key) is not None}
+
+
 def _location_exception_disposition(exc: Exception) -> tuple[str, str]:
     """Classify transport/access failures without retaining sensitive URLs."""
     if isinstance(exc, CandidateBudgetExceeded):
@@ -718,6 +985,8 @@ def _location_exception_disposition(exc: Exception) -> tuple[str, str]:
         return "identity_rejected", "landing_page_identity_rejected"
     if "representation too short" in message:
         return "completeness_rejected", "representation_too_short"
+    if LANDING_ABSTRACT_ONLY_ERROR in message:
+        return "completeness_rejected", "landing_abstract_and_back_matter_only"
     if "landing page yielded" in message:
         return "unavailable", "landing_page_no_full_text_location"
     return "unavailable", "location_unavailable"
@@ -775,6 +1044,8 @@ _TITLE_FUNCTION_WORDS = frozenset({
 # At or below this many distinctive words, a title is too generic for token
 # overlap to identify a work without author agreement.
 _SHORT_TITLE_TOKENS = 3
+# How far into a page's text a cross-language title and byline are read.
+_CROSS_LANGUAGE_TEXT_OPENING = 3000
 
 
 def _verify_text_content_identity(
@@ -792,6 +1063,20 @@ def _verify_text_content_identity(
         return "rejected", f"representation is {purpose_conflict}, not the cited work"
     if expected_doi and expected_doi.lower() in compact_text:
         return "high", "exact DOI appears in acquired text"
+    from app.services import cross_language_identity as cross_language
+    if cross_language.applies_to_text(expected_title, compact_text[:20000]):
+        # A romanised citation of a Han-script page (cross-language-identity-v1):
+        # the cited title read character by character in the page's opening,
+        # with a Han byline name read as a cited surname, or the year.
+        opening = compact_text[:_CROSS_LANGUAGE_TEXT_OPENING]
+        title_seen = cross_language.romanised_title_in_text(expected_title, opening)
+        credited, _names = cross_language.credited_people(expected_author, opening.split())
+        year_seen = bool(expected_year and expected_year in opening)
+        if title_seen and (credited or year_seen):
+            return "high", "romanised title read in the opening with author/year support (cross-language-identity-v1)"
+        if title_seen:
+            return "medium", "romanised title read in the opening without author/year support (cross-language-identity-v1)"
+        return "low", "cited romanised title not read in the opening (cross-language-identity-v1)"
 
     title_overlap = 0.0
     distinctive: set[str] = set()
@@ -865,6 +1150,52 @@ def _distinctive_title_tokens(title: str | None) -> set[str]:
 _OPENING_TITLE_PAGES = 3
 _OPENING_TITLE_WINDOW_WORDS = 300
 _OPENING_TITLE_MIN_OVERLAP = 0.6
+
+
+_TITLE_PAGE_FUNCTION_WORDS = frozenset({
+    "the", "and", "for", "with", "from", "into", "its", "their", "our", "an", "of", "in", "on", "to", "a",
+    "as", "at", "by", "or", "how", "what", "why", "are", "is"})
+
+
+def title_page_names_work(opening: str, title: str | None, author: str | None) -> bool:
+    """Does a copy's opening name the cited title and its first author?
+
+    The title counts when, within the opening's first 300 words, it appears
+    with its spacing removed (a title read from a paper loses spaces:
+    "IdentitiesthroughGame-Making") or all its distinctive words stand close
+    together (a student's slightly different wording). The first author's
+    surname must also appear: a title phrase alone matched a stranger's
+    working paper, and the cited author alone a different chapter (owner
+    decision 2026-10-14, after the review of 8 possible matches).
+    """
+    def words(value):
+        return re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", str(value or "")).casefold())
+
+    head = words(opening)[:_OPENING_TITLE_WINDOW_WORDS]
+    title_words = words(title)
+    if not head or not title_words:
+        return False
+    squashed = "".join(title_words)
+    tokens = {word for word in title_words if len(word) >= 3 and word not in _TITLE_PAGE_FUNCTION_WORDS}
+    title_found = len(squashed) >= 12 and squashed in "".join(head)
+    if not title_found and tokens:
+        span = 2 * len(tokens) + 4
+        title_found = any(tokens <= set(head[index:index + span]) for index in range(len(head)))
+    surname = words(re.split(r"[,&(]", str(author or ""))[0])
+    return bool(title_found and surname and all(part in head for part in surname))
+
+
+def _title_page_confirms(content: bytes, title: str | None, author: str | None) -> bool:
+    """`title_page_names_work` on a PDF's opening pages; never raises."""
+    try:
+        import fitz
+
+        with fitz.open(stream=content, filetype="pdf") as document:
+            opening = " ".join(document[index].get_text()
+                               for index in range(min(_OPENING_TITLE_PAGES, len(document))))
+    except Exception:
+        return False
+    return title_page_names_work(opening, title, author)
 
 
 def _opening_pages_present_title(content: bytes, expected_title: str | None) -> bool:
@@ -1025,9 +1356,83 @@ _TITLE_NOISE_TOKENS = frozenset({
 })
 
 
-def _distinctive_title_tokens(title: str) -> set[str]:
+def _short_title_tokens(title: str) -> set[str]:
+    """Words that make a cited title long enough to match by containment
+    alone (`_landing_title_confirms`). It once shared the name of
+    `_distinctive_title_tokens` and silently replaced it (2026-10-15)."""
     return {token for token in re.split(r"[^A-Za-z0-9]+", title.lower())
             if len(token) >= 3 and token not in _TITLE_NOISE_TOKENS}
+
+
+def _romanised_page_title_outcome(cited_title: str, page_titles: list[str]) -> str | None:
+    """'agreement' or 'minor_difference' when a Han-script page title reads as
+    the cited romanised title (cross-language-identity-v1), else None. Such a
+    page continues to the ordinary content, identity and admission checks
+    instead of being set aside unread."""
+    from app.services.cross_language_identity import compare_titles
+    outcomes = {(compare_titles(cited_title, str(value)) or {}).get("outcome") for value in page_titles}
+    return next((o for o in ("agreement", "minor_difference") if o in outcomes), None)
+
+
+def _densest_text_block(html: str, *, minimum: int = 300) -> str:
+    """The text of the block holding the most letters that no inner block
+    holds, scripts and styles removed; empty below `minimum` letters."""
+    import lxml.html
+    try:
+        document = lxml.html.fromstring(html[:2_000_000])
+    except (ValueError, lxml.etree.ParserError):
+        return ""
+    for node in document.xpath("//script|//style|//nav|//header|//footer"):
+        node.drop_tree()
+    blocks = ("div", "td", "article", "section", "main")
+    letters = lambda node: sum(ch.isalpha() for ch in node.text_content())
+    best, best_own = None, 0
+    for node in document.xpath("|".join(f"//{tag}" for tag in blocks)):
+        total = letters(node)
+        inner = max((letters(child) for child in node if child.tag in blocks), default=0)
+        own = total - inner
+        if own > best_own:
+            best, best_own = node, own
+    if best is None or best_own < minimum:
+        return ""
+    lines = [line.strip() for line in best.text_content().splitlines() if line.strip()]
+    return "\n".join(lines)
+
+
+def _cross_script_admits(judged: dict, cited_author: str | None) -> bool:
+    """The model judged a page in another writing system the cited work, and
+    did not find a cited person missing from it (an organisation's name is a
+    translation and never counts against it)."""
+    if (judged or {}).get("same_work") != "yes":
+        return False
+    if judged.get("author") != "differs":
+        return True
+    from app.services.source_validator import _cited_personal_surnames
+    return bool(cited_author) and not _cited_personal_surnames(cited_author)
+
+
+def _romanised_author_near_title(html: str, page_titles: list[str], cited_author: str | None,
+                                 *, before: int = 5, after: int = 30) -> list[str]:
+    """Han names beside a page's own title that read as the cited people
+    (cross-language-identity-v1); empty when the title is not found."""
+    from app.services.cross_language_identity import _person_matches, credited_people
+    body = html[:400_000]
+    opening = body.lower().find("<body")
+    body = body[opening:] if opening >= 0 else body
+    lines = [line.strip() for line in re.sub(r"<[^>]+>", "\n", body).splitlines() if line.strip()]
+    heads = [str(title).strip()[:8] for title in page_titles if str(title).strip()]
+    start = next((index for index, line in enumerate(lines)
+                  if any(head and head in line for head in heads)), None)
+    if start is None:
+        return []
+    # A labelled name ("编辑：潘越", "作者：…") is read without its label.
+    window = [re.sub(r"[：:]", " ", line) for line in lines[max(0, start - before):start + after]]
+    credited, names = credited_people(cited_author, window)
+    return [name for name in names if any(_person_matches(person, name) for person in credited)]
+
+
+def _romanised_page_title_agrees(cited_title: str, page_titles: list[str]) -> bool:
+    return _romanised_page_title_outcome(cited_title, page_titles) is not None
 
 
 def _landing_title_confirms(cited_title: str, page_titles: list[str]) -> bool:
@@ -1045,7 +1450,7 @@ def _landing_title_confirms(cited_title: str, page_titles: list[str]) -> bool:
     from app.services.pdf_verifier import _aligned_title_containment, _normalize
     if not _html_title_matches(cited_title, page_titles):
         return False
-    if len(_distinctive_title_tokens(cited_title)) >= 4:
+    if len(_short_title_tokens(cited_title)) >= 4:
         return True
     cited = _normalize(cited_title)
     return any(_aligned_title_containment(cited, _normalize(page_title))
@@ -1088,6 +1493,9 @@ class SourceResolver:
         # harnesses may set a bounded capability set to measure adapters, URLs,
         # publisher construction, and institutional routes independently.
         self._acquisition_capabilities: set[str] | None = None
+        # The checking scope's storage settings (owner decision 2026-10-09);
+        # None reads the deployment defaults. Set by the paper workflow.
+        self.storage_policy = None
         # Storage backend is optional — if S3/MinIO is unavailable, the
         # resolver still works (just without caching/persistence). This makes
         # the resolver robust to S3 outages and simplifies testing without Docker.
@@ -1104,6 +1512,34 @@ class SourceResolver:
         )
         self._retrieval_sources = get_retrieval_sources()
         self._lookup_cache = RetrievalLookupCache()
+
+    def for_worker(self) -> "SourceResolver":
+        """A copy for one source-retrieval worker thread (owner decision 2026-10-09).
+
+        The academic adapters are shared: their prefetched lookups and run-wide
+        provider cut-offs belong to the whole run, and every request passes the
+        shared provider gate. The web-search tier is the worker's own, because
+        its providers report each call's outcome and cost through attributes
+        read after the call; it shares the run's call counts and their lock,
+        so the per-run ceilings hold across workers. The source-inspection
+        budget and its lock are shared as well.
+        """
+        if getattr(self, "_source_inspection_cache", None) is None:
+            self._source_inspection_cache = {}
+        lock = self.__dict__.setdefault("_source_inspection_lock", threading.Lock())
+        worker = shallow_copy(self)
+        worker._source_inspection_cache = self._source_inspection_cache
+        worker._source_inspection_lock = lock
+        sources = []
+        for source in self._retrieval_sources:
+            if source.name == "web_search" and hasattr(source, "share_run_budget_with"):
+                own = type(source)()
+                own.share_run_budget_with(source)
+                sources.append(own)
+            else:
+                sources.append(source)
+        worker._retrieval_sources = sources
+        return worker
 
     # ── Public API ────────────────────────────────────────
 
@@ -1420,6 +1856,10 @@ class SourceResolver:
                         "source_kind_verdict": location_attempt.get(
                             "source_kind_verdict"
                         ),
+                        # The model's cross-script comparison of the fetched
+                        # page, when CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED made one.
+                        **({"cross_script_judgment": location_attempt["cross_script_judgment"]}
+                           if isinstance(location_attempt.get("cross_script_judgment"), dict) else {}),
                         # What the fetched page showed, or that nothing beyond a
                         # search snippet was ever observed for this location.
                         "title_reason": (
@@ -1437,6 +1877,7 @@ class SourceResolver:
                         result=observed,
                         candidate_key=location_hash,
                         location_url=(landing.get("source_url") or location_url) if landing else location_url,
+                        opened_page_url=(landing or page_only or {}).get("source_url"),
                         acquisition_outcome=acquisition_outcome,
                         validation_reason=str(location_attempt.get("reason") or "")
                         or None,
@@ -1484,6 +1925,8 @@ class SourceResolver:
                     acquisition_outcome="metadata_only",
                     disposition_reason_code="journal_registration_only",
                 ))
+        elif "archive_page_matches" in (result.metadata or {}):
+            pass  # a located archive page is recorded on the trace, not as a candidate record
         elif "book_metadata_candidates" in (result.metadata or {}):
             for item in result.metadata["book_metadata_candidates"]:
                 candidate_result = RetrievalResult(**item)
@@ -1703,6 +2146,11 @@ class SourceResolver:
                 getattr(reference, "doi", None) or None, getattr(reference, "isbn", None) or None, title or None,
                 author=getattr(reference, "author", None) or None, year=getattr(reference, "year", None) or None,
                 expected_source_kind=expected_kind)
+            if not (found.success and found.full_text):
+                found = self._check_local_cache_for_book(
+                    getattr(reference, "container_title", "") or "", expected_kind,
+                    author=getattr(reference, "author", None) or None,
+                    year=getattr(reference, "year", None) or None) or found
         except Exception:
             return False
         return bool(found.success and found.full_text)
@@ -1723,7 +2171,8 @@ class SourceResolver:
         result = RetrievalResult(
             source_name=provider, success=False,
             locations=[AcquisitionLocation(url=href, provider=provider, is_best=True)],
-            metadata={"requested_url_sha256": hashlib.sha256(href.encode()).hexdigest()})
+            metadata={"requested_url_sha256": hashlib.sha256(href.encode()).hexdigest(),
+                      "earlier_verified_content_sha256": content_sha256})
         try:
             acquired = self._acquire_from_locations(
                 result, expected_doi=getattr(reference, "doi", None) or None, expected_title=title or None,
@@ -1793,7 +2242,9 @@ class SourceResolver:
         reference_id = getattr(reference, "reference_id", None) or "unassigned-reference"
         expected = ExpectedBibliographicFields(
             author_normalization_policy_version='author-etal-comparison-v1',
-            title=getattr(reference, "title", None) or "",
+            # The search form: look-alike letters folded (the reference keeps
+            # the student's exact wording).
+            title=fold_lookalikes(getattr(reference, "title", None) or ""),
             reference_parse_review=bool(getattr(reference, 'needs_review', False)),
             container_title=getattr(reference, 'container_title', '') or '',
             publisher=getattr(reference, 'publisher', '') or '',
@@ -1817,14 +2268,12 @@ class SourceResolver:
                 "submitted_reference": getattr(reference, 'raw_ref', '') or '',
                 "search_policy_version": settings.SEARCH_POLICY_VERSION,
                 "search_retention_policy": "brave-operational-transient-v1" if settings.BRAVE_SEARCH_TRANSIENT_ENABLED else None,
-                "required_web_providers": ["brave", "exa"] if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
+                "required_web_providers": list(required_api_providers()) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
                 "expected": expected,
                 "required": set(
                     required_reference_discovery_routes(
                         expected,
-                        library_metadata_enabled=bool(
-                            expected.doi and settings.DOI_RESOLVER_URL
-                        ),
+                        library_metadata_enabled=False,
                     )
                 ),
                 "queries": [],
@@ -1839,6 +2288,7 @@ class SourceResolver:
                 "No completed-search route policy exists for this source kind."
             )
         provisional_token = _PROVISIONAL_CANDIDATES.set([])
+        graph_token = _LAST_GRAPH.set(None)
         try:
             if identity_only:
                 result = self._resolve_identity_only(reference, expected)
@@ -1865,16 +2315,32 @@ class SourceResolver:
             if not identity_only:
                 self._enrich_journal_registration(reference)
                 self._enrich_book_editions()
+            native = self._native_script_route(reference, identity_only=identity_only)
             (
                 exc.reference_discovery_trace,
                 exc.reference_discovery,
             ) = self._discovery_artifacts()
+            exc.reference_discovery_trace, exc.reference_discovery = self._attach_container_identity(
+                reference, exc.reference_discovery_trace, exc.reference_discovery, identity_only=identity_only)
+            self._attach_native_route(exc.reference_discovery_trace, exc.reference_discovery,
+                                      (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
+            self._attach_periodical_archive(exc.reference_discovery_trace, exc.reference_discovery)
             if not identity_only and isinstance(exc.reference_discovery, dict):
-                self._attach_container_identity(reference, exc.reference_discovery)
                 mismatch = self._doi_title_mismatch()
                 if mismatch:
                     exc.reference_discovery["doi_title_mismatch"] = mismatch
+            book = None if identity_only else self._single_authored_book_text(reference, exc.reference_discovery)
+            if book is not None:
+                book.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
+                book.metadata['reference_discovery'] = exc.reference_discovery
+                return book
             candidates = _PROVISIONAL_CANDIDATES.get()
+            if native is not None and (native.full_text or native.abstract):
+                native.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
+                native.metadata['reference_discovery'] = exc.reference_discovery
+                if not identity_only:
+                    self._update_search_memo(native, exc.reference_discovery_trace)
+                return native
             if not identity_only:
                 self._update_search_memo(candidates[0] if candidates else None,
                                          exc.reference_discovery_trace)
@@ -1891,22 +2357,227 @@ class SourceResolver:
             if not identity_only:
                 self._enrich_journal_registration(reference)
                 self._enrich_book_editions()
+            if not result.full_text:
+                native = self._native_script_route(reference, identity_only=identity_only)
+                if native is not None and (native.full_text or (native.abstract and not result.abstract)):
+                    result = native
             result.metadata = result.metadata or {}
             trace_payload, discovery_payload = self._discovery_artifacts()
+            trace_payload, discovery_payload = self._attach_container_identity(
+                reference, trace_payload, discovery_payload, identity_only=identity_only)
+            self._attach_native_route(trace_payload, discovery_payload,
+                                      (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
+            self._attach_periodical_archive(trace_payload, discovery_payload)
+            if not identity_only and not result.full_text:
+                book = self._single_authored_book_text(reference, discovery_payload)
+                if book is not None:
+                    result = book
             if not identity_only:
                 self._update_search_memo(result, trace_payload)
             result.metadata["reference_discovery_trace"] = trace_payload
+            declared = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("declared_document_url")
+            if declared and not result.full_text:
+                result.metadata.setdefault("declared_document_url", declared)
             if discovery_payload is not None:
                 result.metadata["reference_discovery"] = discovery_payload
-                if not identity_only:
-                    self._attach_container_identity(reference, discovery_payload)
                 mismatch = self._doi_title_mismatch()
                 if mismatch:
                     discovery_payload["doi_title_mismatch"] = mismatch
             return result
         finally:
+            _LAST_GRAPH.reset(graph_token)
             _PROVISIONAL_CANDIDATES.reset(provisional_token)
             _ACTIVE_DISCOVERY_TRACE.reset(token)
+
+    # native-script-route-v1 (owner decision 2026-10-12). The free adapters
+    # asked in a work's own script, the book catalogues for book kinds, at most
+    # this many model comparisons for records the romanisation cannot decide.
+    _NATIVE_ADAPTERS = ("openalex", "crossref")
+    _NATIVE_BOOK_ADAPTERS = ("open_library",)
+    _NATIVE_BOOK_KINDS = frozenset({"monograph", "edited_collection", "book_section", "unknown"})
+    _NATIVE_MODEL_IDENTITY_CALLS = 2
+
+    def _native_script_route(self, reference, *, identity_only: bool) -> RetrievalResult | None:
+        """The native-script route under its own elapsed allowance."""
+        from app.services.retrieval_deadline import separate_deadline_scope
+        from app.services.other_language import other_language_signals
+        if _ACTIVE_DISCOVERY_TRACE.get() is None or not other_language_signals(reference):
+            return None
+        with separate_deadline_scope():
+            return self._native_script_route_body(reference, identity_only=identity_only)
+
+    def _native_script_route_body(self, reference, *, identity_only: bool) -> RetrievalResult | None:
+        """Search a likely other-language work in its own script.
+
+        `native-script-route-v1`. Runs inside a traced reference resolution
+        for a reference with deterministic other-language signals. The
+        configured model proposes query text in the work's own script
+        (`native-script-query-v1`); the free adapters are asked with it (and
+        with the cited translation), then the paid web route with the native
+        title within the existing per-provider query and run caps. Every
+        returned record is compared with the CITED fields: a Han-script record
+        by romanisation (`cross-language-identity-v1`), anything that cannot
+        be decided that way by the existing model comparison, at most
+        `_NATIVE_MODEL_IDENTITY_CALLS` times. The proposal itself never agrees
+        with anything. The route record (`native_script_route`) says whether
+        the route completed: an adapter title search and a Brave or Exa search
+        both finished, and no web provider was skipped by a budget.
+
+        Returns an admitted source (full text, or an abstract of a work whose
+        identity agreed) or None.
+        """
+        from app.services.native_script_query import propose_native_query
+        from app.services.other_language import other_language_signals, split_cited_title
+        from app.services.reference_verification import NATIVE_SCRIPT_ROUTE_POLICIES
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if trace is None:
+            return None
+        signals = other_language_signals(reference)
+        if not signals:
+            return None
+        expected: ExpectedBibliographicFields = trace["expected"]
+        cited = split_cited_title(expected.title)
+        route = {"policy_version": NATIVE_SCRIPT_ROUTE_POLICIES[-1], "signals": signals,
+                 "cited_title": {k: cited[k] for k in ("romanised", "translation")} if cited else None,
+                 "attempt_ids": [], "model_identity_calls": 0}
+        trace["native_script_route"] = route
+        if expired():
+            route["status"] = "elapsed_budget_exhausted"
+            return None
+        proposal = propose_native_query(reference)
+        route["proposal"] = proposal
+        native_title = proposal.get("native_title")
+        if not native_title:
+            route["status"] = "proposal_unavailable"
+            return None
+        native_author = next(iter(proposal.get("native_authors") or []), None)
+        cited_author = expected.authors[0] if expected.authors else None
+        kind = expected.source_kind or "unknown"
+        names = set(self._NATIVE_ADAPTERS) | (
+            set(self._NATIVE_BOOK_ADAPTERS) if kind in self._NATIVE_BOOK_KINDS else set())
+        adapters = [source for source in self._retrieval_sources
+                    if source.name in names
+                    and getattr(source, "handles_source_kind", _any_source_kind)(kind)]
+        found: list[tuple[str, RetrievalResult]] = []
+
+        def recorded(category: str, provider: str, result: RetrievalResult) -> str:
+            self._record_discovery_attempt(category=category, provider=provider, result=result, required=False)
+            attempt_id = trace["attempts"][-1].attempt_id
+            route["attempt_ids"].append(attempt_id)
+            return attempt_id
+
+        translation = (cited or {}).get("translation")
+        for query_title, sources in ((native_title, adapters),
+                                     (translation, [a for a in adapters if a.name in self._NATIVE_ADAPTERS])):
+            if not query_title or not sources:
+                continue
+            for source, provider_result in self._lookup_structured_sources(
+                    sources, None, query_title, None, expected.year or None):
+                self._native_model_fallback(provider_result, expected, route)
+                found.append((recorded("academic_adapter", source.name, provider_result), provider_result))
+        if kind in self._NATIVE_BOOK_KINDS and not expired():
+            from app.services.retrieval.google_books import GoogleBooksRetriever
+            search = GoogleBooksRetriever().search_metadata_result(title=native_title, max_results=5)
+            self._record_book_search(expected, search, fallback=True)
+            route["attempt_ids"].append(trace["attempts"][-1].attempt_id)
+
+        admitted: RetrievalResult | None = None
+        expected_kind = _expected_source_kind_assessment(
+            source_kind=getattr(reference, "source_kind", None) or "unknown",
+            source_kind_confidence=getattr(reference, "source_kind_confidence", "unknown"),
+            source_kind_evidence=tuple(getattr(reference, "source_kind_evidence", ()) or ()),
+            raw_ref=getattr(reference, "raw_ref", None) or None,
+            title=expected.title or None,
+            url=getattr(reference, "url", None) or None,
+        )
+        web_sources = [source for source in self._retrieval_sources
+                       if "web_discovery" in getattr(source, "capabilities", frozenset())
+                       or source.name == "web_search"]
+        for source in web_sources:
+            result = self._try_source(
+                source, None, expected.title or None, cited_author, expected.year or None,
+                expected_source_kind=expected_kind, identity_only=identity_only,
+                query_title=native_title, query_author=native_author)
+            recorded("bounded_web", source.name, result)
+            if result.success and result.full_text and admitted is None:
+                admitted = result
+
+        if admitted is None and not identity_only:
+            admitted = self._native_admit_metadata_record(found, expected, expected_kind)
+        route.update(self._native_route_completion(trace, route["attempt_ids"], native_title))
+        if admitted is not None:
+            admitted.metadata = admitted.metadata or {}
+            admitted.metadata["native_script_route"] = True
+        return admitted
+
+    def _native_model_fallback(self, result: RetrievalResult, expected, route: dict) -> None:
+        """The existing model comparison for a record romanisation cannot decide."""
+        from app.services.cross_language_identity import compare_titles
+        from app.services.cross_script_identity import judge_cross_script_identity
+        if (not result.success or not result.title
+                or route["model_identity_calls"] >= self._NATIVE_MODEL_IDENTITY_CALLS
+                or not cross_script_comparison_unresolved(expected.title, result.title)
+                or compare_titles(expected.title, result.title) is not None):
+            return
+        route["model_identity_calls"] += 1
+        judged = judge_cross_script_identity(
+            {"title": expected.title, "author": expected.authors[0] if expected.authors else "",
+             "year": expected.year, "container_title": expected.container_title},
+            {"titles": [result.title], "date": result.year or "", "text": result.abstract or ""})
+        result.metadata = {**(result.metadata or {}), "cross_script_judgment": judged}
+
+    def _native_admit_metadata_record(self, found, expected, expected_kind) -> RetrievalResult | None:
+        """A record whose identity agreed: its open copy, else its abstract."""
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        abstract = None
+        for attempt_id, result in found:
+            if not result.success:
+                continue
+            agreed = any(
+                candidate.attempt_id == attempt_id and candidate.is_credible
+                and not candidate.has_material_conflict
+                and any(c.field_name == "title" and c.outcome in {"agreement", "minor_difference"}
+                        for c in candidate.comparisons)
+                for candidate in trace["candidates"])
+            if not agreed:
+                continue
+            if (result.locations or result.full_text_url) and not expired():
+                acquired = self._download_and_cache(
+                    _CANONICAL_GRAPH_SOURCE, result, result.doi, expected.title or None,
+                    expected.authors[0] if expected.authors else None, expected.year or None,
+                    expected_source_kind=expected_kind)
+                if acquired.full_text:
+                    return acquired
+            if result.abstract and abstract is None:
+                abstract = result
+        return abstract
+
+    @staticmethod
+    def _native_route_completion(trace: dict, attempt_ids: list[str], native_title: str) -> dict:
+        """Whether the native-script route completed, by the one completion rule
+        (search-completion-v1) over its own attempts and its own-script title;
+        one finished index suffices."""
+        from app.services.search_completion import assess_search_completion
+        completion = assess_search_completion(
+            {"expected": trace["expected"], "queries": trace["queries"], "attempts": trace["attempts"],
+             "required_web_providers": trace.get("required_web_providers")},
+            title=native_title, attempt_ids=set(attempt_ids), any_adapter=True)
+        attempts = [a for a in trace["attempts"] if a.attempt_id in set(attempt_ids)]
+        skipped = sorted({q.execution_provider for a in attempts for q in trace["queries"]
+                          if q.query_id in set(a.query_ids) and q.execution_outcome in {"budget_skipped", "cooldown_skipped"}}
+                         - set(completion.web_routes))
+        return {"status": "completed" if completion.complete else "incomplete",
+                "completion_reason": completion.reason_code,
+                "adapters_completed": list(completion.completed_adapters),
+                "web_completed": list(completion.web_routes), "web_skipped": skipped}
+
+    @staticmethod
+    def _attach_native_route(trace_payload: dict | None, discovery_payload: dict | None, route: dict | None) -> None:
+        if not route:
+            return
+        for payload in (trace_payload, discovery_payload):
+            if isinstance(payload, dict):
+                payload["native_script_route"] = deepcopy(route)
 
     @staticmethod
     def _search_memo_key(trace: dict) -> str | None:
@@ -2031,7 +2702,7 @@ class SourceResolver:
         invention, so the graph refuses the merge; the discrepancy itself is
         what an instructor needs to see.
         """
-        graph = getattr(self, "_last_graph", None)
+        graph = _LAST_GRAPH.get()
         for candidate in getattr(graph, "rejected_candidates", None) or []:
             if candidate.get("rejection_code") == "doi_registers_a_different_title":
                 return {
@@ -2042,19 +2713,95 @@ class SourceResolver:
                 }
         return None
 
-    def _attach_container_identity(self, reference, discovery: dict) -> None:
+    def _single_authored_book_text(self, reference, discovery: dict | None):
+        """The text of the single-authored book a part was cited from, sought
+        as the book itself (owner decision 2026-10-18: the work that exists is
+        the book; the chapter framing is the student's). Searched under the
+        located record's title and author; None when the book was not
+        identified as single-authored or no text was found."""
+        container = (discovery or {}).get("container_identity") if isinstance(discovery, dict) else None
+        if (not container or not container.get("is_monograph") or expired()
+                or getattr(reference, "source_kind", "") != "book_section"):
+            return None
+        from app.services.book_of_part import book_of_cited_part
+        book = book_of_cited_part(container, cited_container_title=getattr(reference, "container_title", ""),
+                                  cited_author=getattr(reference, "author", ""))
+        title, author = (book["title"], book["author"]) if book else ("", "")
+        if not title or not author:
+            return None
+        probe = reference.model_copy(update={
+            "title": title, "author": author, "container_title": "", "pages": "",
+            "source_kind": "monograph", "source_kind_confidence": "medium",
+            "source_kind_evidence": ["single-authored book of a cited part"], "needs_review": False})
+        try:
+            found = self.resolve_reference(probe)
+        except (SourceResolutionError, ValueError, RuntimeError):
+            return None
+        if not found.full_text:
+            return None
+        found.metadata = {**(found.metadata or {}), "held_as_book_of_cited_part": True,
+                          "book_of_cited_part": {"title": title, "author": author,
+                                                 "policy": "single-authored-book-of-part-v1"}}
+        return found
+
+    def _attach_container_identity(self, reference, trace_payload: dict | None,
+                                   discovery: dict | None, *,
+                                   identity_only: bool = False) -> tuple[dict | None, dict | None]:
         """Identify the containing book whenever the cited part is not confirmed.
 
         The part search can end unconfirmed on either path out of
         `resolve_reference`: raised as unresolved, or returned with an
         unchecked lead (Belton's 2026-09-27 rerun: five Brave leads unchecked,
         so "search incomplete"). The book is identifiable either way.
+
+        Once the book is identified, a record sharing only the chapter's title
+        by other authors is another work, and the part's outcome is derived
+        again without it (`is_part_title_namesake`).
         """
-        if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES:
-            return
+        if not isinstance(discovery, dict):
+            return trace_payload, discovery
+        if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES or identity_only:
+            # The chapter itself is confirmed, or is an uncited entry that gets
+            # only the identity lookup, so its book is not searched; but
+            # whether the book is single-authored still decides how a missing
+            # editor is reported: the free title-page check only (2026-10-16).
+            container = (getattr(reference, "container_title", "") or "").strip()
+            # The book as the record that confirmed the chapter names it, not
+            # as the student wrote it ("Sringer eBooks" for the book
+            # "Neoliberalism and Post-Soviet Transition"; Television Without
+            # Frontiers reference 10, 2026-10-18).
+            recorded = next((str((candidate.get("observed") or {}).get("container_title") or "").strip()
+                             for candidate in discovery.get("candidates") or []
+                             if (candidate.get("plausible_identity_match")
+                                 or candidate.get("authoritative_identifier_match"))
+                             and str((candidate.get("observed") or {}).get("container_title") or "").strip()), "")
+            if getattr(reference, "source_kind", "") == "book_section" and (recorded or container):
+                book = recorded or container
+                responsibility = self._container_responsibility(book, getattr(reference, "author", "") or "")
+                discovery["container_identity"] = {
+                    "policy_version": "container-work-identity-v2",
+                    "status": ("part_confirmed" if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES
+                               else "title_page_only"),
+                    "searched_title": book, "title": book,
+                    "is_monograph": responsibility.get("classification") == "single_authored",
+                    "responsibility": responsibility}
+            return trace_payload, discovery
         container_identity = self._identify_container_work(reference)
-        if container_identity:
-            discovery["container_identity"] = container_identity
+        if not container_identity:
+            return trace_payload, discovery
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if container_identity.get("status") == "identified" and trace is not None:
+            namesakes = [candidate for candidate in trace["candidates"]
+                         if is_part_title_namesake(trace["expected"], candidate)]
+            for candidate in namesakes:
+                candidate.plausible_identity_match = False
+                candidate.disposition_reason_code = "part_title_namesake"
+            if namesakes:
+                rederived_trace, rederived = self._discovery_artifacts()
+                if isinstance(rederived, dict):
+                    trace_payload, discovery = rederived_trace, rederived
+        discovery["container_identity"] = container_identity
+        return trace_payload, discovery
 
     def _identify_container_work(self, reference):
         """Identify the book a miscited chapter names, without claiming the part.
@@ -2113,6 +2860,9 @@ class SourceResolver:
         elif responsibility.get("classification") == "single_authored" and not is_monograph:
             is_monograph, kind, kind_confidence = True, "monograph", "medium"
         return {
+            # The catalogue's own record of the book, so later steps use its
+            # real title and author rather than the student's (2026-10-18).
+            "located_record": _best_book_record(discovery),
             "located_source_kind": kind,
             "located_source_kind_confidence": kind_confidence,
             "is_monograph": is_monograph,
@@ -2136,9 +2886,30 @@ class SourceResolver:
             return {"classification": "unresolved", "reason": "catalogue_not_configured" if source is None
                     else "no_cited_author"}
         try:
-            return source.statements_of_responsibility(title, author)
+            found = source.statements_of_responsibility(title, author)
         except Exception as exc:   # an optional check never fails the reference
-            return {"classification": "unresolved", "reason": f"lookup_failed:{type(exc).__name__}"}
+            found = {"classification": "unresolved", "reason": f"lookup_failed:{type(exc).__name__}"}
+        if found.get("classification") != "unresolved":
+            return found
+        # Open Library holds no title-page statement for this book: the
+        # national library catalogues may (title-page-catalogues-v1).
+        from app.services.relevance import extract_surnames
+        from app.services.retrieval import provider_gate
+        from app.services.retrieval import title_page_catalogues as catalogues
+        from app.services.retrieval.open_library import classify_responsibility
+        surnames = extract_surnames(author)
+        if not surnames or expired():
+            return found
+        held = catalogues.catalogue_statements(
+            title, surnames[0],
+            lambda provider, url, params: provider_gate.paced_get(
+                provider, catalogues._PACE_SECONDS, url, params=params, timeout=20, follow_redirects=True))
+        if held is None:
+            return found
+        provider, statements = held
+        return {"classification": classify_responsibility(statements, surnames[0]),
+                "statements": statements[:8], "provider": provider, "policy": catalogues.VERSION,
+                "open_library": {k: found.get(k) for k in ("reason", "work_key") if found.get(k)}}
 
     def _identity_settled(self, graph) -> bool:
         """Is the work confirmed AND already reachable?
@@ -2193,6 +2964,18 @@ class SourceResolver:
                 metadata={"lookup_applicable": False},
             )
 
+    def _settled_abstract_lookups(self, sources, graph, doi, title, author, year):
+        """Skip corroboration-only adapters once identity is settled, except
+        that an abstract-capable one is still asked by DOI when no accepted
+        record holds an abstract (doi-abstract-over-short-page-v1, owner
+        decision 2026-10-13): the DOI's abstract must be in hand before a
+        short page can yield to it."""
+        wanted = [] if not doi or any(r.abstract for r in graph.accepted_results) else [
+            source for source in sources if source.name in _SETTLED_ABSTRACT_SOURCES]
+        if wanted:
+            yield from self._lookup_structured_sources(wanted, doi, title, author, year)
+        yield from self._skipped_sources([source for source in sources if source not in wanted])
+
     @staticmethod
     def _skipped_sources(sources):
         """Record a route the application declined to run, as exactly that.
@@ -2242,6 +3025,10 @@ class SourceResolver:
         """
         candidates = _PROVISIONAL_CANDIDATES.get()
         representation = result.representation
+        if (result.metadata or {}).get('author_conflict'):
+            # Same title, but the byline credits other people: a different
+            # attribution, shown as an author conflict, never provisional text.
+            return
         if (candidates is None or candidates or confidence != 'medium'
                 or representation is None or representation.kind is not RepresentationKind.PDF
                 or text_quality not in {'digital', 'born_digital', 'scan_ocr'}
@@ -2327,6 +3114,81 @@ class SourceResolver:
             candidate.metadata['search_retention_policy'] = BRAVE_TRANSIENT_POLICY
             candidate.metadata['transient_details_discarded'] = True
         candidates.append(candidate)
+
+    def _search_periodical_archive(self, *, title, author, year, container_title, raw_ref,
+                                   expected_kind) -> RetrievalResult | None:
+        """Find a cited magazine article in the Media History Digital Library.
+
+        A free search (media-history-archive-v1) before the paid routes. The
+        page it finds is read like a student's own Lantern link
+        (`lantern-pages-v1`): when the cited pages carry the title, that text
+        is the source. A page that only shows the article (a contents line)
+        makes the reference a possible match. An empty or failed search is
+        never evidence that the article does not exist.
+        """
+        if expired():
+            return None
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if (trace is None or expected_kind.kind not in _PERIODICAL_ARCHIVE_KINDS or not (title or "").strip()
+                or not (container_title or "").strip() or not re.match(r"^\d{4}", year or "")):
+            return None
+        capabilities = getattr(self, "_acquisition_capabilities", None)
+        if capabilities is not None and "academic_adapters" not in capabilities:
+            return None
+        from app.services.retrieval import media_history_archive as archive
+        from app.services.relevance import extract_surnames
+        surnames = extract_surnames(author) if author else []
+        pages = re.findall(r"\d+", (trace["expected"].pages or "").strip())
+        search = archive.find_periodical_article(
+            title, container_title, year, surnames[0] if surnames else (author or ""),
+            pages[0] if pages else "")
+        if search.outcome == "declined":
+            return None  # the library holds no such magazine; nothing was asked
+        empty = search.outcome == "no_results_low_coverage"
+        self._record_discovery_attempt(
+            category="academic_adapter", provider=archive.PROVIDER, required=False,
+            result=RetrievalResult(
+                source_name=archive.PROVIDER, success=search.match is not None,
+                error=None if search.match else "no results" if empty else search.outcome,
+                metadata={
+                    "structured_search_attempts": [
+                        {**attempt, **({"reason_code": "low_coverage_catalogue"}
+                                       if attempt["outcome"] == "no_results" else {})}
+                        for attempt in search.attempts[:8]] or [
+                        {"query": "insufficient-metadata", "outcome": search.outcome}],
+                    "archive_page_matches": [],
+                }),
+        )
+        if search.match is None:
+            return None
+        trace["periodical_archive_match"] = {"policy_version": archive.VERSION,
+                                             **dataclasses.asdict(search.match)}
+        from app.services.retrieval import lantern as pages
+        from app.services.retrieval import provider_gate
+        volume, found_leaf = pages.lantern_target(archive.page_link(search.match.page_id)) or (None, None)
+        cited = pages.cited_page_ranges(raw_ref) or ([pages.cited_pages(raw_ref)] if pages.cited_pages(raw_ref) else [])
+        leaf = pages.article_first_leaf(
+            volume, found_leaf, cited[0][0] if cited else None,
+            lambda address: provider_gate.paced_get("internet_archive", 0.5, address, timeout=30,
+                                                    follow_redirects=True)) if volume else None
+        if leaf is None:
+            return None
+        lantern = self._try_lantern(f"{pages.LANTERN}/catalog/{volume}_{leaf:04d}", title=title, author=author,
+                                    year=year, container_title=container_title, raw_ref=raw_ref,
+                                    searched_author=(surnames[0] if surnames else author or "")
+                                    if search.match.author_beside else "")
+        self._record_discovery_attempt(category="academic_adapter", provider="lantern",
+                                       result=lantern, required=False)
+        return lantern if lantern.success else None
+
+    @staticmethod
+    def _attach_periodical_archive(trace_payload: dict | None, discovery_payload: dict | None) -> None:
+        match = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("periodical_archive_match")
+        if not match:
+            return
+        for payload in (trace_payload, discovery_payload):
+            if isinstance(payload, dict):
+                payload["periodical_archive_match"] = deepcopy(match)
 
     def _enrich_journal_registration(self, reference) -> None:
         """Optional bounded metadata escalation, never an exhaustive archive check."""
@@ -2508,14 +3370,19 @@ class SourceResolver:
                 },
             },
         } for book in search.candidates]
+        # An empty answer is a completed search, not a failure; its reason code
+        # keeps the catalogue's weak coverage, and the route stays optional, so
+        # no completion rule or review counts it as absence (2026-10-16).
+        empty = search.outcome == "no_results_low_coverage"
         result = RetrievalResult(
             source_name="internet_archive", success=bool(candidates),
-            error=None if candidates else search.error_code or search.outcome,
+            error=None if candidates else "no results" if empty else search.error_code or search.outcome,
             metadata={
                 "structured_search_attempts": [{
                     "query": search.query or "insufficient-metadata",
-                    "outcome": search.outcome,
-                    "result_count": len(candidates) if search.outcome == "results" else None,
+                    "outcome": "no_results" if empty else search.outcome,
+                    "result_count": 0 if empty else len(candidates) if search.outcome == "results" else None,
+                    **({"reason_code": "low_coverage_catalogue"} if empty else {}),
                 }],
                 "book_metadata_candidates": candidates,
             },
@@ -2532,7 +3399,11 @@ class SourceResolver:
             "partial, so this is not evidence that the reference is incorrect."
         )
 
-    def resolve(
+    def resolve(self, *args, **kwargs) -> RetrievalResult:
+        """Resolve a reference."""
+        return self._resolve_routes(*args, **kwargs)
+
+    def _resolve_routes(
         self,
         doi: str | None = None,
         isbn: str | None = None,
@@ -2609,6 +3480,14 @@ class SourceResolver:
         if result.success and result.full_text:
             link_not_visited(None, 'authorized_reuse')
             return result
+        # 1.1. A chapter held only as its whole book (owner decision 2026-10-16).
+        book = self._check_local_cache_for_book(container_title, expected_kind, author=author, year=year)
+        if book is not None:
+            self._record_discovery_attempt(category="durable_repository", provider="local_cache",
+                                           result=book, required=False)
+            if book.success and book.full_text:
+                link_not_visited(None, 'authorized_reuse')
+                return book
 
         # 1.5. Reuse bounded abstract/miss lookup state. Full text always wins
         # from the durable repository. A changed cited URL, acquisition-policy
@@ -2667,6 +3546,12 @@ class SourceResolver:
                 f"isbn={isbn}, title={title}"
             )
 
+        # An abstract kept from a publisher landing page that held only an
+        # abstract and back matter (landing-abstract-back-matter-v1), or from
+        # a linked Chinese-language abstract page (cjk-abstract-page-v1); used
+        # only when no other abstract is found.
+        landing_abstract_result: RetrievalResult | None = None
+
         # 2. Try student URL — PDF first, then web-page text for HTML sources.
         capabilities = getattr(self, "_acquisition_capabilities", None)
         if student_url and capabilities is not None and 'student_url' not in capabilities:
@@ -2718,9 +3603,21 @@ class SourceResolver:
                         self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                         return web_result
                     url_failure_reason = web_result.error or "web fetch failed"
+                    landing_abstract_result = landing_abstract_result or _landing_abstract_holder(web_result)
                 else:
                     url_failure_reason = result.error or "URL download failed"
             else:
+                # A Media History Digital Library page link: read the cited
+                # article's scanned pages (lantern-pages-v1, 2026-10-14).
+                from app.services.retrieval.lantern import lantern_target
+                if lantern_target(student_url):
+                    lantern = self._try_lantern(student_url, title=title, author=author, year=year,
+                                                container_title=container_title, raw_ref=raw_ref)
+                    self._record_discovery_attempt(category="student_url", provider="student_url_lantern",
+                                                   result=lantern, required=False)
+                    if lantern.success:
+                        self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
+                        return lantern
                 # Most cited URLs are web pages. Fetch HTML first so news,
                 # government, blog and reference content does not pay for a
                 # failed PDF-only request before reaching its real route.
@@ -2754,35 +3651,21 @@ class SourceResolver:
                     url_failure_reason = result.error or "PDF validation failed"
                 else:
                     url_failure_reason = web_result.error or "web fetch failed"
+                    landing_abstract_result = landing_abstract_result or _landing_abstract_holder(web_result)
                     archived = self._try_archived_copy(student_url, web_result, title, expected_kind,
                                                        author, year, doi)
                     if archived is not None:
                         self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                         return archived
 
-        # 2.5. Try DOI resolver / campus proxy (institutional deployment).
-        #      When DOI_RESOLVER_URL is configured, construct {url}{doi} to
-        #      access the paper through the university's library proxy. This
-        #      is the key to high full-text retrieval rates for paywalled content
-        #      — the proxy handles subscription authentication.
-        if (
-            doi
-            and settings.DOI_RESOLVER_URL
-            and (capabilities is None or "doi_resolver" in capabilities)
-        ):
-            result = self._try_doi_resolver(
-                doi, title, expected_source_kind=expected_kind
-            )
-            self._record_discovery_attempt(
-                category="library_metadata",
-                provider="doi_resolver",
-                result=result,
-                required=True,
-            )
-            if result.success:
-                if result.full_text:
-                    self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
-                return result
+        # 2.6. A cited magazine article in the Media History Digital Library
+        #      (media-history-archive-v1, 2026-10-16): free, before paid search.
+        archived_article = self._search_periodical_archive(
+            title=title, author=author, year=year, container_title=container_title,
+            raw_ref=raw_ref, expected_kind=expected_kind)
+        if archived_article is not None:
+            self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
+            return archived_article
 
         # 3. Merge structured-provider evidence into one canonical work graph,
         #    then acquire from its combined location set. Public-domain sources
@@ -2836,7 +3719,7 @@ class SourceResolver:
                 if result and result.abstract:
                     best_abstract_result = result
 
-            graph = self._last_graph = CanonicalWorkGraph(
+            graph = CanonicalWorkGraph(
                 expected_doi=doi,
                 expected_title=title,
                 expected_author=author,
@@ -2848,6 +3731,7 @@ class SourceResolver:
                 expected_source_kind_confidence=expected_kind.confidence,
                 expected_source_kind_evidence=expected_kind.evidence,
             )
+            _LAST_GRAPH.set(graph)
             # Accuracy first: every adapter still runs whenever the identity
             # question is open. Efficiency second: once the fast metadata
             # routes have confirmed the work *and* a route to its text exists,
@@ -2886,8 +3770,8 @@ class SourceResolver:
             if trailing_sources:
                 for source, provider_result in self._lookup_structured_sources(
                     trailing_sources, doi, title, author, year
-                ) if not self._identity_settled(graph) else self._skipped_sources(
-                    trailing_sources
+                ) if not self._identity_settled(graph) else self._settled_abstract_lookups(
+                    trailing_sources, graph, doi, title, author, year
                 ):
                     self._record_discovery_attempt(
                         category="academic_adapter",
@@ -2949,7 +3833,11 @@ class SourceResolver:
                     expected_source_kind=expected_kind,
                 )
                 self._record_canonical_location_outcomes(merged_result)
-                if merged_result.full_text:
+                preferred = self._abstract_instead_of_short_page(
+                    merged_result, merged_result, enriched_doi, expected_kind, landing=landing_abstract_result)
+                if preferred is not None:
+                    best_abstract_result = preferred
+                elif merged_result.full_text:
                     self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                     return self._finalize_resolution_result(
                         merged_result,
@@ -2959,7 +3847,7 @@ class SourceResolver:
                         year,
                         url_failure_reason,
                     )
-                if merged_result.abstract:
+                elif merged_result.abstract:
                     best_abstract_result = merged_result
 
             # Unknown-year/no-DOI literary works still get the edition route,
@@ -2992,14 +3880,19 @@ class SourceResolver:
                 unquote(parsed_student_url.path).lstrip('/').casefold() == doi.casefold() and
                 (capabilities is None or "student_url" in capabilities))
             direct = None
-            if (doi and not settings.DOI_RESOLVER_URL and not doi_url_visited
+            if (doi and not doi_url_visited
                     and (capabilities is None or "doi_resolver" in capabilities)):
                 direct = self._try_doi_resolver(doi, title,
                     expected_source_kind=expected_kind, public=True,
                     expected_author=author, expected_year=year)
                 self._record_discovery_attempt(category="student_url",
                     provider="public_doi", result=direct, required=False)
-                if direct.success and direct.full_text:
+                landing_abstract_result = landing_abstract_result or _landing_abstract_holder(direct)
+                preferred = self._abstract_instead_of_short_page(
+                    direct, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
+                if preferred is not None:
+                    best_abstract_result = preferred
+                elif direct.success and direct.full_text:
                     self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                     return self._finalize_resolution_result(
                         direct, doi, title, author, year, url_failure_reason)
@@ -3014,7 +3907,11 @@ class SourceResolver:
                 if mdpi is not None:
                     self._record_discovery_attempt(category="student_url",
                         provider=MDPI_FILE_SERVER_ROUTE, result=mdpi, required=False)
-                    if mdpi.success and mdpi.full_text:
+                    preferred = self._abstract_instead_of_short_page(
+                        mdpi, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
+                    if preferred is not None:
+                        best_abstract_result = preferred
+                    elif mdpi.success and mdpi.full_text:
                         self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                         return self._finalize_resolution_result(
                             mdpi, doi, title, author, year, url_failure_reason)
@@ -3038,6 +3935,11 @@ class SourceResolver:
                 )
                 if result.metadata and result.metadata.get("retrieval_trace"):
                     web_retrieval_trace.extend(result.metadata["retrieval_trace"])
+                preferred = self._abstract_instead_of_short_page(
+                    result, best_abstract_result, enriched_doi, expected_kind, landing=landing_abstract_result)
+                if preferred is not None:
+                    best_abstract_result = preferred
+                    continue
                 if result.success and result.full_text:
                     self._delete_lookup_cache(doi, title, author, year, expected_kind.kind)
                     return self._finalize_resolution_result(
@@ -3047,6 +3949,8 @@ class SourceResolver:
                     best_abstract_result = result
 
         # 4. No full text found — abstract fallback.
+        if best_abstract_result is None:
+            best_abstract_result = landing_abstract_result
         if best_abstract_result is not None:
             logger.info(
                 "No acquired representation for doi=%s title=%s, but abstract available from %s",
@@ -3144,14 +4048,16 @@ class SourceResolver:
                 "journal-visible-metadata-body-v1",
                 "journal-title-author-near-year-v1",
                 "provisional-short-title-exclusion-v1",
-                str(settings.SEARCH_SEARXNG_FALLBACK_ENABLED),
+                # A retired fallback flag's former default, kept so stored
+                # lookup signatures stay fresh.
+                "True",
                 str(settings.BRAVE_SEARCH_RETENTION_PERMITTED),
                 str(settings.BRAVE_SEARCH_TRANSIENT_ENABLED),
                 settings.SEARCH_ESCALATION_MAX_CALLS,
                 capability_part,
                 providers,
                 settings.RETRIEVAL_PROVIDER_CONFIG,
-                "doi_resolver" if settings.DOI_RESOLVER_URL else "no_doi_resolver",
+                "no_doi_resolver",
             )
         )
         return hashlib.sha256(context.encode("utf-8")).hexdigest()
@@ -3262,6 +4168,33 @@ class SourceResolver:
 
     # ── Internal helpers ───────────────────────────────────
 
+    def _check_local_cache_for_book(self, container_title, expected_kind, *, author, year):
+        """The library's accepted copy of the book a cited chapter is in.
+
+        Looked up by the book's title without its edition note, and used only
+        when the library record's year and first author's surname are the
+        reference's (owner decision 2026-10-16: Dyer's introduction to
+        *Heavenly bodies*, uploaded but never found by the chapter title).
+        None when the reference is not a chapter or names no book.
+        """
+        if expected_kind.kind != "book_section" or not (container_title or "").strip() or not author or not year:
+            return None
+        from app.services.reference_verification import _EDITION
+        from app.services.relevance import extract_surnames
+        book_title = re.sub(r"\s+", " ", _EDITION.sub(" ", container_title)).strip(" .,")
+        found = self._check_local_cache(
+            None, None, book_title, author=author, year=year,
+            expected_source_kind=SourceKindAssessment("monograph", "medium", ("book of a cited chapter",)))
+        if not found.success:
+            return found
+        cited = [s.casefold() for s in extract_surnames(author)[:1]]
+        held = [s.casefold() for a in (found.authors or [])[:1] for s in extract_surnames(a)[:1]]
+        if not cited or cited != held or str(found.year or "")[:4] != str(year)[:4]:
+            return RetrievalResult(source_name="local_cache", success=False,
+                                   metadata={"reuse_refusal": "book_copy_author_or_year_differs"})
+        found.metadata = {**(found.metadata or {}), "held_as_book_of_cited_part": True}
+        return found
+
     @_timed_retrieval
     def _check_local_cache(
         self,
@@ -3308,8 +4241,13 @@ class SourceResolver:
                         if (record.canonical_work.year != year or
                                 _normalize_cache_author(record.canonical_work.author) != _normalize_cache_author(author)):
                             record = None
+                from app.services.source_reuse import lantern_copy_stale, stored_copy
                 if record is None:
                     return RetrievalResult(source_name="local_cache", success=False)
+                if lantern_copy_stale(record):
+                    return RetrievalResult(source_name="local_cache", success=False,
+                                           metadata={"reuse_refusal": "lantern_pages_changed"})
+                self._record_copy_use(session, record)
                 try:
                     data = self._backend.download(record.content_object.storage_key)
                 except FileNotFoundError:
@@ -3323,30 +4261,42 @@ class SourceResolver:
                         error="Accepted source object unavailable",
                     )
                 kind = RepresentationKind(record.representation_kind)
-                if record.completeness_verdict == 'incomplete':
-                    from app.services.publisher_preview import valid_preview_receipt
-                    if (not author or not year or record.canonical_work.year != year
-                            or _normalize_cache_author(record.canonical_work.author) != _normalize_cache_author(author)
-                            or not valid_preview_receipt((record.validation_evidence or {}).get('publisher_preview'),
-                                hashlib.sha256(data).hexdigest(), record.source_url)):
-                        return RetrievalResult(source_name='local_cache', success=False,
-                            error='Limited preview binding could not be revalidated')
-                if edition_title_fallback:
-                    if kind != RepresentationKind.PDF:
-                        return RetrievalResult(source_name="local_cache", success=False)
+
+                def edition_check():
                     validation = validate_retrieved_pdf(data, expected_title=title,
                         expected_author=author, expected_year=year, document_kind="book",
                         expected_source_kind=expected_source_kind.kind,
                         expected_source_kind_confidence=expected_source_kind.confidence,
                         expected_source_kind_evidence=expected_source_kind.evidence)
-                    if (validation.identity_confidence == "rejected" or validation.completeness == "incomplete"
-                            or not _accepted_copy_has_edition_label(data, title)):
-                        return RetrievalResult(source_name="local_cache", success=False,
-                            error="Edition-qualified library candidate could not be revalidated")
+                    return not (validation.identity_confidence == "rejected"
+                                or validation.completeness == "incomplete"
+                                or not _accepted_copy_has_edition_label(data, title))
+                decision, completeness = stored_copy(
+                    record, data, kind=kind, title=title, author=author, year=year,
+                    normalize_author=_normalize_cache_author,
+                    edition_check=edition_check if edition_title_fallback else None)
+                if not decision.reusable:
+                    return RetrievalResult(source_name="local_cache", success=False,
+                                           error=_STORED_COPY_ERRORS.get(decision.reason),
+                                           metadata={"reuse_refusal": decision.reason})
                 original_kind = (
                     RepresentationKind(record.original_kind)
                     if record.original_kind else None
                 )
+                observed_fields = None
+                if getattr(record, "admitted_by", None) == "retrieval_pipeline":
+                    # The canonical work holds the citation's own fields, so
+                    # returning them as observed confirmed a reference against
+                    # itself. Reuse reports only what the source showed
+                    # (opening-byline-identity-v1); a stored PDF without that
+                    # observation is checked again from its bytes.
+                    observed_fields = _reuse_observed_identity(
+                        record, data, kind, doi=doi, isbn=isbn, title=title,
+                        author=author, year=year, expected_source_kind=expected_source_kind)
+                    if observed_fields is None:
+                        return RetrievalResult(
+                            source_name="local_cache", success=False,
+                            error="Accepted representation identity could not be revalidated")
                 return RetrievalResult(
                     source_name="local_cache",
                     success=True,
@@ -3356,14 +4306,19 @@ class SourceResolver:
                         content=data,
                         source_url=record.source_url,
                         original_kind=original_kind,
-                        completeness=record.completeness_verdict,
+                        completeness=completeness,
                     ),
-                    doi=_registration_bound_doi(record, doi),
-                    title=record.canonical_work.display_title,
-                    year=record.canonical_work.year,
+                    doi=(_registration_bound_doi(record, doi) if observed_fields is None
+                         else _registration_bound_doi(record, observed_fields.get("doi"))),
+                    title=(record.canonical_work.display_title if observed_fields is None
+                           else observed_fields.get("title")),
+                    year=(record.canonical_work.year if observed_fields is None
+                          else observed_fields.get("year")),
                     authors=(
-                        [record.canonical_work.author]
-                        if record.canonical_work.author else []
+                        ([record.canonical_work.author]
+                         if record.canonical_work.author else [])
+                        if observed_fields is None
+                        else [str(value) for value in observed_fields.get("authors") or [] if value]
                     ),
                     metadata={
                         "repository_representation_id": str(record.id),
@@ -3373,6 +4328,8 @@ class SourceResolver:
                         "source_kind": record.canonical_work.work_type,
                         "edition_or_version": record.edition_or_version,
                         "publisher_preview": (record.validation_evidence or {}).get('publisher_preview'),
+                        **({"reuse_observed_identity": observed_fields}
+                           if observed_fields is not None else {}),
                     },
                 )
         for key in self._build_cache_keys(doi, isbn, title):
@@ -3464,6 +4421,85 @@ class SourceResolver:
         return keys
 
     @_timed_retrieval
+    def _try_lantern(self, url: str, *, title, author, year, container_title, raw_ref,
+                     searched_author: str | None = None) -> RetrievalResult:
+        """The cited magazine article's OCR pages from a Lantern link (`lantern-pages-v1`).
+
+        Confirmed when the cited title opens one of the candidate pages, the
+        magazine is the cited container and the cited year falls within the
+        bound volume's dates; the author counts only when named in the text.
+        """
+        from app.services.retrieval import lantern as pages
+        from app.services.retrieval import provider_gate
+
+        def get(address):
+            return provider_gate.paced_get("lantern", 0.5, address, timeout=20, follow_redirects=True)
+
+        def get_archive(address):
+            return provider_gate.paced_get("internet_archive", 0.5, address, timeout=30, follow_redirects=True)
+        try:
+            article = pages.read_article(url, title=title, raw_ref=raw_ref, get=get, get_archive=get_archive,
+                                         searched_author=searched_author)
+        except Exception as e:  # noqa: BLE001 - a failed read falls back to the ordinary web fetch
+            return RetrievalResult(source_name="lantern", success=False,
+                                   error=f"lantern_read_failed:{safe_exception_code(e)}")
+        if article is None:
+            # An answered check that did not identify the work, in the existing
+            # vocabulary, so the reference's search can still complete.
+            return RetrievalResult(source_name="lantern", success=False,
+                                   error="Cited title not found on the linked volume's candidate pages",
+                                   metadata={"lantern": {"policy": pages.POLICY},
+                                             "web_fetch_diagnostic": WebFetchDiagnostic(
+                                                 reason="page_title_mismatch_unconfirmed").model_dump()})
+        content = article.text.encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        surname = re.split(r"[,\s]+", str(author or "").strip())[0] if author else ""
+        authors = [author] if surname and len(surname) > 1 and re.search(
+            rf"\b{re.escape(surname)}\b", article.text, re.IGNORECASE) else []
+        year_ok = pages.year_in_dates(year, article.volume_dates)
+        magazine_ok = (pages.magazine_matches(container_title, article.magazine)
+                       or pages.magazine_matches(article.magazine, raw_ref or ""))
+        confirmed = bool(year_ok and magazine_ok)
+        labels = pages.page_labels(article)
+        record = {"policy": pages.POLICY, "volume": article.volume, "magazine": article.magazine,
+                  "volume_dates": article.volume_dates, "leaves": article.leaves,
+                  "printed_pages": article.printed_pages, "notes": article.notes}
+        coverage = {"verdict": "complete" if article.complete else "not_assessed",
+                    "reason": "cited_pages_read" if article.complete else (article.notes or ["incomplete"])[0],
+                    "policy": pages.POLICY}
+        result = RetrievalResult(
+            source_name="lantern", success=confirmed, title=title, authors=authors,
+            year=year if year_ok else None,
+            representation=SourceRepresentation(
+                kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain", content=content,
+                source_url=article.first_leaf_url, original_kind=RepresentationKind.HTML, charset="utf-8",
+                completeness=coverage["verdict"], metadata={
+                    "web_completeness": coverage,
+                    "printed_page_labels": {"policy": pages.POLICY, "labels": labels, "content_sha256": digest}}),
+            abstract=article.text, full_text_url=article.first_leaf_url,
+            metadata={"lantern": record, "web_completeness": coverage,
+                      # The printed page numbers, bound to this exact text (owner decision 2026-10-14).
+                      "printed_page_labels": {"policy": pages.POLICY, "labels": labels, "content_sha256": digest},
+                      "web_identity": {"title": title, "authors": authors, "year": year if year_ok else None,
+                                       "doi": None},
+                      "requested_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+                      "representation_kind": RepresentationKind.PLAIN_TEXT.value, "text_quality": "scan_ocr"},
+        )
+        _identity, comparisons, _ = _web_identity_comparison(result, title=title, author=author, year=year)
+        result.metadata["identity_comparisons"] = [c.model_dump(mode="json") for c in comparisons]
+        if confirmed:
+            result.metadata.update(identity_confidence="high", work_identity_basis=pages.POLICY,
+                                   identity_reason="Cited title on the scanned page; magazine and year match the volume",
+                                   accepted_representation_sha256=hashlib.sha256(result.full_text).hexdigest(),
+                                   web_fetch_diagnostic=WebFetchDiagnostic(
+                                       reason="bibliographic_identity_confirmed",
+                                       observed_content_sha256=digest).model_dump())
+        else:
+            result.error = "Scanned page found, but the magazine or year does not match the reference"
+            result.metadata.update(identity_confidence="medium", web_fetch_diagnostic=WebFetchDiagnostic(
+                reason="bibliographic_identity_unconfirmed", observed_content_sha256=digest).model_dump())
+        return result
+
     def _try_student_url(
         self,
         url: str,
@@ -3491,10 +4527,19 @@ class SourceResolver:
                 private_value_id("url", url),
                 type(e).__name__,
             )
+            not_pdf = isinstance(e, ValueError) and str(e).startswith("Not a PDF")
             return RetrievalResult(
                 source_name="student_url",
                 success=False,
-                error=f"Student URL download failed ({type(e).__name__})",
+                # "not a PDF" sends the link on to the web route (resolve()); the
+                # bare exception name hid it, so a PDF link answering with a web
+                # page was never checked as one (2026-10-14).
+                error=("Student URL is not a PDF" if not_pdf
+                       else f"Student URL download failed ({type(e).__name__})"),
+                metadata=({'web_fetch_diagnostic': WebFetchDiagnostic(reason='link_not_found').model_dump()}
+                          if _link_gone(url)
+                          else {'web_fetch_diagnostic': WebFetchDiagnostic(reason='link_not_pdf').model_dump()}
+                          if isinstance(e, ValueError) and str(e).startswith("Not a PDF") else {}),
             )
 
         result = RetrievalResult(
@@ -3660,12 +4705,14 @@ class SourceResolver:
         soup = BeautifulSoup(resp.text, "html.parser")
         pdf_url = None
 
-        # Method 1: citation_pdf_url meta tag (highest confidence — academic standard)
-        meta = soup.find("meta", attrs={"name": "citation_pdf_url"})
-        if meta and meta.get("content"):
-            pdf_url = meta["content"]
+        # Method 1: the page's declared PDF (citation_pdf_url and its
+        # repository variants), read by the one landing-page discovery.
+        declared = [location for location in discover_scholarly_locations(resp.text, str(resp.url))
+                    if location.representation_kind is RepresentationKind.PDF]
+        if declared:
+            pdf_url = declared[0].url
             logger.info(
-                "Found PDF via citation_pdf_url meta tag: %s",
+                "Found PDF via declared meta tag: %s",
                 private_value_id("url", pdf_url),
             )
 
@@ -3757,11 +4804,14 @@ class SourceResolver:
         cache = getattr(self, '_source_inspection_cache', None)
         if cache is None:
             cache = self._source_inspection_cache = {}
-        if key in cache:
-            return cache[key]
-        if len(cache) >= max(0, min(settings.SOURCE_INSPECTION_MAX_CALLS, 12)):
-            return {'status': 'not_run', 'reason_code': 'inspection_budget_exhausted', 'decision_applied': False}
-        cache[key] = {'status': 'incomplete', 'reason_code': 'inspection_unavailable', 'decision_applied': False}
+        # One check-and-claim step, so worker copies sharing this run's budget
+        # (`for_worker`) cannot both take its last inspection.
+        with self.__dict__.setdefault('_source_inspection_lock', threading.Lock()):
+            if key in cache:
+                return cache[key]
+            if len(cache) >= max(0, min(settings.SOURCE_INSPECTION_MAX_CALLS, 12)):
+                return {'status': 'not_run', 'reason_code': 'inspection_budget_exhausted', 'decision_applied': False}
+            cache[key] = {'status': 'incomplete', 'reason_code': 'inspection_unavailable', 'decision_applied': False}
         try:
             limitations = []
             if pdf:
@@ -3809,6 +4859,7 @@ class SourceResolver:
         expected_year: str | None,
         expected_source_kind: SourceKindAssessment = SourceKindAssessment(),
         advertised_by_confirmed_landing: bool = False,
+        landing_author_conflict: dict | None = None,
     ) -> tuple[bool, str, str]:
         """Validate one acquired representation before accepting its location.
 
@@ -3824,6 +4875,9 @@ class SourceResolver:
 
         metadata = result.metadata or {}
         result.metadata = metadata
+        # Per-representation observations; never carried to the next location.
+        metadata.pop("observed_identity", None)
+        metadata.pop("author_conflict", None)
         kind = representation.kind
         content = representation.content
 
@@ -3979,6 +5033,28 @@ class SourceResolver:
                         "malware_verdict": safety_report.malware_verdict.value,
                     },
                 }
+            # What this file itself showed (opening-byline-identity-v1). A
+            # byline naming other people caps identity in the validator; a
+            # same-titled landing page credited to someone else carries over
+            # to the file it advertised unless the file's own opening byline
+            # or a DOI printed in it names the cited work.
+            observed_identity = getattr(validation, "observed_identity", None)
+            author_conflict = getattr(validation, "author_conflict", None)
+            if isinstance(observed_identity, dict):
+                metadata["observed_identity"] = observed_identity
+            if (landing_author_conflict and not author_conflict
+                    and not (observed_identity or {}).get("authors")
+                    and not (observed_identity or {}).get("doi")):
+                author_conflict = dict(landing_author_conflict)
+                if identity_confidence == "high":
+                    identity_confidence = "medium"
+            if author_conflict:
+                metadata["author_conflict"] = author_conflict
+                metadata["identity_reason_code"] = (
+                    "landing_page_author_conflict"
+                    if author_conflict.get("basis") == "landing_page"
+                    else "opening_byline_author_conflict"
+                )
         else:
             from app.services.source_validator import detect_nonprose_payload
             nonprose = detect_nonprose_payload(content.decode("utf-8", errors="replace"))
@@ -4060,6 +5136,14 @@ class SourceResolver:
                 )
                 return False, outcome, content_compatibility.reason[:160]
 
+        earlier = metadata.get("earlier_verified_content_sha256")
+        if (earlier and identity_confidence in {"medium", "low"}
+                and hashlib.sha256(content).hexdigest() == earlier):
+            # A re-download carries no search record, so provider identity is
+            # low; a file byte-identical to the copy an earlier run verified
+            # is that copy (Springer re-downloads, 2026-10-09).
+            identity_confidence = "high"
+            identity_reason = f"{identity_reason}; byte-identical to the copy verified in an earlier run"
         metadata["identity_confidence"] = identity_confidence
         metadata["identity_reason"] = identity_reason
         metadata["representation_kind"] = kind.value
@@ -4085,6 +5169,7 @@ class SourceResolver:
         # qualifies, and only from the page that advertised it.
         corroborated = (
             advertised_by_confirmed_landing
+            and not metadata.get("author_conflict")
             and identity_confidence == "medium"
             and kind is RepresentationKind.PDF
             and kind_verdict != "incompatible"
@@ -4097,6 +5182,22 @@ class SourceResolver:
                 f"{identity_reason}; corroborated by the landing page that names "
                 "this work and advertises this file as its full text"
             )
+        # The copy's own title page names the cited title and first author
+        # (owner decision 2026-10-14): the cited work, not a possible match.
+        title_page = (
+            not corroborated
+            and not metadata.get("author_conflict")
+            and identity_confidence == "medium"
+            and kind is RepresentationKind.PDF
+            and kind_verdict != "incompatible"
+            and text_quality in {"digital", "born_digital", "scan_ocr"}
+            and bool(safety_report and safety_report.verdict is SafetyVerdict.CLEAN)
+            and _title_page_confirms(content, expected_title, expected_author)
+        )
+        if title_page:
+            corroborated = True
+            metadata["identity_corroborated_by_title_page"] = True
+            identity_reason = f"{identity_reason}; its title page names the cited title and first author"
         if identity_confidence != "high" and not corroborated:
             self._retain_provisional_candidate(result, confidence=identity_confidence,
                 reason=identity_reason, completeness=completeness,
@@ -4286,6 +5387,11 @@ class SourceResolver:
                         headers={"Accept": location.media_type or "application/xml,text/plain,*/*"},
                         timeout=settings.DISCOVERY_CANDIDATE_TIMEOUT_SECONDS,
                     )
+                    if metadata_record_xml(response.content):
+                        # A repository's METS/MODS/Dublin Core export describes
+                        # the work; it is never its text (Synthetic Embrace
+                        # reference 12, 2026-10-18).
+                        raise ValueError("repository metadata record, not the work's text")
                     text = _extract_text_representation(
                         response.content,
                         location.representation_kind,
@@ -4316,6 +5422,8 @@ class SourceResolver:
                         headers={"Accept": "text/html,application/xhtml+xml,*/*"},
                         timeout=settings.DISCOVERY_CANDIDATE_TIMEOUT_SECONDS,
                     )
+                    if metadata_record_xml(response.content):
+                        raise ValueError("repository metadata record, not the work's text")
                     discovered = discover_scholarly_locations(
                         response.text,
                         str(response.url),
@@ -4363,6 +5471,11 @@ class SourceResolver:
                         else None
                     )
                     if page_title_match is False:
+                        judged = _cross_script_page_judgment(
+                            response, page_titles, expected_title=expected_title,
+                            expected_author=expected_author, expected_year=expected_year)
+                        if judged is not None:
+                            attempt["cross_script_judgment"] = judged
                         # A generic application/login/results title describes
                         # the interface, not necessarily the requested work.
                         # Require independent bibliographic corroboration before
@@ -4386,6 +5499,24 @@ class SourceResolver:
                         # someone else is shown as an author difference
                         # (Kozlovic, owner decision 2026-09-30).
                         attempt["landing_page_observation"] = self._landing_metadata_observation(response)
+                    # A file reached through a same-titled page credited to
+                    # someone else inherits that author conflict
+                    # (opening-byline-identity-v1).
+                    landing_author_conflict = (
+                        None if landing_identity else self._landing_author_conflict(
+                            attempt.get("landing_page_observation"),
+                            expected_doi=expected_doi, expected_title=expected_title,
+                            expected_author=expected_author, expected_year=expected_year,
+                        )
+                    ) or location.metadata.get("landing_author_conflict")
+                    if landing_author_conflict and discovered:
+                        discovered = [
+                            replace(candidate, metadata={
+                                **candidate.metadata,
+                                "landing_author_conflict": landing_author_conflict,
+                            })
+                            for candidate in discovered
+                        ]
                     from app.services.web_completeness import extract_complete_article_body
                     if extract_complete_article_body(response.text, ""):
                         # Reuse the safe response and ordinary observed-field /
@@ -4426,9 +5557,14 @@ class SourceResolver:
                             and location.url != location.landing_page_url
                         )
                     )
+                    landing_abstract_kept = False
                     if is_explicit_full_text:
                         article_text = _extract_scholarly_html(response.text, result.title)
-                        if article_text:
+                        if article_text and self._kept_landing_abstract(
+                                result, attempt, article_text, location.provider,
+                                response.content, expected_doi, bool(landing_identity)):
+                            landing_abstract_kept = True
+                        elif article_text:
                             structured_kind = classify_html_source_kind(
                                 response.text, str(response.url)
                             )
@@ -4456,7 +5592,11 @@ class SourceResolver:
                         # 2026-09-30). Its text is kept as the last resort, with
                         # completeness not established, so it reads as limited text.
                         article_text = _extract_scholarly_html(response.text, result.title)
-                        if article_text and len(article_text.split()) >= 300:
+                        if article_text and self._kept_landing_abstract(
+                                result, attempt, article_text, location.provider,
+                                response.content, expected_doi, bool(landing_identity)):
+                            landing_abstract_kept = True
+                        elif article_text and len(article_text.split()) >= 300:
                             page_kind = classify_html_source_kind(response.text, str(response.url))
                             from app.services.web_completeness import stated_page_completeness
                             # Rule A (owner decision 2026-09-30): complete only with no
@@ -4538,6 +5678,8 @@ class SourceResolver:
                             )
                             record_attempt(attempt)
                             continue
+                        if landing_abstract_kept:
+                            raise ValueError(LANDING_ABSTRACT_ONLY_ERROR)
                         raise ValueError(
                             f"landing page yielded {len(discovered)} acquisition candidate(s)"
                         )
@@ -4552,8 +5694,16 @@ class SourceResolver:
                     expected_year=expected_year or result.year,
                     expected_source_kind=expected_source_kind,
                     advertised_by_confirmed_landing=advertised_by_confirmed_landing,
+                    landing_author_conflict=location.metadata.get("landing_author_conflict"),
                 )
                 attempt["outcome"] = outcome
+                if (result.metadata or {}).get("author_conflict"):
+                    attempt["author_conflict_basis"] = result.metadata["author_conflict"].get("basis")
+                byline_observation = _pdf_byline_conflict_observation(result)
+                if byline_observation is not None:
+                    # The file's own title and opening byline, as an
+                    # observation (identity-only PDF envelope), never identity.
+                    attempt["landing_metadata_observation"] = byline_observation
                 if outcome in {"acquired", "completeness_rejected"} and (result.metadata or {}).get("identity_confidence") == "high":
                     # Preserve source-bound identity independently of admission.
                     # A partial copy can establish identity without full text.
@@ -4672,15 +5822,92 @@ class SourceResolver:
         return False
 
     @staticmethod
+    def _kept_landing_abstract(result: RetrievalResult, attempt: dict, article_text: str, provider: str,
+                               content: bytes, doi: str | None, identity_confirmed: bool) -> bool:
+        """Is this landing page only an abstract and back matter?
+
+        Such a page never becomes limited text (landing-abstract-back-matter-v1,
+        owner decision 2026-10-13): its notes and references are not the work.
+        When the page's own bibliographic fields confirmed the cited work and
+        no adapter abstract is held, its abstract is kept as abstract-only
+        evidence with the page as provenance.
+        """
+        from app.services.abstract_only_pages import (
+            landing_abstract_and_back_matter, landing_abstract_provenance, mainly_abstract_page)
+        observation = landing_abstract_and_back_matter(article_text)
+        if observation is None:
+            # A page that is mainly its abstract, without an access prompt
+            # (owner decision 2026-10-18), is an abstract too.
+            page_abstract = mainly_abstract_page(article_text, (content or b"").decode("utf-8", "replace"))
+            if not page_abstract or not identity_confirmed:
+                # Unconfirmed, the page stays limited text as before rather
+                # than leaving the reference without any text (2026-10-18).
+                return False
+            observation = {"abstract": page_abstract, "back_matter_sections": [],
+                           "abstract_sha256": hashlib.sha256(page_abstract.encode("utf-8")).hexdigest(),
+                           "abstract_words": len(re.findall(r"\w+", page_abstract)),
+                           "policy": "mainly-abstract-landing-page-v1"}
+        content_sha256 = hashlib.sha256(content or b"").hexdigest()
+        attempt["landing_abstract_only"] = {
+            **{key: value for key, value in observation.items() if key != "abstract"},
+            "page_identity_confirmed": identity_confirmed,
+        }
+        if identity_confirmed and not result.abstract:
+            result.abstract = observation["abstract"]
+            result.metadata = result.metadata or {}
+            result.metadata["abstract_provenance"] = landing_abstract_provenance(
+                observation, provider=provider, content_sha256=content_sha256,
+                doi=doi or result.doi)
+        return True
+
+    @staticmethod
     def _landing_metadata_observation(response) -> dict:
-        """The fetched page's bibliographic fields, kept without its address."""
+        """The fetched page's bibliographic fields and its final fetched address,
+        the record's link (owner decision 2026-10-14)."""
         observed = extract_web_source_metadata(response.text, str(response.url))
         fields = {key: observed[key] for key in ("title", "authors", "year", "doi")}
         fields["metadata"] = {key: observed[key] for key in ("container_title", "pages") if observed.get(key)}
-        return {"observed": fields, "content_sha256": hashlib.sha256(response.content).hexdigest()}
+        return {"observed": fields, "content_sha256": hashlib.sha256(response.content).hexdigest(),
+                "source_url": str(response.url)}
 
     @staticmethod
-    def _landing_metadata_identity(response, *, expected_doi, expected_title, expected_author, expected_year):
+    def _landing_author_conflict(observation, *, expected_doi, expected_title, expected_author,
+                                 expected_year) -> dict | None:
+        """A fetched page under the cited title whose own byline names others.
+
+        Uses the ordinary field comparison: the title agrees (or differs only
+        trivially) and the author is a material conflict. Missing fields on
+        either side are never a conflict.
+        """
+        fields = (observation or {}).get("observed") or {}
+        authors = [str(value)[:200] for value in (fields.get("authors") or [])[:8] if value]
+        if not fields.get("title") or not authors:
+            return None
+        active_trace = _ACTIVE_DISCOVERY_TRACE.get()
+        expected = active_trace["expected"] if active_trace is not None else ExpectedBibliographicFields(
+            title=expected_title or "", doi=expected_doi or "",
+            authors=[expected_author] if expected_author else [], year=expected_year or "",
+        )
+        if not expected.title or not expected.authors:
+            return None
+        candidate = build_reference_discovery_candidate(
+            attempt_id="landing-author", provider="independent_landing_metadata",
+            expected=expected,
+            result=RetrievalResult(source_name="independent_landing_metadata", success=True,
+                                   title=str(fields["title"]), authors=authors,
+                                   year=fields.get("year"), doi=fields.get("doi")),
+        )
+        outcomes = {c.field_name: c.outcome for c in candidate.comparisons}
+        if (outcomes.get("title") not in {"agreement", "minor_difference"}
+                or outcomes.get("author") != "material_conflict"):
+            return None
+        return {"policy": OPENING_BYLINE_POLICY, "field": "author", "basis": "landing_page",
+                "observed_authors": authors,
+                "landing_content_sha256": (observation or {}).get("content_sha256")}
+
+    @staticmethod
+    def _landing_metadata_identity(response, *, expected_doi, expected_title, expected_author, expected_year,
+                                   kind_checked: bool = False):
         """Identity-only evidence from the fetched page, never its search snippet.
 
         A metadata page is not an acquired full-text representation. Preserve
@@ -4705,15 +5932,9 @@ class SourceResolver:
             expected=expected,
             result=RetrievalResult(source_name="independent_landing_metadata", success=True, **fields),
         )
-        confirmed = (
-            not expected.reference_parse_review
-            and candidate.plausible_identity_match and not candidate.has_material_conflict
-            and not candidate.has_unresolved_supplied_identity_fields
-            and (candidate.authoritative_identifier_match or sum(
-                c.outcome in {'agreement', 'minor_difference'} for c in candidate.comparisons
-                if c.field_name in {'title', 'author', 'year', 'doi', 'isbn'}
-            ) >= 2)
-        )
+        # The shared page-identity rule; a reference held for parse review
+        # cannot confirm anything.
+        confirmed = not expected.reference_parse_review and identity_confirms_work(candidate, kind_checked=kind_checked)
         if not confirmed:
             return None
         validated_response_identity(str(response.url), hashlib.sha256(response.content).hexdigest(),
@@ -4888,6 +6109,7 @@ class SourceResolver:
                 metadata={'candidate_budget_skipped': isinstance(e, CandidateBudgetExceeded),
                     'web_fetch_diagnostic': WebFetchDiagnostic(reason=(
                     'candidate_budget_exhausted' if isinstance(e, CandidateBudgetExceeded)
+                    else 'link_not_found' if _link_gone(url)
                     else 'access_restricted' if _location_exception_disposition(e)[0] == 'access_restricted'
                     else 'transport_failure' if _location_exception_disposition(e)[0] == 'transport_failure'
                     else 'fetch_unavailable')).model_dump()},
@@ -4898,6 +6120,13 @@ class SourceResolver:
             return {'web_fetch_diagnostic': WebFetchDiagnostic(
                 reason=reason, observed_content_sha256=hashlib.sha256(resp.content).hexdigest(),
             ).model_dump()}
+
+        if metadata_record_xml(resp.content):
+            # A repository metadata export about the work, not its text
+            # (Synthetic Embrace reference 12, 2026-10-18).
+            return RetrievalResult(source_name="web_fetch", success=False,
+                                   error="Repository metadata record, not the work's text",
+                                   metadata=diagnostic("readable_text_unavailable"))
 
         _record_registry_link_identity(url, resp, title, expected_author=expected_author,
                                        expected_year=expected_year, expected_doi=expected_doi)
@@ -4972,12 +6201,18 @@ class SourceResolver:
         # is a wrong page (login, error, or a different article). If no title is
         # extractable (some JS-rendered pages), fall through to content extraction.
         landing_title_confirmed = False
+        romanised_page = None
+        # The model's same-work answer for a page in another writing system
+        # (owner decision 2026-10-13: enough to admit its text and judge it).
+        cross_script_same_work = None
         if title:
             page_titles = _extract_html_titles(resp.text)
             landing_title_confirmed = bool(
                 page_titles and _landing_title_confirms(title, page_titles)
             )
-            if page_titles and not _html_title_matches(title, page_titles):
+            romanised_page = _romanised_page_title_outcome(title, page_titles) if page_titles else None
+            if (page_titles and not _html_title_matches(title, page_titles)
+                    and romanised_page is None):
                 from app.services.submitted_links import is_site_homepage
                 if all(interstitial_page_title(str(value)) for value in page_titles):
                     # A log-in or visitor wall answered in the work's place: a
@@ -4985,7 +6220,9 @@ class SourceResolver:
                     return RetrievalResult(source_name="web_fetch", success=False,
                                            error="Access wall answered in place of the page",
                                            metadata=diagnostic('access_wall'))
-                homepage = is_site_homepage(resp.text, final_url)
+                from app.services.submitted_links import redirected_to_site_root
+                homepage = (is_site_homepage(resp.text, final_url)
+                            or redirected_to_site_root(url, final_url))
                 logger.info(
                     "Web fetch identity mismatch for %s",
                     private_value_id("url", url),
@@ -5008,18 +6245,22 @@ class SourceResolver:
                         error="Page title is in another writing system; its text is not admitted",
                         metadata={'web_identity': observed, 'cross_script_judgment': judged,
                                   **diagnostic('cross_script_title_unresolved')})
-                    return page
-                if not homepage:
-                    _record_link_title_conflict(url, resp, title, page_titles, expected_author=expected_author,
-                                                expected_year=expected_year, expected_doi=expected_doi)
-                return RetrievalResult(
-                    source_name="web_fetch",
-                    success=False,
-                    error="Page title does not match the cited reference — likely wrong page",
-                    metadata=diagnostic('site_homepage' if homepage else 'cross_script_title_unresolved' if all(
-                        cross_script_comparison_unresolved(title, value) for value in page_titles
-                    ) else 'page_title_mismatch_unconfirmed'),
-                )
+                    cross_script_observed(url, hashlib.sha256(resp.content).hexdigest(), judged)
+                    if not _cross_script_admits(judged, expected_author):
+                        return page
+                    cross_script_same_work = judged
+                if cross_script_same_work is None:
+                    if not homepage:
+                        _record_link_title_conflict(url, resp, title, page_titles, expected_author=expected_author,
+                                                    expected_year=expected_year, expected_doi=expected_doi)
+                    return RetrievalResult(
+                        source_name="web_fetch",
+                        success=False,
+                        error="Page title does not match the cited reference — likely wrong page",
+                        metadata=diagnostic('site_homepage' if homepage else 'cross_script_title_unresolved' if all(
+                            cross_script_comparison_unresolved(title, value) for value in page_titles
+                        ) else 'page_title_mismatch_unconfirmed'),
+                    )
 
         # A repository or publisher landing page advertises its own full text
         # through the scholarly `citation_pdf_url` standard. Prefer that over
@@ -5027,6 +6268,7 @@ class SourceResolver:
         # the work, not the work. Ordinary identity, safety and validation
         # gates still apply to the acquired bytes, and a failed acquisition
         # falls through to the existing HTML handling below.
+        declared_document_url = None
         advertised = [
             location
             for location in discover_scholarly_locations(
@@ -5035,6 +6277,15 @@ class SourceResolver:
             if location.representation_kind is RepresentationKind.PDF
         ]
         if advertised:
+            landing_author_conflict = self._landing_author_conflict(
+                {"observed": observed, "content_sha256": hashlib.sha256(resp.content).hexdigest()},
+                expected_doi=expected_doi, expected_title=title,
+                expected_author=expected_author, expected_year=expected_year,
+            )
+            if landing_author_conflict:
+                advertised = [replace(location, metadata={
+                    **location.metadata, "landing_author_conflict": landing_author_conflict,
+                }) for location in advertised]
             landing = RetrievalResult(
                 source_name="landing_page", success=False,
                 title=observed["title"], authors=observed["authors"],
@@ -5060,6 +6311,14 @@ class SourceResolver:
                 landing.success = True
                 return landing
             self._clear_retrieved_representation(landing)
+            # The page names its PDF but the PDF was not fetched (a browser
+            # check, 2026-10-18): the reader can still open it. The page is a
+            # record about the work, so only its own summary is kept, as an
+            # abstract; a breadcrumb and a recommended citation are not text.
+            declared_document_url = advertised[0].url
+            active = _ACTIVE_DISCOVERY_TRACE.get()
+            if isinstance(active, dict):
+                active.setdefault("declared_document_url", declared_document_url)
 
         # Extract readable text
         import trafilatura
@@ -5070,6 +6329,11 @@ class SourceResolver:
             include_tables=False,
             favor_recall=True,
         )
+        if (not page_text or len(page_text) < 100) and (cross_script_same_work or romanised_page):
+            # A page in the work's own language whose body the extractor took
+            # for boilerplate (a ministry's regulation in one bare block,
+            # 2026-10-13): the densest leaf text block is the work's text.
+            page_text = _densest_text_block(resp.text) or page_text
         if not page_text or len(page_text) < 100:
             result = RetrievalResult(
                 source_name="web_fetch",
@@ -5079,8 +6343,11 @@ class SourceResolver:
                 error="Page loaded but no readable article text extracted",
                 metadata=diagnostic('readable_text_unavailable'),
             )
+            if cross_script_same_work:
+                result.metadata['cross_script_judgment'] = cross_script_same_work
             identity, comparisons, confirmed = _web_identity_comparison(result,
                 title=title, author=expected_author, year=expected_year, doi=expected_doi)
+            confirmed = confirmed or bool(cross_script_same_work and not identity.has_material_conflict)
             reason = ('bibliographic_fields_conflict' if identity.has_material_conflict
                 else 'bibliographic_identity_confirmed' if confirmed else 'bibliographic_identity_unconfirmed')
             identity_observed(url, hashlib.sha256(resp.content).hexdigest(), reason,
@@ -5088,6 +6355,11 @@ class SourceResolver:
                 differences=_web_link_differences(comparisons, result, title=title,
                     author=expected_author, year=expected_year, doi=expected_doi))
             result.metadata['identity_comparisons'] = [c.model_dump(mode='json') for c in comparisons]
+            if not identity.has_material_conflict and (
+                    confirmed or romanised_page == "agreement" or cross_script_same_work):
+                # A Chinese-language page that names the cited work by the
+                # cross-language identity standard and is an abstract page.
+                _attach_linked_abstract(result, resp, expected_doi)
             # No representation, accepted hash, success, or admission grant.
             return result
 
@@ -5117,12 +6389,33 @@ class SourceResolver:
             # accepted, and the conflicting type label is not passed on.
             named = RetrievalResult(source_name="web_fetch", success=False, title=observed["title"],
                                     authors=observed["authors"], year=observed["year"], doi=observed["doi"])
+            if romanised_page is not None or cross_script_same_work:
+                # A journal's abstract page in the work's own language whose
+                # title reads as the cited romanised title, or that the model
+                # judged the same work, names the work; it stays a candidate
+                # for comparison (cross-language-identity-v1).
+                named.title = observed["title"] or page_titles[0]
+                named.error = "Page names the cited work; its text is not the cited work's text"
+                named.metadata = {"web_identity": observed, "work_identity_basis": "cross-language-identity-v1",
+                                  **diagnostic('source_kind_unconfirmed')}
+                if cross_script_same_work:
+                    named.metadata["cross_script_judgment"] = cross_script_same_work
+                elif romanised_page == "minor_difference":
+                    from app.services.cross_script_identity import judge_cross_script_identity
+                    named.metadata["cross_script_judgment"] = judge_cross_script_identity(
+                        {'title': title, 'author': expected_author, 'year': expected_year},
+                        {'titles': page_titles, 'date': observed.get('year'), 'text': page_text})
+                judged = named.metadata.get("cross_script_judgment") or {}
+                if cross_script_same_work or romanised_page == "agreement" or judged.get("same_work") == "yes":
+                    _attach_linked_abstract(named, resp, expected_doi)
+                return named
             _identity, _comparisons, names_work = _web_identity_comparison(
                 named, title=title, author=expected_author, year=expected_year, doi=expected_doi)
             if names_work:
                 named.error = "Page names the cited work; its text is not the cited work's text"
                 named.metadata = {"web_identity": observed, "work_identity_basis": "page-citation-metadata-v1",
                                   **diagnostic('source_kind_unconfirmed')}
+                _attach_linked_abstract(named, resp, expected_doi)
                 return named
             return RetrievalResult(
                 source_name="web_fetch",
@@ -5150,6 +6443,29 @@ class SourceResolver:
                 and length_fits_kind(len(re.findall(r"\w+", page_text)), expected_source_kind.kind) is False):
             # Its length cannot be a whole work of the cited kind (2026-09-30).
             web_coverage = {**web_coverage, "verdict": "not_assessed", "reason": "length_does_not_fit_kind"}
+        from app.services.abstract_only_pages import MAINLY_ABSTRACT_POLICY, mainly_abstract_page
+        page_abstract = (mainly_abstract_page(page_text, resp.text)
+                         if web_coverage.get("verdict") != "complete" else None)
+        if page_abstract:
+            # A landing page that is mainly its abstract (with or without
+            # notes and references) is an abstract, not limited text
+            # (owner decision 2026-10-18).
+            return RetrievalResult(
+                source_name="web_fetch", success=True, title=observed["title"],
+                authors=observed["authors"], year=observed["year"], doi=observed["doi"],
+                abstract=page_abstract,
+                metadata={"web_identity": observed,
+                          **({"declared_document_url": declared_document_url} if declared_document_url else {}),
+                          "abstract_provenance": {
+                              "policy": MAINLY_ABSTRACT_POLICY, "basis": "mainly_abstract_landing_page",
+                              "provider": "web_fetch",
+                              "page_content_sha256": hashlib.sha256(resp.content).hexdigest()}})
+        if declared_document_url and web_coverage.get("verdict") != "complete":
+            return RetrievalResult(
+                source_name="web_fetch", success=False,
+                error="The page names its PDF; the PDF was not fetched",
+                metadata={**diagnostic("readable_text_unavailable"),
+                          "declared_document_url": declared_document_url, "web_identity": observed})
         result = RetrievalResult(
             source_name="web_fetch",
             success=True,
@@ -5174,6 +6490,7 @@ class SourceResolver:
             metadata={
                 "web_identity": observed,
                 "web_completeness": web_coverage,
+                **({"declared_document_url": declared_document_url} if declared_document_url else {}),
                 "requested_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
                 "representation_kind": RepresentationKind.PLAIN_TEXT.value,
                 "expected_source_kind": expected_source_kind.kind,
@@ -5182,6 +6499,16 @@ class SourceResolver:
                 "source_kind_verdict": kind_compatibility.verdict,
             },
         )
+        if cross_script_same_work:
+            result.metadata["cross_script_judgment"] = cross_script_same_work
+        elif romanised_page == "minor_difference":
+            # The page title reads nearly as the cited romanised title (a
+            # one-syllable slip, a prefix): the existing model comparison may
+            # settle it (cross-language-identity-v1 with cross-script-identity-v1).
+            from app.services.cross_script_identity import judge_cross_script_identity
+            result.metadata["cross_script_judgment"] = judge_cross_script_identity(
+                {'title': title, 'author': expected_author, 'year': expected_year},
+                {'titles': page_titles, 'date': observed.get('year'), 'text': page_text})
         identity, comparisons, confirmed = _web_identity_comparison(result,
             title=title, author=expected_author, year=expected_year, doi=expected_doi)
         if not confirmed and _organisation_author_in_page(expected_author, comparisons, page_text):
@@ -5189,6 +6516,20 @@ class SourceResolver:
             # author is named in the page text, not as a byline (2026-10-01).
             confirmed = True
             result.metadata['work_identity_basis'] = 'web-organisation-author-in-page-v1'
+        if not confirmed and cross_script_same_work and not identity.has_material_conflict:
+            confirmed = True
+            result.metadata['work_identity_basis'] = 'cross-script-identity-v1'
+        fields_seen = {c.field_name: c.outcome for c in comparisons}
+        if (not confirmed and romanised_page is not None and not identity.has_material_conflict
+                and fields_seen.get('title') in {'agreement', 'minor_difference'}
+                and fields_seen.get('author') == 'unknown'):
+            # A page in the work's own language names its author beside the
+            # title, outside its metadata ("潘越" for "Pan, Y.", 2026-10-12).
+            people = _romanised_author_near_title(resp.text, page_titles, expected_author)
+            if people:
+                confirmed = True
+                result.authors = people
+                result.metadata['work_identity_basis'] = 'cross-language-identity-v1'
         if confirmed and web_coverage.get('verdict') != 'complete' and not identity.has_material_conflict:
             # A confirmed cited web page is the work itself, not a host of it
             # (paper 5 reference 13 read as limited text, 2026-10-03).
@@ -5245,6 +6586,16 @@ class SourceResolver:
             # in the trace and continue the existing permitted discovery chain.
             result.success = False
             result.error = "Observed webpage bibliographic identity remains unconfirmed"
+            # Its abstract may still serve when the page names the work by the
+            # cross-language identity standard (cjk-abstract-page-v1).
+            judged = result.metadata.get("cross_script_judgment") or {}
+            if not identity.has_material_conflict and (
+                    romanised_page == "agreement" or cross_script_same_work or judged.get("same_work") == "yes"):
+                _attach_linked_abstract(result, resp, expected_doi)
+        elif confirmed and not identity.has_material_conflict:
+            # A confirmed Chinese-language abstract page gives its abstract, not
+            # its navigation and metadata as limited text (cjk-abstract-page-v1).
+            _attach_linked_abstract(result, resp, expected_doi)
         return result
 
     def _validated_doi_resolver_pdf(
@@ -5402,8 +6753,8 @@ class SourceResolver:
         at institutions with library subscriptions — it can return full-text
         PDFs that no OA source has.
         """
-        base = "https://doi.org/" if public else settings.DOI_RESOLVER_URL or ""
-        trusted_base = None if public else base
+        base = "https://doi.org/"
+        trusted_base = None
         # Validate + URL-encode the DOI before placing it in the trusted
         # resolver URL (REVIEW §2.4). The DOI is student-controlled; raw
         # concatenation let a DOI like "10.1/x?url=http://internal/..." inject
@@ -5471,9 +6822,10 @@ class SourceResolver:
         # were the original false-acceptance path.
         content_type = resp.headers.get("content-type", "").lower()
         if "text/html" in content_type:
+            # The DOI route tests the page's work type itself below.
             public_identity = (self._landing_metadata_identity(resp,
                 expected_doi=doi, expected_title=title, expected_author=expected_author,
-                expected_year=expected_year) if public else None)
+                expected_year=expected_year, kind_checked=True) if public else None)
             discovered = discover_scholarly_locations(
                 resp.text,
                 final_url,
@@ -5586,6 +6938,15 @@ class SourceResolver:
                     expected_year,
                 )
                 if identity_confidence == "high":
+                    abstract_only = RetrievalResult(
+                        source_name="doi_resolver", success=False, error=LANDING_ABSTRACT_ONLY_ERROR,
+                        doi=doi, metadata={"identity_confidence": identity_confidence,
+                                           "identity_reason": identity_reason})
+                    observation: dict = {}
+                    if self._kept_landing_abstract(abstract_only, observation, page_text, "doi_resolver",
+                                                   resp.content, doi, True):
+                        abstract_only.metadata["landing_abstract_only"] = observation["landing_abstract_only"]
+                        return abstract_only
                     logger.info(
                         "DOI resolver returned identity-gated HTML for %s (%d chars)",
                         doi,
@@ -5653,12 +7014,21 @@ class SourceResolver:
         self, source, doi, title, author, year=None, *,
         expected_source_kind=SourceKindAssessment(),
         identity_only=False,
+        query_title=None,
+        query_author=None,
     ):
-        """Keep cleanup active even when acquisition raises/cancels."""
+        """Keep cleanup active even when acquisition raises/cancels.
+
+        ``query_title``/``query_author`` replace the cited title and author in
+        the search requests only (the native-script route searches a work's
+        own script); every identity and admission check still compares with
+        the cited ``title``, ``author`` and ``year``.
+        """
         try:
             return self._try_source_impl(source, doi, title, author, year,
                                          expected_source_kind=expected_source_kind,
-                                         identity_only=identity_only)
+                                         identity_only=identity_only,
+                                         query_title=query_title, query_author=query_author)
         finally:
             # Legacy/custom retrievers remain untouched. API-first never
             # caches Brave responses; this also clears stale in-memory entries.
@@ -5678,8 +7048,12 @@ class SourceResolver:
         *,
         expected_source_kind: SourceKindAssessment = SourceKindAssessment(),
         identity_only: bool = False,
+        query_title: str | None = None,
+        query_author: str | None = None,
     ) -> RetrievalResult:
         """Try a single retrieval source."""
+        search_title = query_title or title
+        search_author = query_author if query_title else author
         is_web_discovery = (
             "web_discovery" in getattr(source, "capabilities", frozenset())
             or source.name == "web_search"
@@ -5868,7 +7242,8 @@ class SourceResolver:
         policy_providers = getattr(source, "_policy_providers", None)
         api_first = is_web_discovery and isinstance(policy_providers, dict) and bool(policy_providers)
         if api_first:
-            result = acquire(source.search_reference(doi=doi, title=title, author=author, year=year), "api_first")
+            result = acquire(source.search_reference(doi=doi, title=search_title, author=search_author, year=year),
+                             "api_first")
             if result.full_text or identity_satisfied():
                 return result
 
@@ -5885,9 +7260,9 @@ class SourceResolver:
         # Fall back to title search
         if title and not api_first:
             if is_web_discovery:
-                result = source.search_by_title_author(title, author, year)  # type: ignore[call-arg]
+                result = source.search_by_title_author(search_title, search_author, year)  # type: ignore[call-arg]
             else:
-                result = source.search_by_title_author(title, author)
+                result = source.search_by_title_author(search_title, search_author)
             if result.success:
                 result = acquire(result, "title_author")
                 if result.full_text or not is_web_discovery:
@@ -5903,8 +7278,8 @@ class SourceResolver:
         while is_web_discovery and callable(next_tier):
             result = next_tier(
                 doi=doi,
-                title=title,
-                author=author,
+                title=search_title,
+                author=search_author,
                 year=year,
                 tried_providers=tried_search_providers,
             )
@@ -5943,7 +7318,8 @@ class SourceResolver:
         for query, lookup in lookups:
             try:
                 result = (RetrievalResult(source_name=source.name, success=False,
-                          error="reference_elapsed_budget_timeout") if expired() else lookup())
+                          error="reference_elapsed_budget_timeout",
+                          metadata={"elapsed_budget_exhausted": True}) if expired() else lookup())
             except Exception as exc:
                 result = RetrievalResult(source_name=source.name, success=False, error=safe_exception_code(exc))
             observation = {"query": query, "outcome": _search_execution_outcome(result)}
@@ -6082,6 +7458,67 @@ class SourceResolver:
             return True
         return int(match.group()) <= cls._PUBLIC_DOMAIN_FALLBACK_LATEST_YEAR
 
+    def _abstract_instead_of_short_page(self, acquired: RetrievalResult | None,
+                                        holder: RetrievalResult | None, doi: str | None,
+                                        expected_kind: SourceKindAssessment, *,
+                                        landing: RetrievalResult | None = None) -> RetrievalResult | None:
+        """The DOI's adapter abstract in place of a page too short to be the work.
+
+        doi-abstract-over-short-page-v1 (owner decision 2026-10-13): when an
+        academic adapter confirmed the cited DOI and holds that DOI's abstract,
+        an acquired web page that is incomplete and shorter than any whole work
+        of the cited kind yields to the abstract. A complete page, a PDF and
+        substantial limited text keep their place. Returns None when the
+        acquired result stands.
+        """
+        from app.services.abstract_only_pages import (
+            DOI_ABSTRACT_POLICY, doi_confirmed_abstract, publisher_abstract_covers_page, short_page_words)
+        if acquired is None or not acquired.success:
+            return None
+        words = short_page_words(acquired, expected_kind.kind)
+        reason = "acquired_page_too_short_for_a_whole_work"
+        basis = doi_confirmed_abstract(holder, doi) if words is not None else None
+        if basis is None:
+            # The publisher's own page, confirmed through the DOI, gave the
+            # abstract: another site's incomplete page whose prose adds little
+            # to it yields too (owner decision 2026-10-14, Kinzius et al.'s
+            # aggregator page over Springer's abstract).
+            words = publisher_abstract_covers_page(acquired, landing)
+            if words is None:
+                return None
+            holder, reason = landing, "publisher_abstract_covers_third_party_page"
+            basis = {"provider": landing.source_name, "doi": doi,
+                     "publisher_abstract": dict((landing.metadata or {}).get("abstract_provenance") or {})}
+        _, discovery = self._discovery_artifacts()
+        if discovery is not None and discovery.get("outcome") not in _CONFIRMED_DISCOVERY_OUTCOMES:
+            return None
+        representation = acquired.representation
+        displaced = {
+            "provider": acquired.source_name,
+            "words": words,
+            "completeness": representation.completeness,
+            "content_sha256": hashlib.sha256(representation.content).hexdigest(),
+            "cited_kind": expected_kind.kind,
+        }
+        admission = (acquired.metadata or {}).get("durable_admission") or {}
+        if admission.get("state"):
+            displaced["durable_admission_state"] = admission["state"]
+        metadata = {key: value for key, value in (holder.metadata or {}).items()
+                    if key not in _ACQUISITION_ONLY_METADATA}
+        metadata["abstract_provenance"] = {
+            "policy": DOI_ABSTRACT_POLICY,
+            "basis": ("publisher_landing_page" if reason == "publisher_abstract_covers_third_party_page"
+                      else "doi_confirmed_adapter_record"),
+            **basis,
+            "reason": reason,
+            "displaced_page": displaced,
+        }
+        return RetrievalResult(
+            source_name=holder.source_name, success=True, metadata=metadata,
+            abstract=holder.abstract, doi=holder.doi, title=holder.title, year=holder.year,
+            authors=list(holder.authors),
+        )
+
     def _finalize_resolution_result(
         self,
         result: RetrievalResult,
@@ -6145,7 +7582,7 @@ class SourceResolver:
         Caching policy (applied only to identity-verified content):
         - OA content + public-domain texts: ALWAYS cached (free to store)
         - Paywalled content (accessed via campus IP): cached only if
-          CACHE_PAYWALLED_PDFS=True (institution's copyright-policy decision)
+          the storage setting keeps all copies
         """
         downloaded_via_publisher = False
         safety_report = None
@@ -6170,8 +7607,7 @@ class SourceResolver:
                         expected_source_kind=expected_source_kind,
                     )
 
-            # If OA download failed or wasn't available, try publisher PDF
-            # (works on campus networks with IP-based access)
+            # If OA download failed or wasn't available, try publisher PDF.
             capabilities = getattr(self, "_acquisition_capabilities", None)
             if (
                 result.full_text is None
@@ -6311,6 +7747,10 @@ class SourceResolver:
                     if getattr(validation, 'reason_code', None) == 'identity_insufficient_observations':
                         identity_confidence = 'low'
                         result.metadata['identity_reason_code'] = validation.reason_code
+                    if isinstance(getattr(validation, 'observed_identity', None), dict):
+                        result.metadata['observed_identity'] = validation.observed_identity
+                    if getattr(validation, 'author_conflict', None):
+                        result.metadata['author_conflict'] = validation.author_conflict
                     identity_reason = validation.reason
                     completeness = getattr(
                         validation, "completeness", "not_assessed"
@@ -6352,6 +7792,15 @@ class SourceResolver:
                     result.metadata["content_identity_confidence"] = content_identity
                     text_quality = "digital"
                 result.metadata = result.metadata or {}
+                if (identity_confidence == "medium" and representation_kind is RepresentationKind.PDF
+                        and not result.metadata.get("author_conflict")
+                        and getattr(validation, "source_kind_verdict", "unknown") != "incompatible"
+                        and _title_page_confirms(result.full_text, ref_title or result.title, ref_author)):
+                    # Its own title page names the cited title and first author
+                    # (owner decision 2026-10-14): the cited work.
+                    identity_confidence = "high"
+                    identity_reason = f"{identity_reason}; its title page names the cited title and first author"
+                    result.metadata["identity_corroborated_by_title_page"] = True
                 result.metadata["identity_confidence"] = identity_confidence
                 result.metadata["identity_reason"] = identity_reason
                 result.metadata["representation_kind"] = representation_kind.value
@@ -6401,7 +7850,7 @@ class SourceResolver:
                 #   (only now that identity is confirmed)
                 # - Content from publisher URL → check if it's actually OA.
                 #   If OA, cache. If not OA (paywalled), cache only if
-                #   CACHE_PAYWALLED_PDFS=True.
+                #   the storage setting keeps all copies.
                 # - Identity "low"/"skipped" → never cached (uncertain source).
                 is_oa = _check_is_oa(result)
                 should_cache = (
@@ -6411,12 +7860,13 @@ class SourceResolver:
                 )
 
                 if should_cache and downloaded_via_publisher and not is_oa:
-                    # Paywalled content accessed via campus IP
-                    if not settings.CACHE_PAYWALLED_PDFS:
+                    # A publisher PDF without an open-access signal is kept
+                    # only when the storage setting keeps all copies.
+                    if self._storage().sources.keep_copies != "all":
                         should_cache = False
                         logger.info(
-                            "Paywalled PDF for %s verified in-memory, NOT cached "
-                            "(OA=False, CACHE_PAYWALLED_PDFS=False)",
+                            "Publisher PDF for %s verified in-memory, not kept "
+                            "(no open-access signal; storage keeps open access only or none)",
                             result.doi,
                         )
 
@@ -6498,10 +7948,19 @@ class SourceResolver:
         result: RetrievalResult,
         *,
         downloaded_via_publisher: bool,
+        policy=None,
     ) -> tuple[str | None, str]:
+        if policy is None:
+            from app.services.storage_policy import deployment_defaults
+            policy = deployment_defaults()
+        keep = policy.sources.keep_copies
+        if keep == "none":
+            return None, "storage_keeps_no_copies"
         metadata = result.metadata or {}
         explicit = metadata.get("license_class")
         if explicit in LICENSE_CLASSES:
+            if keep == "open_access_only" and explicit not in {"open_access", "public_domain"}:
+                return None, "storage_keeps_open_access_only"
             return explicit, "explicit_representation_metadata"
         if result.source_name in {"gutenberg", "wikisource"}:
             return "public_domain", "public_domain_adapter_policy"
@@ -6510,11 +7969,10 @@ class SourceResolver:
             for location in result.locations
         ):
             return "open_access", "provider_oa_or_licence_evidence"
-        if (
-            settings.CACHE_PAYWALLED_PDFS
-            and (downloaded_via_publisher or result.source_name == "elsevier")
-        ):
-            return "paywalled_db_retrieved", "deployment_subscription_retention_policy"
+        if keep != "all":
+            return None, "storage_keeps_open_access_only"
+        if downloaded_via_publisher or result.source_name == "elsevier":
+            return "paywalled_db_retrieved", "storage_keeps_all_copies"
 
         representation = result.representation
         source_url = (
@@ -6530,10 +7988,7 @@ class SourceResolver:
                 for location in result.locations
             )
         )
-        if (
-            publicly_downloaded
-            and settings.PUBLIC_RETRIEVAL_RETENTION_POLICY == "store_scoped"
-        ):
+        if publicly_downloaded:
             # Public reachability is not a licence conclusion. The deployment
             # has chosen scoped retention, so keep the representation under the
             # neutral restricted class and preserve the policy basis.
@@ -6560,9 +8015,11 @@ class SourceResolver:
         representation = result.representation
         if representation is None or not representation.content:
             return
+        policy = self._storage()
         license_class, retention_basis = self._retrieval_retention_decision(
             result,
             downloaded_via_publisher=downloaded_via_publisher,
+            policy=policy,
         )
         result.metadata = result.metadata or {}
         if license_class is None:
@@ -6606,14 +8063,8 @@ class SourceResolver:
                 ),
             }
 
-        license_expires_at = None
-        if (
-            license_class == "paywalled_db_retrieved"
-            and settings.CAMPUS_ACCESS_TTL_DAYS > 0
-        ):
-            license_expires_at = datetime.now(timezone.utc) + timedelta(
-                days=settings.CAMPUS_ACCESS_TTL_DAYS
-            )
+        from app.services.storage_policy import copy_expiry
+        license_expires_at = copy_expiry(policy)
 
         factory = self._repository_session_factory
         with factory() as session:
@@ -6660,7 +8111,16 @@ class SourceResolver:
                     "public_retrieval_retention_policy": (
                         settings.PUBLIC_RETRIEVAL_RETENTION_POLICY
                     ),
+                    "storage_policy": policy.model_dump(mode="json"),
                 }
+                observed_identity = _admission_observed_identity(
+                    result, doi=ref_doi, title=ref_title, author=ref_author, year=ref_year)
+                if observed_identity is not None:
+                    # The canonical work keeps the cited fields as its lookup
+                    # key; reuse compares only what the source itself showed.
+                    validation_evidence["observed_identity"] = observed_identity
+                if result.metadata.get("printed_page_labels"):
+                    validation_evidence["printed_page_labels"] = result.metadata["printed_page_labels"]
                 ocr_evidence = result.metadata.get("ocr_derivative")
                 if ocr_evidence and result.parent_representation is not None:
                     validation_evidence["ocr_derivative"] = ocr_evidence
@@ -6771,6 +8231,69 @@ class SourceResolver:
                 rollback_source_admissions(session, self._backend)
                 raise
 
+    def _storage(self):
+        from app.services.storage_policy import deployment_defaults
+        return getattr(self, "storage_policy", None) or deployment_defaults()
+
+    def _record_copy_use(self, session, record) -> None:
+        """A kept copy used by a check is kept the chosen months from now, or
+        permanently (owner decision 2026-10-19); never shortened here."""
+        from app.services.storage_policy import copy_expiry
+        current = getattr(record, "expires_at", None)
+        if current is None:
+            return
+        renewed = copy_expiry(self._storage())
+        if renewed is None or renewed > current:
+            record.expires_at = renewed
+            try:
+                session.commit()
+            except Exception:  # noqa: BLE001 - a missed renewal never fails the check
+                session.rollback()
+
+    def retain_validated_copy(self, reference, result: RetrievalResult) -> None:
+        """Keep a validated public copy whatever route found it (owner decision
+        2026-10-09): web search and web-page routes never offered theirs for
+        storage, so each re-run and each later paper fetched or searched for
+        them again. Only a high-identity, clean, publicly addressed copy that
+        no earlier step has already decided on is offered; the deployment's
+        retention policy still decides (`_retrieval_retention_decision`), and
+        a copy without an open-access signal is kept as rights_unclassified,
+        never as openly licensed. Never fails the run."""
+        metadata = result.metadata or {}
+        representation = result.representation
+        if (not self._durable_repository_active() or representation is None or not representation.content
+                or metadata.get("identity_confidence") != "high"
+                or metadata.get("durable_admission") or metadata.get("repository_representation_id")
+                or not str(representation.source_url or "").casefold().startswith(("https://", "http://"))):
+            return
+        from app.services.source_repository import ACCEPTABLE_COMPLETENESS
+        completeness = str(representation.completeness or metadata.get("completeness") or "").casefold()
+        if completeness not in ACCEPTABLE_COMPLETENESS:
+            # A partial copy would wait for review and never be reused.
+            return
+        try:
+            safety_report = None
+            if representation.kind is RepresentationKind.PDF:
+                safety_report = inspect_uploaded_pdf(representation.content)
+                if safety_report.verdict is not SafetyVerdict.CLEAN:
+                    return
+            title = getattr(reference, "title", None) or None
+            self._persist_retrieved_representation(
+                result, ref_doi=getattr(reference, "doi", None) or None, ref_title=title,
+                ref_author=getattr(reference, "author", None) or None,
+                ref_year=getattr(reference, "year", None) or None, identity_confidence="high",
+                identity_reason=metadata.get("identity_reason", ""), downloaded_via_publisher=False,
+                safety_report=safety_report,
+                expected_source_kind=_expected_source_kind_assessment(
+                    source_kind=getattr(reference, "source_kind", None),
+                    source_kind_confidence=getattr(reference, "source_kind_confidence", None),
+                    source_kind_evidence=getattr(reference, "source_kind_evidence", None) or [],
+                    raw_ref=getattr(reference, "raw_ref", "") or "", title=title or "",
+                    url=getattr(reference, "url", None) or None))
+        except Exception as exc:
+            result.metadata = {**metadata, "durable_admission": {"state": "not_stored", "reason": "retention_failed"}}
+            logger.warning("Validated copy was not kept (type=%s)", type(exc).__name__)
+
     def _cache_key_for_verified(
         self,
         doi: str | None,
@@ -6855,6 +8378,9 @@ def _document_kind_for_result(
 _CORROBORATION_ONLY_SOURCES = frozenset(
     {"core", "semantic_scholar", "elsevier", "datacite", "open_library", "eric"}
 )
+# Still asked by DOI for an abstract when identity is settled and no accepted
+# record holds one (doi-abstract-over-short-page-v1).
+_SETTLED_ABSTRACT_SOURCES = frozenset({"semantic_scholar"})
 _CONFIRMED_DISCOVERY_OUTCOMES = frozenset(
     {"confirmed", "confirmed_with_minor_differences"}
 )

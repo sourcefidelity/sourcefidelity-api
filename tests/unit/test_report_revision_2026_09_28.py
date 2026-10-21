@@ -28,13 +28,14 @@ def _layer():
 def test_a_citation_with_two_propositions_gets_lettered_windows_with_bold_wording():
     citations = [_citation()]
     attach_propositions(citations, _layer())
-    assert [p["letter"] for p in citations[0]["propositions"]] == ["A", "B"]
+    # Lowercase, attached to the citation number (owner decision 2026-10-14).
+    assert [p["letter"] for p in citations[0]["propositions"]] == ["a", "b"]
     html = _render_panel_template(citations[0], 10)
     assert '<h2>Citation 10<span data-proposition-suffix></span></h2>' in html
     assert '<strong class="proposition">Production became project-oriented</strong>' in html
     assert '<strong class="proposition">with teams formed around tasks</strong>' in html
     assert html.count('class="selected-citation"') == 2
-    assert 'data-proposition-letter="B" hidden' in html
+    assert 'data-proposition-letter="b" hidden' in html
 
 
 def test_one_proposition_keeps_one_window():
@@ -126,3 +127,15 @@ def test_a_percent_encoded_doi_is_decoded_once(raw, clean):
 
 def test_decoding_never_produces_a_non_doi():
     assert decode_doi("10.1/a%20b") == "10.1/a%20b"
+
+
+def test_the_proposition_letter_follows_the_citation_number_before_its_references():
+    # Owner decision 2026-10-14 (Harlow): "Citation 3a – Reference 18, Reference 25";
+    # built once with the template (2026-10-15).
+    from app.services.evidence_report import citation_heading
+    citation = {"members": [{"reference_id": "r25"}, {"reference_id": "r18"}]}
+    heading = citation_heading("Citation 1", citation, {"r18": 18, "r25": 25})
+    assert heading.startswith("Citation 1<span data-proposition-suffix></span> – ")
+    assert heading.index("Reference 18") < heading.index("Reference 25")
+    assert citation_heading("Citation 2", {"members": [{"reference_id": "other"}]}, {"r18": 18}) == (
+        "Citation 2<span data-proposition-suffix></span>")

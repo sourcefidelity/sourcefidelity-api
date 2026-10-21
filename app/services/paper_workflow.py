@@ -264,8 +264,10 @@ def extract_paper_job(
         retention_policy = resolve_paper_retention_policy(retention_mode)
     except PaperRetentionPolicyError as exc:
         raise PaperWorkflowError(exc.code, str(exc)) from exc
+    from app.services.recheck_copy import kept_by_policy
+    # A file kept for checking again stays until the check ends (`recheck-copy-v1`).
     retention = retention_policy.after_extraction(
-        lambda: cleanup_paper_job_input(session, backend, job.id)
+        (lambda: True) if kept_by_policy(job) else (lambda: cleanup_paper_job_input(session, backend, job.id))
     )
     if not retention.completed:
         job.input_expires_at = datetime.now(timezone.utc)
@@ -286,12 +288,14 @@ def retrieve_paper_sources(
     artifact = _extraction(job)
     _enter(job, JobStage.RETRIEVING)
     session.commit()
-    cited_reference_ids = {
-        reference_id
-        for claim in artifact.citation_claims
-        for reference_id in claim.reference_ids
-    }
+    cited_reference_ids = _cited_reference_ids(artifact)
     active_resolver = resolver or SourceResolver()
+    # What this scope keeps (owner decision 2026-10-09).
+    from app.services.storage_policy import policy_for
+    try:
+        active_resolver.storage_policy = policy_for(session, job.scope_type, job.scope_id)
+    except AttributeError:
+        pass
     from app.services.bibliography_identity import eligible_identity_only, POLICY as IDENTITY_ONLY_POLICY
     # New bibliography-only work must not spend the shared resolver allowance
     # ahead of the pre-existing cited-source acquisition workload.
@@ -333,7 +337,7 @@ def retrieve_paper_sources(
     # An unchanged reference already searched by an earlier run of this paper
     # reuses that result instead of paying again (paper-search-reuse-v1). A
     # targeted refresh never reuses: it exists to search again.
-    from app.services.search.rerun_reuse import prior_results_index, reused_result
+    from app.services.search.rerun_reuse import prior_results_index, reuse_refusal, reused_result
     rerun_index = {} if targeted_refresh else prior_results_index(session, job)
 
     def checkpoint(result_record: dict) -> None:
@@ -365,72 +369,65 @@ def retrieve_paper_sources(
         session.commit()
 
     from app.services.required_reference_author import eligible_author_lookup, discover_author_metadata
+    from app.services.search.rerun_reuse import downloadable, public_copy
     # Bibliography-only inspection is independent of successful author linking.
     # Keep this new registration path bounded; never acquire an uncited source.
     author_lookup_slots = sum('author_metadata_lookup' in r for r in results)
-    for reference in ordered_references:
-        if (reference.reference_id not in cited_reference_ids
-                and reference.reference_id not in completed_reference_ids
-                and artifact.citation_format.lower() == 'apa'
-                and eligible_author_lookup(reference, artifact.required_author_policy_version)):
-            checkpoint(discover_author_metadata(reference,
-                getattr(active_resolver, '_retrieval_sources', []),
-                permitted=author_lookup_slots < 2))
-            author_lookup_slots += 1
-        if (
-            (reference.reference_id not in cited_reference_ids and not eligible_identity_only(reference))
-            or reference.reference_id in completed_reference_ids
-        ):
-            continue
-        result_record = {"reference_id": reference.reference_id}
-        identity_only = reference.reference_id not in cited_reference_ids
-        if identity_only:
-            result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
-        reused = reused_result(rerun_index, reference, identity_only=identity_only)
-        if reused is not None and reused.get("status") == "durable_authorized":
-            try:
-                authorize_representation(session, backend, representation_id=reused["representation_id"],
-                                         scope_type=job.scope_type, scope_id=job.scope_id)
-            except Exception:
-                reused = None   # the stored source is no longer usable here: search again
-        if (reused is not None and not identity_only
-                and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
-            # A source uploaded since the earlier run is in the library now:
-            # resolve the reference, which finds it before any search (2026-10-07).
-            stored = getattr(active_resolver, "stored_copy_available", None)
-            if stored is not None and stored(reference):
-                reused = None
-        refetched = None
-        if reused is not None and reused.get("status") == "transient_authorized":
+    refetch = getattr(active_resolver, "refetch_public_source", None)
+
+    def acquire(plan: dict, context: SearchMemoContext, resolver=None) -> tuple:
+        """Search for or re-download one reference's source. Safe on a worker
+        thread: it never uses the job's session (search memos go through
+        `context`)."""
+        reference, identity_only = plan["reference"], plan["identity_only"]
+        resolver = resolver or active_resolver
+        result = None
+        if plan["public"] is not None:
             # An open-access copy is downloaded again from its verified address,
             # never searched for (paper-search-reuse-v4, owner decision
             # 2026-10-07); any difference searches again.
-            from app.services.search.rerun_reuse import public_copy
-            public = public_copy(reused)
-            refetch = getattr(active_resolver, "refetch_public_source", None)
-            refetched = (refetch(reference, public["href"], provider=public["provider"],
-                                 content_sha256=public["content_sha256"])
-                         if public and refetch and not identity_only else None)
-            if refetched is None:
-                reused = None
-            else:
-                refetched.metadata = {
-                    **(refetched.metadata or {}),
+            public, reused = plan["public"], plan["reused"]
+            result = resolver.refetch_public_source(reference, public["href"], provider=public["provider"],
+                                                    content_sha256=public["content_sha256"])
+            if result is not None:
+                result.metadata = {
+                    **(result.metadata or {}),
                     "reference_discovery": reused.get("reference_discovery"),
                     "reference_discovery_trace": reused.get("reference_discovery_trace"),
                     "submitted_link_observations": reused.get("submitted_link_observations"),
                 }
-                result_record["search_reuse"] = {**reused["search_reuse"], "public_copy_downloaded": True}
-        if reused is not None and refetched is None:
-            checkpoint(reused)
-            continue
-        try:
-            if refetched is not None:
-                result = refetched
-            else:
-                with search_memo_scope(memo_context):
-                    result = active_resolver.resolve_reference(reference, identity_only=True) if identity_only else active_resolver.resolve_reference(reference)
-        except SourceResolutionError as exc:
+                plan["record"]["search_reuse"] = {**reused["search_reuse"], "public_copy_downloaded": True}
+        if result is None:
+            try:
+                with search_memo_scope(context):
+                    result = resolver.resolve_reference(reference, identity_only=True) if identity_only else resolver.resolve_reference(reference)
+            except SourceResolutionError as exc:
+                return None, exc
+        if not identity_only:
+            # A validated public copy from any route is kept (owner decision
+            # 2026-10-09), so later runs and papers reuse it without a search.
+            retain = getattr(resolver, "retain_validated_copy", None)
+            if retain is not None:
+                retain(reference, result)
+        return result, None
+
+    def record_acquisition(plan: dict, result, exc) -> None:
+        """Admit one acquired source and checkpoint it, on the job's thread."""
+        reference, result_record = plan["reference"], plan["record"]
+        if getattr(reference, "url", None) or getattr(reference, "doi", None):
+            # Which student-link handling ran: a later version searches a
+            # link that yielded no text again once (rerun_reuse).
+            from app.services.source_reuse import STUDENT_LINK_ROUTES_VERSION
+            result_record["student_link_routes"] = STUDENT_LINK_ROUTES_VERSION
+        from app.services.source_reuse import SEARCH_RULES_VERSION
+        result_record["search_rules"] = SEARCH_RULES_VERSION
+        if (getattr(result, "metadata", None) or {}).get("held_as_book_of_cited_part"):
+            # The text is the identified single-authored book's (2026-10-18).
+            result_record["held_as_book_of_cited_part"] = True
+        if getattr(result, "source_name", None) == "lantern":
+            from app.services.source_reuse import LANTERN_PAGES_VERSION
+            result_record["lantern_pages"] = LANTERN_PAGES_VERSION
+        if exc is not None:
             result_record.update(
                 status="unavailable",
                 reason_code="source_not_found",
@@ -445,14 +442,18 @@ def retrieve_paper_sources(
             if dependencies:
                 result_record["retryable_provider_dependencies"] = dependencies
             checkpoint(result_record)
-            continue
+            return
         metadata = result.metadata or {}
         result_record["reference_discovery_trace"] = metadata.get(
             "reference_discovery_trace"
         )
         result_record["reference_discovery"] = metadata.get("reference_discovery")
         result_record["submitted_link_observations"] = metadata.get("submitted_link_observations")
-        if identity_only:
+        declared = str(metadata.get("declared_document_url") or "")
+        if declared.startswith("https://"):
+            # The PDF a page named but the app could not fetch (2026-10-18).
+            result_record["declared_document_url"] = declared
+        if plan["identity_only"]:
             # Identity observations do not authorize a representation, abstract,
             # verification run or source admission, even from an injected adapter.
             result_record.update(status="metadata_only", reason_code="bibliography_identity_only")
@@ -461,7 +462,7 @@ def retrieve_paper_sources(
             if dependencies:
                 result_record["retryable_provider_dependencies"] = dependencies
             checkpoint(result_record)
-            continue
+            return
         representation_id = metadata.get("repository_representation_id")
         admission = metadata.get("durable_admission") or {}
         if admission.get("state") == "accepted":
@@ -492,13 +493,23 @@ def retrieve_paper_sources(
                     source_name=result.source_name,
                 )
             checkpoint(result_record)
-            continue
+            return
         representation = result.representation
         if representation is None or not representation.content:
+            # The record that supplied a merged abstract is kept with it
+            # (Television Without Frontiers reference 3, 2026-10-18: the source
+            # of a misleading abstract could not be traced).
+            provenance = metadata.get("abstract_provenance")
+            merged_from = ((metadata.get("canonical_work") or {}).get("abstract_provider")
+                           if isinstance(metadata.get("canonical_work"), dict) else None)
+            if merged_from and not isinstance(provenance, dict):
+                provenance = {"abstract_provider": str(merged_from)[:120]}
             abstract_evidence = _bounded_abstract_evidence(
                 result.abstract,
                 source_name=result.source_name,
+                provenance=provenance,
             )
+
             # A required web search that was skipped (call ceiling, cooldown,
             # elapsed budget) or failed did not finish; "not retrieved" would
             # read as a completed search. The providers named are the ones a
@@ -516,7 +527,7 @@ def retrieve_paper_sources(
             if abstract_evidence:
                 result_record["abstract_evidence"] = abstract_evidence
             checkpoint(result_record)
-            continue
+            return
         try:
             cleanliness = _transient_cleanliness(representation)
         except PaperWorkflowError as exc:
@@ -525,7 +536,7 @@ def retrieve_paper_sources(
                 reason_code=exc.code,
             )
             checkpoint(result_record)
-            continue
+            return
         confidence = metadata.get("identity_confidence")
         provisional = metadata.get('provisional_source') or {}
         possible_match = bool(confidence == 'medium'
@@ -538,19 +549,32 @@ def retrieve_paper_sources(
         # either way. Bound to the validated bytes, not just to the flag.
         corroborated_landing = bool(
             confidence == 'medium'
-            and metadata.get('identity_corroborated_by_landing_page')
+            and (metadata.get('identity_corroborated_by_landing_page')
+                 # Its own title page names the cited title and first author (2026-10-14).
+                 or metadata.get('identity_corroborated_by_title_page'))
             and metadata.get('accepted_representation_sha256')
             == hashlib.sha256(representation.content).hexdigest()
         )
         if confidence != "high" and not possible_match and not corroborated_landing:
             result_record.update(status="unavailable", reason_code="identity_not_verified")
             checkpoint(result_record)
-            continue
+            return
         completeness = (
             representation.completeness
             or metadata.get("completeness")
             or "not_assessed"
         )
+        if getattr(representation, "kind", None) == RepresentationKind.PLAIN_TEXT:
+            # Every route ends here, reuse included (2026-10-13): an index record
+            # is not the work, and a page of notes or listings is never whole.
+            from app.services.source_reuse import stored_text_today
+            decision, completeness = stored_text_today(
+                representation.content.decode("utf-8", "replace"),
+                title=getattr(reference, "title", None), completeness=completeness)
+            if not decision.reusable:
+                result_record.update(status="unavailable", reason_code="representation_is_a_listing")
+                checkpoint(result_record)
+                return
         try:
             run = begin_verification_run(
                 session,
@@ -602,11 +626,88 @@ def retrieve_paper_sources(
                 result_record['public_source_access'] = dict(
                     version='verified-public-source-access-v1', href=source_url,
                     content_sha256=hashlib.sha256(representation.content).hexdigest())
+                # The PDF the retrieved page names, for the reader to open
+                # (the app read only the page, 2026-10-18).
+                declared = str((getattr(result, 'metadata', None) or {}).get('declared_document_url') or '')
+                if declared.startswith('https://'):
+                    result_record['public_source_access']['document_href'] = declared
             # A page accepted as complete under rule A is recorded for review.
             stated = (representation.metadata or {}).get('stated_page_completeness')
             if isinstance(stated, dict):
                 result_record['stated_page_completeness'] = dict(stated)
         checkpoint(result_record)
+
+    # References are searched for at the same time (owner decision
+    # 2026-10-09): planning and recording stay on this thread, in reference
+    # order; only `acquire` runs on worker threads.
+    workers = max(1, int(settings.PAPER_SOURCE_RETRIEVAL_WORKERS or 1))
+    planned: list[dict] = []
+    for reference in ordered_references:
+        if (reference.reference_id not in cited_reference_ids
+                and reference.reference_id not in completed_reference_ids
+                and artifact.citation_format.lower() == 'apa'
+                and eligible_author_lookup(reference, artifact.required_author_policy_version)):
+            checkpoint(discover_author_metadata(reference,
+                getattr(active_resolver, '_retrieval_sources', []),
+                permitted=author_lookup_slots < 2))
+            author_lookup_slots += 1
+        if (
+            (reference.reference_id not in cited_reference_ids and not eligible_identity_only(reference))
+            or reference.reference_id in completed_reference_ids
+        ):
+            continue
+        result_record = {"reference_id": reference.reference_id}
+        identity_only = reference.reference_id not in cited_reference_ids
+        if identity_only:
+            result_record["identity_only_policy"] = IDENTITY_ONLY_POLICY
+        reused = reused_result(rerun_index, reference, identity_only=identity_only)
+        refusal = None if reused is not None else reuse_refusal(rerun_index, reference, identity_only=identity_only)
+        if reused is not None and reused.get("status") == "durable_authorized":
+            try:
+                authorize_representation(session, backend, representation_id=reused["representation_id"],
+                                         scope_type=job.scope_type, scope_id=job.scope_id)
+            except Exception:
+                reused, refusal = None, "stored_copy_unusable"   # search again
+        if (reused is not None and not identity_only
+                and reused.get("status") in {"unavailable", "abstract_only", "metadata_only"}):
+            # A source uploaded since the earlier run is in the library now:
+            # resolve the reference, which finds it before any search (2026-10-07).
+            stored = getattr(active_resolver, "stored_copy_available", None)
+            if stored is not None and stored(reference):
+                reused, refusal = None, "library_copy_available"
+        public = None
+        if reused is not None and downloadable(reused):
+            public = public_copy(reused)
+            if not (public and refetch and not identity_only):
+                public = reused = None
+                refusal = "public_copy_not_downloaded"
+        if reused is not None and public is None:
+            checkpoint(reused)
+            continue
+        if refusal:
+            # Why an earlier result was not reused (provenance, 2026-10-15).
+            result_record["reuse_refusal"] = refusal
+        plan = {"reference": reference, "record": result_record, "identity_only": identity_only,
+                "reused": reused, "public": public}
+        if workers == 1:
+            record_acquisition(plan, *acquire(plan, memo_context))
+        else:
+            planned.append(plan)
+    if planned:
+        # One resolver copy per worker thread (`SourceResolver.for_worker`);
+        # an injected resolver without one is shared as it is.
+        for_worker = getattr(active_resolver, "for_worker", None)
+        # Cited references first, as one at a time: bibliography-only lookups
+        # must not spend the run's search allowance ahead of them.
+        for phase in ([plan for plan in planned if not plan["identity_only"]],
+                      [plan for plan in planned if plan["identity_only"]]):
+            if phase:
+                _acquire_in_parallel(phase, acquire, record_acquisition, memo_context, workers,
+                                     resolver_for_worker=for_worker)
+        # Back in reference order, as one-at-a-time retrieval leaves them.
+        position = {reference.reference_id: index for index, reference in enumerate(ordered_references)}
+        results.sort(key=lambda item: position.get(item.get("reference_id"), len(position)))
+        job.source_results = list(results)
     # Uncited references are not searched, but their own links are visited so
     # a dead or wrong link is reported (owner decision 2026-10-02).
     check_links = getattr(active_resolver, "check_submitted_links", None)
@@ -925,7 +1026,7 @@ def verify_paper_sources(
         "report_ids": report_ids,
         "source_failures": failures,
         "submitted_link_observations": project_observations(artifact.references, source_results,
-            cited_reference_ids={ref_id for claim in artifact.citation_claims for ref_id in claim.reference_ids}),
+            cited_reference_ids=_cited_reference_ids(artifact)),
         "citation_groups": _citation_group_index(
             artifact.citation_claims,
             report_members,
@@ -1047,15 +1148,15 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     }
     refresh_reference_ids = _refresh_reference_ids(job)
     refresh = dict((job.upload_evidence or {}).get(TARGETED_SOURCE_REFRESH_KEY) or {})
-    previous_report = None
-    if refresh_reference_ids:
-        previous_report = session.scalar(
-            select(Report)
-            .where(Report.job_id == job.id)
-            .order_by(Report.report_version.desc(), Report.created_at.desc())
-            .limit(1)
-            .with_for_update()
-        )
+    # Any later run on a job with a report is that report's next version, even
+    # when its refresh marker is missing, so a version number is never reused.
+    previous_report = session.scalar(
+        select(Report)
+        .where(Report.job_id == job.id)
+        .order_by(Report.report_version.desc(), Report.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
     report = Report(
         job_id=job.id,
         total_references=str(len(extraction.references)),
@@ -1099,13 +1200,32 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
             evidence_view,
             backend.download(paper_artifact.presentation_storage_key),
         )
+    # Evidence sentences shown in another language than the statement carry
+    # their English translation (owner decision 2026-10-13); never fails the run.
+    from app.services.evidence_translation import stored_translations, translate_report_view
+    translations, evidence_view = translate_report_view(
+        evidence_view, enabled=settings.PAPER_LLM_PROCESSING_ENABLED,
+        known=stored_translations(previous_report.report_json if previous_report else None))
+    if translations:
+        aggregate_payload["evidence_translations"] = translations
     if previous_report and refresh:
         aggregate_payload["amendment"] = _targeted_amendment_manifest(
             refresh,
             summary,
             previous_report=previous_report,
         )
-    report.report_json = {**aggregate_payload, "evidence_report": evidence_view}
+    from app.services.paper_reuse import FINGERPRINT_KEY, pipeline_fingerprint
+    # The code and settings that built this report: an unchanged resubmission
+    # under the same fingerprint gets this report back (owner decision 2026-10-09).
+    report.report_json = {**aggregate_payload, "evidence_report": evidence_view,
+                          FINGERPRINT_KEY: pipeline_fingerprint()}
+    # A submitted file the scope keeps for checking again (`recheck-copy-v1`)
+    # is marked before the job completes, so the scheduled clean-up waits.
+    from app.services.recheck_copy import kept_by_policy, mark_kept
+    keep_file = bool(kept_by_policy(job) and job.input_storage_key and job.input_deleted_at is None
+                     and not (job.upload_evidence or {}).get("input_cleanup_started"))
+    if keep_file:
+        mark_kept(job)
     job.status = JobStatus.COMPLETED
     job.stage = JobStage.COMPLETED
     if refresh_reference_ids:
@@ -1121,7 +1241,7 @@ def finalize_paper_job(session: Session, backend: StorageBackend, job_id) -> dic
     # Checks every finished report (owner decision 2026-10-07); never fails the run.
     from app.services.report_check import record_report_check
     record_report_check(session, backend, report, job)
-    cleaned = cleanup_paper_job_input(session, backend, job.id)
+    cleaned = False if keep_file else cleanup_paper_job_input(session, backend, job.id)
     return {"job_id": str(job.id), "report_id": str(report.id), "input_cleaned": cleaned}
 
 
@@ -1253,8 +1373,13 @@ def prepare_uploaded_source_refresh(
     representation_id: str | uuid.UUID,
     commit: bool = True,
     refresh_reason: str = "user_source_upload",
+    reverify_current: bool = False,
 ) -> dict:
     """Bind one admitted upload to its exact paper member and targeted refresh.
+
+    `reverify_current` re-checks a source the report already holds, so changed
+    evidence or Judgment rules reach it without a search (development refresh,
+    2026-10-18).
 
     The report-local member is only a hint.  This function independently checks
     the admitted representation, authorization scope, canonical work identity,
@@ -1379,7 +1504,8 @@ def prepare_uploaded_source_refresh(
         None,
     )
     if (
-        current
+        not reverify_current
+        and current
         and current.get("status") == "durable_authorized"
         and current.get("representation_id") == str(representation.id)
     ):
@@ -1553,35 +1679,42 @@ def _shadow_artifact(
     source_title: str = "",
     scope_excerpt: str = "",
 ) -> VerificationEvidenceArtifact:
+    # A source in another writing system than the statement
+    # (cross-language-evidence-v1): recorded on the evidence, the quotation
+    # check is not assessable, and the statement translated into the source's
+    # language is searched as extra, labelled retrieval queries.
+    from app.services.cross_language_evidence import claim_inputs
+    cross_language, translated_queries = claim_inputs(source, getattr(claim, "text", "") or "",
+                                                      llm_enabled=llm_enabled)
     evidence = build_passage_evidence(
         source,
         claim=claim,
         top_k=3,
         active_reference_id=active_reference_id,
         cited_author_label=cited_author_label,
+        cross_language=cross_language,
+        translated_queries=translated_queries,
     )
     if source.identity_verdict == 'possible_match' and identity_reason:
         evidence.source_identity.limitations.append(identity_reason[:1000])
     evidence = attach_verification_candidates(evidence)
     evidence = attach_citation_use_routes(evidence)
-    # Judged before the evidence work, not after it. A source whose own
-    # subject excludes the statement cannot supply evidence for it, so
-    # selecting and ranking passages from it spends two model calls to
-    # produce material the report then withholds. Retrieval itself cannot
-    # be avoided: this judgment reads the document.
+    # The topical comparison the report's mark is made from. The evidence
+    # work below always runs: only the report decides the mark and withholds
+    # the evidence (owner decision 2026-10-15; the run's own skip rule
+    # checked less than the report and left citations with neither).
     if llm_enabled:
         evidence = _attach_source_scope(evidence, claim, scope_excerpt,
                                         source_title=source_title, source=source)
-    topically_mismatched = _scope_mismatch_established(evidence)
-    if llm_enabled and not topically_mismatched:
+    if llm_enabled:
         evidence = attach_source_blind_interpretations(
             evidence,
             response_provider=_student_interpretation_response,
         )
     evidence = attach_evidence_obligations(evidence)
-    if not topically_mismatched:
-        evidence = attach_candidate_passage_retrieval(source, evidence)
-    if llm_enabled and not topically_mismatched:
+    evidence = attach_candidate_passage_retrieval(source, evidence,
+                                                  translated_queries=translated_queries)
+    if llm_enabled:
         evidence = apply_passage_relevance_gate(evidence, source_title=source_title)
         if (
             settings.EVIDENCE_RETRIEVAL_SEMANTIC_BACKEND == "deberta_nli"
@@ -1600,19 +1733,27 @@ def _shadow_artifact(
             evidence = evidence.model_copy(update={
                 "joint_evidence_selection": select_joint_evidence(evidence, source_title=source_title),
             })
-    if llm_enabled and not topically_mismatched:
+    if (settings.CROSS_LANGUAGE_WHOLE_SOURCE_ENABLED
+            and (evidence.cross_language or {}).get("differs")):
+        # A source in another writing system (cross-language-whole-source-v1,
+        # owner decision 2026-10-13): the selector and the Judgment foundation
+        # read the whole source when it fits, since a translated query can
+        # miss a passage worded differently.
+        from app.services.cross_language_whole_source import attach_whole_source
+        evidence = attach_whole_source(source, evidence)
+    if llm_enabled:
         # The citation's one evidence list (owner decision 2026-09-28): GLM picks
         # the numbered source sentences; without it the gate's display is used.
         from app.services.evidence_sentence_selection import attach_sentence_evidence
         evidence = attach_sentence_evidence(evidence)
     evidence = attach_facet_evidence_foundation(evidence)
-    if (llm_enabled and not topically_mismatched
+    if (llm_enabled
             and settings.PAPER_EXPERIMENTAL_RELATIONSHIP_JUDGMENTS_ENABLED
             and source.identity_verdict != 'possible_match'):
         evidence = apply_facet_evidence_judgment(evidence)
         evidence = apply_decisive_label_critic(evidence)
     from app.services.judgment_reserve import build_judgment_reserve, reserve_enabled
-    if reserve_enabled() and not topically_mismatched:
+    if reserve_enabled():
         # Wider-search sentences for the Judgment layout, built while the
         # source is still available; never part of the Evidence Package.
         evidence._judgment_reserve = build_judgment_reserve(source, evidence)
@@ -1621,20 +1762,6 @@ def _shadow_artifact(
 
 # Headroom kept between the composed scope text and the input budget.
 _SCOPE_COMPOSITION_MARGIN = 250
-
-
-def _scope_mismatch_established(evidence) -> bool:
-    """Has the scope comparison already ruled this source out for this claim?"""
-    from app.services.report_layers import scope_mark_qualifies
-    record = getattr(evidence, "source_scope_assessment", None)
-    if record is None or record.status != "complete":
-        return False
-    scope = dict((record.assessment or {}).get("scope_assessment") or {})
-    if not scope:
-        return False
-    scope.setdefault("claim_terms_present", record.claim_terms_present)
-    scope.setdefault("claim_terms_total", record.claim_terms_total)
-    return scope_mark_qualifies(scope, record.coverage)
 
 
 def _attach_source_scope(evidence, claim, excerpt: str, *, source_title: str, source=None):
@@ -1648,7 +1775,9 @@ def _attach_source_scope(evidence, claim, excerpt: str, *, source_title: str, so
     # not its value. Read the value so the comparison means what it says.
     level = getattr(evidence.coverage, "level", None)
     coverage = str(getattr(level, "value", level) or "")
-    if coverage not in {"full_text", "partial_text"} or not excerpt:
+    # Fully retrieved text is never marked a topical mismatch (owner decision
+    # 2026-10-14), so only limited text is compared.
+    if coverage != "partial_text" or not excerpt:
         return evidence
     # The opening states the work's own scope; the passages show what it
     # actually discusses. Composed into one block so the existing binding,
@@ -1710,7 +1839,7 @@ def _transient_cleanliness(representation) -> str:
     return "clean"
 
 
-def _bounded_abstract_evidence(value, *, source_name: str) -> dict | None:
+def _bounded_abstract_evidence(value, *, source_name: str, provenance: dict | None = None) -> dict | None:
     """Retain bounded abstract evidence without treating it as full text."""
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
@@ -1728,6 +1857,9 @@ def _bounded_abstract_evidence(value, *, source_name: str) -> dict | None:
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "truncated": len(bounded) < len(text),
         "source_name": str(source_name or "scholarly metadata service")[:200],
+        # Why this abstract stands in for a page, and where it came from
+        # (doi-abstract-over-short-page-v1, landing-abstract-back-matter-v1).
+        **({"provenance": dict(provenance)} if isinstance(provenance, dict) else {}),
     }
 
 
@@ -1735,6 +1867,63 @@ def _canonical_work_id(reference) -> str:
     identity = reference.doi or reference.title or reference.raw_ref
     digest = hashlib.sha256(identity.strip().casefold().encode("utf-8")).hexdigest()
     return f"work:{digest}"
+
+
+def _acquire_in_parallel(planned: list[dict], acquire, record, memo_context, workers: int,
+                         *, resolver_for_worker=None) -> None:
+    """Run `acquire` for the planned references on up to `workers` threads and
+    `record` each outcome on this thread as it arrives.
+
+    References naming the same work run one after another in one thread, so
+    the later one finds the copy the earlier one stored. Each reference's
+    search memo writes wait for its checkpoint (`DeferredSearchMemoStore`);
+    the job's session is used by one thread at a time under `lock`. Every
+    worker has finished before this returns or raises, so nothing touches the
+    session afterwards.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import contextvars
+    import dataclasses
+    import threading
+    from app.services.search.search_memo import DeferredSearchMemoStore
+
+    lock = threading.Lock()
+    local = threading.local()
+
+    def resolver():
+        """This thread's own resolver copy, made on its first reference."""
+        if resolver_for_worker is None:
+            return None
+        if getattr(local, "resolver", None) is None:
+            local.resolver = resolver_for_worker()
+        return local.resolver
+
+    groups: dict[str, list[dict]] = {}
+    for plan in planned:
+        groups.setdefault(_canonical_work_id(plan["reference"]), []).append(plan)
+
+    def run(group: list[dict]) -> list[tuple]:
+        outcomes = []
+        for plan in group:
+            store = (DeferredSearchMemoStore(memo_context.store, lock)
+                     if memo_context.store is not None else None)
+            outcomes.append((plan, store, acquire(plan, dataclasses.replace(memo_context, store=store), resolver())))
+        return outcomes
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(groups)),
+                            thread_name_prefix="source-retrieval") as executor:
+        futures = [executor.submit(contextvars.copy_context().run, run, group) for group in groups.values()]
+        try:
+            for future in as_completed(futures):
+                for plan, store, (result, error) in future.result():
+                    with lock:
+                        if store is not None:
+                            store.apply()
+                        record(plan, result, error)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def _refresh_reference_ids(job: Job) -> list[str]:
@@ -1840,7 +2029,7 @@ def _retryable_provider_dependencies(
     no-match, bibliographic conflict, or insufficient citation metadata must
     never be silently converted into provider-recovery work. Within that, only
     providers the completion gate itself counts as blocking are named -- see
-    `search_blocking_providers`. ``discovery_trace`` is no longer read; the
+    `search_completion.assess_record`. ``discovery_trace`` is no longer read; the
     trace lists every provider that was queried, required or not, which is how
     an optional provider came to trigger re-runs it could never complete.
     """
@@ -1880,17 +2069,15 @@ def _blocking_providers_from_record(discovery_record: dict | None) -> list[str]:
     which is the safe outcome, whereas guessing would re-run it on a trigger
     nobody can justify.
     """
-    from app.services.reference_discovery import (
-        ReferenceDiscoveryRecord, search_blocking_providers)
+    from app.services.reference_discovery import ReferenceDiscoveryRecord
+    from app.services.search_completion import assess_record
     if (discovery_record or {}).get("outcome") != "search_incomplete":
         return []
     try:
         record = ReferenceDiscoveryRecord.model_validate(discovery_record)
     except ValueError:
         return []
-    return search_blocking_providers(
-        record.required_route_categories, record.attempts, record.queries,
-        record.search_policy_version)
+    return list(assess_record(record).blocking_providers)
 
 
 def _report_source_failure_reason(source_result: dict) -> str:
@@ -1919,6 +2106,24 @@ def _report_source_failure_reason(source_result: dict) -> str:
         if other_candidate_found
         else "cited_webpage_unavailable"
     )
+
+
+def _cited_reference_ids(artifact) -> set[str]:
+    """References a citation in the paper links to, so they are searched.
+
+    The claims' references, plus those an accepted citation links to whose
+    claim was rejected at the claim boundary (a marker whose membership could
+    not be bound, 2026-10-12): the claim stays rejected, but the reference is
+    cited and is searched and verified like any other.
+    """
+    cited = {reference_id for claim in artifact.citation_claims for reference_id in claim.reference_ids}
+    rejected = {(item.passage_start, item.passage_end, item.citation_marker)
+                for item in getattr(artifact, "claim_boundary_rejections", None) or []}
+    for citation in (getattr(artifact, "citations", None) or []) if rejected else []:
+        if (citation.drop_reason is None and citation.link_status == "linked"
+                and (citation.passage_start, citation.passage_end, citation.citation_marker) in rejected):
+            cited.update(citation.reference_ids)
+    return cited
 
 
 def _claims_by_reference(claims: list) -> dict[str, list]:

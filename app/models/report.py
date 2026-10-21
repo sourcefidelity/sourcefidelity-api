@@ -58,6 +58,21 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class ReportRedirect(Base):
+    """A deleted older report's address and the latest report it now opens
+    (owner decision 2026-10-20: keep only the latest report)."""
+
+    __tablename__ = "report_redirects"
+
+    old_report_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class VerificationReportRecord(Base):
     """Immutable, exact-scope evidence snapshot for one verification."""
 

@@ -2,13 +2,11 @@
 from copy import deepcopy
 import hashlib
 
-import fitz
 import pytest
 
 from app.services.report_layers import member_layers, topical_mismatch, member_marks
 from app.services.report_member_navigation import availability_tone
 from app.services.evidence_report import render_evidence_report_html
-from app.services.report_export import _render_pdf, _TONE_COLORS
 
 
 def mismatch():
@@ -62,7 +60,6 @@ def test_three_display_controls_and_distinct_available_text_states():
     assert "name !== changed" not in html
     tones = {availability_tone({'coverage_level': level}) for level in ['full_text', 'partial_text', 'abstract_only', 'unavailable']}
     assert len(tones) == 4
-    assert len({_TONE_COLORS[tone] for tone in tones}) == 4
     from bs4 import BeautifulSoup
     parsed = BeautifulSoup(html, 'html.parser')
     bar = parsed.select_one('#report-layout > .workspace-bar')
@@ -99,17 +96,3 @@ def test_simultaneous_marks_do_not_paint_over_the_source_fill():
     assert '<rect class="layer-indicator indicator-reference"' in markup
     assert '<line class="layer-indicator indicator-reference"' not in markup
     assert '<circle class="layer-indicator indicator-reference"' not in markup
-
-
-def test_partial_text_pdf_has_mauve_fill_and_neutral_span():
-    with fitz.open() as doc:
-        page = doc.new_page()
-        page.insert_text((72,72), 'A claim (Writer, 2020).')
-        content = doc.tobytes()
-    citation = {'citation_marker': '(Writer, 2020)', 'members': [{'coverage_level': 'partial_text', 'source': {'author': 'Writer', 'year': '2020'}}],
-                'paper_location': {'rectangles': [{'page_index': 0, 'x0': 70, 'y0': 50, 'x1': 300, 'y1': 85}]}}
-    output, counts = _render_pdf(content, citations=[citation], reference_practice=[], export_binding='synthetic')
-    with fitz.open(stream=output, filetype='pdf') as pdf:
-        fills = [d['fill'] for d in pdf[0].get_drawings() if d['fill']]
-        assert any(all(abs(a-b)<.002 for a,b in zip(fill,_TONE_COLORS['partial_evidence'])) for fill in fills)
-    assert counts['citation_underlines'] == counts['source_member_highlights'] == 1

@@ -7,13 +7,15 @@ def _process_local_provider_pacing(monkeypatch):
     """Provider pacing tests control their own clock; never touch a real Redis."""
     from app.config import settings
     monkeypatch.setattr(settings, "RETRIEVAL_SHARED_PACING_ENABLED", False)
+    # The cross-process request gate is tested on its own (test_provider_gate.py).
+    monkeypatch.setattr(settings, "PROVIDER_GATE_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)
 def _code_default_web_fallback(monkeypatch):
     """Tests see the code default, not the local deployment's fallback choice."""
     from app.config import settings
-    monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "searxng")
+    monkeypatch.setattr(settings, "SEARCH_WEB_FALLBACK_PROVIDER", "none")
     monkeypatch.setattr(settings, "TAVILY_USD_PER_CREDIT", None)
 
 
@@ -26,3 +28,13 @@ def _judgment_off_unless_a_test_enables_it(monkeypatch):
     # The GLM evidence selector and judge must never reach the live provider from tests.
     monkeypatch.setattr(settings, "ZAI_ENABLED", False)
     monkeypatch.setattr(settings, "JUDGMENT_JUDGES", "zai_glm")
+
+
+
+@pytest.fixture(autouse=True)
+def _second_required_provider_is_exa(monkeypatch, request):
+    """The suite's search tests were written against Exa as the second required
+    provider; DeepSeek is the code default since 2026-10-19 and has its own
+    tests (test_deepseek_search.py), which set it explicitly."""
+    from app.config import settings as _settings
+    monkeypatch.setattr(_settings, "SEARCH_SECOND_REQUIRED_PROVIDER", "exa")

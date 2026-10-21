@@ -25,6 +25,7 @@ from app.services.workflow_retry import is_retryable as _is_retryable
 from app.services.workflow_execution import WorkflowOwnershipLost, stage_execution
 from app.tasks.celery_app import celery_app
 from app.services.processing_metrics import measure_paper_stage
+from app.services.llm_cache import llm_cache_scope
 from app.services.paper_dispatch import (
     DISPATCH_KEY, MAX_STAGE_STARTS, STAGES, WorkflowBusy, attempt_id_for,
     attempt_matches, claim_dispatch, job_execution_lock, pending_stage,
@@ -171,8 +172,9 @@ def _start_stage(session, job_id, attempt_id, stage):
     intent["stage_starts"] = starts
     job.upload_evidence = {**job.upload_evidence, DISPATCH_KEY: intent}
     job.status = JobStatus.RUNNING
+    scope = (job.scope_type, job.scope_id)
     session.commit()
-    return True
+    return scope
 
 
 def _run_stage(task, job_id, attempt_id, stage):
@@ -183,9 +185,11 @@ def _run_stage(task, job_id, attempt_id, stage):
                     factory = owner.session_factory
                     with factory() as session:
                         try:
-                            if not _start_stage(session, job_id, attempt_id, stage):
+                            scope = _start_stage(session, job_id, attempt_id, stage)
+                            if not scope:
                                 return {"already_completed": True}
-                            with measure_paper_stage(factory, job_id, stage, workflow_attempt=attempt_id):
+                            with measure_paper_stage(factory, job_id, stage, workflow_attempt=attempt_id), \
+                                    llm_cache_scope(*scope):
                                 try:
                                     backend = get_storage_backend()
                                     if stage == "verify":

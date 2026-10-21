@@ -74,7 +74,7 @@ class SearchResult:
 class SearchProvider(ABC):
     """Abstract web search provider.
 
-    Implementations include SearXNGSearch, TavilySearch and ExaSearch.
+    Implementations include BraveSearch, TavilySearch and ExaSearch.
     Selected via settings.SEARCH_PROVIDER in the factory (search/__init__.py).
     """
 

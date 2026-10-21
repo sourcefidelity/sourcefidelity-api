@@ -195,3 +195,65 @@ def test_possible_wrapped_url_warns_without_repair_or_request(tail, uncertain):
     assert row.state == 'not_checked' and not row.requests
     assert ref.url == url
     assert ('extracted address may be incomplete' in render_link_checks([row.model_dump(mode='json')])) is uncertain
+
+
+def test_a_video_page_title_and_upload_date_are_not_link_conflicts():
+    def video_observed(url):
+        ref = ParsedReference(reference_id='r', url=url, title='A documentary')
+        rows = initial_observations(ref)
+        digest = hashlib.sha256(b'response').hexdigest()
+        now = datetime.now(timezone.utc)
+        rows[0].requests = [LinkRequest(started_at=now, completed_at=now,
+            request_sha256=rows[0].request_sha256, response_sha256=digest,
+            http_status=200, outcome='response', destination_origin='https://www.youtube.com')]
+        rows[0].state = 'observed'
+        return ref, rows, digest
+    differences = [{'field': 'title', 'submitted': 'A documentary', 'destination': 'Uploader title'},
+                   {'field': 'year', 'submitted': '2003', 'destination': '2017'}]
+    ref, rows, digest = video_observed('https://www.youtube.com/watch?v=abc')
+    token = ACTIVE_LINKS.set(rows)
+    try:
+        identity_observed(ref.url, digest, 'bibliographic_fields_conflict', ['title', 'year'],
+                          differences=differences)
+    finally:
+        ACTIVE_LINKS.reset(token)
+    assert rows[0].requests[0].destination_identity == 'not_assessed'
+    # Nor is the uploader: a video link is checked only for whether it opens (owner decision 2026-10-16).
+    ref, rows, digest = video_observed('https://youtu.be/abc')
+    token = ACTIVE_LINKS.set(rows)
+    try:
+        identity_observed(ref.url, digest, 'bibliographic_fields_conflict', ['title', 'author'],
+                          differences=[differences[0], {'field': 'author', 'submitted': 'Ames, B.',
+                                                        'destination': 'Corrin, T.'}])
+    finally:
+        ACTIVE_LINKS.reset(token)
+    assert rows[0].requests[0].destination_identity == 'not_assessed'
+
+
+def test_a_film_cited_by_its_credits_is_traditional_media_whatever_site_it_links_to():
+    from app.services.source_type import classify_reference_source_kind
+    film = "Marsh, T. (Director). (2003). Lanterns [TV Movie]. Harbour Pictures. https://youtu.be/abc123"
+    assert classify_reference_source_kind(film, title="Lanterns", url="https://youtu.be/abc123").kind == "traditional_media"
+    upload = "Harbour Channel. (2017, May 2). Lanterns [Video]. YouTube. https://youtu.be/abc123"
+    assert classify_reference_source_kind(upload, title="Lanterns", url="https://youtu.be/abc123").kind == "video"
+
+
+def test_a_deep_link_redirected_to_a_front_page_is_a_moved_page():
+    from app.services.submitted_links import redirected_to_site_root
+    assert redirected_to_site_root("http://lawcommons.example.edu/iclr/vol14/iss1/9", "https://lira.example.edu/")
+    assert not redirected_to_site_root("https://example.org/", "https://example.org/")
+    assert not redirected_to_site_root("https://example.org/a/b", "https://example.org/a/b/")
+
+
+def test_a_doi_without_its_prefix_still_links():
+    from app.services.evidence_report import _link_reference_text
+    html = _link_reference_text("In Harbour Books (pp. 23–42). doi:1007/978-3-319-00000-0_2")
+    assert 'href="https://doi.org/10.1007/978-3-319-00000-0_2"' in html
+
+
+def test_bepress_repositories_name_their_pdf():
+    from app.services.retrieval.landing_page import discover_scholarly_locations
+    page = ('<html><head><meta name="bepress_citation_pdf_url" '
+            'content="https://commons.example.edu/cgi/viewcontent.cgi?article=1&amp;context=jil"></head></html>')
+    [location] = discover_scholarly_locations(page, "https://commons.example.edu/jil/vol1/iss1/1/")
+    assert location.url.endswith("viewcontent.cgi?article=1&context=jil")

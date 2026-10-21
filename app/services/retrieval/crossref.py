@@ -7,8 +7,11 @@ author roles -> monograph vs edited-collection detection).
 
 import html
 import logging
+import time
 
 import httpx
+
+from app.services.retrieval import provider_gate
 
 from app.config import settings
 from app.log_safety import safe_exception_code
@@ -25,6 +28,16 @@ from app.services.processing_metrics import record_provider_request
 logger = logging.getLogger(__name__)
 
 CROSSREF_BASE = "https://api.crossref.org"
+_RETRY_DELAYS = (1.0, 3.0)
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_FAILURE_HOLD_SECONDS = 10.0
+
+
+def _budget_allows(delay: float) -> bool:
+    """A retry fits: no reference budget, or more than the delay plus a request left."""
+    from app.services.retrieval_deadline import remaining_seconds
+    left = remaining_seconds()
+    return left is None or left > delay + 5.0
 
 
 class CrossrefRetriever(RetrievalSource):
@@ -48,11 +61,40 @@ class CrossrefRetriever(RetrievalSource):
         }
 
     def _get(self, url: str, params: dict | None = None) -> httpx.Response:
+        """One Crossref request, retried twice after a dropped connection, a
+        timeout, a 429 or a 5xx, while the reference's time budget allows
+        (2026-10-11: one refused connection failed the reference's search)."""
+        for attempt in range(len(_RETRY_DELAYS) + 1):
+            last = attempt == len(_RETRY_DELAYS)
+            try:
+                resp = self._get_once(url, params)
+            except httpx.TransportError:
+                if last or not _budget_allows(_RETRY_DELAYS[attempt]):
+                    # Still failing: hold every process back briefly rather
+                    # than keep opening connections Crossref is refusing.
+                    provider_gate.defer(self.name, _FAILURE_HOLD_SECONDS)
+                    raise
+                time.sleep(_RETRY_DELAYS[attempt])
+                continue
+            if resp.status_code in _RETRY_STATUSES and not last and _budget_allows(_RETRY_DELAYS[attempt]):
+                time.sleep(_RETRY_DELAYS[attempt])
+                continue
+            return resp
+        raise AssertionError("unreachable")
+
+    def _get_once(self, url: str, params: dict | None = None) -> httpx.Response:
         self.provider_metrics["calls"] += 1
         record_provider_request("crossref")
         try:
-            resp = httpx.get(
+            # The mailto header puts requests in Crossref's polite pool. Its
+            # documentation says 10 per second and 3 in flight; the live pool
+            # reported 3 per second (2026-10-11), so pacing starts there and
+            # follows the X-Rate-Limit headers each response carries.
+            resp = provider_gate.paced_get(
+                "crossref", 1 / 3,
                 url,
+                places=3,
+                keep_alive=True,
                 headers=self._headers(),
                 params=params,
                 timeout=self.policy.timeout_seconds,

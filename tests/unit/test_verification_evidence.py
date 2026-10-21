@@ -1805,8 +1805,8 @@ def test_exact_scope_is_required_even_when_same_bytes_exist_elsewhere(
         session,
         storage,
         _pdf("Authorized course evidence."),
-        scope_type="assessment",
-        scope_id="assessment-1",
+        scope_type="personal_owner",
+        scope_id="owner-1",
         expires_at=datetime.now(timezone.utc) + timedelta(days=30),
     )
 
@@ -1815,8 +1815,8 @@ def test_exact_scope_is_required_even_when_same_bytes_exist_elsewhere(
             session,
             storage,
             representation_id=record.id,
-            scope_type="assessment",
-            scope_id="assessment-2",
+            scope_type="personal_owner",
+            scope_id="owner-2",
         )
 
 
@@ -1826,8 +1826,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
         session,
         storage,
         _pdf("Expired evidence."),
-        scope_type="assessment",
-        scope_id="assessment-1",
+        scope_type="personal_owner",
+        scope_id="owner-1",
         expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
     )
     with pytest.raises(EvidenceAuthorizationError, match="expired"):
@@ -1835,8 +1835,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
             session,
             storage,
             representation_id=expired.id,
-            scope_type="assessment",
-            scope_id="assessment-1",
+            scope_type="personal_owner",
+            scope_id="owner-1",
         )
 
     expired.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
@@ -1847,8 +1847,8 @@ def test_expired_or_nonaccepted_representation_fails_closed(session: Session) ->
             session,
             storage,
             representation_id=expired.id,
-            scope_type="assessment",
-            scope_id="assessment-1",
+            scope_type="personal_owner",
+            scope_id="owner-1",
         )
 
 
@@ -2079,6 +2079,50 @@ def test_quotation_locator_reports_match_on_different_page(session: Session) -> 
     assert artifact.quotation_check.outcome == "all_spans_literal_match"
     assert artifact.locator_check.status == "complete"
     assert artifact.locator_check.outcome == "located_span_outside_supplied_locator"
+
+
+def test_a_source_without_page_numbers_cannot_place_a_quotation_outside_its_locator(
+    session: Session,
+) -> None:
+    # Owner review 2026-10-14 (Harlow citations 1, 2 and 8): a webpage or an
+    # unpaginated text has no page to compare, so the locator is not assessed.
+    storage = MemoryStorage()
+    content = b"An unpaginated page. The exact quoted evidence appears on this page."
+    record = _admit(session, storage, content, kind=RepresentationKind.PLAIN_TEXT, media_type="text/plain")
+    source = authorize_representation(
+        session, storage, representation_id=record.id, scope_type="personal_owner", scope_id="owner-1")
+    artifact = build_passage_evidence(
+        source,
+        claim=_claim('"The exact quoted evidence appears on this page."', claim_type="quotation",
+                     page_locator="27"),
+    )
+    assert artifact.quotation_check.outcome == "all_spans_literal_match"
+    assert artifact.locator_check.status == "not_assessable"
+    assert artifact.locator_check.outcome == "page_label_unavailable"
+
+
+def test_printed_page_labels_of_a_scanned_magazine_check_the_locator() -> None:
+    # Owner decision 2026-10-14 (Lantern pages): the printed numbers label the
+    # pages of the text, so the locator is checked against them.
+    from dataclasses import replace as _replace
+    content = b"26\nOpening page of the story.\fThe exact quoted evidence appears on this page.\n27"
+    now = datetime.now(timezone.utc)
+    source = AuthorizedRepresentation(
+        representation_id="lantern-rep", canonical_work_id="w", content_object_id="o",
+        content_sha256=hashlib.sha256(content).hexdigest(), content=content, representation_kind="plain_text",
+        media_type="text/plain", provenance="public_web", scope_type="personal_owner", scope_id="owner-1",
+        identity_verdict="verified", identity_confidence=0.9, completeness_verdict="complete",
+        text_quality="scan_ocr", edition_or_version=None, created_at=now, admitted_at=now,
+        page_labels=("26", "27"))
+    quote = '"The exact quoted evidence appears on this page."'
+    inside = build_passage_evidence(source, claim=_claim(quote, claim_type="quotation", page_locator="27"))
+    assert inside.locator_check.outcome == "located_span_matches_supplied_locator"
+    outside = build_passage_evidence(source, claim=_claim(quote, claim_type="quotation", page_locator="26"))
+    assert outside.locator_check.outcome == "located_span_outside_supplied_locator"
+    single = _replace(source, content=content.split(b"\f")[1],
+                      content_sha256=hashlib.sha256(content.split(b"\f")[1]).hexdigest(), page_labels=("27",))
+    alone = build_passage_evidence(single, claim=_claim(quote, claim_type="quotation", page_locator="27"))
+    assert alone.locator_check.outcome == "located_span_matches_supplied_locator"
 
 
 def test_author_accepted_manuscript_does_not_claim_publisher_page_match(
@@ -2463,3 +2507,83 @@ def test_multi_reference_title_block_keeps_its_dedicated_channel_and_method():
     # which the report validator requires for the title-block exemption.
     assert candidate.method == "document_level_member_evidence"
     assert "candidate_document_metadata" in channels
+
+
+def test_a_quoted_term_on_the_cited_page_is_located_there_not_earlier(session: Session) -> None:
+    # Demir & Sepli, p. 140 (2026-10-14): "tariff" also occurs on an earlier page.
+    storage = MemoryStorage()
+    content = _pdf(
+        "A tariff schedule was published by the ministry in the first chapter of the report.",
+        "Protectionism can be implied through tariffs and non-tariff barriers such as quotas.",
+    )
+    record = _admit(session, storage, content)
+    source = authorize_representation(session, storage, representation_id=record.id,
+                                      scope_type="personal_owner", scope_id="owner-1")
+    artifact = build_passage_evidence(
+        source,
+        claim=_claim('protectionism can be manifested through "tariff" and "non-tariff barriers"',
+                     claim_type="quotation", page_locator="2"),
+    )
+    assert artifact.locator_check.outcome == "located_span_matches_supplied_locator"
+
+
+def test_a_contents_entry_reading_references_does_not_drop_later_quotations() -> None:
+    from app.services.verification_evidence import _SourcePage, _exact_phrase_candidates
+    contents = "Contents\nIntroduction 1\nThe Cycles 40\nReferences\nIndex 230"
+    body = ("This chapter turns to the second square, focusing on the “SF worlds,” that is, "
+            "the genre’s imaginary worlds and the conflicts staged within their spaces.")
+    pages = [_SourcePage(index=0, label="v", text=contents), _SourcePage(index=1, label="17", text=body)]
+    claim = "The film builds what the author describes as “SF Worlds,” where everyday spaces turn hostile."
+    found = _retrieve_candidates(pages, claim_text=claim, claim_type="quotation", page_locator="", top_k=3)
+    assert [(c.page_index, c.method) for c in found] == [(1, "exact_quotation")]
+    assert found[0].passage_role != "reference_list"
+    phrase = _exact_phrase_candidates(pages, "the genre’s imaginary worlds and the conflicts staged")
+    assert [c.page_index for c in phrase] == [1]
+    # A real reference list still is one.
+    references = "References\nAdams, J. (2019). Worlds apart. Press.\nfocusing on the “SF worlds,” again"
+    assert _retrieve_candidates([_SourcePage(index=0, label="200", text=references)], claim_text=claim,
+                                claim_type="quotation", page_locator="", top_k=3) == []
+
+
+def test_headings_titles_and_contents_are_not_evidence() -> None:
+    from app.services.verification_evidence import _SourcePage, _source_blocks, passage_role_from_text
+    assert passage_role_from_text("SF Bodies") == "heading"
+    assert passage_role_from_text("The Science Fiction Film in \nContemporary Hollywood\n"
+                                  "A Social Semiotics of Bodies and Worlds\nEvdokia Stefanopoulou") == "heading"
+    assert passage_role_from_text("3\nThe Techno-Humans Cycle: The Exceptional \nand the Ordinary Technological Body") == "heading"
+    assert passage_role_from_text("Introduction 1\nThe Cycles 39\nThe Creatures Cycle 107\nBibliography 188") == "document_navigation"
+    # Prose fragments stay eligible.
+    assert passage_role_from_text("However, the above observations refer to the protagonist of the superhero") != "heading"
+    assert passage_role_from_text("These abilities are used only to wreak havoc \nand terminate all human life.") != "heading"
+    # A heading line glued between two sentences becomes its own excluded block.
+    text = ("I argue that the two squares disclose the deep structure of the genre.\n"
+            "First Semiotic Square: SF Bodies\n"
+            "The majority of critical studies on SF film point to the genre’s preoccupation with technology "
+            "(see Kuhn 1990). I label this square the SF bodies.")
+    blocks = _source_blocks([_SourcePage(index=20, label="15", text=text)])
+    by_role = {role: block_text for _page, _s, _e, block_text, role in blocks}
+    assert by_role["heading"] == "First Semiotic Square: SF Bodies"
+    assert all("First Semiotic Square" not in block_text for *_x, block_text, role in blocks if role != "heading")
+    for page, start, end, block_text, _role in blocks:
+        assert page.text[start:end] == block_text
+
+
+def test_a_parts_quoted_words_are_located_exactly_and_kept():
+    from app.services.verification_evidence import _SourcePage, _candidate_union_candidates
+    filler = " ".join(f"Urban spaces and technology shape setting {i} in many films about cities." for i in range(12))
+    pages = [_SourcePage(index=0, label="1", text=filler),
+             _SourcePage(index=1, label="17", text="The second square focuses on the “SF worlds,” that is, "
+                                                  "the genre’s imaginary worlds and their conflicts.")]
+    entries, _incomplete, _limits = _candidate_union_candidates(
+        pages, query_text="the city sits within what she describes as “SF Worlds,” where spaces turn hostile",
+        page_locator="", broad_passages=[], top_k=3)
+    assert any(c.page_index == 1 and "candidate_exact_quotation" in channels for c, channels in entries)
+
+
+def test_a_library_catalogue_record_is_publication_metadata():
+    from app.services.verification_evidence import passage_role_from_text
+    assert passage_role_from_text("Title: Harbour lights at dusk : a study \nof ports / Lena Moor.") == "publication_metadata"
+    assert passage_role_from_text("Description: London : Harbour Press, 2021. |") == "publication_metadata"
+    assert passage_role_from_text("Identifiers: LCCN 2020123456 (print) | ISBN 9781234567890") == "publication_metadata"
+    assert passage_role_from_text("The title of the film, as she notes, changed twice before release. "
+                                  "Its description in the press was brief.") == "body_prose"

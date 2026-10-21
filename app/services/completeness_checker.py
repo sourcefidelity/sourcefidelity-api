@@ -758,9 +758,15 @@ def _signal_article_continuous_run(
     first = sorted(printed[0])
     if not first:
         return {"vote": None, "detail": "Article continuous-run check: no printed first-page number"}
-    start = first[0]
-    expected_run = list(range(start, start + logical_pages))
-    if not all(value in labels for value, labels in zip(expected_run, printed)):
+    # The page number is the first-page number the following pages continue;
+    # a footnote marker ("4") is not (a 17-page law-review article,
+    # 2026-10-19). One interior page whose number is not read still belongs to
+    # the run; the first and last pages must carry theirs.
+    def misses(start: int) -> list[int]:
+        return [index for index, labels in enumerate(printed) if start + index not in labels]
+    start = min(first, key=lambda value: (len(misses(value)), value))
+    missing = misses(start)
+    if len(missing) > 1 or (missing and missing[0] in {0, logical_pages - 1}):
         return {
             "vote": None,
             "detail": "Article continuous-run check: printed pagination is not an unbroken run",

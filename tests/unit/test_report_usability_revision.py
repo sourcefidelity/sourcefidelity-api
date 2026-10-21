@@ -11,7 +11,6 @@ from test_report_export import export_store
 from app.services.evidence_report import _render_panel_template
 from app.services.interactive_report_export import build_interactive_report_html
 from app.services.report_member_navigation import missing_reference_targets, marker_words
-from app.services.report_export import build_released_report_export
 
 
 def test_multiline_field_has_a_highlight_on_each_affected_line():

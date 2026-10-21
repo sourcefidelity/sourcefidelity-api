@@ -430,6 +430,18 @@ def _reference_author_count(ref: ParsedReference) -> int:
     return max(1, len(_reference_lead_surnames(ref)))
 
 
+# A person's initials: with full stops, or at most three bare capitals ("D").
+_INITIALS = re.compile(r"(?:[A-Z]\.\s*-?\s*)+|[A-Z]{1,3}")
+
+
+def _organisation_list(ref: ParsedReference) -> bool:
+    """Group authors separated by commas or "&", with no person's initials
+    ("Library of Congress, MBRS, & Moving Image Section"): their count is not
+    read, so "et al." is not called a difference (owner review 2026-10-14)."""
+    parts = [part.strip() for part in re.split(r",|&", ref.author or "") if part.strip()]
+    return len(parts) >= 2 and not any(_INITIALS.fullmatch(part) for part in parts)
+
+
 def spelling_distance(a: str, b: str) -> int:
     """Optimal-string-alignment distance: insertions, deletions, substitutions, adjacent swaps."""
     rows = [list(range(len(b) + 1))]
@@ -596,11 +608,13 @@ def _find_citations_in_paragraph(
             if year and not year_candidates and len(name_candidates) == 1:
                 candidates = name_candidates
                 link_differences.append(f"year:{name_candidates[0].year or 'n.d.'}")
-                if et_al and _reference_author_count(name_candidates[0]) < 3:
+                if (et_al and _reference_author_count(name_candidates[0]) < 3
+                        and not _organisation_list(name_candidates[0])):
                     link_differences.append(f"author_count:{_count_word(_reference_author_count(name_candidates[0]))}")
             elif year_candidates and len(year_candidates) == 1 and et_al:
                 candidates = year_candidates
-                link_differences.append(f"author_count:{_count_word(_reference_author_count(year_candidates[0]))}")
+                if not _organisation_list(year_candidates[0]):
+                    link_differences.append(f"author_count:{_count_word(_reference_author_count(year_candidates[0]))}")
             elif year_candidates and len(year_candidates) == 1:
                 lead = _reference_lead_surnames(year_candidates[0])
                 candidates = year_candidates
@@ -781,6 +795,8 @@ def _find_citations_in_paragraph(
 
         # APA narrative: Author (Year)
         narrative_year_spans = []
+        titled_markers: list[str] = []
+        titled_references = references
         references = list({ref.reference_id: ref for refs in ref_index.values() for ref in refs}.values())
         for year_match in APA_YEAR_ONLY_RE.finditer(para_text):
             title_matches = []
@@ -824,6 +840,23 @@ def _find_citations_in_paragraph(
                               marker_start=start, marker_end=year_match.end(), marker_type="narrative",
                               exact_candidates=[ref for _, ref in title_matches])
                 narrative_year_spans.append((start, year_match.end()))
+            elif quoted := quoted_title_before(para_text, year_match.start()):
+                # "Section 4 of 'The Interim Measures …' (2002)": a quoted title
+                # with a bare year names the reference with that title, whatever
+                # its author (owner decision 2026-10-12). No match is left to the
+                # marker census, which names the missing entry.
+                start, title = quoted
+                found, differences = quoted_title_references(title, year_match.group(1), titled_references)
+                if found:
+                    locator = year_match.group(2) or ""
+                    append_linked(author=title, year=year_match.group(1),
+                                  page=re.sub(r"^(?:p|pp)\.\s*", "", locator, flags=re.IGNORECASE),
+                                  raw_marker=para_text[start:year_match.end()],
+                                  marker_member=para_text[start:year_match.end()],
+                                  marker_start=start, marker_end=year_match.end(), marker_type="narrative",
+                                  exact_candidates=found, differences=differences)
+                    narrative_year_spans.append((start, year_match.end()))
+                    titled_markers.append(para_text[start:year_match.end()])
         for m in APA_NARRATIVE_RE.finditer(para_text):
             if any(start <= m.start() and m.end() <= end for start, end in narrative_year_spans):
                 continue
@@ -899,6 +932,15 @@ def _find_citations_in_paragraph(
                 marker_end=m.end(),
                 marker_type="narrative",
             )
+
+        # A title quoted as a marker names the work; it is not quoted wording,
+        # so it does not make its sentence a quotation.
+        citations = [
+            citation.model_copy(update={"claim_type": _detect_claim_type(
+                re.sub("|".join(map(re.escape, titled_markers)), " ", citation.text))})
+            if titled_markers and citation.claim_type == "quotation" else citation
+            for citation in citations
+        ]
 
     return citations
 
@@ -994,6 +1036,89 @@ def _title_year_reference(content: str, references: list[ParsedReference]):
     found = [reference for reference in references
              if (named := _raw_title_year(reference)) and named[1] == match[2] and key(named[0]) == key(match[1])]
     return (found[0], match[1], match[2]) if len(found) == 1 else None
+
+
+_QUOTE_FAMILIES = ("'‘’", '"“”')
+
+
+def quoted_title_before(text: str, end: int) -> tuple[int, str] | None:
+    """The quoted title closing immediately before ``end`` (a bare-year marker):
+    the offset of its opening mark and its wording. Straight and curly marks of
+    one family may be mixed (‘Title' or "Title”); an opening mark must start a
+    word and a closing mark must end one, so the apostrophe in "People's" never
+    delimits a title (owner decision 2026-10-12)."""
+    before = text[:end].rstrip()
+    close = len(before) - 1
+    family = next((marks for marks in _QUOTE_FAMILIES if close > 0 and before[close] in marks), None)
+    if family is None or before[close - 1].isspace():
+        return None
+    for start in range(close - 1, max(-1, close - 152), -1):
+        if before[start] not in family:
+            continue
+        after = before[start + 1]
+        if (start == 0 or before[start - 1].isspace() or before[start - 1] in "([{—–-/") and not after.isspace():
+            title = before[start + 1:close].strip(" ,.")
+            return (start, title) if len(title) >= 2 else None
+        if after.isspace() or after in ",.;:!?)":
+            return None  # another quotation closes inside: not one title
+    return None
+
+
+def _title_words(value: str) -> list[str]:
+    value = re.sub(r"\s*\[[^]]+\]\s*$", "", str(value or ""))
+    value = "".join(c for c in unicodedata.normalize("NFKD", value) if not unicodedata.combining(c))
+    words = re.findall(r"[^\W_]+", value.casefold())
+    return words[1:] if len(words) > 1 and words[0] in {"the", "a", "an"} else words
+
+
+def _title_stem(word: str) -> str:
+    """Plural and simple word-form variants share a stem: services/service,
+    publication/publishing, provisions/provision."""
+    if word.endswith("ies") and len(word) > 4:
+        word = word[:-3] + "y"
+    elif word.endswith("s") and not word.endswith("ss") and len(word) > 3:
+        word = word[:-1]
+    if word.endswith("e") and len(word) > 4:
+        word = word[:-1]
+    for suffix in ("ication", "ation", "ishing", "ing", "ion"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[:-len(suffix)]
+    return word
+
+
+def quoted_title_references(title: str, year: str, references: list[ParsedReference]):
+    """References a quoted title with a bare year names, with or without an
+    author (owner decision 2026-10-12). Titles match on case-folded words
+    without punctuation; a close variant (plural, word form, a leading "The")
+    counts only for three words or more and high similarity. One match links
+    even with a different year, kept as a difference; several stay ambiguous
+    unless exactly one has the same title and year. Returns the candidates and
+    the differences for a single match."""
+    if not re.fullmatch(r"(?:19|20)\d{2}[a-z]?", year or ""):
+        return [], []
+    cited = _title_words(title)
+    if len("".join(cited)) < 4:
+        return [], []
+    exact, variant = [], []
+    for reference in references:
+        named = _raw_title_year(reference)
+        forms = {tuple(_title_words(form)) for form in (reference.title, named[0] if named else "") if form}
+        if tuple(cited) in forms:
+            exact.append(reference)
+        elif len(cited) >= 3 and any(
+                len(form) == len(cited)
+                and all(_title_stem(a) == _title_stem(b) for a, b in zip(form, cited))
+                and SequenceMatcher(None, " ".join(form), " ".join(cited)).ratio() >= 0.85
+                for form in forms):
+            variant.append(reference)
+    plausible = list({ref.reference_id: ref for ref in [*exact, *variant]}.values())
+    if len(plausible) > 1:
+        same = [ref for ref in exact if _year_key(ref.year)[:4] == year[:4]]
+        plausible = same if len(same) == 1 else plausible
+    if len(plausible) != 1:
+        return plausible, []
+    differs = _year_key(plausible[0].year) != _year_key(year)
+    return plausible, ([f"year:{plausible[0].year or 'n.d.'}"] if differs else [])
 
 
 def _reference_contains_locator(reference: ParsedReference, locator: str) -> bool:

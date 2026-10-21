@@ -57,7 +57,7 @@
   // Open a window that has no mark on the paper (an unplaced citation or an
   // unlocated reference): the window still opens; nothing scrolls.
   // A citation with several judged propositions has one window per
-  // proposition (owner request 2026-09-28): "Citation N - A", its wording in bold.
+  // proposition (owner request 2026-09-28): "Citation 3a" (owner decision 2026-10-14), its wording in bold.
   function showProposition(proposition) {
     const texts = [...panel.querySelectorAll('.selected-citation[data-proposition]')];
     const suffix = panel.querySelector('[data-proposition-suffix]');
@@ -65,7 +65,23 @@
     const chosen = texts.find(el => el.dataset.proposition === proposition) || texts[0];
     texts.forEach(el => { el.hidden = el !== chosen; });
     panel.dataset.proposition = chosen.dataset.proposition;
-    if (suffix) suffix.textContent = ' - ' + chosen.dataset.propositionLetter;
+    if (suffix) suffix.textContent = chosen.dataset.propositionLetter;
+    // Quotation and locator checks show only for a part that quotes one of
+    // their terms (owner request 2026-10-14); a heading left empty hides too.
+    const fold = value => String(value || '').toLowerCase().replace(/[‘’“”"']/g, '').replace(/\s+/g, ' ').trim();
+    const wording = fold(chosen.textContent);
+    panel.querySelectorAll('[data-quote-targets]').forEach(el => {
+      let terms = [];
+      try { terms = JSON.parse(el.dataset.quoteTargets); } catch (error) { terms = []; }
+      el.hidden = texts.length > 1 && terms.length > 0 && !terms.some(term => wording.includes(fold(term)));
+    });
+    panel.querySelectorAll('.finding-list').forEach(list => {
+      const items = [...list.children];
+      const empty = items.length > 0 && items.every(item => item.hidden);
+      list.hidden = empty;
+      const heading = list.previousElementSibling;
+      if (heading && heading.querySelector('.issue-heading')) heading.hidden = empty;
+    });
     return chosen.dataset.proposition;
   }
   function propositionsIn(template) {
@@ -311,16 +327,29 @@
   // report once, when no upload is still sending, refreshing or waiting, so a
   // later upload is neither cut off nor shown as never made.
   let uploadsSending=0;
-  async function awaitSuccessor(url, message, attemptId) {
+  async function awaitSuccessor(url, message, attemptId, failureText) {
     try {
       const response=await fetch(url,{credentials:'same-origin'});if(!response.ok)throw new Error('Report update status is unavailable.');const data=await response.json();
       if(data.successor_available&&!data.processing&&!data.queued_uploads&&!uploadsSending){window.location.assign('/report/'+encodeURIComponent(data.latest_report_id)+window.location.search);return;}
       const failure=data.last_reanalysis_failure;
       // A new search is watched for its own attempt only; the upload wording belongs to uploads.
-      if(failure&&(attemptId===undefined||failure.attempt_id===attemptId)){message.textContent=attemptId===undefined?'The source was stored, but the report could not be updated. Retry the upload.':'The new search could not update the report.';return;}
-      setTimeout(()=>awaitSuccessor(url,message,attemptId),1500);
-    }catch(error){message.textContent=error.message;}
+      if(failure&&(attemptId===undefined||failure.attempt_id===attemptId)){message.textContent=failureText||(attemptId===undefined?'The source was stored, but the report could not be updated. Retry the upload.':'The new search could not update the report.');return;}
+      setTimeout(()=>awaitSuccessor(url,message,attemptId,failureText),1500);
+    }catch(error){
+      // A dropped connection no longer ends the watch (2026-10-18): the
+      // report kept updating while the page stopped asking.
+      message.textContent=error.message;setTimeout(()=>awaitSuccessor(url,message,attemptId,failureText),5000);
+    }
   }
+  // An older version opened by link or reload moves to the newest one, or
+  // waits for an update still running (2026-10-18).
+  (async()=>{
+    const id=(window.location.pathname.match(/^\/report\/([0-9a-f-]{36})\/?$/)||[])[1];if(!id)return;
+    const url='/report/'+id+'/successor';
+    try{const response=await fetch(url,{credentials:'same-origin'});if(!response.ok)return;const data=await response.json();
+      if(data.successor_available||data.processing||data.queued_uploads)awaitSuccessor(url,document.createElement('span'));}
+    catch(error){}
+  })();
   document.addEventListener('click', event => {
     const choose=event.target.closest('[data-choose-source]');
     if(!choose)return;
@@ -328,27 +357,33 @@
     form.querySelector('input[type=file]').click();
   });
   document.addEventListener('change', event => {if(event.target.matches('.source-upload input[type=file]') && event.target.files.length)event.target.closest('form').requestSubmit();});
+  // Several files from Sources to Upload, one after another to the same route;
+  // one line per file: its name and that upload's message (owner decision 2026-10-18).
+  async function uploadSeveral(form,message,button,input){
+    const files=[...input.files],lines=[];let statusUrl=null;
+    button.disabled=true;uploadsSending++;
+    for(const file of files){
+      message.textContent='Uploading and checking source…';
+      const body=new FormData();body.append('file',file,file.name);
+      let text;
+      try{const response=await fetch(form.action,{method:'POST',body,credentials:'same-origin'}),data=await response.json();
+        if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Source upload could not be completed.');
+        text=data.message;if(data.status_url)statusUrl=data.status_url;}
+      catch(error){text=error.message;}
+      lines.push(file.name+': '+text);
+    }
+    uploadsSending--;input.value='';button.disabled=false;
+    message.textContent=lines.join('\n');message.style.whiteSpace='pre-line';
+    if(statusUrl){const follow=document.createElement('span');message.after(follow);awaitSuccessor(statusUrl,follow);}
+  }
   document.addEventListener('submit', async event => {
     const form=event.target;if(!form.classList.contains('source-upload'))return;event.preventDefault();
     const message=form.querySelector('.upload-status'),button=form.querySelector('button'),input=form.querySelector('input[type=file]');
+    if(input.files.length>1){await uploadSeveral(form,message,button,input);return;}
     button.disabled=true;message.textContent='Uploading and checking source…';uploadsSending++;
     try{const response=await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin'}),data=await response.json();if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Source upload could not be completed.');message.textContent=data.message;input.disabled=true;if(data.status_url)awaitSuccessor(data.status_url,message);}
     catch(error){message.textContent=error.message;button.disabled=false;input.value='';}
     finally{uploadsSending--;}
-  });
-  document.addEventListener('submit', async event => {
-    const form=event.target;if(!form.classList.contains('search-again'))return;event.preventDefault();
-    const message=form.querySelector('.upload-status'),button=form.querySelector('button');
-    // Owner-approved wording (2026-09-29).
-    button.disabled=true;form.setAttribute('aria-busy','true');message.textContent='Searching again…';
-    try{const response=await fetch(form.action,{method:'POST',credentials:'same-origin'}),data=await response.json().catch(()=>({}));
-      if(response.ok&&data.status_url&&data.attempt_id){awaitSuccessor(data.status_url,message,String(data.attempt_id));return;}
-      if(response.status===410){form.remove();return;}   // marks released since the page opened
-      if(response.status===429){message.textContent='This reference was already searched again today. Try again tomorrow.';}
-      else if(response.status===409){message.textContent='The report is already being updated.';button.disabled=false;}
-      else{message.textContent='';button.disabled=false;}}
-    catch(error){message.textContent='';button.disabled=false;}
-    form.removeAttribute('aria-busy');
   });
   // view-state:start
   // Three layouts. Paper slides the window away and lets the paper take the

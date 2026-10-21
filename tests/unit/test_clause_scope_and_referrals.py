@@ -3,6 +3,8 @@ is judged on its own clause; "see" citations are not judged; a narrower hanging
 indent is stated as narrower, not missing."""
 from types import SimpleNamespace
 
+import pytest
+
 from app.services.candidate_relationship_judgment import _member_clause_spans
 from app.services.judgment_input import judgment_eligibility, referral_citation
 
@@ -133,3 +135,96 @@ def test_sources_sharing_a_bracket_share_its_clause():
     assert pieces == [("Ports feared automation (Ames, 2023)", ["a"]),
                       ("as well as claims that cranes will change them (Bell, 2023; Cole, 2023).", ["b", "c"])]
     assert [text[s:e] for s, e in _member_clause_spans(claim, "c")] == ["as well as claims that cranes will change them"]
+
+
+def _cue(text):
+    from app.services.candidate_relationship_judgment import research_cue_spans
+    out = research_cue_spans(text, [(0, len(text))])
+    return None if out is None else [text[a:b] for a, b in out]
+
+
+def test_only_what_the_research_found_is_judged():
+    # Owner decision 2026-10-09 (the owner's long article): the writer's own study is not judged against the source.
+    assert _cue("Harbour crews need training in automation, though research has shown that their supervisors "
+                "rarely receive it") == ["their supervisors rarely receive it"]
+    assert _cue("They support studies that find crews use cranes strategically and with care") == [
+        "crews use cranes strategically and with care"]
+    assert _cue("The interviewed crews and supervisors believe that cranes can reduce injuries at night, "
+                "corroborating early studies in busy ports") == ["cranes can reduce injuries at night"]
+    assert _cue("They believe the cranes help new workers learn quickly, as found in research on dock crews") == [
+        "the cranes help new workers learn quickly"]
+    assert _cue("Peer observers watched the crews, which has been shown to improve safety reports and crew trust") == [
+        "which has been shown to improve safety reports and crew trust"]
+
+
+def test_ordinary_statements_and_the_writers_own_study_are_left_whole():
+    assert _cue("Cranes reduce delays in busy ports") is None
+    assert _cue("Our studies have shown that cranes reduce delays in busy ports") is None
+    assert _cue("Research has shown that") is None
+
+
+def test_sources_sharing_an_ending_or_a_research_opening_are_judged_on_it():
+    text = ("Research on ports in general (Ames, 2020), and on river ports in particular (Bell, 2021), "
+            "has shown that crane training is essential for crews.")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    spans = lambda ref: [text[a:b] for a, b in _member_clause_spans(claim, ref)]
+    assert spans("a") == ["Research on ports in general",
+                          "has shown that crane training is essential for crews"]
+    assert spans("b") == ["and on river ports in particular",
+                          "has shown that crane training is essential for crews"]
+    text = ("Crews think cranes can speed loading, as found in research on river ports (Ames, 2020) "
+            "and sea ports (Bell, 2021).")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    assert [text[a:b] for a, b in _member_clause_spans(claim, "b")] == [
+        "Crews think cranes can speed loading, as found in research on river ports", "and sea ports"]
+
+
+def test_a_list_of_separate_claims_shares_nothing():
+    claim = _claim(LIST, ("(Ames, 2022)", "a"), ("(Bell & Cole, 2024)", "b"), ("(Dunn, 2023)", "d"))
+    assert [LIST[a:b] for a, b in _member_clause_spans(claim, "b")] == ["fail to lift heavy loads"]
+    text = "Crews preferred cranes (Ames, 2020), and owners cut costs (Bell, 2021), so ports grew."
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    assert [text[a:b] for a, b in _member_clause_spans(claim, "b")] == ["and owners cut costs"]
+
+
+def test_a_sentence_whose_sources_share_wording_stays_one_citation():
+    from app.services.candidate_relationship_judgment import citation_clause_segments
+    text = ("Research on ports in general (Ames, 2020), and on river ports in particular (Bell, 2021), "
+            "has shown that crane training is essential for crews.")
+    claim = _claim(text, ("(Ames, 2020)", "a"), ("(Bell, 2021)", "b"))
+    for m in claim.citation_markers:
+        m.marker_type = "parenthetical"
+    assert citation_clause_segments(claim, ["a", "b"]) is None
+    claim = _claim(LIST, ("(Ames, 2022)", "a"), ("(Bell & Cole, 2024)", "b"), ("(Dunn, 2023)", "d"))
+    for m in claim.citation_markers:
+        m.marker_type = "parenthetical"
+    assert len(citation_clause_segments(claim, ["a", "b", "d"])) == 3
+
+
+@pytest.mark.parametrize(("reason", "note"), [
+    ("antecedent_unresolved", "Not judged: it could not be determined what this statement refers to."),
+    ("wider_search_unavailable", "Not judged: the judge found no evidence in the sentences it read, and no "
+                                 "further sentences from the source were available to check."),
+])
+def test_a_not_judged_result_says_why_in_the_owners_words(reason, note):
+    # Owner wording 2026-10-14 (Harlow review).
+    from html import unescape
+    from app.services.judgment_report import judgment_result
+    result = judgment_result({"display_state": "not_judged", "reason_code": reason}, {}, None)
+    assert note in unescape(result["html"])
+
+
+def test_see_also_skips_only_its_own_source():
+    from app.services.citation_signals import referral_source
+    text = "Attendance rose sharply (Jones, 2021; see also Smith, 2020)."
+    group = {"text": "(Jones, 2021; see also Smith, 2020)", "local_start": 24, "local_end": 59,
+             "reference_ids": ["jones", "smith"]}
+    assert not referral_source(text, [group], "jones", "Jones, A")
+    assert referral_source(text, [group], "smith", "Smith, B")
+    split = [{"text": "(Jones, 2021;", "local_start": 24, "local_end": 37, "reference_ids": ["jones"]},
+             {"text": "see also Smith, 2020)", "local_start": 38, "local_end": 59, "reference_ids": ["smith"]}]
+    assert not referral_source(text, split, "jones") and referral_source(text, split, "smith")
+    narrative = "The debate continues; see also Smith (2020) and, for the data, Jones (2021)."
+    markers = [{"text": "Smith (2020)", "local_start": 31, "local_end": 43, "reference_ids": ["smith"]},
+               {"text": "Jones (2021)", "local_start": 63, "local_end": 75, "reference_ids": ["jones"]}]
+    assert referral_source(narrative, markers, "smith") and not referral_source(narrative, markers, "jones")

@@ -54,6 +54,11 @@ def llm_cost(usage: dict) -> float | None:
     return sum(v*r for v,r in zip(values,rates))/1_000_000
 
 
+# Free search routes since removed (searxng 2026-10-19, duckduckgo
+# 2026-09-22), named so older stored receipts keep their totals.
+_REMOVED_FREE_ROUTES = ('searxng', 'duckduckgo')
+
+
 def search_trace_cost(sources: list[dict]) -> dict:
     calls = {}; cost = 0.; unknown = 0
     # Only actual query execution receipts, not attempts + candidates + traces.
@@ -70,9 +75,9 @@ def search_trace_cost(sources: list[dict]) -> dict:
                 cost += observed
             elif provider == 'brave':
                 cost += count*.005
-            # 'duckduckgo' appears only in receipts predating its removal;
-            # it was uncosted, so historical totals stay correct.
-            elif provider not in ('searxng','duckduckgo'):
+            # Free routes now removed appear only in older receipts; they
+            # were uncosted, so historical totals stay correct.
+            elif provider not in _REMOVED_FREE_ROUTES:
                 unknown += count
     return dict(search_api_calls=sum(calls.values()), search_calls_by_provider=calls,
                 search_cost_usd=round(cost,8), search_cost_unknown_calls=unknown,
@@ -95,9 +100,9 @@ def search_cost_by_provider(records: list[dict]) -> list[dict]:
             continue
         observed = any(type(r.get('cost_usd')) in (int, float) and math.isfinite(r['cost_usd'])
                        and r['cost_usd'] >= 0 for r in subset)
-        # SearXNG receipts carry an explicit 0.0; a free route is not a
-        # provider-reported charge.
-        basis = ('free' if provider in ('searxng', 'duckduckgo') else 'observed' if observed
+        # Removed free routes' receipts carry an explicit 0.0; a free route
+        # is not a provider-reported charge.
+        basis = ('free' if provider in _REMOVED_FREE_ROUTES else 'observed' if observed
                  else 'tariff' if provider == 'brave' else 'unknown')
         rows.append({'provider': provider or 'unnamed', 'calls': totals['search_api_calls'],
                      'cost_usd': None if basis == 'unknown' else totals['search_cost_usd'],

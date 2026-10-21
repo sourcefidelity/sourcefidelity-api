@@ -72,7 +72,7 @@ def test_a_dummy_it_opening_needs_no_antecedent():
 
 
 def test_propositions_sharing_words_are_underlined_once(monkeypatch):
-    # The owner's article, 2026-10-08: the smaller keeps the shared words.
+    # The owner's article, 2026-10-08: the shared words lead into the proposition after them (2026-10-14).
     from app.services import judgment_layer
     calls = []
     monkeypatch.setattr(judgment_layer, "claim_span_rectangles",
@@ -87,6 +87,27 @@ def test_propositions_sharing_words_are_underlined_once(monkeypatch):
     outer = {"group": "d", "ranges": [(0, 200)]}
     judgment_layer._separate_contained([inner, outer], {}, {})
     assert outer["display_ranges"] == [(60, 200)]   # containing: bolded on its added words (2026-09-29)
+
+
+def test_a_shared_lead_in_takes_the_style_of_the_proposition_after_it(monkeypatch):
+    # Owner review 2026-10-14 (Harlow citation 3): the lead-in all three
+    # clauses share leads into the first clause, not the shortest one.
+    from app.services import judgment_layer
+    drawn = {}
+    monkeypatch.setattr(judgment_layer, "claim_span_rectangles",
+                        lambda citation, ranges, words: ([{"ranges": ranges}], "exact"))
+    first = {"group": "a", "ranges": [(0, 10), (12, 30)]}
+    second = {"group": "b", "ranges": [(0, 10), (32, 36)]}
+    third = {"group": "c", "ranges": [(0, 10), (38, 60)]}
+    judgment_layer._separate_contained([first, second, third], {}, {})
+    for mark in (first, second, third):
+        drawn[mark["group"]] = mark.get("rects", [{"ranges": mark["ranges"]}])[0]["ranges"]
+    assert drawn == {"a": [(0, 10), (12, 30)], "b": [(32, 36)], "c": [(38, 60)]}
+    # A shared ending goes with the proposition just before it.
+    early = {"group": "d", "ranges": [(0, 20), (50, 60)]}
+    late = {"group": "e", "ranges": [(30, 40), (50, 60)]}
+    judgment_layer._separate_contained([early, late], {}, {})
+    assert early["rects"][0]["ranges"] == [(0, 20)] and late.get("rects") is None
 
 
 def test_the_no_passage_line_is_tagged_for_the_judgment_window():
@@ -112,3 +133,37 @@ def test_underline_boxes_do_not_bridge_other_words_on_the_line():
     words = [(0, (10, 0, 20, 10, "a")), (0, (22, 0, 30, 10, "b")), (0, (60, 0, 70, 10, "e"))]
     assert len(_merge_per_line(words, [0, 1, 4])) == 2
     assert len(_merge_per_line(words)) == 1
+
+
+def test_a_web_address_or_doi_is_never_patchwriting():
+    # The long article, 2026-10-08: "https://doi.org/10.1075…" matched the source's own DOI.
+    from app.services.patchwriting import _excluded_spans
+    text = "As shown at https://doi.org/10.1075/ports.12.3 and doi: 10.1000/xyz, cranes rust."
+    kinds = [(span.kind, text[span.local_start:span.local_end]) for span in _excluded_spans(text)]
+    assert ("web_address", "https://doi.org/10.1075/ports.12.3") in kinds
+    assert any(kind == "web_address" and value.startswith("doi:") for kind, value in kinds)
+
+
+def test_patchwriting_against_a_limited_text_is_not_shown():
+    from app.services.patchwriting_report import build_passages
+    text = "requiring that cranes lift five tonnes in every port of the region"
+    finding = {"kind": "close_paraphrase", "student_region": {"paper_start": 0, "paper_end": len(text), "text": text},
+               "source_sentences": [{"text": "required cranes to lift five tonnes in every port"}],
+               "student_matched_spans": [{"paper_start": 0, "paper_end": len(text)}]}
+    block = {"sources": {"r1": {"status": "compared", "findings": [finding]}}}
+    view = {"title": "Harbour rules"}
+    assert build_passages(block, lambda rid: view, coverage_by_reference={"r1": "partial_text"}) == []
+    assert len(build_passages(block, lambda rid: view, coverage_by_reference={"r1": "full_text"})) == 1
+
+
+def test_a_cited_title_cut_before_its_part_is_a_possible_match_with_author_and_year():
+    # Curle et al. (2020), the long article: an unspaced dash and "Part 1: Literature review" left off.
+    from app.services.reference_verification import _possible_match
+    expected = {"title": "Harbour cranes in ports–Crane automation"}
+    record = {"provider": "openalex", "observed": {"title": "Harbour cranes in ports – Crane automation. Part 1: Review"},
+              "comparisons": [{"field_name": "title", "outcome": "material_conflict"},
+                              {"field_name": "author", "outcome": "minor_difference"},
+                              {"field_name": "year", "outcome": "agreement"}]}
+    assert _possible_match(record, expected)
+    other_year = {**record, "comparisons": [*record["comparisons"][:2], {"field_name": "year", "outcome": "material_conflict"}]}
+    assert not _possible_match(other_year, expected)

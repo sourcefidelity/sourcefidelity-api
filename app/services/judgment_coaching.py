@@ -18,6 +18,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.services.citation_structure import describes_research_literature
 from app.services.judge_arms import call_cost_usd
 from app.services.llm_service import LLMCallFailure, chat_completion_json
 
@@ -194,7 +195,7 @@ def _plain(text: str) -> str:
 
 
 def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, panel: dict,
-                   sentences: dict) -> tuple[dict, dict]:
+                   sentences: dict, *, describes_research: bool = False) -> tuple[dict, dict]:
     """(payload with short aliases, bound sets) from the agreed judges' readings.
 
     Evidence is bound only when at least two valid judges cited it, or every
@@ -267,6 +268,13 @@ def coaching_input(state: str, claim: str, citation_marker: str, facets: dict, p
         "judge_rationales": rationales[:6] if state == "split" else rationales[:3],
         "evidence_sentences": [{"sentence_id": s_alias[sid], "text": sentences[sid]} for sid in bound_sentences],
     }
+    if describes_research or describes_research_literature(claim):
+        # The judge asked whether the work is an example of the research the
+        # statement describes (owner decision 2026-10-09).
+        payload["citation_function_instruction"] = (
+            "The statement describes a body of research and cites this work as one example of it. The result says "
+            "whether the work is research of the kind described. Words about the research as a whole (most, much "
+            "less, all, recent) are the writer's own synthesis; never say the source does not state them.")
     if speaker_reasons:
         payload["speaker_reasons"] = speaker_reasons
         payload["speaker_instruction"] = (
@@ -354,7 +362,8 @@ def coaching_cache_key(route, system_prompt: str, user_prompt: str, version: str
 
 
 def coach(state: str, claim: str, citation_marker: str, facets: dict, panel: dict, sentences: dict, *,
-          route, call=chat_completion_json, cache_lookup=None, cache_store=None) -> dict:
+          route, call=chat_completion_json, cache_lookup=None, cache_store=None,
+          describes_research: bool = False) -> dict:
     """A checked model note, or the fixed note for the state; never raises."""
     if state not in COACHED_STATES and state not in {"undecided", "split"}:
         return {"status": "not_applicable"}
@@ -366,7 +375,8 @@ def coach(state: str, claim: str, citation_marker: str, facets: dict, panel: dic
                 "facet_ids": [], "sentence_ids": [], "violations": ["no_note_model"], "attempts": 0,
                 "cost_usd": 0.0, "cost_basis": "unpriced"}
     try:
-        payload, bound = coaching_input(state, claim, citation_marker, facets, panel, sentences)
+        payload, bound = coaching_input(state, claim, citation_marker, facets, panel, sentences,
+                                        describes_research=describes_research)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         return {"version": version, "status": "template", "note": fixed_note,
                 "facet_ids": [], "sentence_ids": [], "violations": [f"input_{type(exc).__name__}"],

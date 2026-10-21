@@ -355,8 +355,10 @@ def test_possible_match_paper_pipeline_cleans_source_and_preserves_label(monkeyp
         aggregate = session.scalar(select(Report))
         view = aggregate.report_json['evidence_report']
         html = render_evidence_report_html(view, csp_nonce='test-provisional-nonce')
-        assert 'Possible source match' in html
-        assert 'The publication year differs from the reference.' in html
+        # A possible-match copy shows no text (owner decision 2026-10-14).
+        assert 'Possible source match' not in html
+        assert 'The publication year differs from the reference.' not in html
+        assert 'No Text Retrieved' in html
         for citation in view['citations']:
             for member in citation['members']:
                 assert member['identity_status'] == 'possible_match'
@@ -515,6 +517,39 @@ def test_cited_sources_keep_priority_over_uncited_search_budget(monkeypatch):
         session.commit()
         retrieve_paper_sources(session, storage, job_id, resolver=NoSources())
         assert calls == [(cited_id, False), ("alphabetically-first-uncited", True)]
+
+
+def test_a_reference_linked_only_from_a_rejected_claim_is_still_searched(monkeypatch):
+    """2026-10-12: a claim rejected at the claim boundary stays rejected, but
+    the reference its citation links to is cited and is searched."""
+    from app.services.source_resolver import SourceResolutionError
+    factory, storage, job_id = _retry_test_job(monkeypatch)
+    calls = []
+    class NoSources:
+        def resolve_reference(self, reference, *, identity_only=False):
+            calls.append((reference.reference_id, identity_only))
+            raise SourceResolutionError("Synthetic unavailable source")
+    with factory() as session:
+        job = session.get(Job, job_id)
+        payload = dict(job.extraction_payload)
+        cited_id = payload["references"][0]["reference_id"]
+        webpage = dict(payload["references"][0], source_kind="webpage", needs_review=True)
+        payload["references"] = [*payload["references"], dict(webpage, reference_id="rejected-claim-only"),
+                                 dict(webpage, reference_id="genuinely-uncited")]
+        citation = dict(payload["citations"][0], reference_ids=["rejected-claim-only"], link_status="linked",
+                        citation_marker="(Pan & Fu, 2016)", passage_start=900, passage_end=960)
+        payload["citations"] = [*payload["citations"], citation]
+        payload["claim_boundary_rejections"] = [{"passage_start": 900, "passage_end": 960,
+                                                 "citation_marker": "(Pan & Fu, 2016)",
+                                                 "reason": "citation_marker_membership_incomplete"}]
+        job.extraction_payload = payload
+        job.source_results = []
+        job.stage = "extracted"
+        session.commit()
+        retrieve_paper_sources(session, storage, job_id, resolver=NoSources())
+        assert calls == [(cited_id, False), ("rejected-claim-only", False)]
+        assert "rejected-claim-only" not in {r for c in job.extraction_payload["citation_claims"]
+                                             for r in c["reference_ids"]}
 
 
 @pytest.mark.parametrize("store_only", [False, True])
@@ -931,24 +966,29 @@ def test_report_distinguishes_failed_cited_webpage_with_metadata_only():
 def test_only_blocking_providers_become_retry_dependencies():
     """A provider is a re-run trigger only if the completion gate counts it.
 
-    Rewritten 2026-09-24. The previous version asserted that SearXNG became a
+    Rewritten 2026-09-24. The previous version asserted that an optional fallback became a
     trigger because its query was cooldown-skipped, whatever its role. All four
     re-run waves on 2026-09-23 -- 192 reference re-runs -- came from exactly
-    that, though SearXNG cannot complete or invalidate a search under
+    that, though an optional fallback cannot complete or invalidate a search under
     `api-first-search-v2`, and they moved fabrication flags between report
     versions without changing any completion gate.
     """
     from tests.unit.blocked_discovery import blocked_record
 
     optional = blocked_record("r1", policy="api-first-search-v2", web_outcomes={
-        "brave": "results", "exa": "results", "searxng": "cooldown_skipped"})
+        "brave": "results", "exa": "results", "tavily": "cooldown_skipped"})
     required_web = blocked_record("r2", policy="api-first-search-v2",
-                                  web_outcomes={"brave": "timeout", "exa": "results"})
-    adapter = blocked_record("r3", adapter="core")
+                                  web_outcomes={"brave": "timeout", "exa": "timeout"})
+    one_web_failed = blocked_record("r2b", policy="api-first-search-v2",
+                                    web_outcomes={"brave": "timeout", "exa": "results"})
+    adapter = blocked_record("r3", adapter="crossref")
 
     assert _retryable_provider_dependencies(None, optional) == []
-    assert _retryable_provider_dependencies(None, required_web) == ["brave"]
-    assert _retryable_provider_dependencies(None, adapter) == ["core"]
+    assert _retryable_provider_dependencies(None, required_web) == ["brave", "exa"]
+    # Exa finishing leaves Brave's provider-side failure non-blocking:
+    # search-completion-v1, owner decision 2026-10-19.
+    assert _retryable_provider_dependencies(None, one_web_failed) == []
+    assert _retryable_provider_dependencies(None, adapter) == ["crossref"]
     # A reference that got a real answer is never re-run.
     assert _retryable_provider_dependencies(
         None, {**adapter, "outcome": "unlocated_after_search"}) == []
@@ -966,6 +1006,7 @@ def test_metadata_only_identity_survives_checkpoint_reload_and_report(monkeypatc
 
     monkeypatch.setattr("socket.socket.connect", forbidden)
     monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr("app.tasks.judgment.dispatch_report_judgment", lambda _run_id: None)
     monkeypatch.setattr(paper_upload, "scan_with_clamd", lambda _: (SafetyVerdict.CLEAN, "OK"))
     engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
     Base.metadata.create_all(engine)
@@ -2052,13 +2093,13 @@ def test_provider_recovery_refreshes_only_affected_member_as_immutable_successor
         failed = next(item for item in source_results if item["status"] == "unavailable")
         failed_reference_id = failed["reference_id"]
         # The refresh recomputes blocking providers from the stored record, so
-        # the record must genuinely be held incomplete by SearXNG. Under the
-        # legacy policy SearXNG is a required web route, which it is not under
+        # the record must genuinely be held incomplete by Tavily. Under the
+        # legacy policy Tavily is a required web route, which it is not under
         # api-first.
         from tests.unit.blocked_discovery import blocked_record
         failed["reference_discovery"] = blocked_record(
-            failed_reference_id, web_outcomes={"searxng": "cooldown_skipped"})
-        failed["retryable_provider_dependencies"] = ["searxng"]
+            failed_reference_id, web_outcomes={"tavily": "cooldown_skipped"})
+        failed["retryable_provider_dependencies"] = ["tavily"]
         job.source_results = source_results
         session.commit()
 
@@ -2067,7 +2108,7 @@ def test_provider_recovery_refreshes_only_affected_member_as_immutable_successor
     with factory() as session:
         first_report_id = finalize_paper_job(session, storage, job_id)["report_id"]
         assert prepare_provider_recovery_refresh(
-            session, job_id, provider="searxng"
+            session, job_id, provider="tavily"
         ) == [failed_reference_id]
         resolver = CompoundResolver()
         retrieve_paper_sources(session, storage, job_id, resolver=resolver)

@@ -99,3 +99,29 @@ def test_an_opaque_continuation_joins_only_when_the_pdf_link_target_proves_it():
     assert repair_reference_urls(refs, _clean_text(layout), link_targets=frozenset({full}))[0].url == full
     other = frozenset({"https://example.test/publication/1_Theorising_the_Practice_of_Media_extra"})
     assert repair_reference_urls(refs, _clean_text(layout), link_targets=other)[0].url != full
+
+
+def test_a_query_after_a_space_following_the_question_mark_is_one_address():
+    # The Regulation paper's reference 8 (2026-10-14): "initDatabaseDetail? siteId=14&…".
+    from app.services.schemas import ParsedReference
+    raw = ("Cui, B. (2017). Report title. Social Sciences Academic Press. "
+           "https://www.pishu.com.cn/skwx_ps/initDatabaseDetail? siteId=14&contentId=8448721&contentType=literature")
+    ref = ParsedReference(reference_id="r8", raw_ref=raw, title="Report title", author="Cui, B.", year="2017",
+                          url="https://www.pishu.com.cn/skwx_ps/initDatabaseDetail?")
+    [repaired] = repair_reference_urls([ref], raw)
+    assert repaired.url == ("https://www.pishu.com.cn/skwx_ps/initDatabaseDetail?"
+                            "siteId=14&contentId=8448721&contentType=literature")
+    # Prose after an ordinary address is never joined.
+    plain = ParsedReference(reference_id="r9", raw_ref="Retrieved from https://example.org/page? and then more",
+                            title="t", author="a", year="2017", url="https://example.org/page?")
+    assert repair_reference_urls([plain], plain.raw_ref)[0].url == "https://example.org/page?"
+
+
+def test_a_query_in_the_next_word_paragraph_after_the_question_mark_is_one_address():
+    from app.services.schemas import ParsedReference
+    section = ("Cui, B. (2017). Report title. Social Sciences Academic Press. "
+               "https://www.pishu.com.cn/skwx_ps/initDatabaseDetail?\n\nsiteId=14&contentId=8448721&contentType=literature")
+    ref = ParsedReference(reference_id="r8", raw_ref=" ".join(section.split()), title="Report title", author="Cui, B.",
+                          year="2017", url="https://www.pishu.com.cn/skwx_ps/initDatabaseDetail?")
+    [repaired] = repair_reference_urls([ref], section)
+    assert repaired.url.endswith("initDatabaseDetail?siteId=14&contentId=8448721&contentType=literature")

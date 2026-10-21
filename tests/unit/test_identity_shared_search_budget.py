@@ -30,7 +30,6 @@ def test_identity_references_share_exhausted_required_search_allowance(cascade, 
         assert all(q['execution_outcome']=='budget_skipped' and q['provider_calls']==0 for q in queries)
     assert search.search_metrics['provider_calls:brave']==2
     assert search.search_metrics['provider_calls:exa']==1
-    providers['searxng'].search.assert_not_called()
     providers['tavily'].search.assert_not_called()
 
 

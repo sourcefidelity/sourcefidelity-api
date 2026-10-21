@@ -43,6 +43,20 @@ def is_site_homepage(html: str, url: str) -> bool:
     return bool(soup.title and soup.title.get_text(strip=True))
 
 
+def redirected_to_site_root(requested_url: str, final_url: str) -> bool:
+    """A link to a page deep in a site that now redirects to a site's front
+    page: the page moved or is gone, whatever the front page holds (news
+    teasers in <article> elements had hidden it; Television Without Frontiers
+    reference 9, 2026-10-18)."""
+    try:
+        requested, final = urlsplit(requested_url), urlsplit(final_url)
+    except ValueError:
+        return False
+    deep = len([part for part in (requested.path or '/').split('/') if part]) >= 2
+    root = re.fullmatch(r'/(?:[a-z]{2}(?:-[a-z]{2})?/?)?(?:index\.(?:html?|aspx?|php))?', final.path or '/', re.I)
+    return bool(deep and root and not final.query and (requested.netloc, requested.path) != (final.netloc, final.path))
+
+
 class LinkHop(BaseModel):
     model_config = ConfigDict(extra="forbid")
     destination_sha256: Hash
@@ -56,6 +70,22 @@ class LinkIdentityDifference(BaseModel):
     field: Literal['title', 'author', 'year', 'doi']
     submitted: str = Field(min_length=1, max_length=2000)
     destination: str = Field(min_length=1, max_length=2000)
+
+
+class CrossScriptLinkJudgment(BaseModel):
+    """The configured model's cross-script comparison of this exact response
+    (`cross-script-identity-v1`), kept with its provenance, never its rationale."""
+    model_config = ConfigDict(extra="forbid")
+    version: str = Field(min_length=1, max_length=60)
+    payload_sha256: Hash
+    configured_model: str = Field(default='', max_length=120)
+    returned_model: str | None = Field(default=None, max_length=120)
+    returned_provider: str | None = Field(default=None, max_length=120)
+    total_tokens: int | None = Field(default=None, ge=0)
+    reported_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    same_work: Literal['yes', 'no', 'unsure']
+    author: Literal['agrees', 'differs', 'not_shown'] = 'not_shown'
+    call: Literal['answered', 'failed', 'invalid_answer']
 
 
 class LinkRequest(BaseModel):
@@ -91,6 +121,8 @@ class LinkRequest(BaseModel):
     # HTTP observations alone cannot establish these independent axes.
     destination_identity: Literal["not_assessed", "confirmed", "bibliographic_conflict", "unconfirmed"] = "not_assessed"
     admitted_content: Literal["not_assessed", "admitted"] = "not_assessed"
+    cross_script_judgment: CrossScriptLinkJudgment | None = None
+    cross_script_evidence_sha256: Hash | None = None
 
     @model_validator(mode="after")
     def valid_times(self):
@@ -112,6 +144,10 @@ class LinkRequest(BaseModel):
             not self.response_sha256 or self.page_evidence_sha256 != self.response_sha256
         ):
             raise ValueError('Page observation requires exact response binding')
+        if self.cross_script_judgment is not None and (
+            not self.response_sha256 or self.cross_script_evidence_sha256 != self.response_sha256
+        ):
+            raise ValueError('Cross-script judgment requires exact response binding')
         if self.source_validation != 'not_assessed' and (
             not self.response_sha256 or self.source_validation_sha256 != self.response_sha256
         ):
@@ -162,6 +198,17 @@ def link_not_visited(url, reason):
     for row in ACTIVE_LINKS.get() or []:
         if row.state == 'not_checked' and (url is None or row.request_sha256 == binding(str(url))):
             row.not_checked_reason = reason
+
+
+def observed_outcome(url) -> str | None:
+    """The link checker's classified outcome of its latest request for this
+    submitted link in the current reference (`not_found`, `removed`,
+    `timeout`, ...), or None when it has not been requested. Other components
+    read this instead of classifying responses themselves (2026-10-14)."""
+    for row in ACTIVE_LINKS.get() or []:
+        if row.request_sha256 == binding(str(url)) and row.requests:
+            return row.requests[-1].outcome
+    return None
 
 
 def safe_origin(value):
@@ -268,6 +315,12 @@ def identity_observed(url, content_sha256, reason, fields=(), *, differences=())
                'bibliographic_identity_unconfirmed': 'unconfirmed'}.get(reason)
     if not outcome:
         return
+    from app.services.web_source_metadata import is_video_host
+    if is_video_host(url) and outcome == 'bibliographic_conflict':
+        # A video page's title, upload date and uploader are the uploader's,
+        # not the work's: the link is checked only for whether it opens
+        # (owner decision 2026-10-16).
+        return
     for row in ACTIVE_LINKS.get() or []:
         if row.request_sha256 != binding(str(url)):
             continue
@@ -292,6 +345,32 @@ def page_observed(url, content_sha256, reason):
             if request.response_sha256 == content_sha256:
                 request.page_observation = reason
                 request.page_evidence_sha256 = content_sha256
+
+
+def cross_script_observed(url, content_sha256, judged):
+    """Keep the model's cross-script judgment on the response it compared.
+
+    Owner decision 2026-10-12: a page in another writing system that the model
+    judged to be the cited work (and whose people it did not judge to differ)
+    confirms the destination, as a confirmed identity comparison would.
+    """
+    try:
+        judgment = CrossScriptLinkJudgment.model_validate(
+            {k: v for k, v in (judged or {}).items() if k in CrossScriptLinkJudgment.model_fields})
+    except (ValueError, TypeError):
+        return
+    for row in ACTIVE_LINKS.get() or []:
+        if row.request_sha256 != binding(str(url)):
+            continue
+        for request in row.requests:
+            if request.response_sha256 != content_sha256:
+                continue
+            request.cross_script_judgment = judgment
+            request.cross_script_evidence_sha256 = content_sha256
+            if (judgment.same_work == 'yes' and judgment.author != 'differs'
+                    and request.destination_identity == 'not_assessed'):
+                request.destination_identity = 'confirmed'
+                request.identity_evidence_sha256 = content_sha256
 
 
 def bind_authorized_admission(values, metadata, representation_id):
@@ -333,6 +412,9 @@ def validated_response_identity(url, content_sha256, reason, fields=()):
                'medium': 'unconfirmed', 'low': 'unconfirmed'}.get(reason)
     if not url or not outcome:
         return []
+    from app.services.web_source_metadata import is_video_host
+    if is_video_host(url) and outcome == 'bibliographic_conflict':
+        outcome, fields = 'unconfirmed', []
     records = []
     for row in ACTIVE_LINKS.get() or []:
         for request in row.requests:

@@ -77,7 +77,8 @@ def _glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
         if "client" not in cache:
             from openai import OpenAI
             cache["client"] = OpenAI(api_key=secret_value(settings.OPENROUTER_API_KEY),
-                                     base_url=settings.OPENROUTER_BASE_URL)
+                                     base_url=settings.OPENROUTER_BASE_URL,
+                                     timeout=settings.LLM_CALL_TIMEOUT_SECONDS)
         return cache["client"]
 
     ceiling = [routing["max_price"]["prompt"], routing["max_price"]["completion"]]
@@ -128,7 +129,8 @@ def _zai_glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
     def client():
         if "client" not in cache:
             from openai import OpenAI
-            cache["client"] = OpenAI(api_key=secret_value(settings.ZAI_API_KEY), base_url=settings.ZAI_BASE_URL)
+            cache["client"] = OpenAI(api_key=secret_value(settings.ZAI_API_KEY), base_url=settings.ZAI_BASE_URL,
+                                     timeout=settings.LLM_CALL_TIMEOUT_SECONDS)
         return cache["client"]
 
     ceiling = [policy["max_price"]["prompt"], policy["max_price"]["completion"]]
@@ -138,6 +140,7 @@ def _zai_glm_route(settings: Settings) -> tuple[LLMRoute, dict]:
         # Thinking cannot be disabled on GLM-5.3-Flash; lowest effort, room to answer.
         extra_body={"thinking": {"type": "enabled"}, "reasoning_effort": settings.ZAI_REASONING_EFFORT},
         max_output_tokens=_GLM_MAX_OUTPUT_TOKENS,
+        max_in_flight=max(0, int(settings.ZAI_MAX_IN_FLIGHT)),
         # The list price when one is on record; the ceiling bounds the estimate otherwise.
         price_context=lambda model: {"pricing_basis": "configured_ceiling",
                                      "ceiling_usd_per_million": ceiling, "model": model,

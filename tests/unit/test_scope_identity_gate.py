@@ -7,7 +7,7 @@ and whether the scope judgment is bound to the text it was made against.
 import hashlib
 
 from app.services.evidence_report import _title_and_author_agree
-from app.services.report_layers import _reference_identified, topical_mismatch
+from app.services.report_layers import reference_identified, topical_mismatch
 from app.services.passage_relevance import assess_retrieved_text_scope
 
 
@@ -37,23 +37,28 @@ class TestWhichWorkIsThis:
 
 class TestSubjectComparisonEligibility:
     def test_confirmed_reference_qualifies(self):
-        assert _reference_identified({"reference_identity": {"status": "confirmed"}})
+        assert reference_identified({"reference_identity": {"status": "confirmed"}})
 
     def test_wrong_year_on_a_recognised_work_qualifies(self):
         """Khan: title and author agree, the student's year is wrong."""
-        assert _reference_identified({"reference_identity": {
+        assert reference_identified({"reference_identity": {
             "status": "bibliographic_conflict", "title_and_author_agree": True}})
 
     def test_conflict_without_a_recognised_work_does_not(self):
-        assert not _reference_identified({"reference_identity": {
+        assert not reference_identified({"reference_identity": {
             "status": "bibliographic_conflict", "title_and_author_agree": False}})
 
     def test_unlocated_reference_never_qualifies(self):
         """Belton: never identified, so its displayed subject proves nothing."""
-        for status in ("search_incomplete", "unlocated_after_search",
-                       "possible_match", "insufficient_metadata"):
-            assert not _reference_identified({"reference_identity": {
+        for status in ("search_incomplete", "unlocated_after_search", "insufficient_metadata"):
+            assert not reference_identified({"reference_identity": {
                 "status": status, "title_and_author_agree": True}}), status
+        # A possible match qualifies only when a record agrees on title and
+        # author (owner decision 2026-10-18; Belton's records agreed on neither).
+        assert reference_identified({"reference_identity": {
+            "status": "possible_match", "title_and_author_agree": True}})
+        assert not reference_identified({"reference_identity": {
+            "status": "possible_match", "title_and_author_agree": False}})
 
 
 def _scope_member(coverage, text, claim, *, version, scope_coverage, identity="confirmed"):
@@ -89,11 +94,11 @@ SOURCE = "This article examines United States platform markets and their regulat
 
 
 class TestRetrievedDocumentScope:
-    def test_full_text_mismatch_is_now_marked(self):
-        """Khan: the check used to be skipped entirely once text was retrieved."""
+    def test_a_fully_retrieved_text_is_never_marked(self):
+        """Owner decision 2026-10-14 (Harlow citation 7): full text is judged instead."""
         member = _scope_member("full_text", SOURCE, CLAIM,
                                version="fulltext-topic-v1", scope_coverage="full_text")
-        assert topical_mismatch(member, {"student_text": CLAIM})
+        assert not topical_mismatch(member, {"student_text": CLAIM})
 
     def test_partial_text_is_also_comparable(self):
         member = _scope_member("partial_text", SOURCE, CLAIM,

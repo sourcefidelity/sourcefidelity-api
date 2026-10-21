@@ -47,7 +47,8 @@ def test_both_required_providers_answering_is_a_completed_search():
     assert full_text_search_incompleteness(_trace({"brave": "results", "exa": "no_results"})) is None
 
 
-def test_optional_searxng_cooldown_does_not_make_the_search_incomplete():
+def test_stored_optional_fallback_cooldown_does_not_make_the_search_incomplete():
+    # A record from before the SearXNG fallback was removed (2026-10-19).
     trace = _trace({"brave": "results", "exa": "results", "searxng": "cooldown_skipped"})
     assert full_text_search_incompleteness(trace) is None
 
@@ -80,9 +81,9 @@ def test_no_required_web_route_is_not_assessed_here():
 
 def test_legacy_policy_reads_query_outcomes_under_the_required_web_attempt():
     assert full_text_search_incompleteness(
-        _trace({"searxng": "cooldown_skipped"}, policy="configured-search-v1")) == {"providers": ["searxng"]}
+        _trace({"tavily": "cooldown_skipped"}, policy="configured-search-v1")) == {"providers": ["tavily"]}
     assert full_text_search_incompleteness(
-        _trace({"searxng": "results"}, policy="configured-search-v1")) is None
+        _trace({"tavily": "results"}, policy="configured-search-v1")) is None
 
 
 def _abstract_only_resolver(trace):

@@ -89,3 +89,84 @@ def test_feeds_are_not_article_xml_and_view_pdf_is_retained():
     locations=discover_scholarly_locations(html,'https://journal.example/article')
     assert [l.url for l in locations]==['https://journal.example/article.xml',
         'https://journal.example/download?id=1','https://journal.example/paper.pdf?download=1']
+
+
+def matched_member():
+    member, citation = bound_member()
+    scope = member['abstract_relevance']['scope_assessment']
+    scope.update(relevance='generally_relevant', attention=False, topic_relation='overlapping',
+                 broad_subject_relation='compatible', plausible_connection='present')
+    return member, citation
+
+
+def test_a_generally_relevant_comparison_is_a_topical_match_under_the_mismatch_conditions():
+    from app.services.report_layers import topical_match
+    member, citation = matched_member()
+    assert topical_match(member, citation) and not topical_mismatch(member, citation)
+    member['abstract_relevance']['scope_assessment']['relevance'] = 'uncertain'
+    assert not topical_match(member, citation)
+    for change in ({'reference_identity': {'status': 'possible_match'}}, {'coverage_level': 'full_text'}):
+        other, cited = matched_member()
+        other.update(change)
+        assert not topical_match(other, cited)
+    other, cited = matched_member()
+    cited['members'] = [other, {}, {}]   # a statement naming three sources shows neither
+    assert not topical_match(other, cited)
+    other, cited = matched_member()
+    cited['student_text'] += ' Changed.'  # no longer the statement assessed
+    assert not topical_match(other, cited)
+
+
+def test_the_window_names_the_topic_in_words():
+    from app.services.evidence_report import _member_label
+    member, citation = matched_member()
+    assert _member_label(member, citation).endswith('Abstract Retrieved</span></span> – Topical Match')
+    mismatch, cited = bound_member()
+    assert 'Topical Match' not in _member_label(mismatch, cited)
+
+
+def test_a_possible_match_agreeing_on_title_and_author_carries_topic_labels():
+    from app.services.report_layers import topical_match
+    member, citation = matched_member()
+    member['reference_identity'] = {'status': 'possible_match', 'title_and_author_agree': True}
+    assert topical_match(member, citation)
+    member['reference_identity'] = {'status': 'possible_match', 'title_and_author_agree': False}
+    assert not topical_match(member, citation)
+
+
+def test_a_clause_citation_is_checked_against_the_whole_statement_assessed():
+    from app.services.report_layers import topical_match
+    member, citation = matched_member()
+    clause = {'student_text': 'and a clause of it (Writer, 2020).', 'members': [member],
+              'clause_of': {'student_text': citation['student_text']}}
+    assert topical_match(member, clause)
+    mismatch, cited = bound_member()
+    assert topical_mismatch(mismatch, {'student_text': 'a clause.', 'members': [mismatch],
+                                       'clause_of': {'student_text': cited['student_text']}})
+
+
+def test_the_text_of_an_identified_single_authored_book_carries_topic_labels():
+    from app.services.report_layers import topical_match
+    member, citation = matched_member()
+    member['reference_identity'] = {'status': 'search_incomplete'}
+    assert not topical_match(member, citation)
+    member.update(located_book={'title': 'Material strength'}, text_is_located_book=True)
+    assert topical_match(member, citation)
+    member['text_is_located_book'] = False   # text from elsewhere stays unlabelled
+    assert not topical_match(member, citation)
+
+
+def test_an_unsettled_comparison_reads_topical_relevance_uncertain():
+    from app.services.evidence_report import _member_label, _render_panel_template
+    from app.services.report_layers import topical_uncertain
+    member, citation = matched_member()
+    scope = member['abstract_relevance']['scope_assessment']
+    scope['relevance'] = 'uncertain'
+    member['abstract_scope_note'] = {'note': 'Both concern material strength.'}
+    assert topical_uncertain(member, citation)
+    assert _member_label(member, citation).endswith(' – Topical Relevance Uncertain')
+    html = _render_panel_template(citation, 1)
+    assert 'Both concern material strength. Read the source to judge whether it supports the statement.' in html
+    scope['relevance'] = 'generally_relevant'   # a match keeps its note without the sentence
+    html = _render_panel_template(citation, 1)
+    assert 'Read the source to judge' not in html and 'Topical Match' in html

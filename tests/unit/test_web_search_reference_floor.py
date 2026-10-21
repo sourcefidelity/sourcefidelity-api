@@ -23,17 +23,16 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", True)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:1,exa:1")
     monkeypatch.setattr(settings, "WEB_SEARCH_PER_REFERENCE_FLOOR", "brave:1,exa:1")
     monkeypatch.setattr(settings, "WEB_SEARCH_HARD_MAX_CALLS", "brave:3,exa:3")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng")}
+                 for name in ("brave", "exa")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name))
     return WebSearchRetriever(health_store=Mock()), providers
 
 
@@ -49,8 +48,8 @@ def _exa_outcomes(result):
 
 def test_defaults_are_bounded():
     from app.config import Settings
-    assert Settings.model_fields["WEB_SEARCH_PER_REFERENCE_FLOOR"].default == "brave:3,exa:2"
-    assert Settings.model_fields["WEB_SEARCH_HARD_MAX_CALLS"].default == "brave:120,exa:80"
+    assert Settings.model_fields["WEB_SEARCH_PER_REFERENCE_FLOOR"].default == "brave:3,exa:2,deepseek:2"
+    assert Settings.model_fields["WEB_SEARCH_HARD_MAX_CALLS"].default == "brave:120,exa:80,deepseek:80"
 
 
 def test_later_references_keep_a_floor_after_the_job_ceiling_is_spent(cascade):

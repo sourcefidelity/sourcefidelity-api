@@ -75,11 +75,13 @@ def test_embedded_doi_conflict_rejects_otherwise_similar_pdf() -> None:
     assert reasons == ["doi_conflict"]
 
 
-@pytest.mark.parametrize("title_page,author,accepted", [(4, "Jordan Scholar", True), (6, "Jordan Scholar", False), (4, "Unrelated Writer", False)])
+# Ten pages of front matter (2026-10-18: Maynard's title page is page eight).
+@pytest.mark.parametrize("title_page,author,accepted", [(4, "Jordan Scholar", True), (8, "Jordan Scholar", True),
+                                                        (11, "Jordan Scholar", False), (4, "Unrelated Writer", False)])
 def test_book_front_matter_identity_remains_bounded(title_page, author, accepted):
     title = "Embodied cinema: Stars and society"
     document = fitz.open()
-    for number in range(1, 7):
+    for number in range(1, 12):
         page = document.new_page()
         if number == title_page:
             page.insert_text((72, 72), "Embodied cinema\nStars and society\nJordan Scholar", fontsize=16)

@@ -3,7 +3,7 @@
 Owner decision, 2026-09-24: keep automatic re-runs on by default, trigger them
 only for providers the completion gate counts as blocking, and allow them to be
 switched off. Measured basis: every one of the four re-run waves on 2026-09-23
-(4, 90, 47 and 51 reference re-runs) was triggered by SearXNG, which cannot
+(4, 90, 47 and 51 reference re-runs) was triggered by an optional fallback, which cannot
 complete or invalidate a search under `api-first-search-v2`. Those waves
 changed potentially-fabricated-reference flags back and forth between report
 versions -- 15 fabricated references were flagged in some versions and not
@@ -15,34 +15,27 @@ from unittest.mock import Mock
 import pytest
 
 from app.services.paper_workflow import _blocking_providers_from_record
-from app.services.reference_discovery import (
-    ReferenceDiscoveryRecord, _search_is_incomplete, search_blocking_providers)
+from app.services.reference_discovery import ReferenceDiscoveryRecord
+from app.services.search_completion import assess_record
 from tests.unit.blocked_discovery import blocked_record
 
 
-@pytest.fixture(autouse=True)
-def _institutional_deployment(monkeypatch):
-    """Automatic re-searching happens only in an Institutional deployment
-    (owner decision 2026-09-29); these tests exercise that behaviour."""
-    import app.services.assessment_marks as marks
-    monkeypatch.setattr(marks, "institutional_deployment", lambda: True)
 
 
 
 def _gate(record: dict) -> bool:
     r = ReferenceDiscoveryRecord.model_validate(record)
-    return _search_is_incomplete(r.required_route_categories, r.attempts,
-                                 r.queries, r.search_policy_version)
+    return not assess_record(r).complete
 
 
 @pytest.mark.parametrize("record", [
-    blocked_record("a", adapter="core"),
+    blocked_record("a", adapter="openalex"),
     blocked_record("b", adapter="crossref"),
     blocked_record("c", policy="api-first-search-v2",
-                   web_outcomes={"brave": "timeout", "exa": "results"}),
+                   web_outcomes={"brave": "timeout", "exa": "timeout"}),
     blocked_record("d", policy="api-first-search-v2",
-                   web_outcomes={"brave": "results", "exa": "rate_limited"}),
-    blocked_record("e", web_outcomes={"searxng": "cooldown_skipped"}),
+                   web_outcomes={"brave": "rate_limited", "exa": "operational_failure"}),
+    blocked_record("e", web_outcomes={"tavily": "cooldown_skipped"}),
 ])
 def test_a_named_blocker_always_means_the_search_is_incomplete(record) -> None:
     """The trigger must never name a provider on a search that already completed."""
@@ -50,9 +43,22 @@ def test_a_named_blocker_always_means_the_search_is_incomplete(record) -> None:
     assert _gate(record) is True
 
 
+@pytest.mark.parametrize("web_outcomes", [
+    {"brave": "timeout", "exa": "results"},
+    {"brave": "results", "exa": "rate_limited"},
+])
+def test_one_web_providers_failure_names_no_blocker_when_the_other_finished(web_outcomes) -> None:
+    # A provider-side failure of one required web provider leaves the other
+    # sufficient: search-completion-v1, owner decision 2026-10-19.
+    record = blocked_record("r", policy="api-first-search-v2", web_outcomes=web_outcomes)
+
+    assert _blocking_providers_from_record(record) == []
+    assert _gate(record) is False
+
+
 def test_an_optional_web_provider_never_triggers_under_api_first() -> None:
     record = blocked_record("r", policy="api-first-search-v2", web_outcomes={
-        "brave": "results", "exa": "results", "searxng": "operational_failure"})
+        "brave": "results", "exa": "results", "tavily": "operational_failure"})
 
     assert _blocking_providers_from_record(record) == []
 
@@ -60,9 +66,14 @@ def test_an_optional_web_provider_never_triggers_under_api_first() -> None:
 def test_a_required_web_api_that_never_ran_is_blocking() -> None:
     """Exa absent entirely is as blocking as Exa failing."""
     record = blocked_record("r", policy="api-first-search-v2",
-                            web_outcomes={"brave": "results"})
+                            web_outcomes={"brave": "timeout"})
 
-    assert _blocking_providers_from_record(record) == ["exa"]
+    assert _blocking_providers_from_record(record) == ["brave", "exa"]
+    # Brave finishing is enough on its own, so an absent Exa then blocks
+    # nothing: search-completion-v1, owner decision 2026-10-19.
+    record = blocked_record("r", policy="api-first-search-v2",
+                            web_outcomes={"brave": "results"})
+    assert _blocking_providers_from_record(record) == []
 
 
 def test_an_optional_adapter_that_failed_is_not_blocking() -> None:
@@ -97,13 +108,15 @@ def test_a_provider_that_answered_is_not_a_recovery_target() -> None:
 def test_the_refresh_ignores_a_stale_stored_trigger_list() -> None:
     """Jobs stored before this change list every queried provider.
 
-    The refresh recomputes from the record, so an old list naming SearXNG does
-    not re-run a reference SearXNG was never blocking.
+    The refresh recomputes from the record, so an old list naming an optional
+    fallback does not re-run a reference that fallback was never blocking.
     """
     from app.services.paper_workflow import prepare_provider_recovery_refresh
 
+    # Brave fails too: with Brave answering, Exa's failure alone would not hold
+    # the search incomplete (search-completion-v1, owner decision 2026-10-19).
     record = blocked_record("ref-1", policy="api-first-search-v2", web_outcomes={
-        "brave": "results", "exa": "timeout", "searxng": "cooldown_skipped"})
+        "brave": "timeout", "exa": "timeout", "tavily": "cooldown_skipped"})
     from types import SimpleNamespace
 
     from app.models.job import JobStatus
@@ -113,14 +126,14 @@ def test_the_refresh_ignores_a_stale_stored_trigger_list() -> None:
             status=JobStatus.COMPLETED, store_only=False, extraction_payload={"x": 1},
             upload_evidence={}, verification_summary={}, stage="completed",
             source_results=[{"reference_id": "ref-1", "reference_discovery": record,
-                             "retryable_provider_dependencies": ["searxng", "exa"]}])
+                             "retryable_provider_dependencies": ["tavily", "exa"]}])
     session = Mock()
 
     import app.services.paper_workflow as workflow
     original = workflow._job
     try:
         workflow._job = lambda _s, _id: fresh_job()
-        assert prepare_provider_recovery_refresh(session, "j", provider="searxng",
+        assert prepare_provider_recovery_refresh(session, "j", provider="tavily",
                                                  commit=False) == []
         workflow._job = lambda _s, _id: fresh_job()
         assert prepare_provider_recovery_refresh(session, "j", provider="exa",

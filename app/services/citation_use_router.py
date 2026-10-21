@@ -52,15 +52,6 @@ _APPLICATION_FRAME_WITHOUT_TARGET = re.compile(
     r"[^.;:]{0,100}\b(?:framework|theory|model|concept|typology|method|approach)\b",
     re.IGNORECASE | re.DOTALL,
 )
-_FURTHER_REFERENCE_TEXT = re.compile(
-    r"(?:\bfor\s+(?:further\s+)?(?:background|discussion|overview|review)\b"
-    r".{0,80}\bsee(?:\s+also)?\b|\bsee\s+also\b|\bcf\.)",
-    re.IGNORECASE | re.DOTALL,
-)
-_FURTHER_REFERENCE_MARKER = re.compile(
-    r"^\s*\(\s*(?:see(?:\s+also)?|cf\.)\b",
-    re.IGNORECASE,
-)
 _MULTI_SOURCE_COMPARISON = re.compile(
     r"\b(?:unlike|similarly|conversely|in\s+contrast\s+to|compared\s+with|"
     r"whereas|both\s+.+?\s+and|neither\s+.+?\s+nor|"
@@ -339,10 +330,18 @@ def _route_candidate(
 
 
 def _is_further_reference(artifact: VerificationEvidenceArtifact) -> bool:
-    return bool(
-        _FURTHER_REFERENCE_MARKER.search(artifact.claim.citation_marker)
-        or _FURTHER_REFERENCE_TEXT.search(artifact.claim.text)
-    )
+    """This source is cited as further reading (`citation_signals`, one rule
+    with Judgment eligibility; the other sources of the sentence are not)."""
+    from app.services.citation_signals import referral_source
+    claim = artifact.claim
+    markers = [m.model_dump() for m in claim.citation_markers]
+    if not markers and claim.citation_marker:
+        at = max(claim.text.find(claim.citation_marker), 0)
+        markers = [{"text": claim.citation_marker, "local_start": at,
+                    "local_end": at + len(claim.citation_marker), "reference_ids": []}]
+    binding = artifact.source_binding
+    return referral_source(claim.text, markers, binding.reference_id if binding else None,
+                           (binding.cited_author_label or "") if binding else "")
 
 
 def _is_exemplification(claim_text: str, candidate_text: str) -> bool:

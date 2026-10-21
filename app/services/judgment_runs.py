@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.services import judgment_reasons
 from app.config import settings
 from app.models.job import Job
 from app.models.judgment import (
@@ -34,11 +35,11 @@ from app.models.report import Report, VerificationReportRecord
 from app.services.facet_evidence_judgment import FACET_JUDGMENT_VERSION, CandidateFacetFinding
 from app.services.judge_arms import JudgePanelUnavailable, coaching_route, formal_judge_arms, policy_hash
 from app.services.judgment_input import JudgmentInputUnavailable, judgment_eligibility, prepare_from_payload
+from app.services.citation_structure import describes_research_literature
 from app.services.judgment_coaching import COACHED_STATES, coach
-from app.services.judgment_report import candidate_text
+from app.services.judgment_report import candidate_text, names_only_other_sources
 from app.services.judgment_panel import PANEL_VERSION, ArmResult, CandidatePanelResult, judge_candidate
 
-UNDECIDED_REASONS = frozenset({"judge_undecided", "judges_undecided"})
 from app.services.llm_service import chat_completion_json
 
 logger = logging.getLogger(__name__)
@@ -48,12 +49,15 @@ WHOLE_CITATION = "__citation__"
 NO_NOTICE = "none"
 _FAILURES_BEFORE_STOPPING = 3
 ACTIVE = frozenset({"queued", "running"})
-_PRE_CALL_REASONS = (
-    ("antecedent", "antecedent_unresolved"),
-    ("exceeded its configured budget", "prompt_over_budget"),
-    ("sentences were unavailable", "evidence_unavailable"),
-)
 
+
+
+def _whole_source_read(payload: dict, candidate_id: str) -> bool:
+    """The candidate's foundation held every sentence of the source."""
+    whole = (payload.get("cross_language") or {}).get("whole_source") or {}
+    found = (whole.get("foundation") or {}).get(candidate_id) or {}
+    return (whole.get("status") == "applied" and found.get("truncated") is False
+            and bool(found.get("whole_source_sentences")))
 
 def _now():
     return datetime.now(timezone.utc)
@@ -87,6 +91,56 @@ def create_run(session: Session, report_id: uuid.UUID, principal, *, force_new: 
     return run
 
 
+# A judge that failed is asked again later, automatically (owner direction
+# 2026-10-18: a full text gets a judgment, not a "Try Again" note). A retry is
+# a new run: cached valid answers are reused, so only failed answers are paid
+# for again. At most three automatic retries per report version.
+AUTO_RETRY_SUBJECT = "judgment-auto-retry"
+MAX_AUTO_RETRIES = 3
+AUTO_RETRY_AFTER = timedelta(minutes=10)
+AUTO_RETRY_WINDOW = timedelta(days=7)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def auto_retry_failed_runs(session: Session, *, dispatch: Callable, now: datetime | None = None) -> dict:
+    """Start a new run for each newest report version whose latest run failed or
+    left a part with a failed judge."""
+    from types import SimpleNamespace
+    now = now or _now()
+    latest: dict = {}
+    for run in session.scalars(select(JudgmentRun).where(JudgmentRun.created_at >= now - AUTO_RETRY_WINDOW)
+                               .order_by(JudgmentRun.created_at.desc())):
+        latest.setdefault((run.report_id, run.scope_type, run.scope_id), run)
+    started = 0
+    for (report_id, scope_type, scope_id), run in latest.items():
+        if run.status in ACTIVE or _aware(run.updated_at) > now - AUTO_RETRY_AFTER:
+            continue
+        report = session.get(Report, report_id)
+        if report is None or session.scalar(select(Report.id).where(
+                Report.job_id == report.job_id).order_by(Report.report_version.desc(),
+                                                         Report.created_at.desc()).limit(1)) != report.id:
+            continue   # a newer version of the report exists
+        failed = run.status == "failed" or any(
+            judgment_reasons.retryable(code) for code in session.scalars(
+                select(JudgmentCandidateResult.reason_code).where(JudgmentCandidateResult.run_id == run.id)))
+        if not failed:
+            continue
+        attempts = session.scalar(select(func.count()).select_from(JudgmentRun).where(
+            JudgmentRun.report_id == report_id, JudgmentRun.requested_by == AUTO_RETRY_SUBJECT)) or 0
+        if attempts >= MAX_AUTO_RETRIES:
+            continue
+        principal = SimpleNamespace(scope_type=scope_type, scope_id=scope_id, subject=AUTO_RETRY_SUBJECT)
+        new = create_run(session, report_id, principal, force_new=True)
+        session.commit()
+        if getattr(new, "created_now", False):
+            dispatch(new.id)
+            started += 1
+    return {"retried": started}
+
+
 def eligible_members(view: dict) -> list[tuple[int | None, str]]:
     """(citation number, verification report id) in paper order, de-duplicated."""
     seen, members = set(), []
@@ -99,11 +153,45 @@ def eligible_members(view: dict) -> list[tuple[int | None, str]]:
     return members
 
 
+def _writer_own_work(view: dict, citation_number, record_id: str, payload: dict, prepared, route, call,
+                     cache) -> dict:
+    """Which judgeable parts of one cited statement describe the writer's own work."""
+    from app.services.writer_own_work import own_work_parts
+    if not settings.PAPER_LLM_PROCESSING_ENABLED:
+        return {"own_work": set(), "cost_usd": 0.0}
+    citations = view.get("citations") or []
+    index = next((i for i, c in enumerate(citations) if c.get("citation_number") == citation_number), None)
+    citation = citations[index] if index is not None else {}
+    statement = str((citation.get("clause_of") or citation).get("student_text")
+                    or (payload.get("claim") or {}).get("text") or "")
+    # The sentences just before the statement, as the resolver and the judge
+    # read them (rules audit 2026-10-18: the previous citations missed an
+    # uncited "My film follows a robot." before "It echoes ...").
+    context = sorted((payload.get("claim") or {}).get("antecedent_context") or [],
+                     key=lambda segment: -int(segment.get("distance_before") or 0))
+    before = (" ".join(str(segment.get("text") or "") for segment in context) if context else
+              " ".join(str(c.get("student_text") or "") for c in citations[max(0, (index or 0) - 2):index or 0]))
+    member = next((m for m in citation.get("members") or [] if str(m.get("verification_report_id")) == record_id), {})
+    # Judgeable parts, and parts left unresolved by "it"/"this" (which may be
+    # the writer's own work).
+    parts = []
+    for item in prepared.items:
+        if not isinstance(item, CandidateFacetFinding):
+            parts.append((item.bundle.candidate_id, candidate_text(payload, item.bundle.candidate_id)))
+        elif _pre_call_reason(item) == "antecedent_unresolved":
+            parts.append((item.candidate_id, candidate_text(payload, item.candidate_id)))
+    reference = str((member.get("source") or {}).get("raw_reference") or "")
+    return own_work_parts(statement, before, reference, parts, route=route, call=call,
+                          cache_lookup=cache.coaching_lookup, cache_store=cache.coaching_store)
+
+
 def _pre_call_reason(finding: CandidateFacetFinding) -> str:
-    text = " ".join(finding.limitations or [])
-    for needle, reason in _PRE_CALL_REASONS:
-        if needle in text:
-            return reason
+    """The reason the claim's preparation recorded, by its exact message
+    (facet_evidence_judgment.PRE_CALL_REASONS), never by searching the text."""
+    from app.services.facet_evidence_judgment import PRE_CALL_REASONS
+    for limitation in finding.limitations or []:
+        if limitation in PRE_CALL_REASONS:
+            return PRE_CALL_REASONS[limitation]
     return "not_assessed_before_judging"
 
 
@@ -214,6 +302,7 @@ def execute_run(
     call=chat_completion_json,
     wider_search_factory: Callable | None = None,
     coaching_route_factory: Callable | None = None,
+    translation_call: Callable | None = None,
 ) -> JudgmentRun:
     """Judge every eligible candidate of one run; safe to call twice.
 
@@ -245,6 +334,12 @@ def execute_run(
         return finish("failed", "report_not_in_scope")
     view = (report.report_json or {}).get("evidence_report") or {}
     cache = _ScopedCache(session, run)
+    # Judge-cited sentences in another language than the statement get their
+    # English translation (evidence-translation-v1); kept ones are not re-sent.
+    from app.services.evidence_translation import (
+        VERSION as TRANSLATION_VERSION, call_cost, judgment_translations, stored_translations,
+    )
+    known_translations = stored_translations(report.report_json)
     seq = 0
     # DeepSeek writes the notes whichever model judges (owner decision 2026-09-27).
     note_route = next((r for r in routes if r.arm_id == "deepseek"), None)
@@ -283,9 +378,28 @@ def execute_run(
             continue
         run.candidate_total += sum(1 for _ in prepared.items)
         wider_search = wider_search_factory(session, record_id, run)
+        # Parts about the writer's own work are not judged against the source
+        # (writer-own-work-v1, owner direction 2026-10-18).
+        own_work = _writer_own_work(view, citation_number, record_id, payload, prepared, note_route, call, cache)
+        run.spend_usd += own_work["cost_usd"]
         for item in prepared.items:
+            candidate_id = item.candidate_id if isinstance(item, CandidateFacetFinding) else item.bundle.candidate_id
+            if names_only_other_sources(payload, candidate_id):
+                # A part carrying only other references' markers is theirs to
+                # support, not this source's (Synthetic Embrace citation 1,
+                # 2026-10-18): it is left out of this source's window, as the
+                # Judgment layer leaves out its mark (rules audit 2026-10-18).
+                run.candidate_total -= 1
+                continue
             if isinstance(item, CandidateFacetFinding):
-                write(citation_number, record_id, item.candidate_id, "not_judged", _pre_call_reason(item))
+                reason = _pre_call_reason(item)
+                if reason == "antecedent_unresolved" and candidate_id in own_work["own_work"]:
+                    # "It also echoes ..." where "it" is the writer's own work.
+                    reason = "writer_own_work"
+                write(citation_number, record_id, candidate_id, "not_judged", reason)
+                continue
+            if item.bundle.candidate_id in own_work["own_work"]:
+                write(citation_number, record_id, item.bundle.candidate_id, "not_judged", "writer_own_work")
                 continue
             limit = _spend_limit_reached(session, run)
             if limit:
@@ -298,7 +412,12 @@ def execute_run(
             spend = result.spend_usd
             consecutive_failures = consecutive_failures + 1 if result.reason_code == "judge_failed" else 0
             wider = None
-            if result.display_state == "insufficient":
+            if result.display_state == "insufficient" and _whole_source_read(payload, item.bundle.candidate_id):
+                # The judge read every sentence of the source and none supports
+                # the statement: no wider search is left, so it stands
+                # (owner decision 2026-10-13, cross-language-whole-source-v1).
+                result.reason_code = "whole_source_read"
+            elif result.display_state == "insufficient":
                 # Red only after a wider search of new sentences agrees again.
                 outcome = wider_search(context, item, routes, run, cache, call) if wider_search else None
                 if outcome is None:
@@ -308,15 +427,25 @@ def execute_run(
                     wider = outcome["record"]
                     spend += outcome.get("spend_usd", 0.0)
                     result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]
+            elif (result.display_state == "not_judged" and judgment_reasons.undecided(result.reason_code)
+                    and getattr(wider_search, "combined", None)):
+                # An undecided statement is judged again with the wider
+                # search's new sentences added to its first ones (owner
+                # decision 2026-10-18); with nothing new, undecided stands.
+                outcome = wider_search.combined(context, item, routes, run, cache, call)
+                if outcome is not None:
+                    wider = outcome["record"]
+                    spend += outcome.get("spend_usd", 0.0)
+                    result.display_state, result.reason_code = outcome["display_state"], outcome["reason_code"]
             coaching = None
             note_state = result.display_state
-            if (result.display_state == "not_judged" and result.reason_code in UNDECIDED_REASONS
+            if (result.display_state == "not_judged" and judgment_reasons.uncertain_judge(result.reason_code)
                     and any(a.finding is not None and a.finding.status == "uncertain"
                             for a in result.arms if a.status == "valid" and a.in_majority)):
                 # A judge left part of the statement uncertain: the note says why
                 # (owner decision 2026-09-30). An unresolved statement keeps its fixed note.
                 note_state = "undecided"
-            elif result.display_state == "not_judged" and result.reason_code.removeprefix("wider_search_") == "samples_split":
+            elif result.display_state == "not_judged" and judgment_reasons.samples_split(result.reason_code):
                 # Answers with no shared result: the note explains the statement and
                 # the source, never the answers (owner decision 2026-10-03).
                 note_state = "split"
@@ -331,14 +460,28 @@ def execute_run(
                                  context.claim.citation_marker or "", facets,
                                  wider_record.get("panel") or _panel_json(result), sentences,
                                  route=note_route, call=call, cache_lookup=cache.coaching_lookup,
-                                 cache_store=cache.coaching_store)
+                                 cache_store=cache.coaching_store,
+                                 describes_research=describes_research_literature(context.claim.text))
                 spend += coaching.get("cost_usd") or 0.0
                 coaching = {k: v for k, v in coaching.items() if k != "cache_key"}
+            panel = _panel_json(result)
+            cited = {sid: sentence.text for sid, sentence in prepared.sentences.items()}
+            cited.update((wider or {}).get("sentences") or {})
+            translated, made = judgment_translations((wider or {}).get("panel") or panel, cited,
+                                                     context.claim.text, known=known_translations,
+                                                     completion=translation_call,
+                                                     enabled=settings.PAPER_LLM_PROCESSING_ENABLED)
+            if translated:
+                known_translations.update(translated)
+                panel["evidence_translations"] = translated
+            if made:
+                panel["evidence_translation"] = {"version": TRANSLATION_VERSION, "calls": made}
+                spend += call_cost(made)
             run.spend_usd += spend
             run.unpriced_calls += sum(1 for a in result.arms if not a.cached and a.cost_basis == "unpriced"
                                       and a.receipt)
             write(citation_number, record_id, item.bundle.candidate_id, result.display_state,
-                  result.reason_code, panel=_panel_json(result),
+                  result.reason_code, panel=panel,
                   wider={k: v for k, v in (wider or {}).items() if k != "sentences"} or None,
                   arm_ids=cache.ids([a.cache_key for a in result.arms if a.status == "valid"]),
                   spend=spend, coaching=coaching)

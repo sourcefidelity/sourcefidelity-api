@@ -29,7 +29,8 @@ from app.services.verification_evidence import (
 
 # Foundation versions whose stored sentences this prompt contract can read.
 # v10 foundations (24 merged units) stay judgeable; v11 keeps real sentences.
-JUDGEABLE_FOUNDATION_VERSIONS = frozenset({FACET_FOUNDATION_VERSION, "exact-facet-evidence-foundation-v11",
+JUDGEABLE_FOUNDATION_VERSIONS = frozenset({FACET_FOUNDATION_VERSION, "exact-facet-evidence-foundation-v12",
+                                          "exact-facet-evidence-foundation-v11",
                                           "exact-facet-evidence-foundation-v10"})
 _CLAIM_STORAGE_FIELDS = ("text_truncated", "text_sha256")
 
@@ -56,6 +57,10 @@ def judgment_eligibility(payload: dict) -> Eligibility:
     # A "see" citation is never judged, whatever text was retrieved (2026-10-07).
     if referral_citation(payload):
         return Eligibility(False, "referral_citation")
+    # A citation that is only a quotation needs no Judgment; its quotation and
+    # locator checks still run (owner rule 2026-10-12).
+    if (payload.get("claim") or {}).get("quotation_form") == "quotation_only":
+        return Eligibility(False, "quotation_only")
     coverage = (payload.get("coverage") or {}).get("level")
     if coverage != "full_text":
         return Eligibility(False, "not_complete_full_text")
@@ -77,17 +82,15 @@ def judgment_eligibility(payload: dict) -> Eligibility:
     return Eligibility(True, "eligible")
 
 
-_REFERRAL_SIGNAL = re.compile(r"^\(\s*(?:see(?:\s+also)?|cf\.?)\s", re.IGNORECASE)
-
-
 def referral_citation(payload: dict) -> bool:
     """Every marker naming this source is a "see"/"see also"/"cf." signal,
     which points to further reading rather than supporting the statement
-    (owner decision 2026-10-07)."""
-    reference_id = (payload.get("source_binding") or {}).get("reference_id")
-    markers = [m for m in (payload.get("claim") or {}).get("citation_markers") or []
-               if isinstance(m, dict) and (not reference_id or reference_id in (m.get("reference_ids") or []))]
-    return bool(markers) and all(_REFERRAL_SIGNAL.match(str(m.get("text") or "")) for m in markers)
+    (owner decision 2026-10-07; one rule with the router, `citation_signals`)."""
+    from app.services.citation_signals import referral_source
+    binding = payload.get("source_binding") or {}
+    claim = payload.get("claim") or {}
+    return referral_source(str(claim.get("text") or ""), claim.get("citation_markers") or [],
+                           binding.get("reference_id"), str(binding.get("cited_author_label") or ""))
 
 
 def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
@@ -102,6 +105,7 @@ def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
         # (owner decision 2026-10-03), for the prompt and its interpretation alike.
         from app.services.antecedent_resolver import (
             _EXPLETIVE_IT, previous_sentence_antecedent, without_expletive_dependency)
+        from app.services.cross_language_whole_source import stored_passages
         candidates = VerificationCandidateSet.model_validate(payload.get("verification_candidates") or {})
         # A stored part opening with a dummy "It" was marked as needing an
         # antecedent, and the judge then declined it (citation 10, 2026-10-08).
@@ -119,7 +123,7 @@ def judgment_context_from_payload(payload: dict) -> SimpleNamespace:
             # Only page coordinates are read (locator status), never passage text.
             passages=[SimpleNamespace(passage_id=p.get("passage_id"), page_index=p.get("page_index"),
                                       page_label=p.get("page_label"))
-                      for p in payload.get("passages") or []],
+                      for p in stored_passages(payload)],
         )
     except (ValueError, TypeError) as exc:
         raise JudgmentInputUnavailable("stored_record_invalid") from exc

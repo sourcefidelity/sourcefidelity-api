@@ -200,6 +200,13 @@ def begin_verification_run(
         key=key,
         content=representation.content,
     )
+    printed = (representation.metadata or {}).get("printed_page_labels") or {}
+    if (representation.kind == RepresentationKind.PLAIN_TEXT and printed.get("content_sha256") == digest
+            and isinstance(printed.get("labels"), list)
+            and len(printed["labels"]) == representation.content.count(b"\f") + 1):
+        # A scanned magazine's printed page numbers, bound to this exact text
+        # (lantern-pages-v1, owner decision 2026-10-14).
+        object_record["page_labels"] = [label if isinstance(label, str) else None for label in printed["labels"]]
     run = VerificationRunRecord(
         id=run_id,
         audit_version=RUN_AUDIT_VERSION,
@@ -326,6 +333,9 @@ def load_verification_run_source(
         created_at=run.started_at,
         admitted_at=None,
         verification_run_id=str(run.id),
+        page_labels=(tuple(source["page_labels"]) if isinstance(source.get("page_labels"), list)
+                     and run.representation_kind == "plain_text"
+                     and len(source["page_labels"]) == content.count(b"\f") + 1 else None),
         page_repairs=tuple(sorted(repairs.texts.items())) if repairs else (),
         page_repair_manifest_sha256=repairs.manifest_sha256 if repairs else None,
     )

@@ -246,10 +246,12 @@ def test_a_supplied_year_still_requires_observed_year():
     assert not trace["candidates"] and record["outcome"] == "search_incomplete"
 
 
-def test_a_same_titled_page_by_someone_else_keeps_its_byline_without_its_address():
+def test_a_same_titled_page_by_someone_else_keeps_its_byline_and_fetched_address():
     # Kozlovic, 2026-09-30: the page's own title and byline are kept as an
     # observation (never identity), so the author difference can be shown.
     # Its first version read the absent address and failed the paper run.
+    # Owner decision 2026-10-14: the address the application fetched is the
+    # located record's link.
     html = HTML.replace("Example, Alice", "Different, Bob").replace(
         f'<meta name="citation_doi" content="{DOI}">', '')
     result, trace, record = acquire("exa", html=html)
@@ -257,8 +259,7 @@ def test_a_same_titled_page_by_someone_else_keeps_its_byline_without_its_address
     [candidate] = trace["candidates"]
     assert candidate["observed"]["title"] == TITLE and candidate["observed"]["authors"] == ["Different, Bob"]
     assert candidate["identity_evidence_kind"] is None and not candidate["validated_identity_content_sha256"]
-    attempt = result.metadata["location_attempts"][0]
-    assert "source_url" not in attempt["landing_page_observation"]
+    assert candidate["page_url"] and candidate["page_url"].startswith("https://")
 
 
 def test_a_reused_page_inspection_keeps_the_page_observation():

@@ -28,5 +28,19 @@ def run_report_judgment(run_id: str) -> dict:
         return {"status": getattr(run, "status", None), "reason": getattr(run, "reason_code", None)}
 
 
+@celery_app.task(name="retry_failed_judgments", acks_late=True, max_retries=0)
+def retry_failed_judgments() -> dict:
+    """Ask a failed judge again later (judgment_runs.auto_retry_failed_runs)."""
+    from app.services.judgment_runs import auto_retry_failed_runs
+
+    with SessionLocal() as session:
+        try:
+            return auto_retry_failed_runs(session, dispatch=dispatch_report_judgment)
+        except Exception as exc:   # a scan that fails waits for the next one
+            session.rollback()
+            logger.warning("Judgment retry scan failed (type=%s)", type(exc).__name__)
+            return {"retried": 0}
+
+
 def dispatch_report_judgment(run_id) -> None:
     run_report_judgment.apply_async(args=[str(run_id)], queue=JUDGMENT_QUEUE)

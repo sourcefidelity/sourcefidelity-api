@@ -327,38 +327,6 @@ def test_passage_words_bind_to_the_page_and_unbound_passages_stay_reachable():
     assert (link['data-go-to'], link['data-go-to-mark']) == ('citation-panel-2', 'patchwriting-mark-2')
 
 
-def test_pdf_export_carries_patchwriting_in_the_citation_and_reference_sections_without_internals():
-    from app.services.report_export import _render_pdf
-    paper = _paper(['Some opening words. Remote learning reduced the engagement',
-                    'of first year students in large lectures, as shown.',
-                    'Later the student wrote these other words about lectures.'])
-    first = finding(start=20, share=0.9)
-    second = finding(start=500, text='the student wrote these other words about lectures')
-    passages = passages_for(block(**{'ref-1': [first, second]}))
-    attach_passage_geometry(passages, paper, [])
-    citations = [citing([MEMBER], 0, 200)]
-    citations[0]['paper_location'] = {'localization_level': 'semantic_only', 'rectangles': []}
-    view = {'citations': citations, 'reference_practice': [], 'patchwriting_passages': passages,
-            'paper_surface': {}, 'overview': {}}
-    content, counts = _render_pdf(paper, citations=citations, reference_practice=[], export_binding='x', view=view)
-    assert counts['patchwriting_passages'] == 2
-    with fitz.open(stream=content, filetype='pdf') as document:
-        import unicodedata
-        appendix = unicodedata.normalize('NFKC', ' '.join(' '.join(page.get_text().split())
-                                                          for page in list(document)[1:]))
-        toc = [entry[1] for entry in document.get_toc()]
-        links = [link for link in document[0].get_links() if link.get('kind') == fitz.LINK_GOTO]
-    assert 'Citation 1, source 1' in toc and 'Passage 1' not in appendix
-    assert links
-    section = appendix[appendix.index('Citation 1, source 1'):]
-    for text in ('Academic Practice ' + QUOTED, '“' + STUDENT + '”', 'Source (p. 4):',
-                 '“Remote learning reduced the engagement of first-year students in large lectures.”'):
-        assert text in section
-    assert ('Reference 1 ' + reference('1')['raw_reference'] + ' Academic Practice ' + CLOSE
-            + ' “the student wrote these other words about lectures”') in appendix
-    assert not any(term in appendix for term in INTERNALS)
-
-
 def test_interactive_export_keeps_patchwriting_in_the_citation_window_without_internals(export_store):
     from app.services.interactive_report_export import build_interactive_report_html
     _, _, _, _, view, paper = export_store

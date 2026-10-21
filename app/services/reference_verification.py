@@ -1,7 +1,7 @@
 """Whether the application could confirm that a cited work exists.
 
 Owner-approved 2026-09-24 as `reference-verification-v1`; the current policy is
-v2 (2026-09-29/30, see POLICY). This replaces the
+v3 (2026-10-12, see POLICY). This replaces the
 former "potentially fabricated" review flag. The application cannot decide
 fabrication; it can say, truthfully, that the searches suited to the kind of
 work did not locate it. That statement is an Evidence finding, not an Academic
@@ -26,6 +26,7 @@ import hashlib
 import json
 import re
 
+from app.services.search.policy import REQUIRED_WEB_PROVIDER_NAMES
 from app.services.reference_review_scope import text_key
 from app.services.source_type import is_bibliographically_searchable, normalize_source_kind
 
@@ -34,8 +35,16 @@ from app.services.source_type import is_bibliographically_searchable, normalize_
 # Books title searches) and 2026-10-01 (a required web provider skipped by our
 # own budget leaves the search incomplete). v1 values stay readable; nothing
 # parses this string back.
-POLICY = 'reference-verification-v2'
-POLICY_VERSIONS = ('reference-verification-v1', POLICY)
+# v3 (owner decision 2026-10-12): a likely other-language work, a candidate
+# whose title could not be compared across writing systems and a supplied link
+# that answered with unreadable text stay neutral, and a web page confirmed by
+# discovery is verified whatever its link check says. A likely other-language
+# work can be found unverifiable only after its native-script route
+# (native-script-route-v1) completed; a failed or unattempted route stays
+# neutral, and that route's searches neither complete nor fail the ordinary
+# required routes.
+POLICY = 'reference-verification-v4'
+POLICY_VERSIONS = ('reference-verification-v1', 'reference-verification-v2', 'reference-verification-v3', POLICY)
 FINDING_TYPE = 'unverified_reference'
 LABEL = 'Cannot be verified'
 # Owner wording 2026-09-30.
@@ -57,7 +66,7 @@ REQUIRED_ADAPTERS = {
     'thesis': ('openalex', 'crossref', 'datacite'),
     'unknown': ('openalex', 'crossref', 'datacite'),
 }
-WEB_PROVIDERS = frozenset({'brave', 'exa'})
+WEB_PROVIDERS = REQUIRED_WEB_PROVIDER_NAMES
 BOOK_CATALOGUES = frozenset({'google_books', 'open_library', 'internet_archive'})
 COMPLETED_ROUTE = frozenset({'no_match', 'candidate_found', 'candidates_processed'})
 COMPLETED_QUERY = frozenset({'results', 'no_results'})
@@ -70,7 +79,7 @@ CONFIRMED = frozenset({'confirmed', 'confirmed_with_minor_differences'})
 PROVIDER_NAMES = {
     'crossref': 'Crossref', 'openalex': 'OpenAlex', 'datacite': 'DataCite',
     'google_books': 'Google Books', 'open_library': 'Open Library',
-    'brave': 'Brave Search', 'exa': 'Exa',
+    'brave': 'Brave Search', 'exa': 'Exa', 'deepseek': 'DeepSeek Search',
 }
 
 
@@ -120,6 +129,54 @@ def registered_unread_doi(reference, discovery: dict | None, link_observations) 
     if found.group(1) and issue.isdigit() and int(found.group(1)) != int(issue):
         return 'registered'
     return 'agrees'
+
+
+# Reasons that mean every search suited to the kind completed without
+# locating the work; the neutral ones withhold the finding for a reason the
+# searches could not overcome (reference-verification-v3).
+COMPLETED_WITHOUT_MATCH_REASONS = frozenset({
+    'suited_searches_completed_without_match', 'cross_script_candidate_unresolved',
+    'other_language_route_not_searched', 'submitted_link_unreadable',
+})
+
+# Moved to app/services/other_language.py so discovery can trigger the
+# native-script route (native-script-route-v1); re-exported here.
+from app.services.other_language import (  # noqa: E402
+    CJK as _CJK, other_language_signals, split_cited_title,
+)
+
+
+NATIVE_SCRIPT_ROUTE_POLICIES = ('native-script-route-v1',)
+
+
+def _native_script_route_state(discovery: dict) -> str:
+    """'completed', 'incomplete' or 'not_searched' for the work's own script.
+
+    A recorded native-script route (`native-script-route-v1`) decides: only a
+    route whose adapter and web searches completed counts; a route that failed,
+    was skipped by a budget or had no query text stays incomplete. Without a
+    route record, a reference cited in its own script was searched in that
+    script by the ordinary route when a completed query carries Han, kana or
+    Hangul.
+    """
+    route = discovery.get('native_script_route')
+    if isinstance(route, dict) and route.get('policy_version') in NATIVE_SCRIPT_ROUTE_POLICIES:
+        return 'completed' if route.get('status') == 'completed' else 'incomplete'
+    if any(q.get('execution_outcome') in COMPLETED_QUERY and _CJK.search(str(q.get('normalized_query') or ''))
+           for q in discovery.get('queries') or []):
+        return 'completed'
+    return 'not_searched'
+
+
+def _link_unreadable(discovery: dict, link_observations) -> bool:
+    """A supplied link answered, but no readable text could be taken from it."""
+    if any(a.get('reason_code') == 'link_text_unreadable' for a in discovery.get('attempts') or []):
+        return True
+    return any(isinstance(request, dict) and request.get('outcome') == 'response'
+               and isinstance(request.get('http_status'), int) and 200 <= request['http_status'] < 300
+               and request.get('page_observation') == 'readable_text_unavailable'
+               for row in link_observations or [] if isinstance(row, dict)
+               for request in row.get('requests') or [])
 
 
 def _outcomes(candidate: dict) -> dict:
@@ -216,6 +273,14 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
         # title cut short by parsing ("Party Dominance vs", Hao, 2026-10-06),
         # whatever the author's name order.
         return True
+    if (outcomes.get('author') in {'agreement', 'minor_difference'} and outcomes.get('year') == 'agreement'
+            and len(cited_words) >= 4 and observed_words[:len(cited_words)] == cited_words):
+        # The same author and year, the cited title (four words or more, read
+        # word by word so an unspaced dash separates words) the start of the
+        # record's: a title cut before its part or subtitle ("English in higher
+        # education–English medium" for "… English medium. Part 1: Literature
+        # review", Curle 2020, the long article, 2026-10-08).
+        return True
     if (outcomes.get('author') in {'agreement', 'minor_difference'}
             and candidate.get('provider') in BOOK_CATALOGUES | {'crossref', 'openalex'}
             and _same_main_title(expected.get('title'), observed)):
@@ -228,56 +293,7 @@ def _possible_match(candidate: dict, expected: dict | None = None) -> bool:
     return candidate.get('provider') == 'web_search' and _page_title_matches(expected, observed)
 
 
-# Structured title parameters: Crossref `query.title`, OpenAlex `title.search`
-# (as a parameter or inside `filter`).
-_TITLE_PARAMETERS = ('query.title', 'title.search')
-# A parameter or path that confines the search to one journal or source. A
-# title query inside one journal cannot show that the work is absent from the
-# index, so it never satisfies the title-led requirement by itself.
-_SCOPE_MARKERS = ('/journals/', 'issn:', 'container-title', 'primary_location.source', 'locations.source',
-                  'host_venue', 'source.id', 'journal')
-
-
-def _structured_query(text: str) -> dict | None:
-    """Parse a recorded structured request: JSON ``{path, params}`` or ``k=v&...``."""
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict):
-        params = parsed.get('params') if isinstance(parsed.get('params'), dict) else parsed
-        return {'path': str(parsed.get('path') or ''), 'params': {str(k): str(v) for k, v in params.items()}}
-    if '=' in text and not text.startswith(('title:', 'doi:', 'isbn:')):
-        from urllib.parse import parse_qsl, urlsplit
-        split = urlsplit(text)
-        return {'path': split.path, 'params': dict(parse_qsl(split.query or text))}
-    return None
-
-
-def _title_led(query: dict) -> bool:
-    """A query that searched the index by the cited title, not only an identifier.
-
-    The resolver records `title:<title> author:<author>`; journal discovery and
-    other structured requests record their parameters instead, so
-    `query.title` / `title.search` count too (reference-verification-v2). A
-    structured title query confined to one journal or source does not count.
-    """
-    text = str(query.get('normalized_query') or '')
-    # Google Books records its title search as `intitle:<title>`. Counted
-    # since 2026-09-30, together with the title-only fallback search and the
-    # tolerant book-title match that keep genuine books unflagged.
-    if text.startswith(('title:', 'intitle:')) or ' title:' in text or ' intitle:' in text:
-        return True
-    structured = _structured_query(text)
-    if structured is None:
-        return False
-    params = structured['params']
-    titled = any(key in params for key in _TITLE_PARAMETERS) or any(
-        f'{key}:' in params.get('filter', '') for key in _TITLE_PARAMETERS)
-    scoped = any(marker in structured['path'] for marker in _SCOPE_MARKERS) or any(
-        marker in f'{key}={value}' for key, value in params.items()
-        if key not in _TITLE_PARAMETERS for marker in _SCOPE_MARKERS)
-    return titled and not scoped
+from app.services.search_completion import _structured_query, _title_led  # noqa: E402,F401
 
 
 def assess_reference_verification(reference, discovery: dict | None, web_page_check: dict | None = None,
@@ -299,6 +315,11 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         if web_page_check.get('archive') == 'matched':
             result.update(status='verified', reason_code='archived_page_confirmed')
             return result
+        if isinstance(discovery, dict) and discovery.get('outcome') in CONFIRMED:
+            # Discovery confirmed the work (a student link named it across
+            # writing systems, 2026-10-12): the link check cannot undo that.
+            result.update(status='verified', reason_code=discovery['outcome'])
+            return result
         if web_page_check.get('link') == 'near':
             # The linked page carries nearly the cited title: shown, never flagged.
             result.update(status='possible_match', reason_code='submitted_page_near_title')
@@ -312,6 +333,14 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
     expected = discovery.get('expected') or {}
     kind = normalize_source_kind(expected.get('source_kind') or getattr(reference, 'source_kind', None))
     result['source_kind'] = kind
+    archive_page = discovery.get('periodical_archive_match') or {}
+    if archive_page.get('page_id'):
+        # A digitised magazine page shows the article (media-history-archive-v1):
+        # shown as a possible match and never flagged (2026-10-16).
+        result.update(status='possible_match', reason_code='periodical_archive_page_located',
+                      archive_page={k: archive_page.get(k) for k in
+                                    ('page_id', 'publication', 'volume_dates', 'read_url', 'excerpt')})
+        return result
     if not web_rule and not is_bibliographically_searchable(kind):
         result['reason_code'] = 'not_held_by_academic_indexes'
         return result
@@ -331,9 +360,16 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         result.update(status='container_located', reason_code='containing_work_located',
                       containing_work={k: container.get(k) for k in ('title', 'authors', 'year', 'provider')})
         return result
-    if container.get('outcome') == 'possible_match':
+    responsibility = container.get('responsibility') or {}
+    title_page_found = bool(responsibility.get('statements')
+                            and responsibility.get('classification') in {'single_authored', 'edited'})
+    if container.get('outcome') == 'possible_match' or title_page_found:
         # A possible match is shown but never flagged; that holds for the book
-        # a part names as much as for the part (Belton's 2026-09-27 rerun).
+        # a part names as much as for the part (Belton's 2026-09-27 rerun). A
+        # catalogue's title page for the book under its main title and the
+        # cited author also shows the book exists, though the search under the
+        # entry's own garbled title found nothing (Synthetic Embrace reference
+        # 10, owner decision 2026-10-18).
         result.update(status='possible_match', reason_code='containing_work_possible_match',
                       containing_work={k: container.get(k) for k in ('title', 'authors', 'year', 'provider')})
         return result
@@ -354,55 +390,49 @@ def assess_reference_verification(reference, discovery: dict | None, web_page_ch
         result['reason_code'] = 'cross_script_page_unresolved'
         return result
 
-    queries = {q.get('query_id'): q for q in discovery.get('queries') or []}
-    title = text_key(expected.get('title') or getattr(reference, 'title', '') or '')
-    completed, failed, web, self_skipped = set(), set(), set(), set()
-    for attempt in discovery.get('attempts') or []:
-        category, provider = attempt.get('route_category'), attempt.get('provider')
-        attempted = [queries[q] for q in attempt.get('query_ids') or [] if q in queries]
-        route_done = attempt.get('permitted') and attempt.get('completed_at') and attempt.get('outcome') in COMPLETED_ROUTE
-        if category == 'academic_adapter':
-            done = [q for q in attempted if q.get('execution_outcome') in COMPLETED_QUERY and _title_led(q)]
-            if route_done and done:
-                completed.add(provider)
-            elif (attempt.get('outcome') in {'operational_failure', 'unavailable', 'access_restricted'}
-                    and attempt.get('reason_code') != 'route_not_applicable'):   # declined, not failed
-                failed.add(provider)
-        elif category == 'bounded_web':
-            for q in attempted:
-                engine = q.get('execution_provider')
-                if engine not in WEB_PROVIDERS:
-                    continue
-                if (route_done and q.get('execution_outcome') in COMPLETED_QUERY
-                        and title and title in text_key(q.get('normalized_query'))):
-                    web.add(engine)
-                elif q.get('execution_outcome') not in COMPLETED_QUERY:
-                    failed.add(engine)
-                    if q.get('execution_outcome') in SELF_SKIPPED_QUERY:
-                        self_skipped.add(engine)
-    # A web page is held by web search, not by the scholarly indexes.
-    required = () if web_rule else required_adapters(kind)
-    missing = [p for p in required if p not in completed]
-    result.update(required_routes=list(required), completed_routes=sorted(completed & set(required)),
-                  web_routes=sorted(web))
-    if missing or not web:
-        result.update(status='search_incomplete',
-                      reason_code='required_route_incomplete' if missing else 'title_web_search_incomplete',
-                      incomplete_routes=missing + ([] if web else ['web search']),
-                      failed_routes=sorted(failed))
+    # One answer for every use (search-completion-v1, owner decisions 2026-10-19).
+    # The native-script route has its own completion; its searches neither
+    # complete nor fail the ordinary required routes.
+    from app.services.search_completion import assess_search_completion
+    native_attempts = set((discovery.get('native_script_route') or {}).get('attempt_ids') or [])
+    completion = assess_search_completion(
+        discovery, kind=kind, title=expected.get('title') or getattr(reference, 'title', '') or '',
+        web_rule=web_rule, exclude_attempt_ids=native_attempts)
+    result.update(required_routes=list(completion.required_routes),
+                  completed_routes=list(completion.completed_routes), web_routes=list(completion.web_routes))
+    if not completion.complete:
+        result.update(status='search_incomplete', reason_code=completion.reason_code,
+                      incomplete_routes=list(completion.incomplete_routes),
+                      failed_routes=list(completion.failed_routes))
         return result
-    budget_skipped = sorted(self_skipped - web)
-    if budget_skipped:
-        result.update(status='search_incomplete', reason_code='web_search_skipped_by_budget',
-                      incomplete_routes=[PROVIDER_NAMES[p] for p in budget_skipped],
-                      failed_routes=sorted(failed))
-        return result
+    required, web = completion.required_routes, set(completion.web_routes)
     doi_state = registered_unread_doi(reference, discovery, link_observations)
     if doi_state == 'agrees':
         result.update(status='possible_match', reason_code='registered_doi_agrees')
         return result
     if doi_state:
         result['reason_code'] = 'registered_doi_unread'
+        return result
+    # Owner decision 2026-10-12: searches that could not reach the work are
+    # no sign that it is missing. A candidate titled in another writing
+    # system that nothing compared, a work in another language that no search
+    # looked for in its own script, and a supplied link that answered with
+    # text that could not be read all leave the reference not assessed.
+    if any(c.get('field_name') == 'title' and c.get('reason_code') == 'cross_script_title_unresolved'
+           for candidate in candidates for c in candidate.get('comparisons') or []):
+        result['reason_code'] = 'cross_script_candidate_unresolved'
+        return result
+    signals = other_language_signals(reference)
+    native_state = _native_script_route_state(discovery) if signals else 'completed'
+    if native_state != 'completed':
+        # Only a completed search in the work's own script can stand behind
+        # the finding; a failed or unattempted one stays neutral (2026-10-12).
+        result.update(reason_code=('other_language_route_incomplete' if native_state == 'incomplete'
+                                   else 'other_language_route_not_searched'),
+                      other_language_signals=signals)
+        return result
+    if _link_unreadable(discovery, link_observations):
+        result['reason_code'] = 'submitted_link_unreadable'
         return result
     searched = [PROVIDER_NAMES.get(p, p) for p in required] + [PROVIDER_NAMES[p] for p in sorted(web)]
     finding = dict(
@@ -453,8 +483,10 @@ def same_title_author_difference(reference, discovery: dict | None) -> dict | No
                 candidate.get('provider') == 'web_search'
                 and _page_title_matches({'title': getattr(reference, 'title', '')}, observed.get('title'))):
             continue
+        from app.services.web_source_metadata import _label_only_author
         authors = [re.sub(r'^[\W_]+', '', str(a)).strip() for a in observed.get('authors') or []]
-        authors = [a for a in authors if a]
+        # Interface text or a search provider's name is no author (2026-10-21).
+        authors = [a for a in authors if a and not _label_only_author(a)]
         surnames = frozenset(s.casefold() for a in authors for s in extract_surnames(a))
         if not surnames:
             continue

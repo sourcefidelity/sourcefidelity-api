@@ -51,6 +51,29 @@ return target - now
 """
 
 
+# As _RESERVE, but books nothing when the slot is more than ARGV[3] ms away,
+# so a caller that will not wait never pushes later callers back.
+_RESERVE_WITHIN = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local nxt = tonumber(redis.call('GET', KEYS[1]) or '0')
+local start = math.max(now, nxt)
+if start - now > tonumber(ARGV[3]) then return -1 end
+redis.call('SET', KEYS[1], start + tonumber(ARGV[1]), 'PX', tonumber(ARGV[2]))
+return start - now
+"""
+# Take one of ARGV[1] in-flight places for ARGV[2] ms; expired places free themselves.
+_ACQUIRE_PLACE = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then return 0 end
+redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[3])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]) + 60000)
+return 1
+"""
+
+
 def _redis():
     global _client
     if not getattr(settings, "RETRIEVAL_SHARED_PACING_ENABLED", True):
@@ -124,3 +147,70 @@ def exclusive(provider: str, *, hold_seconds: float, wait_seconds: float):
                 lock.release()
             except redis.RedisError:
                 pass   # expired while held; the timeout already freed it
+
+
+def reserve_start_within(provider: str, interval_seconds: float, max_wait_seconds: float) -> float | None:
+    """Like `reserve_start`, but returns -1.0 and books nothing when the slot
+    is more than `max_wait_seconds` away."""
+    client = _redis()
+    if client is None:
+        return None
+    interval_ms = max(0, int(interval_seconds * 1000))
+    try:
+        wait_ms = client.eval(_RESERVE_WITHIN, 1, _PREFIX + provider + ":next", interval_ms,
+                              max(interval_ms * 4, 60_000), max(0, int(max_wait_seconds * 1000)))
+    except redis.RedisError as exc:
+        _disable(exc)
+        return None
+    return -1.0 if int(wait_ms) < 0 else int(wait_ms) / 1000
+
+
+def acquire_place(provider: str, limit: int, hold_seconds: float, token: str) -> bool | None:
+    """Take one of `limit` in-flight places shared by every process; None when
+    shared pacing is unavailable. A place expires after `hold_seconds`."""
+    client = _redis()
+    if client is None:
+        return None
+    try:
+        return bool(client.eval(_ACQUIRE_PLACE, 1, _PREFIX + provider + ":places", int(limit),
+                                max(1, int(hold_seconds * 1000)), token))
+    except redis.RedisError as exc:
+        _disable(exc)
+        return None
+
+
+def release_place(provider: str, token: str) -> None:
+    client = _redis()
+    if client is None:
+        return
+    try:
+        client.zrem(_PREFIX + provider + ":places", token)
+    except redis.RedisError as exc:
+        _disable(exc)
+
+
+def store_limits(provider: str, limits: dict, ttl_seconds: int = 86_400) -> None:
+    """Remember the limits a provider reported (numbers only) for every process."""
+    import json
+    client = _redis()
+    if client is None:
+        return
+    try:
+        client.set(_PREFIX + provider + ":limits", json.dumps(limits, sort_keys=True), ex=ttl_seconds)
+    except redis.RedisError as exc:
+        _disable(exc)
+
+
+def stored_limits(provider: str) -> dict | None:
+    import json
+    client = _redis()
+    if client is None:
+        return None
+    try:
+        raw = client.get(_PREFIX + provider + ":limits")
+        value = json.loads(raw) if raw else None
+    except (redis.RedisError, ValueError) as exc:
+        if isinstance(exc, redis.RedisError):
+            _disable(exc)
+        return None
+    return value if isinstance(value, dict) else None

@@ -13,7 +13,6 @@ from app.services.search.base import SearchResult
 def test_doi_queue_preserves_title_recovery_within_inspection_limit(monkeypatch, capacity):
     monkeypatch.setattr(settings, 'SEARCH_POLICY_VERSION', 'api-first-search-v2')
     monkeypatch.setattr(settings, 'BRAVE_SEARCH_TRANSIENT_ENABLED', True)
-    monkeypatch.setattr(settings, 'SEARCH_SEARXNG_FALLBACK_ENABLED', False)
     monkeypatch.setattr(settings, 'SEARCH_ESCALATION_MAX_CALLS', 'brave:3,exa:3')
     provider = Mock(name='brave', last_status='completed', last_cost_usd=None,
                     last_reason_code=None)
@@ -41,7 +40,6 @@ def test_doi_queue_preserves_title_recovery_within_inspection_limit(monkeypatch,
 def test_identifier_only_query_still_uses_available_capacity(monkeypatch):
     monkeypatch.setattr(settings, 'SEARCH_POLICY_VERSION', 'api-first-search-v2')
     monkeypatch.setattr(settings, 'BRAVE_SEARCH_TRANSIENT_ENABLED', True)
-    monkeypatch.setattr(settings, 'SEARCH_SEARXNG_FALLBACK_ENABLED', False)
     monkeypatch.setattr(settings, 'SEARCH_ESCALATION_MAX_CALLS', 'brave:3,exa:3')
     provider=Mock(name='brave',last_status='completed',last_cost_usd=None,last_reason_code=None)
     provider.name='brave'

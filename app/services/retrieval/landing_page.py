@@ -10,6 +10,9 @@ from app.services.retrieval.base import AcquisitionLocation, RepresentationKind
 
 _META_LOCATIONS = {
     "citation_pdf_url": (RepresentationKind.PDF, "application/pdf"),
+    # Digital Commons repositories (bepress) name their PDF this way
+    # (Television Without Frontiers, four law-review references, 2026-10-18).
+    "bepress_citation_pdf_url": (RepresentationKind.PDF, "application/pdf"),
     "citation_fulltext_html_url": (RepresentationKind.HTML, "text/html"),
     "citation_xml_url": (RepresentationKind.XML, "application/xml"),
 }

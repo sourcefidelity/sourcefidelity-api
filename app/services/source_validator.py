@@ -50,6 +50,11 @@ class ValidationResult:
     source_kind_verdict: str = "unknown"
     source_inspection: dict | None = None
     reason_code: str | None = None
+    # Fields the source itself showed (opening-byline-identity-v1); never
+    # filled from the citation. None when identity was never examined.
+    observed_identity: dict | None = None
+    # The opening byline names other people and none of the cited authors.
+    author_conflict: dict | None = None
 
 
 def validate_ocr_derivative_text(
@@ -115,7 +120,7 @@ def validate_ocr_derivative_text(
             source_kind_verdict=compatibility.verdict,
         )
 
-    identity = _check_identity_observations(
+    observation = _identity_observation(
         front_text, "", expected_doi, expected_title, expected_author,
         expected_year,
         prominent_title=any(_title_in_layout_spans(spans, height, expected_title or "")
@@ -123,6 +128,7 @@ def validate_ocr_derivative_text(
                                                   else [(_layout_spans or [], _layout_height)])[:3]),
         prominent_years=_document_years_in_lines(_layout_lines or [], _layout_height),
     )
+    identity = observation.confidence
     accept = identity == "high" and completeness == "complete"
     has_layout = _layout_spans is not None or bool(
         _layout_pages and any(spans for spans, _ in _layout_pages[:3])
@@ -141,6 +147,9 @@ def validate_ocr_derivative_text(
         page_count=page_count,
         observed_source_kind=observed_kind.kind,
         source_kind_verdict=compatibility.verdict,
+        observed_identity=observation.observed,
+        author_conflict=observation.author_conflict,
+        reason_code="opening_byline_author_conflict" if observation.author_conflict else None,
     )
 
 
@@ -340,11 +349,18 @@ def _validate_retrieved_pdf_deterministic(
 
     # Layer 2: Identity check — is this the RIGHT source?
     # (Now safe to run — text quality check confirmed text is extractable.)
-    identity = _check_identity(pdf_bytes, expected_doi, expected_title,
-                                expected_author, expected_year)
-    if identity != "high" and expected_kind.kind in {"monograph", "edited_collection"}:
+    observation = _check_identity_detail(pdf_bytes, expected_doi, expected_title,
+                                         expected_author, expected_year)
+    identity = observation.confidence
+    observed_identity = dict(observation.observed)
+    author_conflict = observation.author_conflict
+    if (identity != "high" and not author_conflict
+            and expected_kind.kind in {"monograph", "edited_collection"}):
         if _late_book_title_identity(pdf_bytes, expected_title, expected_author, expected_year):
             identity = "high"
+            # The fallback found the title, author and year on a title page.
+            observed_identity.update(title=expected_title, authors=[expected_author],
+                                     year=expected_year)
     if identity == "rejected":
         return ValidationResult(
             accept=False, identity_confidence="rejected",
@@ -352,7 +368,9 @@ def _validate_retrieved_pdf_deterministic(
             reason="The inspected front matter does not provide enough information "
                    "to establish this source's identity.",
             reason_code="identity_insufficient_observations",
+            observed_identity=observed_identity,
         )
+    conflict_code = "opening_byline_author_conflict" if author_conflict else None
 
     # Layer 3: Completeness — is this a full document?
     completeness = "skipped"
@@ -374,6 +392,9 @@ def _validate_retrieved_pdf_deterministic(
                 page_count=page_count,
                 reason="PDF appears incomplete (truncated, missing back matter, "
                        "or significantly shorter than expected).",
+                observed_identity=observed_identity,
+                author_conflict=author_conflict,
+                reason_code=conflict_code,
             )
 
     # Only high-confidence identity can be used automatically.  Medium/low
@@ -395,6 +416,9 @@ def _validate_retrieved_pdf_deterministic(
         + ", ".join(reasons),
         observed_source_kind=observed_kind.kind,
         source_kind_verdict=kind_compatibility.verdict,
+        observed_identity=observed_identity,
+        author_conflict=author_conflict,
+        reason_code=conflict_code,
     )
 
 
@@ -514,7 +538,7 @@ def _has_prominent_front_title_support(
                 ]
                 if not spans:
                     continue
-                if _title_in_layout_spans(spans, float(page.rect.height), title,
+                if _title_in_layout_spans(spans, float(page.rect.height), expected_title or "",
                                           title_zone=title_zone):
                     return True
         finally:
@@ -537,7 +561,19 @@ def _title_in_layout_spans(spans: list[dict], height: float, title: str,
         if float(span["bbox"][1]) <= height * title_zone
         or (display_type and float(span.get("size", 0.0)) >= max_size - 0.1)
     )
-    return _normalize_identity_text(title) in _normalize_identity_text(prominent)
+    from app.services import cross_language_identity as cross_language
+    if cross_language.applies_to_text(title, prominent):
+        # A romanised cited title against a Han-script title zone, read
+        # character by character (cross-language-identity-v1).
+        return cross_language.romanised_title_in_text(title, prominent)
+    normalized = _normalize_identity_text(title)
+    if " " not in normalized:
+        # A one-word title ("Introduction") is prominent only as a whole line,
+        # never as a word inside a longer title.
+        return any(_normalize_identity_text(span["text"]) == normalized for span in spans
+                   if float(span["bbox"][1]) <= height * title_zone
+                   or (display_type and float(span.get("size", 0.0)) >= max_size - 0.1))
+    return normalized in _normalize_identity_text(prominent)
 
 
 def _explicit_first_page_document_years(pdf_bytes: bytes) -> set[str]:
@@ -677,6 +713,18 @@ def _detect_nonwork_listing(
             and len(re.findall(r'https?://', front_text[:12000])) >= 3):
         return "a download/catalog listing"
 
+    # A bibliographic index's record of a work (2026-10-13): its abstract,
+    # "References listed on", "Most related items", "Download full text from
+    # publisher". Several such standalone headings make it a record, not a text.
+    # Callers may pass whitespace-compacted text, so phrases, not lines.
+    index_headings = {
+        heading.casefold() for heading in re.findall(
+            r'(?i)\b(references listed on \w+|most related items|more about this item|'
+            r'download full text from publisher|access and download statistics)\b',
+            front_text[:60000])}
+    if len(index_headings) >= 3:
+        return "a bibliographic index record"
+
     # A repository metadata export reproduces a work's exact title and authors
     # as labelled fields. It is a record about the work, never the work's text.
     # Require several distinct Dublin Core element labels so that ordinary
@@ -765,11 +813,261 @@ def _detect_nonwork_listing(
     return None
 
 
+# ── Opening byline (opening-byline-identity-v1) ─────────────────────────
+#
+# A cited surname found anywhere in the first pages used to earn the full
+# author weight. A same-titled bank note whose byline named two other people
+# reached `high` because the cited author appeared only in its footnote as a
+# cited source. Author credit now comes only from the opening title block: the
+# lines around the visible title, where a byline sits, never footnotes,
+# references or body text further down the page.
+
+OPENING_BYLINE_POLICY = "opening-byline-identity-v1"
+_OPENING_LINES_BEFORE_TITLE = 12
+_OPENING_LINES_AFTER_TITLE = 12
+_OPENING_LINES_WITHOUT_TITLE = 15
+_TITLE_LINE_WINDOW = 6
+_TITLE_SEARCH_LINES = 200
+_NAME_LINE_LOOKAHEAD = 3
+
+# Words that mark an organisational author or a non-name line. A cited
+# organisation is never contradicted by a personal byline.
+_ORGANISATION_WORDS = frozenset({
+    "academy", "agency", "association", "authority", "bank", "board", "bureau",
+    "centre", "center", "college", "commission", "committee", "company",
+    "corporation", "council", "department", "division", "federation", "fund",
+    "foundation", "government", "group", "inc", "institute", "institution",
+    "laboratory", "league", "limited", "ltd", "ministry", "museum", "network",
+    "office", "organisation", "organization", "panel", "parliament", "press",
+    "programme", "program", "project", "service", "services", "society",
+    "school", "secretariat", "team", "trust", "union", "university",
+    "journal", "review", "note", "notes", "paper", "report", "bulletin",
+    "series", "economic", "economics", "research", "policy", "studies",
+})
+_NAME_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "in", "on", "for", "to", "from", "with", "at",
+    "into", "towards", "toward", "between", "under", "over", "after", "before",
+    "beyond", "versus", "vs", "through", "about", "against", "among", "without",
+    "is", "are", "was", "how", "why", "what", "when", "where", "who", "new",
+    "abstract", "summary", "introduction", "contents", "chapter", "volume",
+    "issue", "edition", "page", "pages", "january", "february", "march",
+    "april", "may", "june", "july", "august", "september", "october",
+    "november", "december", "spring", "summer", "autumn", "fall", "winter",
+    "edited", "editor", "editors", "eds", "ed", "prepared", "written",
+    "translated", "foreword", "preface", "copyright", "published", "draft",
+    "working", "key", "points", "highlights", "executive",
+})
+
+
+@dataclass(frozen=True)
+class IdentityObservation:
+    """Identity confidence plus what the source itself showed."""
+    confidence: str
+    observed: dict
+    author_conflict: dict | None = None
+
+
+def _opening_zone(front_text: str, expected_title: str | None) -> tuple[list[str], int | None]:
+    """Return the title block lines and the index of the title's last line.
+
+    The zone is the lines just above the visible cited title plus a bounded
+    run below it, where a byline, date and affiliation sit. Without a located
+    title it is the opening lines of the first page only.
+    """
+    lines = [line.strip() for line in (front_text or "").splitlines() if line.strip()]
+    title = _normalize_identity_text(expected_title or "")
+    if len(title) >= 10:
+        for start in range(min(len(lines), _TITLE_SEARCH_LINES)):
+            joined = ""
+            for end in range(start, min(start + _TITLE_LINE_WINDOW, len(lines))):
+                joined = f"{joined} {_normalize_identity_text(lines[end])}".strip()
+                if title in joined:
+                    first = max(0, start - _OPENING_LINES_BEFORE_TITLE)
+                    return (lines[first:end + 1 + _OPENING_LINES_AFTER_TITLE], end - first)
+                if len(joined) > len(title) + 200:
+                    break
+    return lines[:_OPENING_LINES_WITHOUT_TITLE], None
+
+
+_AUTHOR_NOTE_HEADING = re.compile(
+    r"^(?:mini[\s-]?bio(?:graphy)?|about the (?:authors?|contributors?)|authors?'?\s*biograph(?:y|ies)"
+    r"|biographical (?:note|statement)s?|notes? on (?:the )?contributors?)\s*:?\s*$",
+    re.IGNORECASE)
+_AUTHOR_NOTE_LINES = 4
+# Affiliation and correspondence marks set against a name ("Quint1", "Moor*").
+_AFFILIATION_MARK = re.compile(r"(?<=[^\W\d_])(?:\d{1,2}|[*†‡§¶])+(?=[\s,;.]|$)", re.MULTILINE)
+
+
+def _without_affiliation_marks(text: str) -> str:
+    return _AFFILIATION_MARK.sub(" ", text)
+
+
+def _author_note_lines(front_text: str) -> list[str]:
+    """The lines under an author-note heading in the opening pages."""
+    lines = [line.strip() for line in (front_text or "").splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if _AUTHOR_NOTE_HEADING.match(line):
+            return lines[index + 1:index + 1 + _AUTHOR_NOTE_LINES]
+    return []
+
+
+def _name_identity_text(value: str) -> str:
+    """Identity text that keeps a hyphenated name one word ("Swinnerton-Dyer")."""
+    return _normalize_identity_text(re.sub(r"(?<=[^\W\d_])[-‐‑](?=[^\W\d_])", "", value))
+
+
+def _contains_name(normalized_text: str, name: str, normalize=_name_identity_text) -> bool:
+    name = normalize(name)
+    text = f" {normalized_text} "
+    return bool(name) and (f" {name} " in text or f" {name.replace(' ', '')} " in text)
+
+
+def _cited_author_segments(expected_author: str | None) -> list[str]:
+    """Split a cited author list into one string per person (the one splitter)."""
+    from app.services.relevance import author_segments
+    return author_segments(expected_author)
+
+
+def _segment_surname(segment: str) -> str:
+    if "," in segment:
+        return _normalize_identity_text(segment.split(",", 1)[0])
+    tokens = segment.split()
+    return _normalize_identity_text(tokens[-1]) if tokens else ""
+
+
+def _cited_personal_surnames(expected_author: str | None) -> list[str]:
+    """Surnames of a cited list of people; empty for an organisation."""
+    value = " ".join(str(expected_author or "").split())
+    if not value:
+        return []
+    words = {word.casefold() for word in re.findall(r"[^\W\d_]+", value)}
+    if words & _ORGANISATION_WORDS:
+        return []
+    personal = bool(re.search(r"[^\W\d_][\w'’\-]*,\s*[^\W\d_]", value))
+    if not personal:
+        tokens = value.split()
+        personal = (2 <= len(tokens) <= 4
+                    and all(token[:1].isupper() for token in tokens)
+                    and not any(token.casefold().strip(".") in _NAME_STOPWORDS
+                                for token in tokens))
+    if not personal:
+        return []
+    surnames = [_segment_surname(segment) for segment in _cited_author_segments(value)]
+    return [surname for surname in dict.fromkeys(surnames) if len(surname) >= 3]
+
+
+def _explicit_opening_byline(opening_text: str, metadata_author: str | None) -> str:
+    """Shared explicit opening byline rule (identity-only-pdf-metadata-v1).
+
+    Embedded author metadata counts only when the opening text repeats it;
+    otherwise only an explicit "By ..." line is a byline. Returns "" when the
+    opening shows neither.
+    """
+    author = " ".join(str(metadata_author or "")[:300].split())
+    if author and _normalize_identity_text(author) and (
+            _normalize_identity_text(author) in _normalize_identity_text(opening_text)):
+        return author
+    match = re.search(r"(?im)^by[ \t]+([^\n]{3,150})$", opening_text)
+    return match.group(1).strip() if match else ""
+
+
+def _byline_names(text: str) -> list[str]:
+    cleaned = re.sub(r"[\d*†‡§¹²³⁴⁵⁶⁷⁸⁹⁰]+", " ", text)
+    parts = re.split(r",|;|&|\band\b", cleaned)
+    return [" ".join(part.split()) for part in parts
+            if len(re.findall(r"[^\W\d_]+", part)) >= 2][:8]
+
+
+def _personal_name_line(line: str, title_words: set[str]) -> list[str]:
+    """Two or more personal names alone on one line, or nothing.
+
+    Deliberately narrow: a subtitle, date, section heading or organisation
+    line is never read as a byline. A single unlabelled name is not enough.
+    """
+    if len(line) > 120 or re.search(r"\d{2,}|@|https?:|www\.", line):
+        return []
+    cleaned = re.sub(r"[\d*†‡§¹²³⁴⁵⁶⁷⁸⁹⁰]+", " ", line)
+    parts = [part.strip() for part in re.split(r",|;|&|\band\b", cleaned) if part.strip()]
+    names = []
+    for part in parts:
+        tokens = part.split()
+        if not 2 <= len(tokens) <= 4:
+            return []
+        for token in tokens:
+            bare = token.strip(".")
+            if (not token[:1].isupper()
+                    or not all(ch.isalpha() or ch in ".'’-" for ch in token)
+                    or bare.casefold() in _NAME_STOPWORDS
+                    or bare.casefold() in _ORGANISATION_WORDS
+                    or (len(bare) >= 4 and _normalize_identity_text(bare) in title_words)):
+                return []
+        names.append(" ".join(tokens))
+    return names if len(names) >= 2 else []
+
+
+def _opening_byline(zone: list[str], title_end: int | None, expected_title: str | None,
+                    metadata_author: str | None) -> tuple[list[str], str | None]:
+    """Names in an explicit opening byline, and how they were found."""
+    opening = "\n".join(zone)
+    explicit = _explicit_opening_byline(opening, metadata_author)
+    if explicit:
+        basis = "metadata_author" if metadata_author and explicit == " ".join(
+            str(metadata_author)[:300].split()) else "explicit_by_line"
+        return _byline_names(explicit), basis
+    if title_end is not None:
+        title_words = set(_normalize_identity_text(expected_title or "").split())
+        for line in zone[title_end + 1:title_end + 1 + _NAME_LINE_LOOKAHEAD]:
+            names = _personal_name_line(line, title_words)
+            if names:
+                return names, "name_line_below_title"
+    return [], None
+
+
+def _author_observation(front_text: str, metadata_author: str | None,
+                        expected_title: str | None, expected_author: str | None,
+                        full_text_identity: str) -> tuple[bool, list[str], dict | None, list[str]]:
+    """Author credit, credited cited authors, byline conflict and byline names."""
+    if not expected_author:
+        return False, [], None, []
+    zone, title_end = _opening_zone(front_text, expected_title)
+    # An author note ("Mini Bio", "About the author") names the writer of a
+    # manuscript that has no byline; it counts with the title block.
+    zone_identity = _name_identity_text(
+        _without_affiliation_marks("\n".join([*zone, *_author_note_lines(front_text)])))
+    first = _normalize_identity_text(_identity_surname(expected_author))
+    personal = _cited_personal_surnames(expected_author)
+    names, basis = _opening_byline(zone, title_end, expected_title, metadata_author)
+    if personal:
+        credited = len(first) >= 3 and _contains_name(zone_identity, first)
+        segments = [segment for segment in _cited_author_segments(expected_author)
+                    if len(_segment_surname(segment)) >= 3
+                    and _contains_name(zone_identity, _segment_surname(segment))]
+        conflict = None
+        if names and not any(_contains_name(zone_identity, surname) for surname in personal):
+            conflict = {"policy": OPENING_BYLINE_POLICY, "field": "author",
+                        "basis": basis, "observed_authors": names}
+        all_segments = [segment for segment in _cited_author_segments(expected_author)
+                        if len(_segment_surname(segment)) >= 3]
+        authors = ([expected_author] if credited and len(segments) == len(all_segments)
+                   else segments if credited else [])
+        return credited, authors, conflict, names
+    # An organisation is named in headers, footers and copyright lines as
+    # often as in a title block; its whole name anywhere in the opening pages
+    # still counts, and a personal byline never contradicts it.
+    full = _normalize_identity_text(expected_author)
+    credited = bool(
+        (len(first) >= 3 and _contains_name(zone_identity, first))
+        or (len(full) >= 3 and _contains_name(full_text_identity, full, _normalize_identity_text))
+    )
+    return credited, [expected_author] if credited else [], None, names
+
+
 def _visible_identity_support_count(
     front_text: str,
     expected_title: str | None,
     expected_author: str | None,
     expected_year: str | None,
+    metadata_author: str | None = None,
 ) -> int:
     """Count independent visible front-matter support for embedded metadata."""
     normalized = _normalize_identity_text(front_text)
@@ -784,11 +1082,23 @@ def _visible_identity_support_count(
             matches = sum(token in normalized for token in title_tokens)
             support += int(matches / len(title_tokens) >= 0.6)
     if expected_author:
-        surname = _normalize_identity_text(_identity_surname(expected_author))
-        support += int(bool(surname and len(surname) >= 3 and surname in normalized))
+        support += int(_author_observation(front_text, metadata_author, expected_title,
+                                           expected_author, normalized)[0])
     if expected_year:
         support += int(expected_year in front_text)
     return support
+
+
+def _extract_pdf_metadata_author(pdf_bytes: bytes) -> str:
+    """The embedded author field alone, bounded; empty when unreadable."""
+    try:
+        import fitz
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+            return str((document.metadata or {}).get("author") or "")[:300]
+    except Exception:
+        return ""
+
 
 def _check_identity(
     pdf_bytes: bytes,
@@ -805,13 +1115,25 @@ def _check_identity(
 
     Returns: "high" | "medium" | "low" | "rejected"
     """
+    return _check_identity_detail(pdf_bytes, expected_doi, expected_title,
+                                  expected_author, expected_year).confidence
+
+
+def _check_identity_detail(
+    pdf_bytes: bytes,
+    expected_doi: Optional[str],
+    expected_title: Optional[str],
+    expected_author: Optional[str],
+    expected_year: Optional[str],
+) -> IdentityObservation:
     front_text = _extract_pdf_front_text(pdf_bytes)
     identity_metadata = _extract_pdf_identity_metadata(pdf_bytes)
-    return _check_identity_observations(
+    return _identity_observation(
         front_text, identity_metadata, expected_doi, expected_title,
         expected_author, expected_year,
         prominent_title=_has_prominent_front_title_support(pdf_bytes, expected_title),
         prominent_years=_explicit_first_page_document_years(pdf_bytes),
+        metadata_author=_extract_pdf_metadata_author(pdf_bytes) if identity_metadata else "",
     )
 
 
@@ -825,33 +1147,76 @@ def _check_identity_observations(
     *,
     prominent_title: bool,
     prominent_years: set[str],
+    metadata_author: str | None = None,
 ) -> str:
+    """Shared native/OCR identity policy; callers supply only observed signals."""
+    return _identity_observation(
+        front_text, identity_metadata, expected_doi, expected_title,
+        expected_author, expected_year, prominent_title=prominent_title,
+        prominent_years=prominent_years, metadata_author=metadata_author,
+    ).confidence
+
+
+def _identity_observation(
+    front_text: str,
+    identity_metadata: str,
+    expected_doi: Optional[str],
+    expected_title: Optional[str],
+    expected_author: Optional[str],
+    expected_year: Optional[str],
+    *,
+    prominent_title: bool,
+    prominent_years: set[str],
+    metadata_author: str | None = None,
+) -> IdentityObservation:
     """Shared native/OCR identity policy; callers supply only observed signals.
 
     Layout absence is not title prominence. This internal scorer neither
     authorizes source access nor decides completeness, readability or admission.
     Representation-level listing/type guards remain in the consolidated entries.
+    The returned observation holds only fields this source itself showed.
     """
     text = f"{front_text}\n{identity_metadata}"[:24000]
 
     if not text.strip():
-        return "rejected"
+        return IdentityObservation("rejected", {"policy": OPENING_BYLINE_POLICY})
+    from app.services import cross_language_identity as cross_language
+    if not expected_doi and cross_language.applies_to_text(expected_title, text):
+        return _cross_language_identity_observation(
+            front_text, identity_metadata, expected_title, expected_author, expected_year,
+            prominent_title=prominent_title, prominent_years=prominent_years)
 
     text_identity = _normalize_identity_text(text)
+    author_match, observed_authors, author_conflict, byline = _author_observation(
+        front_text, metadata_author, expected_title, expected_author, text_identity,
+    )
+    year_match = bool(expected_year and expected_year in text)
+    doi_in_front = bool(expected_doi and expected_doi.lower() in front_text.lower())
+
+    def observed(title_seen: bool) -> dict:
+        return {
+            "policy": OPENING_BYLINE_POLICY,
+            "title": expected_title if title_seen else None,
+            "authors": observed_authors,
+            "year": expected_year if year_match else None,
+            "doi": expected_doi if doi_in_front else None,
+            "byline": byline,
+        }
 
     # ── DOI match (definitive — unique identifier) ──
     if expected_doi:
         normalized_doi = expected_doi.lower()
-        if normalized_doi in front_text.lower():
-            return "high"
+        if doi_in_front:
+            return IdentityObservation("high", observed(prominent_title), author_conflict)
         if (
             normalized_doi in identity_metadata.lower()
             and _visible_identity_support_count(
-                front_text, expected_title, expected_author, expected_year
+                front_text, expected_title, expected_author, expected_year,
+                metadata_author,
             )
             >= 2
         ):
-            return "high"
+            return IdentityObservation("high", observed(prominent_title), author_conflict)
 
     # ── Multi-field triangulation ──
     # Collect signals from each available field
@@ -879,7 +1244,8 @@ def _check_identity_observations(
             not title_exact
             and title_in_metadata
             and _visible_identity_support_count(
-                front_text, expected_title, expected_author, expected_year
+                front_text, expected_title, expected_author, expected_year,
+                metadata_author,
             )
             >= 2
         ):
@@ -898,20 +1264,14 @@ def _check_identity_observations(
     elif title_fuzzy:
         signals.append(("title_fuzzy", 1))
 
-    # Signal 2: Author surname
-    author_match = False
-    if expected_author:
-        # Shared convention: "Croteau, D." or "Jane Smith" supplies a surname.
-        author_raw = _identity_surname(expected_author)
-        surname = _normalize_identity_text(author_raw)
-        if surname and len(surname) >= 3 and surname in text_identity:
-            author_match = True
-            signals.append(("author", 2))
+    # Signal 2: Author surname, credited only in the opening title block
+    # (opening-byline-identity-v1). A surname in a footnote, the references or
+    # the body is a cited source, not this document's author.
+    if author_match:
+        signals.append(("author", 2))
 
     # Signal 3: Year
-    year_match = False
-    if expected_year and expected_year in text:
-        year_match = True
+    if year_match:
         signals.append(("year", 1))
 
     # ── Scoring: require triangulation (2+ signals) for acceptance ──
@@ -927,13 +1287,116 @@ def _check_identity_observations(
     )
 
     if total_score >= 5:  # e.g., title_exact(3) + author(2) = 5
-        return "medium" if visible_year_conflict else "high"
+        confidence = "medium" if visible_year_conflict else "high"
     elif total_score >= 3:  # e.g., title_exact(3) alone, or title_fuzzy(1) + author(2)
-        return "medium"
+        confidence = "medium"
     elif total_score >= 2:  # e.g., author(2) alone, or title_fuzzy(1) + year(1)
-        return "low"
+        confidence = "low"
     else:
-        return "rejected"
+        confidence = "rejected"
+    if author_conflict and confidence == "high":
+        # The opening byline names other people and none of the cited authors.
+        confidence = "medium"
+    return IdentityObservation(confidence, observed(title_exact), author_conflict)
+
+# The title block of a Han-script document: title, byline, affiliation.
+_CROSS_LANGUAGE_OPENING_LINES = 30
+
+
+def _cross_language_identity_observation(
+    front_text: str,
+    identity_metadata: str,
+    expected_title: str | None,
+    expected_author: str | None,
+    expected_year: str | None,
+    *,
+    prominent_title: bool,
+    prominent_years: set[str],
+) -> IdentityObservation:
+    """A romanised citation of a Han-script document (cross-language-identity-v1).
+
+    The same triangulation as the ordinary scorer, read across writing
+    systems: the cited romanised title shown prominently (title zone or
+    display type, read character by character) is the title signal; a Han
+    byline name in the opening lines that reads as a cited surname with the
+    cited initial is the author signal (opening-byline-identity-v1 with
+    romanised names); the year as usual. Only fields the document showed are
+    reported. A plain occurrence of the title elsewhere supports, never decides.
+    """
+    from app.services import cross_language_identity as cross_language
+    lines = [line.strip() for line in (front_text or "").splitlines() if line.strip()]
+    opening = lines[:_CROSS_LANGUAGE_OPENING_LINES]
+    credited, names = cross_language.credited_people(expected_author, opening)
+    people = cross_language.cited_people(expected_author)
+    text = f"{front_text}\n{identity_metadata}"[:24000]
+    year_match = bool(expected_year and expected_year in text)
+    title_fuzzy = cross_language.romanised_title_in_text(expected_title, text)
+    signals = (3 if prominent_title else 1 if title_fuzzy else 0) + (2 if credited else 0) + (1 if year_match else 0)
+    visible_year_conflict = bool(expected_year and prominent_years and expected_year not in prominent_years)
+    confidence = ("medium" if visible_year_conflict else "high") if signals >= 5 else \
+        "medium" if signals >= 3 else "low" if signals >= 2 else "rejected"
+    conflict = None
+    if names and people and not credited:
+        conflict = {"policy": OPENING_BYLINE_POLICY, "field": "author", "basis": "han_name_line",
+                    "observed_authors": names[:8], "method": cross_language.VERSION}
+        if confidence == "high":
+            confidence = "medium"
+    authors = ([expected_author] if credited and len(credited) == len(people)
+               else [f"{surname.title()}, {initials[:1].upper()}." if initials else surname.title()
+                     for surname, initials in credited])
+    return IdentityObservation(confidence, {
+        "policy": OPENING_BYLINE_POLICY,
+        "method": cross_language.VERSION,
+        "title": expected_title if prominent_title else None,
+        "authors": authors,
+        "year": expected_year if year_match else None,
+        "doi": None,
+        "byline": names[:8],
+    }, conflict)
+
+
+_TEXT_OPENING_LINES = 40
+_TEXT_OPENING_CHARS = 6000
+
+
+def observe_text_identity(
+    text: str,
+    *,
+    expected_doi: str | None = None,
+    expected_title: str | None = None,
+    expected_author: str | None = None,
+    expected_year: str | None = None,
+) -> dict:
+    """Fields a stored text representation itself shows in its opening.
+
+    For reuse of an admitted non-PDF representation (opening-byline-identity-v1):
+    a field is reported only when the opening of the text shows it -- the cited
+    title among the opening lines, a cited surname in the title block, the
+    cited year or DOI in the opening. Nothing is filled from the citation, so
+    an unobserved field stays None and cannot agree with the reference.
+    """
+    opening = "\n".join((text or "")[:_TEXT_OPENING_CHARS].splitlines()[:_TEXT_OPENING_LINES])
+    normalized = _normalize_identity_text(opening)
+    title = _normalize_identity_text(expected_title or "")
+    title_seen = len(title) >= 10 and title in normalized
+    _credited, authors, _conflict, byline = _author_observation(
+        opening, None, expected_title if title_seen else None, expected_author, normalized)
+    from app.services import cross_language_identity as cross_language
+    if not title_seen and cross_language.applies_to_text(expected_title, opening):
+        # A romanised citation of a Han-script text (cross-language-identity-v1).
+        title_seen = cross_language.romanised_title_in_text(expected_title, opening)
+        credited, byline = cross_language.credited_people(expected_author, opening.split())
+        people = cross_language.cited_people(expected_author)
+        authors = [expected_author] if credited and len(credited) == len(people) else []
+    return {
+        "policy": OPENING_BYLINE_POLICY,
+        "basis": "text_opening",
+        "title": expected_title if title_seen else None,
+        "authors": authors,
+        "year": expected_year if expected_year and expected_year in opening else None,
+        "doi": expected_doi if expected_doi and expected_doi.lower() in opening.lower() else None,
+        "byline": byline,
+    }
 
 
 def _identity_surname(author: str) -> str:

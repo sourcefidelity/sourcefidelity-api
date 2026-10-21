@@ -170,6 +170,8 @@ def record_report_check(session, backend, report, job) -> dict | None:
         outcome = {"version": CHECK_VERSION, "report_id": str(report.id), "passed": None,
                    "error": type(exc).__name__}
     try:
+        # Re-read under a lock: a refresh started meanwhile must keep its marker.
+        session.refresh(job, with_for_update=True)
         evidence = dict(job.upload_evidence or {})
         evidence["report_check"] = outcome
         job.upload_evidence = evidence

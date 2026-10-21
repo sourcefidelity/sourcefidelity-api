@@ -32,9 +32,12 @@ def case(*, alternative=True, completed=True):
     now = datetime.now(timezone.utc)
     for i,message in enumerate(messages):
         attempt_id = f'metadata-{i}'
-        query = message['DOI'] if i == 0 else ref.title
+        # The title search is recorded title-led, as the resolver records it
+        # (search-completion-v1 counts an index only through one).
+        query = message['DOI'] if i == 0 else f'title:{ref.title}'
         trace.queries.append(ReferenceSearchQuery(query_id=attempt_id, route_category='academic_adapter',
-            provider='crossref', normalized_query=query, query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            provider='crossref', execution_provider='crossref', normalized_query=query,
+            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
             execution_outcome='results', provider_calls=1, result_count=1))
         trace.attempts.append(ReferenceRouteAttempt(attempt_id=attempt_id, route_category='academic_adapter',
             provider='crossref', required=True, permitted=True, query_ids=[attempt_id],
@@ -42,6 +45,15 @@ def case(*, alternative=True, completed=True):
         trace.candidates.append(build_reference_discovery_candidate(attempt_id=attempt_id,
             provider='crossref', expected=expected, result=CrossrefRetriever()._parse_message(message)))
     if completed:
+        # OpenAlex, the kind's other required index, finished empty.
+        query = f'title:{ref.title}'
+        trace.queries.append(ReferenceSearchQuery(query_id='openalex', route_category='academic_adapter',
+            provider='openalex', execution_provider='openalex', normalized_query=query,
+            query_sha256=hashlib.sha256(query.encode()).hexdigest(),
+            execution_outcome='no_results', provider_calls=1, result_count=0))
+        trace.attempts.append(ReferenceRouteAttempt(attempt_id='openalex', route_category='academic_adapter',
+            provider='openalex', required=True, permitted=True, query_ids=['openalex'],
+            outcome='no_match', started_at=now, completed_at=now))
         for provider in ('brave', 'exa'):
             trace.queries.append(ReferenceSearchQuery(query_id=provider, provider=provider,
                 execution_provider=provider, route_category='bounded_web', normalized_query=ref.title,
@@ -78,9 +90,26 @@ def test_wrong_doi_alone_or_incomplete_search_is_only_identifier_error(alternati
 @pytest.mark.parametrize('failure', ['timeout','rate_limited','captcha','budget_skipped','cooldown_skipped'])
 def test_required_provider_failure_never_becomes_fabrication(failure):
     ref, record, trace = case()
+    # Both web providers fail: one finishing would suffice on its own
+    # (search-completion-v1, owner decision 2026-10-19).
+    for index in (-1, -2):
+        trace['queries'][index]['execution_outcome'] = failure
+        record['queries'][index]['execution_outcome'] = failure
+    assert kinds(assess_reference_credibility(ref, record, trace)) == ['reference_identifier_conflict']
+
+
+@pytest.mark.parametrize('failure,flagged', [('timeout', True), ('rate_limited', True), ('captcha', True),
+                                             ('budget_skipped', False), ('cooldown_skipped', False)])
+def test_one_web_providers_failure(failure, flagged):
+    # A provider-side failure of Exa leaves Brave's finished search sufficient;
+    # a provider we skipped ourselves still holds it open (search-completion-v1,
+    # owner decision 2026-10-19).
+    ref, record, trace = case()
+    assert trace['queries'][-1]['execution_provider'] == 'exa'
     trace['queries'][-1]['execution_outcome'] = failure
     record['queries'][-1]['execution_outcome'] = failure
-    assert kinds(assess_reference_credibility(ref, record, trace)) == ['reference_identifier_conflict']
+    assert kinds(assess_reference_credibility(ref, record, trace)) == (
+        ['potentially_fabricated_reference'] if flagged else ['reference_identifier_conflict'])
 
 
 @pytest.mark.parametrize('field', ['title','author','year','doi','reference_id'])

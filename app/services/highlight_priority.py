@@ -2,7 +2,9 @@
 from copy import deepcopy
 import xml.etree.ElementTree as ET
 
-ACADEMIC_FINDINGS = frozenset({'duplicate_reference_entry', 'reference_author_conflict'})
+# A whole edited book cited for a claim does not say which text was read: an
+# Academic Practice issue (owner decision 2026-10-18).
+ACADEMIC_FINDINGS = frozenset({'duplicate_reference_entry', 'reference_author_conflict', 'whole_edited_book_cited'})
 # A DOI that registers a different work is a submitted-link issue, whichever
 # check noticed it (owner decision 2026-09-24).
 SUBMITTED_LINK_FINDINGS = frozenset({'submitted_link_issue', 'reference_identifier_conflict',
@@ -62,6 +64,9 @@ def prioritize_svg_highlights(markup):
             classes = set(element.get('class', '').split())
             priority = (3 if classes & {'academic-highlight', 'unverified-highlight', 'quote-difference-mark', 'mark-practice'} else
                         2 if classes & {'reference-formatting-hit', 'indicator-reference'} else
+                        # An uncited reference's whole-entry yellow sits under the
+                        # entry's own finding marks (2026-10-16).
+                        1.8 if 'uncited-highlight' in classes else
                         1.5 if 'mark-relevance' in classes else
                         1 if classes & {'source-highlight', 'selection-bg'} else 0)
             if priority:

@@ -121,7 +121,8 @@ def qwen_api_client(settings: Settings):
     from openai import OpenAI
 
     qwen_api_policy(settings)
-    return OpenAI(api_key=secret_value(settings.QWEN_API_KEY), base_url=settings.QWEN_BASE_URL)
+    return OpenAI(api_key=secret_value(settings.QWEN_API_KEY), base_url=settings.QWEN_BASE_URL,
+                  timeout=settings.LLM_CALL_TIMEOUT_SECONDS)
 
 
 _ZAI_HOSTS = frozenset({"api.z.ai", "open.bigmodel.cn"})

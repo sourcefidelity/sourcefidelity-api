@@ -80,9 +80,17 @@ def test_two_distinct_metadata_services_work_without_student_or_candidate_doi():
     trace['credibility_reference_sha256'] = hashlib.sha256(ref.raw_ref.encode()).hexdigest()
     trace['candidates'] = [candidate(p, trace['expected'], doi='').model_dump(mode='json')
                            for p in ('core', 'openalex')]
-    trace['attempts'][0].update(attempt_id='core', provider='core', query_ids=['core'])
     trace['queries'] = trace['queries'][:4]
-    trace['queries'][0].update(query_id='core', provider='core', execution_provider='core')
+    # Crossref stays a finished, empty search: an index the kind requires must
+    # finish for the search to count as complete (search-completion-v1). Core
+    # supplies the second record alongside OpenAlex.
+    trace['attempts'][0].update(outcome='no_match', query_ids=['crossref'])
+    trace['queries'][0].update(execution_outcome='no_results', result_count=0)
+    core_query = deepcopy(trace['queries'][1])
+    core_query.update(query_id='core', provider='core', execution_provider='core')
+    core_attempt = deepcopy(trace['attempts'][1])
+    core_attempt.update(attempt_id='core', provider='core', query_ids=['core'])
+    trace['queries'].append(core_query); trace['attempts'].append(core_attempt)
     assert assess_reference_credibility(ref, None, trace)['findings']
 
 

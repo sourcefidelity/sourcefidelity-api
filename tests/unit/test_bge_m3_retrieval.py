@@ -1,8 +1,12 @@
 """Model-free regressions for optional BGE-M3 retrieval orchestration."""
 
-import numpy as np
+import pytest
 
-from app.services.bge_m3_retrieval import (
+# numpy comes with the optional local-model packages (requirements-nli.txt),
+# not requirements.txt; without them this optional feature is not testable.
+np = pytest.importorskip("numpy")
+
+from app.services.bge_m3_retrieval import (  # noqa: E402
     BgeM3HybridIndex,
     HybridPassage,
     HybridRankedPassage,

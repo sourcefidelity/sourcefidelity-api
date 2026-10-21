@@ -239,3 +239,62 @@ class TestObservedSideIsSurfaced:
         source = inspect.getsource(reference_discovery.build_reference_discovery_candidate)
         assert "('volume', volume)" in source
         assert "('issue', issue)" in source
+
+
+def test_a_structured_volume_from_a_provider_record_never_fails_the_run():
+    # OpenAlex, 2026-10-11: the whole work record is the candidate's metadata
+    # and its `volume` was an object; comparing it failed the paper run.
+    from app.services.reference_discovery import ExpectedBibliographicFields, build_reference_discovery_candidate
+    from app.services.retrieval.base import RetrievalResult
+    expected = ExpectedBibliographicFields(title="Harbour cranes", authors=["Ames, J."], year="2020",
+                                           volume="12", issue="3")
+    result = RetrievalResult(source_name="openalex", success=True, title="Harbour cranes", year="2020",
+                             metadata={"volume": {"value": "12"}, "issue": 3})
+    candidate = build_reference_discovery_candidate(attempt_id="a1", provider="openalex",
+                                                    expected=expected, result=result)
+    outcomes = {c.field_name: c.outcome for c in candidate.comparisons}
+    assert outcomes["volume"] == "unknown"      # not a volume: treated as missing
+    assert outcomes["issue"] == "agreement"     # a whole number is read as text
+
+
+def test_a_search_found_page_the_application_opened_keeps_its_own_address():
+    # Owner decision 2026-10-14: the search result is not kept, but the
+    # address of the page the application fetched and read is.
+    from app.services.reference_discovery import (
+        ExpectedBibliographicFields, build_reference_discovery_candidate)
+    from app.services.retrieval.base import RetrievalResult
+    common = dict(attempt_id='a-0', provider='web_search', discovery_provider='brave',
+                  expected=ExpectedBibliographicFields(title='A work', year='2020'),
+                  result=RetrievalResult(source_name='web_search', success=True, title='A work'),
+                  location_url='https://example.org/found', acquisition_outcome='unavailable')
+    assert build_reference_discovery_candidate(**common).page_url is None
+    opened = build_reference_discovery_candidate(**common, opened_page_url='https://example.org/work/1')
+    assert opened.page_url == 'https://example.org/work/1'
+
+
+def test_a_chapter_record_naming_another_book_is_a_conflict_and_a_journal_translation_is_not():
+    from types import SimpleNamespace
+    from app.services.reference_discovery import _chapter_record_names_another_book
+    agree = [SimpleNamespace(field_name="title", outcome="agreement"),
+             SimpleNamespace(field_name="author", outcome="agreement")]
+    chapter = SimpleNamespace(source_kind="book_section", pages="23-42")
+    assert _chapter_record_names_another_book(chapter, agree, "Sringer eBooks",
+                                              "Neoliberalism and Post-Soviet Transition", "23-42")
+    assert not _chapter_record_names_another_book(chapter, agree, "Neoliberalism and post-Soviet transition: essays",
+                                                  "Neoliberalism and Post-Soviet Transition", "23-42")
+    assert not _chapter_record_names_another_book(chapter, agree, "Sringer eBooks",
+                                                  "Neoliberalism and Post-Soviet Transition", "40-61")
+    journal = SimpleNamespace(source_kind="journal_article", pages="1-9")
+    assert not _chapter_record_names_another_book(journal, agree, "Economics and Law", "Ekonomia i Prawo", "1-9")
+
+
+def test_a_whole_edited_book_is_named_and_a_chapter_is_not():
+    from types import SimpleNamespace
+    from app.services.reference_formatting import WHOLE_EDITED_BOOK_TEXT, whole_edited_book_findings
+    book = SimpleNamespace(reference_id="r1", source_kind="edited_collection", source_kind_confidence="high",
+                           title="The harbour and social theory",
+                           raw_ref="Lane, A., & Moor, B. (Eds.). (2008). The harbour and social theory. Harbour Press.")
+    chapter = SimpleNamespace(reference_id="r2", source_kind="edited_collection", source_kind_confidence="high",
+                              title="Ports", raw_ref="Kay, C. (2008). Ports. In A. Lane (Eds.), Harbours. Harbour Press.")
+    [finding] = whole_edited_book_findings([book, chapter], "apa")
+    assert finding["reference_id"] == "r1" and finding["finding"] == WHOLE_EDITED_BOOK_TEXT

@@ -71,7 +71,7 @@ def test_result_is_persisted_with_bounded_fields_and_labels(checker):
     check = checker()
     check.run(_source(), "ref-1")
     block = check.summary_block()
-    assert block["policy_version"] == "patchwriting-v5" and block["decision_applied"] is False
+    assert block["policy_version"] == "patchwriting-v6" and block["decision_applied"] is False
     assert block["body"]["status"] == "ready"
     entry = block["sources"]["ref-1"]
     assert entry["status"] == "compared"
@@ -160,7 +160,7 @@ def test_only_the_report_projection_reads_the_result():
     # projection module; renderers never read the stored block or its internals.
     root = Path(__file__).resolve().parents[2] / "app"
     renderers = [
-        "services/evidence_report.py", "services/report_export.py", "services/interactive_report_export.py",
+        "services/evidence_report.py", "services/interactive_report_export.py",
         "services/report_interactions.js", "services/report_judgment.js", "services/judgment_report.py",
         "services/verification_report.py", "routers/report.py", "routers/status.py",
     ]

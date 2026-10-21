@@ -310,3 +310,55 @@ def test_answers_with_no_shared_result_get_a_note_about_the_statement_and_source
     assert all(r.coaching["status"] == "model" and r.coaching["version"] == "judgment-split-note-v1"
                for r in split)
     assert systems and all("never say how many there were" in s for s in systems)
+
+
+def test_a_failed_judge_is_asked_again_automatically_three_times_at_most(store):
+    session, report, _records = store
+    dispatched = []
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    run = runs.create_run(session, report.id, PRINCIPAL)
+    session.commit()
+    session.add(JudgmentCandidateResult(run_id=run.id, seq=1, citation_index=1, verification_report_id=_records[0].id,
+                                        candidate_id="c1", display_state="not_judged", reason_code="judge_failed",
+                                        panel={}, arm_result_ids=[]))
+    run.status = "completed"
+    session.commit()
+    assert runs.auto_retry_failed_runs(session, dispatch=dispatched.append, now=later) == {"retried": 1}
+    for _ in range(4):
+        newest = runs.latest_run(session, report.id, PRINCIPAL)
+        newest.status = "failed"
+        session.commit()
+        runs.auto_retry_failed_runs(session, dispatch=dispatched.append, now=later)
+    assert len(dispatched) == runs.MAX_AUTO_RETRIES
+    # A run that judged everything is left alone.
+    session.query(JudgmentRun).filter(JudgmentRun.requested_by == runs.AUTO_RETRY_SUBJECT).delete()
+    session.query(JudgmentCandidateResult).filter(JudgmentCandidateResult.run_id == run.id).update(
+        {"display_state": "supported", "reason_code": "judge_supports"})
+    session.commit()
+    assert runs.auto_retry_failed_runs(session, dispatch=dispatched.append, now=later) == {"retried": 0}
+
+
+def test_an_undecided_statement_is_judged_again_with_the_wider_sentences(store):
+    session, report, _ = store
+    asked = []
+
+    def wider(context, item, routes, run, cache, call):
+        raise AssertionError("the no-evidence path is not used for an undecided result")
+
+    def combined(context, item, routes, run, cache, call):
+        asked.append(item.bundle.candidate_id)
+        return {"display_state": "supported", "reason_code": "decided_in_wider_search",
+                "record": {"status": "completed", "new_sentences": 9, "combined_with_first_selection": True},
+                "spend_usd": 0.001}
+    wider.combined = combined
+    judge = _fake_call({"deepseek": "uncertain", "glm": "uncertain", "qwen": "uncertain"})
+
+    def call(system_prompt, user_prompt, **kwargs):
+        if '"coaching_request"' in user_prompt:
+            return {"note": "n", "facet_ids": [], "sentence_ids": []}
+        return judge(system_prompt, user_prompt, **kwargs)
+    run = _run(session, report, call=call, wider_search_factory=lambda *_: wider)
+    judged = [r for r in _rows(session, run) if r.citation_index == 1]
+    assert asked and judged and all((r.display_state, r.reason_code) == ("supported", "decided_in_wider_search")
+                                    for r in judged)
+    assert all(r.wider_search["combined_with_first_selection"] for r in judged)

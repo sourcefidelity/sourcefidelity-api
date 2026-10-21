@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import re
 from difflib import SequenceMatcher
-from typing import Callable
+from typing import Callable, Sequence
 
 from app.services.patchwriting_at_check import SUMMARY_KEY
 
@@ -75,10 +75,21 @@ def _only_title_words(region: dict, start: int, spans: list[tuple[int, int]], ti
 
 
 def _finding_rows(block: dict, known: Callable[[str], bool],
-                  title_of: Callable[[str], str] = lambda _r: "") -> list[dict]:
+                  title_of: Callable[[str], str] = lambda _r: "",
+                  coverage_by_reference: dict | None = None,
+                  reference_titles: Sequence[str] = ()) -> list[dict]:
+    from app.services.patchwriting import copied_only_titles
     rows = []
     for reference_id, entry in (block.get("sources") or {}).items():
         if not isinstance(entry, dict) or entry.get("status") != "compared" or not known(reference_id):
+            continue
+        # Only a source the report shows as full text (2026-10-08: two flags
+        # against limited texts on the long article).
+        shown = (coverage_by_reference or {}).get(reference_id)
+        if shown is not None:
+            if shown != "full_text":
+                continue
+        elif ((entry.get("coverage") or {}).get("completeness_verdict") or "complete") != "complete":
             continue
         for finding in entry.get("findings") or []:
             if not isinstance(finding, dict) or finding.get("kind") not in _RANK:
@@ -102,6 +113,11 @@ def _finding_rows(block: dict, known: Callable[[str], bool],
             from app.services.text_extractor import _LICENCE_LINE
             if _LICENCE_LINE.search(str(region.get("text") or "")) and "://" in str(region.get("text") or ""):
                 continue   # a page's licence footer read as paper text (2026-10-07)
+            from app.services.patchwriting import _WEB_ADDRESS
+            if not _WEB_ADDRESS.sub("", str(region.get("text") or "")).strip(" .,;:()[]"):
+                continue   # only a web address or DOI (2026-10-08)
+            if copied_only_titles(str(region.get("text") or ""), start, spans, reference_titles):
+                continue   # only the title of a work the paper cites (2026-10-18)
             if finding["kind"] == "close_paraphrase" and (
                     _only_conventional(region, start, spans)
                     or _only_title_words(region, start, spans, title_of(reference_id))):
@@ -295,7 +311,9 @@ def _comparison(row: dict) -> dict:
     return {"student": _student_segments(row, marked, student), "excerpts": excerpts}
 
 
-def build_passages(block: dict | None, reference_view: Callable[[str], dict | None]) -> list[dict]:
+def build_passages(block: dict | None, reference_view: Callable[[str], dict | None],
+                   coverage_by_reference: dict | None = None,
+                   reference_titles: Sequence[str] = ()) -> list[dict]:
     """Merge overlapping findings into numbered passages; never raises on bad rows."""
     if not block:
         return []
@@ -312,7 +330,7 @@ def build_passages(block: dict | None, reference_view: Callable[[str], dict | No
         view = views.get(reference_id) or {}
         return str(view.get("title") or (view.get("source") or {}).get("title") or "")
 
-    for row in _finding_rows(block, known, title_of):
+    for row in _finding_rows(block, known, title_of, coverage_by_reference, reference_titles):
         if groups and row["start"] < end:
             groups[-1].append(row)
             end = max(end, row["end"])
@@ -361,6 +379,17 @@ def _merge_rectangles(rectangles: list[dict]) -> list[dict]:
     return merged
 
 
+def _probe_texts(part: dict) -> list[tuple[str, int, int]]:
+    """The part's exact text, then the same text without a leading or trailing
+    word fragment (a stored region that began inside "Altman’s", 2026-10-18)."""
+    text, start, end = str(part["text"]), int(part["start"]), int(part["end"])
+    probes = [(text, start, end)]
+    first = re.match(r"\s*\S{1,2}\s+", text)
+    if first and len(text) > first.end():
+        probes.append((text[first.end():], start + first.end(), end))
+    return probes
+
+
 def attach_passage_geometry(passages: list[dict], pdf_content: bytes, citations: list[dict]) -> None:
     """Bind each passage's exact words to the page with the citation-anchor binder.
 
@@ -386,23 +415,32 @@ def attach_passage_geometry(passages: list[dict], pdf_content: bytes, citations:
                 continue
             if context:
                 contexts.append(context)
-            probes.append(InTextCitation(
-                text=part["text"], passage_start=part["start"], passage_end=part["end"],
-                paragraph_index=len(contexts) - 1 if context else 10**9))
-            owners.append(passage)
+            for text, start, end in _probe_texts(part):
+                probes.append(InTextCitation(
+                    text=text, passage_start=start, passage_end=end,
+                    paragraph_index=len(contexts) - 1 if context else 10**9))
+                owners.append((passage, id(part)))
     if not probes:
         return
     artifact = bind_citations_to_pdf(pdf_content, citations=probes, paragraphs=contexts)
     anchors = {(a.passage_start, a.passage_end, a.citation_text_sha256): a for a in artifact.anchors}
-    bound: dict[int, list[dict] | None] = {}
-    for probe, passage in zip(probes, owners):
-        key = id(passage)
+    # Each part takes its first probe that binds exactly; a passage is placed
+    # when every part is.
+    part_rects: dict[tuple, list[dict] | None] = {}
+    for probe, (passage, part_key) in zip(probes, owners):
+        key = (id(passage), part_key)
+        if part_rects.get(key):
+            continue
         anchor = anchors.get((probe.passage_start, probe.passage_end,
                               hashlib.sha256(probe.text.encode("utf-8")).hexdigest()))
-        if anchor is None or anchor.localization_level != "exact_rectangle":
-            bound[key] = None
-        elif bound.get(key, []) is not None:
-            bound[key] = (bound.get(key) or []) + [r.model_dump(mode="json") for r in anchor.rectangles]
+        part_rects[key] = ([r.model_dump(mode="json") for r in anchor.rectangles]
+                           if anchor is not None and anchor.localization_level == "exact_rectangle" else None)
+    bound: dict[int, list[dict] | None] = {}
+    for (passage_key, _part), rects in part_rects.items():
+        if rects is None:
+            bound[passage_key] = None
+        elif bound.get(passage_key, []) is not None:
+            bound[passage_key] = (bound.get(passage_key) or []) + rects
     for passage in passages:
         rectangles = bound.get(id(passage))
         if rectangles:

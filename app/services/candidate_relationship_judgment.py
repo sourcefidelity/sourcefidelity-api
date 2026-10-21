@@ -47,7 +47,14 @@ from app.services.verification_evidence import (
 )
 
 
-CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v11-list-tail"
+# The prompt names its one candidate by a fixed alias, not the run-specific
+# ID, so an identical request in a later run is answered from the model
+# answer cache (owner decision 2026-10-09).
+PROMPT_CANDIDATE_ID = "c1"
+
+
+# v12, 2026-10-18: a narrative lead-in is judged when nothing else is.
+CANDIDATE_GENERATOR_VERSION = "application-verification-candidates-v12-narrative-lead-in"
 CANDIDATE_JUDGMENT_VERSION = "one-candidate-relationship-v2"
 MAX_CANDIDATES = 16
 MAX_PASSAGES = 3
@@ -299,6 +306,9 @@ def attach_verification_candidates(
     member_spans = _member_clause_spans(claim, getattr(getattr(artifact, "source_binding", None), "reference_id", None))
     if member_spans:
         content_spans = member_spans
+    research_spans = research_cue_spans(claim.text, content_spans)
+    if research_spans:
+        content_spans = research_spans
     guard_segments = [
         _segment(artifact, start, end, "whole_unit_guard")
         for start, end in content_spans
@@ -354,6 +364,20 @@ def attach_verification_candidates(
                      if spec.spans and all(start >= marker_span[1] for start, _ in spec.spans)
                      and spec.attribution == "cited_source" else spec for spec in specs]
     specs = _deduplicate_specs(specs)[: MAX_CANDIDATES - 1]
+    # A narrative citation whose only wording is its lead-in ("... also aligns
+    # with Hess's theory.", "... the Hollywood system introduced by Dyer.")
+    # attributes that wording to the source; with nothing else to judge it is
+    # the part judged (owner direction 2026-10-18: a full text is judged; the
+    # writer's-own-work check still sets the student's own work aside).
+    if (claim.citation_marker_type == "narrative" and specs
+            and not any(spec.relationship_eligible for spec in specs)):
+        specs = [replace(spec, kind="clause", method="narrative_leading_source_statement",
+                         attribution="cited_source", relationship_eligible=True,
+                         verification_scope="bounded_passage_relationship",
+                         requires_context=_requires_parent_context(claim.text, spec.spans))
+                 if spec.method == "narrative_leading_student_context"
+                 and _substantive_word_count(" ".join(claim.text[a:b] for a, b in spec.spans)) >= 3
+                 else spec for spec in specs]
     specialized_voice = any(
         spec.attribution != "cited_source" or not spec.relationship_eligible
         for spec in specs
@@ -370,7 +394,8 @@ def attach_verification_candidates(
         # A source scoped to its own clause keeps its provenance on the
         # candidate; the generator version (and so every unaffected
         # candidate's ID and cached Judgment) is unchanged (2026-10-07).
-        method="member_clause_scope_v1" if member_spans else "complete_citation_unit_guard",
+        method=("research_cue_scope_v1" if research_spans else
+                "member_clause_scope_v1" if member_spans else "complete_citation_unit_guard"),
         eligible=not has_decomposition,
         requires_context=_requires_parent_context(claim.text, content_spans),
     )
@@ -645,7 +670,7 @@ def apply_candidate_relationship_judgment(
             masked_segments.append({"role": segment.role, "text": masked.text})
         prompt = json_data_envelope(
             {
-                "candidate_id": candidate.candidate_id,
+                "candidate_id": PROMPT_CANDIDATE_ID,
                 "candidate_kind": candidate.kind,
                 "candidate_attribution": candidate.attribution,
                 "requires_parent_context": candidate.requires_parent_context,
@@ -1249,7 +1274,7 @@ def _validated_finding(
     *,
     local_context_status="not_required",
 ):
-    if response.candidate_id != candidate.candidate_id:
+    if response.candidate_id != PROMPT_CANDIDATE_ID:
         raise ValueError("candidate ID mismatch")
     passage_ids = list(dict.fromkeys(response.passage_ids))
     if any(passage_id not in allowed_passages for passage_id in passage_ids):
@@ -1379,6 +1404,64 @@ def _passage_matches_authorization(artifact, passage):
     )
 
 
+# A writer setting their own findings beside research (owner decision
+# 2026-10-09, the owner's long article): only what the research found is
+# judged against the cited source; the writer's own clause or frame is not.
+_RESEARCH_SUBJECT = (r"(?:(?:previous|prior|earlier|early|other|recent|existing|much|some|further|past|the)\s+)?"
+                     r"(?:research|studies|scholars|scholarship|literature|work|evidence)")
+_RESEARCH_THAT = re.compile(
+    r"\b" + _RESEARCH_SUBJECT + r"\s+(?:has\s+|have\s+|had\s+)?(?:also\s+|consistently\s+|repeatedly\s+|long\s+)?"
+    r"(?:shown|found|suggested|indicated|demonstrated|reported|noted|argued|established|confirmed)\s+that\s+", re.I)
+_RESEARCH_RELATIVE_FIND = re.compile(
+    r"\b(?:studies|research|work|scholarship|findings)\s+(?:that|which)\s+"
+    r"(?:finds?|found|shows?|showed|shown|suggests?|suggested|reports?|reported|demonstrates?|demonstrated|"
+    r"indicates?|indicated)\s+(?:that\s+)?", re.I)
+_SHOWN_RELATIVE = re.compile(
+    r",?\s*(?=which\s+(?:has|have|had)\s+(?:been\s+)?(?:shown|found|reported|demonstrated)\s+to\s)", re.I)
+_TRAILING_CORROBORATION = re.compile(
+    r",\s*(?:as\s+(?:found|shown|reported|noted|observed|seen|suggested)\s+(?:in|by)|corroborating|confirming|"
+    r"echoing|supporting|mirroring|consistent\s+with|in\s+line\s+with|in\s+keeping\s+with)\s+(?:the\s+)?"
+    r"(?:(?:early|earlier|previous|prior|other|recent|existing|past)\s+)?"
+    r"(?:research|studies|findings|work|literature|scholarship)\b", re.I)
+_OWN_FRAME = re.compile(
+    r"^[A-Z][\w’'-]*(?:\s+[\w’'-]+){0,6}?\s+(?:believe|believed|think|thought|feel|felt|reported|say|said|"
+    r"noted|agree|agreed|perceive|perceived|consider|considered|expressed)\s+(?:that\s+)?", re.I)
+_OWN_STUDY_BEFORE = re.compile(r"\b(?:our|my|we)\s+(?:\w+\s+){0,2}$", re.I)
+
+
+def research_cue_spans(text, spans):
+    """The spans narrowed to what the cited research found, or None when no
+    research cue applies: "though research has shown that P" and "studies that
+    find P" keep P; "Our participants believe P, as found in research" and
+    "…, corroborating earlier studies" keep P without the writer's frame;
+    "X, which has been shown to P" keeps the relative clause. A cue preceded by
+    "our", "my" or "we" is the writer's own study and is left alone."""
+    narrowed, changed = [], False
+    for start, end in spans:
+        segment = text[start:end]
+        result = None
+        for pattern in (_RESEARCH_THAT, _RESEARCH_RELATIVE_FIND):
+            match = pattern.search(segment)
+            if match and not _OWN_STUDY_BEFORE.search(segment[:match.start()]):
+                result = _trim_optional(text, start + match.end(), end)
+                break
+        if result is None:
+            match = _TRAILING_CORROBORATION.search(segment)
+            if match:
+                frame = _OWN_FRAME.match(segment[:match.start()])
+                result = _trim_optional(text, start + (frame.end() if frame else 0), start + match.start())
+        if result is None:
+            match = _SHOWN_RELATIVE.search(segment)
+            if match and match.start() > 0:
+                result = _trim_optional(text, start + match.end(), end)
+        if result and result != (start, end) and len(re.findall(r"[A-Za-z]{2,}", text[result[0]:result[1]])) >= 3:
+            narrowed.append(result)
+            changed = True
+        else:
+            narrowed.append((start, end))
+    return narrowed if changed else None
+
+
 def parenthetical_markers(claim):
     """The claim's parenthetical citation markers in text order. A narrative
     citation's bracketed year ("Hartmn (2016) highlights …") is not one: only
@@ -1439,6 +1522,10 @@ def citation_clause_segments(claim, reference_ids):
     if any(re.search(r"[.!?][\"”’')]*\s+[A-Z]", text[a.local_end:b.local_start])
            for a, b in zip(markers, markers[1:])):
         return None
+    # Sources judged on wording they share stay one citation (2026-10-09).
+    if any(_with_shared_wording(text, markers, m, markers[i - 1].local_end if i else 0, [])
+           for i, m in enumerate(markers)):
+        return None
     remainder = text[last.local_end:]
     closes = len(re.findall(r"[A-Za-z]{2,}", remainder)) < 3
     if len(markers) == 1 and closes:
@@ -1481,7 +1568,54 @@ def _member_clause_spans(claim, reference_id):
     spans = [span for span in (_trim_optional(text, start, marker.local_start),
                                _trim_optional(text, later_start, len(text)) if later_start < len(text) else None)
              if span]
-    return spans or None
+    return _with_shared_wording(text, markers, marker, start, spans) or spans or None
+
+
+_SENTENCE_BREAK = re.compile(r"[.!?][\"”’')]*\s")
+_PREDICATE_START = re.compile(
+    r"\s*,?\s*(?:has|have|had|is|are|was|were|can|could|may|might|will|would|should|must|do|does|did|"
+    r"shows?|showed|suggests?|suggested|indicates?|indicated|finds?|found|reveals?|revealed|"
+    r"demonstrates?|demonstrated|confirms?|confirmed)\b", re.I)
+_FINITE_VERB = re.compile(
+    r"\b(?:is|are|was|were|has|have|had|can|could|may|might|will|would|should|must|do|does|did|"
+    r"\w{3,}(?:ed|es))\b", re.I)
+
+
+_OPENING_RESEARCH = re.compile(r"\b(?:research|studies|literature)\b", re.I)
+
+
+def _with_shared_wording(text, markers, marker, start, spans):
+    """A source whose own piece is not a statement on its own (no verb:
+    "Research on X in general (Ames, 2020), and in Y in particular (Bell,
+    2021), has shown that P") is also judged on the wording its sentence
+    shares: the ending after the last marker when that ending is the
+    sentence's predicate, otherwise an opening about research before the
+    sentence's first marker (owner decision 2026-10-09). None when nothing is shared."""
+    piece = text[start:marker.local_start]
+    if _FINITE_VERB.search(piece) or len(re.findall(r"[A-Za-z]{2,}", piece)) > 8:
+        return None
+    same = [m for m in markers if not _SENTENCE_BREAK.search(
+        text[min(m.local_end, marker.local_end):max(m.local_start, marker.local_start)])]
+    if len(same) < 2:
+        return None
+    last = same[-1]
+    end_match = _SENTENCE_BREAK.search(text, last.local_end)
+    sentence_end = end_match.start() if end_match else len(text)
+    ending = text[last.local_end:sentence_end]
+    if _PREDICATE_START.match(ending):
+        shared = _trim_optional(text, last.local_end, sentence_end)
+        return sorted(set(spans) | {shared}) if shared else None
+    if same[0] is marker:
+        return None
+    opening_start = 0
+    for found in _SENTENCE_BREAK.finditer(text, 0, same[0].local_start):
+        opening_start = found.end()
+    shared = _trim_optional(text, opening_start, same[0].local_start)
+    # Only an opening about research is shared ("…, as found in research on A
+    # (Ames, 2020) and B (Bell, 2021)"); a list of separate claims is not.
+    if not shared or not _OPENING_RESEARCH.search(text[shared[0]:shared[1]]):
+        return None
+    return sorted(set(spans) | {shared})
 
 
 def _content_spans(text, marker_span):

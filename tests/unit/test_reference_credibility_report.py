@@ -32,14 +32,6 @@ def test_legacy_strong_flag_is_soft_red_evidence_with_one_summary_and_audit_only
     assert 'https://apastyle' not in panel
     combined=_render_reference_panel_template(f,1,combined=True)
     assert 'issue-heading evidence' not in combined and raw not in combined
-    from app.services.report_export import _render_pdf
-    rendered, _ = _render_pdf(doc.tobytes(), citations=[], reference_practice=[f],
-        export_binding='synthetic-test', view=None)
-    with fitz.open(stream=rendered, filetype='pdf') as exported:
-        text = '\n'.join(page.get_text() for page in exported)
-        assert 'Sources 1' in text and 'Cannot be veri' in text      # the PDF font sets 'fi' as a ligature
-        assert 'Potentially fabricated' not in text
-        assert not any('10.1234/coastal' in str(link) for page in exported for link in page.get_links())
     # An unplaced report issue is not advertised in the summary.
     f['rectangles']=[]
     summaries=_build_report_summary(citations=[],overview={},pervasive_hanging_indent=False,reference_practice=[f],require_paper_flags=True)
@@ -64,15 +56,6 @@ def test_factual_identifier_error_is_purple_link_issue_in_academic_summary():
     assert not soup.select('rect.reference-formatting-hit')
     from app.services.evidence_report import _formatting_overlaps
     assert not _formatting_overlaps({'paper_location':{'rectangles':f['rectangles']}},f)
-    from app.services.report_export import _render_pdf
-    with fitz.open() as doc:
-        doc.new_page().insert_text((40,60),'Author. Title. doi:10.1234/a')
-        rendered,_=_render_pdf(doc.tobytes(),citations=[],reference_practice=[f],export_binding='test',view=None)
-    with fitz.open(stream=rendered,filetype='pdf') as doc:
-        assert 'Submitted-Link Issue' in '\n'.join(p.get_text() for p in doc)
-        strokes=[d['color'] for d in doc[0].get_drawings() if d['color']]
-        assert any(all(abs(a-b)<.001 for a,b in zip(color,(.463,.318,.659))) for color in strokes)
-        assert doc[0].get_links()
 
 
 def test_placeholder_remains_orange():

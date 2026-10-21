@@ -193,3 +193,60 @@ def test_connected_peer_failure_preserves_status_not_body(monkeypatch, ref):
     assert request.safety_reason == 'non_public_connected_peer'
     assert request.outcome == 'safety_refused'
     assert 'private detail' not in rows[0].model_dump_json()
+
+
+@pytest.mark.parametrize('same_work,author,identity', [
+    ('yes', 'agrees', 'confirmed'), ('yes', 'not_shown', 'confirmed'),
+    ('yes', 'differs', 'not_assessed'), ('unsure', 'not_shown', 'not_assessed'), ('no', 'differs', 'not_assessed'),
+])
+def test_a_cross_script_judgment_is_kept_on_the_link_and_a_same_work_answer_verifies_the_page(
+        monkeypatch, same_work, author, identity):
+    """Owner decision 2026-10-12: the model's judgment of the student's own
+    link was discarded, so a page it named stayed "not telling"."""
+    from app.services.reference_verification import assess_reference_verification
+    from app.services.source_resolver import SourceResolver
+    from app.services.submitted_link_display import render_link_checks
+    from app.services.web_page_verification import web_page_check
+    body = '<html><head><title>北方平原的河流</title></head><body><p>林青</p></body></html>'
+    fixture_transport(monkeypatch, lambda req: httpx.Response(200, text=body, headers={'content-type': 'text/html'},
+                                                              request=req))
+    judged = {'version': 'cross-script-identity-v1', 'payload_sha256': 'a' * 64, 'configured_model': 'model-x',
+              'returned_model': 'model-x', 'returned_provider': 'provider-x', 'total_tokens': 12,
+              'reported_cost_usd': 0.0001, 'same_work': same_work, 'author': author,
+              'page_authors': ['林青'], 'call': 'answered'}
+    monkeypatch.setattr('app.services.cross_script_identity.judge_cross_script_identity', lambda *a, **k: judged)
+    reference = ParsedReference(reference_id='r1', url='https://pages.example/rivers/42', source_kind='webpage',
+                                title='Rivers of the northern plain', author='Lin, Q.', year='2021')
+
+    @observe_reference
+    def check(self, reference):
+        return SourceResolver.__new__(SourceResolver)._try_web_fetch(reference.url, reference.title,
+                                                                    expected_author='Lin, Q.', expected_year='2021')
+    rows = check(None, reference).metadata['submitted_link_observations']
+    request = SubmittedLink.model_validate(rows[0]).requests[0]
+    # A same-work answer goes on to the page's content checks (owner decision
+    # 2026-10-13); this fixture page has too little text to admit.
+    assert request.page_observation == ('readable_text_unavailable' if identity == 'confirmed'
+                                        else 'cross_script_title_unresolved')
+    assert request.cross_script_judgment.same_work == same_work
+    assert request.cross_script_judgment.returned_model == 'model-x'
+    assert request.cross_script_evidence_sha256 == request.response_sha256 == hashlib.sha256(body.encode()).hexdigest()
+    assert request.destination_identity == identity and request.admitted_content == 'not_assessed'
+    assert '林青' not in json.dumps(rows)          # page names are not kept on the link
+    verdict = assess_reference_verification(reference, None, web_page_check(reference, rows), rows)
+    if identity == 'confirmed':
+        assert (verdict['status'], verdict['reason_code']) == ('verified', 'submitted_page_confirmed')
+        assert 'could not be resolved across writing systems' not in render_link_checks(rows)
+    else:
+        assert verdict['status'] == 'not_assessed' and verdict['reason_code'] == 'web_page_link_not_telling'
+
+
+def test_a_cross_script_judgment_needs_the_exact_response():
+    from app.services.submitted_links import LinkRequest
+    base = dict(started_at='2026-10-12T00:00:00Z', completed_at='2026-10-12T00:00:01Z', request_sha256='a' * 64,
+                outcome='response', http_status=200, response_sha256='b' * 64,
+                cross_script_judgment={'version': 'cross-script-identity-v1', 'payload_sha256': 'c' * 64,
+                                       'same_work': 'yes', 'call': 'answered'})
+    with pytest.raises(ValueError):
+        LinkRequest.model_validate({**base, 'cross_script_evidence_sha256': 'd' * 64})
+    assert LinkRequest.model_validate({**base, 'cross_script_evidence_sha256': 'b' * 64}).cross_script_judgment

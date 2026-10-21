@@ -22,15 +22,14 @@ def cascade(monkeypatch):
     monkeypatch.setattr(settings, "SEARCH_POLICY_VERSION", API_FIRST_SEARCH_POLICY)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_RETENTION_PERMITTED", False)
     monkeypatch.setattr(settings, "BRAVE_SEARCH_TRANSIENT_ENABLED", True)
-    monkeypatch.setattr(settings, "SEARCH_SEARXNG_FALLBACK_ENABLED", False)
     monkeypatch.setattr(settings, "SEARCH_ESCALATION_MAX_CALLS", "brave:4,exa:4,tavily:4")
     providers = {name: Mock(name=name, last_status="completed", last_cost_usd=None)
-                 for name in ("brave", "exa", "searxng", "tavily")}
+                 for name in ("brave", "exa", "tavily")}
     for name, provider in providers.items():
         provider.name = name
         provider.search.return_value = []
     monkeypatch.setattr("app.services.retrieval.web_search.get_search_provider",
-                        lambda name=None: providers.get(name or "searxng"))
+                        lambda name=None: providers.get(name or "tavily"))
     return WebSearchRetriever(health_store=Mock()), providers
 
 
@@ -149,7 +148,7 @@ def test_builder_is_inert_when_off_and_bounds_long_fields(monkeypatch):
     assert entry.disposition == "unknown" and len(entry.reason_code) == 100
 
 
-def test_searxng_is_not_recorded():
-    # It relays engines whose terms are unchecked (owner review 2026-09-29).
+def test_only_providers_with_checked_retention_terms_are_recorded():
+    # An allowlist (owner review 2026-09-29); Brave is deliberately absent.
     from app.services.search.candidate_audit import AUDITABLE_PROVIDERS
     assert AUDITABLE_PROVIDERS == frozenset({"exa", "tavily"})

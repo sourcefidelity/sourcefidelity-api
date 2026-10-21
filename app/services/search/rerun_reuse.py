@@ -18,7 +18,9 @@ content hash (``verified-public-source-access-v1``): it is downloaded again
 with the same checks and used only if the file is byte-identical
 (``paper-search-reuse-v4``, owner decision 2026-10-07); otherwise the reference
 is searched again. A transient text without that record is searched again. A search that was
-incomplete, a reference whose parse changed, a cited reference whose earlier
+incomplete, a likely other-language work whose earlier search did not complete
+a search in the work's own script (``native-script-route-v1``,
+``paper-search-reuse-v5``, owner decision 2026-10-12), a reference whose parse changed, a cited reference whose earlier
 record was identity-only (or the reverse) and a targeted refresh with
 ``force_search`` all search again. The reused record keeps its original
 discovery record and dates, so the report reads the original search.
@@ -29,11 +31,15 @@ import copy
 from datetime import datetime, timedelta, timezone
 
 from app.config import settings
+# The reuse rules (source_reuse, 2026-10-15); these names stay importable here.
+from app.services.source_reuse import (  # noqa: F401
+    _network_failed, _required_searches_completed, downloadable, earlier_result,
+    native_script_route_due, public_copy,
+)
 
-POLICY = "paper-search-reuse-v4"
-_REUSABLE_STATUSES = frozenset({"durable_authorized", "unavailable", "abstract_only", "metadata_only"})
-_INCOMPLETE_REASONS = frozenset({"full_text_search_incomplete", "transient_verification_run_unavailable",
-                                 "transient_source_admission_failed", "durable_representation_not_authorized"})
+POLICY = "paper-search-reuse-v5"
+
+
 
 
 def _norm(value) -> str:
@@ -41,106 +47,19 @@ def _norm(value) -> str:
 
 
 def reference_signature(reference, *, identity_only: bool) -> tuple:
-    """Unchanged reference text and parse, and the same cited/identity-only mode."""
+    """Unchanged reference text and parse, and the same cited/identity-only mode.
+    The parsed link is part of the parse: a repaired address (a query split by
+    a space, 2026-10-14) is a link the earlier search never followed."""
     get = (lambda name: reference.get(name)) if isinstance(reference, dict) else (lambda name: getattr(reference, name, None))
     return (_norm(get("raw_ref")), _norm(get("source_kind")), _norm(get("title")), _norm(get("author")),
-            _norm(get("year")), _norm(get("container_title")), _norm(get("doi")), bool(identity_only))
+            _norm(get("year")), _norm(get("container_title")), _norm(get("doi")), bool(identity_only),
+            _norm(get("url")))
 
 
-def _required_searches_completed(item: dict, reference: dict | None) -> bool:
-    """reference-verification-v2 found every required search complete."""
-    if not reference:
-        return False
-    from app.services.reference_verification import assess_reference_verification
-    from app.services.schemas import ParsedReference
-    try:
-        parsed = ParsedReference.model_validate(reference)
-    except Exception:
-        return False
-    verdict = assess_reference_verification(parsed, item.get("reference_discovery"))
-    return verdict.get("reason_code") == "suited_searches_completed_without_match"
-
-
-def public_copy(item: dict) -> dict | None:
-    """The earlier run's verified open-access address and file hash, if kept."""
-    access = item.get("public_source_access") or {}
-    href, digest = str(access.get("href") or ""), str(access.get("content_sha256") or "")
-    if (access.get("version") == "verified-public-source-access-v1" and href.startswith("https://")
-            and len(digest) == 64 and item.get("source_name")):
-        return {"href": href, "content_sha256": digest, "provider": str(item["source_name"])}
-    return None
-
-
-def _reusable(item: dict, reference: dict | None = None) -> bool:
-    if item.get("status") == "transient_authorized":
-        return public_copy(item) is not None
-    if item.get("status") == "durable_authorized":
-        # The text itself is stored; how the search ended does not matter.
-        return bool(item.get("representation_id"))
-    discovery = item.get("reference_discovery") or {}
-    if (isinstance(reference, dict) and reference.get("source_kind") == "book_section"
-            and (reference.get("container_title") or "").strip()
-            and discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
-            and not discovery.get("container_identity")):
-        # An unconfirmed chapter whose book was never identified is searched
-        # again, so a corrected book lookup reaches it (Gershon, 2026-10-04).
-        return False
-    if item.get("status") == "link_check_only":
-        # An uncited web page's own search (webpage-verification-v1): reused
-        # once its web providers answered (paper 10's Statista, 2026-10-04).
-        return bool(item.get("web_page_check")) and _web_search_answered(discovery)
-    if item.get("status") not in _REUSABLE_STATUSES or item.get("reason_code") in _INCOMPLETE_REASONS:
-        return False
-    if item.get("full_text_search_incomplete_providers"):
-        return False
-    if item.get("retryable_provider_dependencies"):
-        # An optional provider left a retry, but every search the reference's
-        # kind requires finished (paper 10: OpenAlex re-searched each run, 2026-10-04).
-        return _required_searches_completed(item, reference)
-    if _network_failed(discovery):
-        return False
-    if discovery.get("outcome") == "search_incomplete":
-        return _required_searches_completed(item, reference) or _no_provider_at_fault(discovery)
-    return bool(discovery)
-
-
-def _no_provider_at_fault(discovery: dict) -> bool:
-    """Incomplete only for reasons a repeat would meet again: every required
-    provider answered, and the gaps are filtered index records, unresolved
-    web-search leads or pages that did not confirm the work (owner decision
-    2026-10-07; Franchise 2's 8 such references were searched again each run).
-    A provider whose failure holds the search incomplete still forces a new
-    search; so does a reference whose parse was incomplete."""
-    from app.services.paper_workflow import _blocking_providers_from_record
-    if (discovery.get("expected") or {}).get("reference_parse_review"):
-        return False
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    if not any(a.get("route_category") == "bounded_web" for a in attempts):
-        return False
-    return not _blocking_providers_from_record(discovery)
-
-
-def _web_search_answered(discovery: dict) -> bool:
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    web = [a for a in attempts if a.get("route_category") == "bounded_web"]
-    return bool(web) and all(a.get("outcome") in {"candidate_found", "no_match"} for a in web)
-
-
-def _network_failed(discovery: dict) -> bool:
-    """The earlier run could not reach the student's link, or most indexes:
-    a network failure, not a finished search (2026-10-02)."""
-    attempts = [a for a in discovery.get("attempts") or [] if isinstance(a, dict)]
-    # A failed student link matters only when nothing else confirmed the work:
-    # a confirmed reference is not searched again for it (paper 4 re-run,
-    # 2026-10-02: 15 confirmed references re-searched, USD 0.35).
-    if (discovery.get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}
-            and any(a.get("route_category") == "student_url" and a.get("outcome") == "operational_failure"
-                    for a in attempts)):
-        return True
-    adapters = [a for a in attempts if a.get("route_category") == "academic_adapter"
-                and a.get("outcome") != "unavailable"]
-    failed = sum(1 for a in adapters if a.get("outcome") == "operational_failure")
-    return bool(adapters) and failed * 2 >= len(adapters)
+def excluded_job_ids() -> frozenset[str]:
+    """Runs whose results are never reused (``SEARCH_REUSE_EXCLUDED_JOBS``)."""
+    raw = getattr(settings, "SEARCH_REUSE_EXCLUDED_JOBS", "") or ""
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
 def prior_results_index(session, job) -> dict:
@@ -150,26 +69,61 @@ def prior_results_index(session, job) -> dict:
         return {}
     from app.models.job import Job, JobStatus
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    prior = (session.query(Job)
-             .filter(Job.scope_type == job.scope_type, Job.scope_id == job.scope_id, Job.id != job.id,
-                     Job.status == JobStatus.COMPLETED, Job.created_at >= since,
-                     Job.source_results.isnot(None), Job.extraction_payload.isnot(None))
-             .order_by(Job.created_at.desc()).limit(50).all())
+    base = (session.query(Job)
+            .filter(Job.scope_type == job.scope_type, Job.scope_id == job.scope_id, Job.id != job.id,
+                    Job.status == JobStatus.COMPLETED, Job.created_at >= since,
+                    Job.source_results.isnot(None), Job.extraction_payload.isnot(None)))
+    prior = base.order_by(Job.created_at.desc()).limit(50).all()
+    # The same paper's own earlier runs always count, however many other
+    # papers ran since (2026-10-08: the long article's run had fallen out of
+    # the 50 most recent, so none of its 65 results was reused).
+    filename = getattr(job, "filename", None)
+    if filename:
+        seen = {item.id for item in prior}
+        same = base.filter(Job.filename == filename).order_by(Job.created_at.desc()).limit(10).all()
+        prior = sorted([*prior, *(item for item in same if item.id not in seen)],
+                       key=lambda item: item.created_at, reverse=True)
+    excluded = excluded_job_ids()
     index: dict = {}
     for earlier in prior:
+        if str(earlier.id).lower() in excluded:
+            continue
         references = {ref.get("reference_id"): ref for ref in (earlier.extraction_payload or {}).get("references") or []}
         for item in earlier.source_results or []:
             reference = references.get(item.get("reference_id"))
-            if reference is None or not _reusable(item, reference):
+            if reference is None:
                 continue
             key = reference_signature(reference, identity_only=bool(item.get("identity_only_policy")))
+            decision = earlier_result(item, reference)
+            if not decision.reusable:
+                # Why the most recent earlier result was not reused (provenance).
+                index.setdefault(("refused",) + key, decision.reason)
+                index.setdefault(("refused",) + parsed_signature(key), decision.reason)
+                continue
             index.setdefault(key, (str(earlier.id), item))
+            index.setdefault(parsed_signature(key), (str(earlier.id), item))
     return index
+
+
+def parsed_signature(signature: tuple) -> tuple:
+    """The same work parsed identically, whatever the reference's punctuation
+    or layout: another paper citing it in its own format reuses the result
+    (owner decision 2026-10-09). The reference text itself is left out."""
+    return ("parsed",) + tuple(signature[1:])
+
+
+def _identifying(signature: tuple) -> bool:
+    """A parse with a DOI, or a title with an author and year, names one work."""
+    _, _, title, author, year, _, doi = signature[:7]
+    return bool(doi) or bool(title and author and year)
 
 
 def reused_result(index: dict, reference, *, identity_only: bool) -> dict | None:
     """A copy of the earlier result for this reference, re-keyed to it, or None."""
-    found = index.get(reference_signature(reference, identity_only=identity_only))
+    signature = reference_signature(reference, identity_only=identity_only)
+    found = index.get(signature)
+    if found is None and _identifying(signature):
+        found = index.get(parsed_signature(signature))
     if found is None:
         return None
     prior_job_id, item = found
@@ -194,3 +148,12 @@ def reused_result(index: dict, reference, *, identity_only: bool) -> dict | None
     record["search_reuse"] = {"policy_version": POLICY, "from_job_id": prior_job_id,
                               "searched_at": (record.get("reference_discovery") or {}).get("created_at")}
     return record
+
+
+def reuse_refusal(index: dict, reference, *, identity_only: bool) -> str | None:
+    """Why the most recent earlier result for this reference was not reused, if one was refused."""
+    signature = reference_signature(reference, identity_only=identity_only)
+    found = index.get(("refused",) + signature)
+    if found is None and _identifying(signature):
+        found = index.get(("refused",) + parsed_signature(signature))
+    return found

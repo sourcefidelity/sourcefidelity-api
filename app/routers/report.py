@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 import hashlib
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import re
 import uuid
 from io import BytesIO
@@ -20,6 +20,7 @@ import fitz
 from app.database import get_db
 from app.security import (
     AuthenticatedPrincipal,
+    PAPER_CHECK_CAPABILITY,
     REPORT_PAPER_CAPABILITY,
     REPORT_SOURCE_CAPABILITY,
     REPORT_SESSION_COOKIE,
@@ -39,7 +40,6 @@ from app.services.evidence_report import (
     EvidenceReportError,
     enable_authenticated_paper_actions,
     load_authorized_evidence_report_bundle,
-    member_search_incomplete,
     render_evidence_report_html,
     project_reference_flags,
 )
@@ -55,9 +55,7 @@ from app.services.paper_workflow import (
     PaperWorkflowError,
     prepare_uploaded_source_refresh,
 )
-from app.services.report_export import ReportExportError, build_released_report_export
 from app.tasks.source_reanalysis import schedule_uploaded_source_reanalysis
-from app.services.search_retry import SearchAgainRateLimited, prepare_search_again_refresh
 from app.tasks.check_paper import dispatch_paper_workflow
 
 router = APIRouter()
@@ -149,11 +147,12 @@ def get_report(
 ):
     """Return the evidence-led HTML projection in the resolved viewer scope."""
     principal.require(REPORT_VIEW_CAPABILITY)
+    moved = _moved_to(session, report_id, principal)
+    if moved:
+        return RedirectResponse(f"/report/{moved}", status_code=303)
     view, artifact, paper_content = _load_bundle(session, backend, report_id, principal)
     nonce = secrets.token_urlsafe(24)
-    view = enable_authenticated_paper_actions(
-        view, report_id=report_id,
-        search_again_enabled=not _report_marks_released(session, report_id, principal))
+    view = enable_authenticated_paper_actions(view, report_id=report_id)
     with fitz.open(stream=paper_content, filetype="pdf") as document:
         view = project_reference_flags(view, document, hashlib.sha256(paper_content).hexdigest())
         view["paper_surface"]["selectable_words"] = {
@@ -177,24 +176,6 @@ def get_report(
     )
 
 
-def _report_marks_released(session: Session, report_id: str, principal) -> bool:
-    """Whether the report's paper belongs to an assessment with marks released."""
-    from app.services.assessment_marks import job_marks_released
-    if not isinstance(session, Session):
-        return False  # only a database session can hold the record
-    try:
-        report = session.get(Report, uuid.UUID(str(report_id)))
-    except ValueError:
-        return False
-    if not isinstance(report, Report):
-        return False
-    job = session.get(Job, report.job_id)
-    if (not isinstance(job, Job) or job.scope_type != principal.scope_type
-            or job.scope_id != principal.scope_id):
-        return False
-    return job_marks_released(session, job)
-
-
 def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id: str, principal) -> dict | None:
     from app.services import judgment_runs as runs
     from app.services.judgment_layer import build_judgment_layer
@@ -210,16 +191,6 @@ def _static_judgment_layer(session: Session, view: dict, paper: bytes, report_id
     layer.update(fake_panel=settings.JUDGMENT_FAKE_PANEL, static=True,
                  static_results=all_result_items(session, run, principal))
     return layer
-
-
-def _export_judgment_summary(session: Session, report_id: str, principal) -> dict | None:
-    """The page's Judgment tally for the PDF's Sources to Upload, or None."""
-    try:
-        details = _run_details(session, report_id, principal)
-    except Exception:  # noqa: BLE001 - the PDF is still built without the count
-        return None
-    summary = details.get("judgment_summary") if isinstance(details, dict) else None
-    return summary if isinstance(summary, dict) else None
 
 
 def _run_details(session: Session, report_id: str, principal) -> dict:
@@ -271,82 +242,11 @@ def get_interactive_report_download(
     view['judgment_layer'] = _static_judgment_layer(session, view, paper, report_id, principal)
     try:
         content = build_interactive_report_html(view, paper)
-    except (ValueError, ReportExportError) as exc:
+    except ValueError as exc:
         raise HTTPException(status_code=409, detail='Interactive export is unavailable') from exc
     return Response(content, media_type='text/html', headers={
         'Content-Disposition': 'attachment; filename="interactive-report.html"',
         'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff'})
-
-
-@router.get("/{report_id}/export.pdf")
-def get_released_report_pdf(
-    report_id: str,
-    audience: str | None = Query(None, include_in_schema=False),
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Return a deterministic released-only derivative of the retained PDF."""
-    principal.require(REPORT_PAPER_CAPABILITY)
-    try:
-        exported = build_released_report_export(
-            session,
-            backend,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            judgment_summary=_export_judgment_summary(session, report_id, principal),
-        )
-    except EvidenceReportAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, ReportExportError) as exc:
-        raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
-    return Response(
-        content=exported.content,
-        media_type="application/pdf",
-        headers={
-            "Cache-Control": "no-store, private",
-            "Content-Disposition": 'attachment; filename="sourcefidelity-report.pdf"',
-            "Content-Security-Policy": "sandbox",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-            "X-SourceFidelity-Export-SHA256": exported.manifest["export_sha256"],
-            "X-SourceFidelity-Manifest-SHA256": exported.manifest_sha256,
-        },
-    )
-
-
-@router.get("/{report_id}/export/manifest")
-def get_released_report_manifest(
-    report_id: str,
-    audience: str | None = Query(None, include_in_schema=False),
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Return the text-free binding manifest for the current released export."""
-    principal.require(REPORT_PAPER_CAPABILITY)
-    try:
-        exported = build_released_report_export(
-            session,
-            backend,
-            report_id=report_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-            judgment_summary=_export_judgment_summary(session, report_id, principal),
-        )
-    except EvidenceReportAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Report not found") from exc
-    except (EvidenceReportError, ReportExportError) as exc:
-        raise HTTPException(status_code=409, detail="Report export is unavailable") from exc
-    return JSONResponse(
-        {**exported.manifest, "manifest_sha256": exported.manifest_sha256},
-        headers={
-            "Cache-Control": "no-store, private",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
 
 
 @router.get("/{report_id}/successor")
@@ -358,6 +258,10 @@ def get_report_successor_status(
 ):
     """Return text-free lineage status for a report awaiting reanalysis."""
     principal.require(REPORT_VIEW_CAPABILITY)
+    moved = _moved_to(session, report_id, principal)
+    if moved:
+        status = get_report_successor_status(moved, principal, session, backend)
+        return {**status, "requested_report_id": report_id, "successor_available": True}
     _load_bundle(session, backend, report_id, principal)
     try:
         requested_id = uuid.UUID(report_id)
@@ -378,6 +282,22 @@ def get_report_successor_status(
     failure = dict(
         (job.upload_evidence or {}).get("last_targeted_source_refresh_failure") or {}
     )
+    # A "Check Again" run is the same submission's next version (recheck-copy-v1):
+    # the newest completed re-check's report is the successor.
+    from app.models.job import JobStatus
+    from app.services.recheck_copy import lineage
+    rechecking = False
+    for later in lineage(session, job)[1:]:
+        if later.status == JobStatus.COMPLETED:
+            newer = session.scalar(select(Report).where(Report.job_id == later.id)
+                                   .order_by(Report.report_version.desc(), Report.created_at.desc()).limit(1))
+            latest = newer or latest
+            rechecking = False
+        elif later.status == JobStatus.FAILED:
+            failure = {"attempt_id": str(later.id), "code": "recheck_failed"}
+            rechecking = False
+        else:
+            rechecking = True
     return {
         "requested_report_id": str(requested.id),
         "latest_report_id": str(latest.id),
@@ -385,10 +305,82 @@ def get_report_successor_status(
         "successor_available": latest.id != requested.id,
         "processing": bool(
             (job.upload_evidence or {}).get("targeted_source_refresh")
-        ),
+        ) or rechecking,
         "queued_uploads": len((job.upload_evidence or {}).get("queued_source_uploads") or []),
         "last_reanalysis_failure": failure or None,
     }
+
+
+def _moved_to(session: Session, report_id: str, principal) -> str | None:
+    """The latest report a deleted older report's address opens, in the
+    viewer's scope (owner decision 2026-10-20); None for any other address."""
+    from app.services.record_expiry import current_report_id
+    try:
+        parsed = uuid.UUID(str(report_id))
+    except ValueError:
+        return None
+    if session.get(Report, parsed) is not None:
+        return None
+    target = current_report_id(session, parsed)
+    return str(target) if target and _report_job(session, str(target), principal) else None
+
+
+def _report_job(session: Session, report_id: str, principal) -> Job | None:
+    """The report's job when it belongs to the viewer's scope, else None."""
+    try:
+        report = session.get(Report, uuid.UUID(str(report_id)))
+    except ValueError:
+        return None
+    if not isinstance(report, Report):
+        return None
+    job = session.get(Job, report.job_id)
+    if (not isinstance(job, Job) or job.scope_type != principal.scope_type
+            or job.scope_id != principal.scope_id):
+        return None
+    return job
+
+
+@router.post("/{report_id}/check-again")
+def check_paper_again(
+    report_id: str,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_report_principal),
+    session: Session = Depends(get_db),
+    backend: StorageBackend = Depends(get_storage_backend),
+):
+    """Check the kept submitted file again (owner decision 2026-10-13, S1 step 3c).
+
+    The page then follows the newest version exactly as after a source upload;
+    an unchanged paper under unchanged rules returns its existing report.
+    """
+    from app.services.paper_dispatch import attempt_id_for
+    from app.services.paper_upload import PaperUploadError
+    from app.services.recheck_copy import RecheckInProgress, RecheckUnavailable, start_recheck
+    from app.tasks.check_paper import check_paper_task
+    principal.require(PAPER_CHECK_CAPABILITY)
+    require_same_origin_request(request)
+    _load_bundle(session, backend, report_id, principal)
+    job = _report_job(session, report_id, principal)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    try:
+        outcome, value = start_recheck(session, backend, job, scope_type=principal.scope_type,
+                                       scope_id=principal.scope_id)
+    except RecheckInProgress as exc:
+        raise HTTPException(status_code=409, detail="The report is already being updated.") from exc
+    except RecheckUnavailable as exc:
+        raise HTTPException(status_code=410, detail="The submitted file is no longer kept") from exc
+    except PaperUploadError as exc:
+        raise HTTPException(status_code=503, detail=exc.code) from exc
+    if outcome == "reused":
+        return {"reused": True, "report_id": str(value.id)}
+    try:
+        queued = check_paper_task.delay(str(value.id), attempt_id_for(value))
+        value.task_id = queued.id
+        session.commit()
+    except Exception:
+        session.rollback()
+    return {"status_url": f"/report/{quote(str(report_id), safe='')}/successor", "attempt_id": str(value.id)}
 
 
 @router.get("/{report_id}/paper")
@@ -656,6 +648,7 @@ def upload_citation_source(
             detail="Supplied HTML source intake is disabled; upload a PDF",
         )
     matches = []
+    books = _located_books(session, report_id, principal)
     for member in candidates:
         source = member.get("source") or {}
         if supplied_page:
@@ -689,6 +682,21 @@ def upload_citation_source(
         )
         if verified:
             matches.append(member)
+            continue
+        # The whole book a cited chapter is in (owner requests 2026-10-18,
+        # Synthetic Embrace: Maynard's book for a chapter reference): first as
+        # the catalogue records it, then as the student wrote it.
+        for book, book_author in _book_identities(source, books.get(str(member.get("reference_id") or ""))):
+            if verify_instructor_upload(file_bytes, provided_title=book, provided_author=book_author or None)[0]:
+                matches.append({**member, "_uploaded_book_title": book})
+                break
+    # One book cited for several of its chapters serves them all (rules audit
+    # 2026-10-18: it was refused as "cannot be uniquely matched").
+    same_book = bool(len(matches) > 1 and all(m.get("_uploaded_book_title") for m in matches)
+                     and len({m["_uploaded_book_title"] for m in matches}) == 1)
+    book_members = matches if same_book else []
+    if same_book:
+        matches = matches[:1]
     if len(matches) != 1:
         label = "page" if supplied_page else "PDF"
         detail = (
@@ -704,19 +712,21 @@ def upload_citation_source(
         filename=file.filename or ("source.html" if supplied_page else "source.pdf"),
         headers=file.headers,
     )
+    book = member.get("_uploaded_book_title")
     result = admit_uploaded_source(
         request=request,
         file=checked_file,
         doi=str(source.get("doi") or "") or None,
         isbn=None,
-        title=str(source.get("title") or "") or None,
+        title=book or str(source.get("title") or "") or None,
         author=str(source.get("author") or "") or None,
         year=str(source.get("year") or "") or None,
         expected_pages=None,
-        expected_first_page=_stated_page_range(source)[0],
-        expected_last_page=_stated_page_range(source)[1],
-        document_kind=None,
-        source_kind=(
+        # A whole book is checked as a book, not against the chapter's pages.
+        expected_first_page=None if book else _stated_page_range(source)[0],
+        expected_last_page=None if book else _stated_page_range(source)[1],
+        document_kind="book" if book else None,
+        source_kind="monograph" if book else (
             str(source.get("source_kind") or "")
             if str(source.get("source_kind") or "") not in {"", "unknown"}
             else None
@@ -738,6 +748,10 @@ def upload_citation_source(
         reference_id=reference_id,
         admission=result,
     )
+    # The book's other chapter references refresh after this one (queued).
+    for other in book_members[1:]:
+        _start_uploaded_source_reanalysis(session, backend, report_id=report_id,
+                                          reference_id=str(other.get("reference_id") or ""), admission=result)
     return {
         "status": result.get("status", "ok"),
         "review_status": result.get("review_status"),
@@ -746,70 +760,25 @@ def upload_citation_source(
     }
 
 
-@router.post("/{report_id}/reference/{reference_id}/search-again")
-def search_reference_again(
-    report_id: str,
-    reference_id: str,
-    request: Request,
-    principal: AuthenticatedPrincipal = Depends(get_report_principal),
-    session: Session = Depends(get_db),
-    backend: StorageBackend = Depends(get_storage_backend),
-):
-    """Search one reference with an incomplete search again (owner decision 2026-09-29).
 
-    Starts a forced targeted refresh of that reference only; the page then
-    follows the successor report exactly as after a source upload.
-    """
-    principal.require(REPORT_SOURCE_CAPABILITY)
-    require_same_origin_request(request)
-    view, _, _ = _load_bundle(session, backend, report_id, principal)
-    members = [
-        member
-        for citation in view.get("citations", [])
-        for member in citation.get("members", [])
-        if member.get("reference_id") == reference_id
-    ]
-    if not members:
-        raise HTTPException(status_code=404, detail="Reference not found")
-    if not any(member_search_incomplete(member) for member in members):
-        raise HTTPException(status_code=409, detail="This reference has no incomplete search")
+
+def _located_books(session: Session, report_id: str, principal) -> dict:
+    """reference id -> the book a chapter was found to be part of."""
     try:
-        prepared = prepare_search_again_refresh(
-            session,
-            report_id=report_id,
-            reference_id=reference_id,
-            scope_type=principal.scope_type,
-            scope_id=principal.scope_id,
-        )
-    except SearchAgainRateLimited as exc:
-        raise HTTPException(
-            status_code=429,
-            detail=str(exc),
-            headers={"Retry-After": str(exc.retry_after_seconds)},
-        ) from exc
-    except PaperWorkflowError as exc:
-        if exc.code == "assessment_marks_released":
-            # Marks were released after the page was opened: the page removes
-            # the button (owner decision 2026-09-29).
-            raise HTTPException(status_code=410, detail=exc.code) from exc
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    publication_pending = False
-    try:
-        task_id = dispatch_paper_workflow(prepared["job_id"], prepared["attempt_id"])
-    except Exception:
-        # The committed attempt is resumed by bounded workflow recovery.
-        task_id = None
-        publication_pending = True
-    return {
-        "reanalysis_status": "scheduled",
-        "base_report_id": prepared.get("report_id"),
-        "attempt_id": prepared["attempt_id"],
-        "task_id": task_id,
-        "publication_pending": publication_pending,
-        "status_url": f"/report/{report_id}/successor",
-    }
+        job = _report_job(session, report_id, principal)
+    except Exception:  # noqa: BLE001 - optional: the student's own book title is still tried
+        return {}
+    return {str(item.get("reference_id")): (item.get("reference_discovery") or {}).get("container_identity") or {}
+            for item in (getattr(job, "source_results", None) or []) if isinstance(item, dict)}
+
+
+def _book_identities(source: dict, container: dict | None) -> list[tuple[str, str]]:
+    """(title, author) pairs to match an uploaded whole book against (`book_of_part`)."""
+    if str(source.get("source_kind") or "") != "book_section":
+        return []
+    from app.services.book_of_part import book_identities
+    return book_identities(container, cited_container_title=str(source.get("container_title") or ""),
+                           cited_author=str(source.get("author") or ""))
 
 
 def _start_uploaded_source_reanalysis(

@@ -152,34 +152,41 @@ def test_evidence_package_hash_rejects_mutation():
 
 def test_evidence_package_can_bind_completed_reference_discovery():
     artifact = _artifact()
-    normalized_query = "title:careful checking improves accuracy"
-    query = ReferenceSearchQuery(
-        query_id="query-1",
-        route_category="academic_adapter",
-        provider="crossref",
-        normalized_query=normalized_query,
-        query_sha256=hashlib.sha256(normalized_query.encode()).hexdigest(),
-    )
+    # Every index the kind requires and a title web search, each finished
+    # (search-completion-v1).
+    routes = [("crossref", "academic_adapter", "title:careful checking improves accuracy"),
+              ("openalex", "academic_adapter", "title:careful checking improves accuracy"),
+              ("brave", "bounded_web", '"careful checking improves accuracy"')]
+    queries, attempts = [], []
+    for provider, category, normalized_query in routes:
+        queries.append(ReferenceSearchQuery(
+            query_id=f"query-{provider}",
+            route_category=category,
+            provider=provider,
+            execution_provider=provider,
+            execution_outcome="no_results",
+            normalized_query=normalized_query,
+            query_sha256=hashlib.sha256(normalized_query.encode()).hexdigest(),
+        ))
+        attempts.append(ReferenceRouteAttempt(
+            attempt_id=f"attempt-{provider}",
+            route_category=category,
+            provider=provider,
+            required=True,
+            permitted=True,
+            query_ids=[f"query-{provider}"],
+            outcome="no_match",
+            started_at=artifact.created_at,
+            completed_at=artifact.created_at,
+        ))
     discovery = derive_reference_discovery_record(
         reference_id="reference-1",
         expected=ExpectedBibliographicFields(
-            title="Careful checking improves accuracy"
+            title="Careful checking improves accuracy", source_kind="journal_article"
         ),
-        required_route_categories=["academic_adapter"],
-        queries=[query],
-        attempts=[
-            ReferenceRouteAttempt(
-                attempt_id="attempt-1",
-                route_category="academic_adapter",
-                provider="crossref",
-                required=True,
-                permitted=True,
-                query_ids=["query-1"],
-                outcome="no_match",
-                started_at=artifact.created_at,
-                completed_at=artifact.created_at,
-            )
-        ],
+        required_route_categories=["academic_adapter", "bounded_web"],
+        queries=queries,
+        attempts=attempts,
         candidates=[],
         created_at=artifact.created_at,
     )

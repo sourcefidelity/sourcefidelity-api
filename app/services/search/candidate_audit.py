@@ -1,7 +1,7 @@
 """Development-only audit of web-search candidate links.
 
 Enabled only by ``SEARCH_CANDIDATE_AUDIT_URLS``. A developer can then open each
-Exa, Tavily or SearXNG candidate the resolver considered and check whether its
+Exa or Tavily candidate the resolver considered and check whether its
 disposition was right. Brave candidates are never recorded here: the Brave
 Search API terms (§3.2(i)) forbid storing search results beyond transient
 operational use, so Brave keeps its count-only transient audit.
@@ -18,7 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field
 AUDIT_POLICY = "dev-candidate-audit-v1"
 # An allowlist, not a denylist: a provider is recorded only after its terms
 # were checked for result retention. Brave is deliberately absent.
-# SearXNG relays other engines (Google CSE here) whose terms are unchecked, so it is not recorded.
 AUDITABLE_PROVIDERS = frozenset({"exa", "tavily"})
 MAX_AUDIT_CANDIDATES = 256
 MAX_AUDIT_URL_LENGTH = 2000
@@ -42,7 +41,7 @@ _DISPOSITIONS = frozenset(AuditDisposition.__args__)
 
 class SearchCandidateAuditEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    provider: Literal["exa", "tavily", "searxng"]
+    provider: Literal["exa", "tavily"]
     query_id: str | None = Field(default=None, max_length=128)
     rank: int | None = Field(default=None, ge=1, le=10_000)
     url: str = Field(min_length=1, max_length=MAX_AUDIT_URL_LENGTH)

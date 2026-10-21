@@ -77,20 +77,6 @@ def test_only_the_references_differing_text_is_shown():
 
 
 
-def test_a_heading_naming_a_work_is_not_a_citation():
-    from app.services.evidence_report import heading_citation
-    heading = {'student_text': 'Classical Hollywood: The Day the Earth Stood Still (Wise, 1951)',
-               'citation_marker': '(Wise, 1951)'}
-    assert heading_citation(heading)
-    assert heading_citation({'student_text': 'Post-Classical Hollywood: Star Trek: The Motion Picture (Wise, 1979)',
-                             'citation_marker': '(Wise, 1979)'})
-    sentence = {'student_text': 'The film was released across 2,000 theatres (Bond, 2020).', 'citation_marker': '(Bond, 2020)'}
-    no_stop = {'student_text': 'the studio controlled every stage of release (Bond, 2020)', 'citation_marker': '(Bond, 2020)'}
-    assert not heading_citation(sentence) and not heading_citation(no_stop)
-    assert heading_citation({'student_text': "Killer's Kiss (1955): Classical Hollywood Film Analysis",
-                             'citation_marker': "Killer's Kiss (1955)"})
-
-
 def test_a_confirmed_cited_web_page_is_whole_when_not_cut_off():
     # Paper 5 reference 13 (a 569-word event page) read as limited text, 2026-10-03.
     from app.services.web_completeness import confirmed_page_completeness
