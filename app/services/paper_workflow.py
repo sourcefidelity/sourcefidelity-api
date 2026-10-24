@@ -435,6 +435,10 @@ def retrieve_paper_sources(
                 reference_discovery=exc.reference_discovery,
                 submitted_link_observations=getattr(exc, "submitted_link_observations", None),
             )
+            declared = str(getattr(exc, "declared_document_url", None) or "")
+            if declared.startswith("https://"):
+                # Kept when the search ends unresolved too (discovery-recorder-v1).
+                result_record["declared_document_url"] = declared
             dependencies = _retryable_provider_dependencies(
                 exc.reference_discovery_trace,
                 exc.reference_discovery,

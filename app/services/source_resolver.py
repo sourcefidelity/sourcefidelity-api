@@ -152,7 +152,7 @@ from app.services.safe_fetch import (
 logger = logging.getLogger(__name__)
 
 
-def _append_unique_candidate(trace: dict, candidate) -> None:
+def _append_unique_candidate(trace, candidate) -> None:
     """Append a discovery candidate unless its exact record is already present.
 
     A candidate's id is derived from its attempt, provider and record key, so a
@@ -161,10 +161,7 @@ def _append_unique_candidate(trace: dict, candidate) -> None:
     the whole trace invalid, and the reference then cannot be assessed at all,
     so one repeated row silently costs a real finding.
     """
-    if any(existing.candidate_id == candidate.candidate_id
-           for existing in trace["candidates"]):
-        return
-    trace["candidates"].append(candidate)
+    trace.add_candidate(candidate, unique=True)
 
 
 def _search_execution_outcome(result: RetrievalResult) -> str:
@@ -289,7 +286,8 @@ def _route_error_code(result) -> str | None:
     return "unclassified"
 
 
-_ACTIVE_DISCOVERY_TRACE: ContextVar[dict | None] = ContextVar(
+# The current cited reference's discovery recorder (discovery-recorder-v1).
+_ACTIVE_DISCOVERY_TRACE: ContextVar["DiscoveryRecorder | None"] = ContextVar(
     "sourcefidelity_reference_discovery_trace", default=None
 )
 
@@ -1529,7 +1527,7 @@ class SourceResolver:
     def _require_discovery_route(category: str) -> None:
         trace = _ACTIVE_DISCOVERY_TRACE.get()
         if trace is not None:
-            trace["required"].add(category)
+            trace.require(category)
 
     @staticmethod
     def _record_discovery_attempt(
@@ -1538,16 +1536,18 @@ class SourceResolver:
         provider: str,
         result: RetrievalResult,
         required: bool,
-    ) -> None:
+    ) -> str | None:
+        """Record one route attempt with its queries and candidates; the
+        attempt's id, or None when no recorder is active or it was not kept."""
         trace = _ACTIVE_DISCOVERY_TRACE.get()
         if trace is None:
-            return
+            return None
         applicable = (result.metadata or {}).get("lookup_applicable", True)
         if not applicable:
             required = False
         if required:
-            trace["required"].add(category)
-        expected: ExpectedBibliographicFields = trace["expected"]
+            trace.require(category)
+        expected: ExpectedBibliographicFields = trace.expected
         if expected.doi:
             query_text = f"doi:{expected.doi}"
         elif expected.isbn:
@@ -1562,7 +1562,7 @@ class SourceResolver:
                 )
                 if value
             )
-        ordinal = len(trace["attempts"]) + 1
+        ordinal = len(trace.attempts) + 1
         query_inputs = []
         for search_attempt in (result.metadata or {}).get("structured_search_attempts", []):
             query_inputs.append((
@@ -1586,7 +1586,7 @@ class SourceResolver:
                             else None
                         ),
                     )
-                    if trace.get("search_policy_version") == "api-first-search-v2" or item not in seen_query_inputs:
+                    if trace.search_policy_version == "api-first-search-v2" or item not in seen_query_inputs:
                         seen_query_inputs.add(item)
                         query_inputs.append((*item, search_attempt))
         if not query_inputs:
@@ -1607,7 +1607,7 @@ class SourceResolver:
                 unicodedata.normalize("NFKC", raw_query).casefold(),
             ).strip() or "insufficient-metadata"
             query_seed = (
-                f"{trace['reference_id']}:{category}:{provider}:{ordinal}:"
+                f"{trace.reference_id}:{category}:{provider}:{ordinal}:"
                 f"{query_index}:{execution_provider or ''}:{execution_outcome}:"
                 f"{result_count if result_count is not None else ''}:{normalized_query}"
             )
@@ -1653,7 +1653,7 @@ class SourceResolver:
             )
         seed = ":".join(
             (
-                trace["reference_id"],
+                trace.reference_id,
                 category,
                 provider,
                 str(ordinal),
@@ -1684,6 +1684,15 @@ class SourceResolver:
         elif category == "bounded_web" and transient_audits and not bounded_candidate_returned:
             outcome = "candidates_processed"
             reason_code = "transient_candidate_accounting"
+        elif result.success and "archive_page_matches" in (result.metadata or {}):
+            # A located magazine-archive page is kept on the trace
+            # (periodical_archive_match) and read as its own attempt; this search
+            # adds no candidate record. Recorded as found with no candidate, it
+            # failed the record's binding check and dropped the whole record
+            # (2026-10-21). The archive is an optional route, so this outcome
+            # never completes or fails a required search.
+            outcome = "no_match"
+            reason_code = "archive_page_located"
         elif result.success or bounded_candidate_returned or observed_web_candidate or (result.metadata or {}).get("candidate_budget_skipped"):
             outcome = "candidate_found"
             reason_code = "candidate_returned"
@@ -1768,8 +1777,8 @@ class SourceResolver:
             timing_version=timing.get('version'),
             elapsed_seconds=timing.get('elapsed_seconds'),
         )
-        trace["queries"].extend(queries)
-        trace["attempts"].append(attempt)
+        if trace.add_attempt(attempt, queries) is None:
+            return None
         location_records: dict[str, dict] = {}
         for phase in (result.metadata or {}).get("retrieval_trace", []):
             for candidate_location in phase.get("candidate_locations", []):
@@ -1851,7 +1860,7 @@ class SourceResolver:
                         ),
                     },
                 )
-                trace["candidates"].append(
+                trace.add_candidate(
                     build_reference_discovery_candidate(
                         attempt_id=attempt.attempt_id,
                         provider=provider,
@@ -1935,7 +1944,7 @@ class SourceResolver:
                     existing = next(
                         (
                             candidate
-                            for candidate in trace["candidates"]
+                            for candidate in trace.candidates
                             if candidate.provider == provider
                             and candidate.location_sha256 == location_hash
                             and candidate.attempt_id == attempt.attempt_id
@@ -1946,7 +1955,7 @@ class SourceResolver:
                         if existing.location_rank is None or rank < existing.location_rank:
                             existing.location_rank = rank
                         continue
-                    trace["candidates"].append(
+                    trace.add_candidate(
                         build_reference_discovery_candidate(
                             attempt_id=attempt.attempt_id,
                             provider=provider,
@@ -1972,7 +1981,7 @@ class SourceResolver:
                         )
                     )
             else:
-                trace["candidates"].append(
+                trace.add_candidate(
                     build_reference_discovery_candidate(
                         attempt_id=attempt.attempt_id,
                         provider=provider,
@@ -1980,6 +1989,7 @@ class SourceResolver:
                         result=result,
                     )
                 )
+        return attempt.attempt_id
 
     @staticmethod
     def _record_canonical_location_outcomes(result: RetrievalResult) -> None:
@@ -1989,7 +1999,7 @@ class SourceResolver:
             return
         attempts = list((result.metadata or {}).get("location_attempts") or [])
         by_hash: dict[str, list] = {}
-        for candidate in trace["candidates"]:
+        for candidate in trace.candidates:
             if candidate.location_sha256:
                 by_hash.setdefault(candidate.location_sha256, []).append(candidate)
         for item in attempts:
@@ -2027,71 +2037,34 @@ class SourceResolver:
                     candidate.validation_reason_sha256 = reason_hash
 
     @staticmethod
-    def _discovery_artifacts() -> tuple[dict | None, dict | None]:
-        trace = _ACTIVE_DISCOVERY_TRACE.get()
-        if trace is None:
-            return None, None
+    def _discovery_extra_limitations() -> list[str]:
+        """Limitations known only at the end: the elapsed allowance and the
+        candidate allowance's counts (computed once, never written back)."""
+        extra = []
         if expired():
-            limitation = f"{ELAPSED_POLICY}: reference elapsed allowance exhausted; unfinished operations are not negative search evidence."
-            if limitation not in trace.setdefault("limitations", []):
-                trace["limitations"].append(limitation)
+            extra.append(f"{ELAPSED_POLICY}: reference elapsed allowance exhausted; unfinished operations are not negative search evidence.")
         budget = ACTIVE_CANDIDATE_BUDGET.get()
         if budget is not None:
             counts = budget.snapshot()
-            limitation = (f"Operation candidate allowance: {counts['attempted']} attempted; "
-                          f"{counts['not_attempted']} not attempted; limit {counts['limit']}.")
-            if limitation not in trace.setdefault("limitations", []):
-                trace["limitations"].append(limitation)
-        precursor = ReferenceDiscoveryTrace(
-            candidate_ranking_policy_version="candidate-purpose-ranking-v1",
-            search_capacity_policy_version="search-inspection-capacity-v4",
-            metadata_screen_resolution_policy_version="screened-metadata-work-binding-v1",
-            bounded_review_policy_version="bounded-reference-review-v9",
-            metadata_identity_policy_version="corroborated-metadata-identity-v1",
-            credibility_policy_version="reference-credibility-v4",
-            credibility_reference_sha256=hashlib.sha256(trace["submitted_reference"].encode()).hexdigest()
-                if trace.get("submitted_reference") else None,
-            **({"journal_checks": trace["journal_checks"]} if "journal_checks" in trace else {}),
-            search_retention_policy=trace.get("search_retention_policy"),
-            search_policy_version=trace.get("search_policy_version", "configured-search-v1"),
-            required_web_providers=trace.get("required_web_providers", []),
-            reference_id=trace["reference_id"],
-            expected=trace["expected"],
-            required_route_categories=sorted(trace["required"]),
-            queries=trace["queries"],
-            attempts=trace["attempts"],
-            candidates=trace["candidates"],
-            limitations=list(trace.get("limitations") or [])
-            + [
-                "The trace is evaluated by the fail-closed completion assessor before any live outcome is attached."
-            ],
-        )
-        completion = assess_reference_discovery_trace(precursor)
-        # Read by the completed-search memo (search-reuse-memo-v1), including
-        # the suppressed completed no-match outcome below.
-        trace["derived_outcome"] = (
-            completion.record.outcome if completion.ready and completion.record is not None else None)
-        accepted_record = None
-        limitations = list(precursor.limitations)
-        if completion.ready and completion.record is not None:
-            if completion.record.outcome == "unlocated_after_search":
-                limitations.append(
-                    "A completed no-match outcome is suppressed pending its real acceptance control."
-                )
-            else:
-                accepted_record = completion.record.model_dump(mode="json")
-        elif completion.blocker_codes:
-            limitations.append(
-                "Completion blockers: " + ", ".join(completion.blocker_codes)
-            )
-        completed_trace = precursor.model_copy(
-            update={
-                "candidates_complete": completion.ready,
-                "outcome_derived": accepted_record is not None,
-                "limitations": limitations,
-            }
-        )
-        return completed_trace.model_dump(mode="json"), accepted_record
+            extra.append(f"Operation candidate allowance: {counts['attempted']} attempted; "
+                         f"{counts['not_attempted']} not attempted; limit {counts['limit']}.")
+        return extra
+
+    @staticmethod
+    def _discovery_finished(*, preview: bool = False):
+        """The current reference's trace and record (discovery-recorder-v1);
+        `preview` leaves out the finishing attachments. Changes nothing."""
+        from app.services.discovery_recorder import Finished
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if trace is None:
+            return Finished(None, None, None)
+        extra = SourceResolver._discovery_extra_limitations()
+        return trace.preview(extra) if preview else trace.finish(extra)
+
+    @staticmethod
+    def _discovery_artifacts() -> tuple[dict | None, dict | None]:
+        done = SourceResolver._discovery_finished()
+        return done.trace, done.record
 
     def _try_archived_copy(self, student_url, failed, title, expected_kind, author, year, doi):
         """The Internet Archive's capture of a submitted page that failed live
@@ -2244,31 +2217,20 @@ class SourceResolver:
         expected.edition_sensitive = is_edition_sensitive_reference(
             expected, getattr(reference, "raw_ref", "") or ""
         )
-        token = _ACTIVE_DISCOVERY_TRACE.set(
-            {
-                "reference_id": reference_id,
-                "submitted_reference": getattr(reference, 'raw_ref', '') or '',
-                "search_policy_version": settings.SEARCH_POLICY_VERSION,
-                "search_retention_policy": "brave-operational-transient-v1" if settings.BRAVE_SEARCH_TRANSIENT_ENABLED else None,
-                "required_web_providers": list(required_api_providers()) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
-                "expected": expected,
-                "required": set(
-                    required_reference_discovery_routes(
-                        expected,
-                        library_metadata_enabled=False,
-                    )
-                ),
-                "queries": [],
-                "attempts": [],
-                "candidates": [],
-                "limitations": [],
-            }
-        )
-        trace = _ACTIVE_DISCOVERY_TRACE.get()
-        if trace is not None and not trace["required"]:
-            trace["limitations"].append(
-                "No completed-search route policy exists for this source kind."
-            )
+        from app.services.discovery_recorder import DiscoveryRecorder
+        outer = _ACTIVE_DISCOVERY_TRACE.get()
+        token = _ACTIVE_DISCOVERY_TRACE.set(DiscoveryRecorder(
+            reference_id=reference_id,
+            submitted_reference=getattr(reference, 'raw_ref', '') or '',
+            search_policy_version=settings.SEARCH_POLICY_VERSION,
+            search_retention_policy="brave-operational-transient-v1" if settings.BRAVE_SEARCH_TRANSIENT_ENABLED else None,
+            required_web_providers=list(required_api_providers()) if settings.SEARCH_POLICY_VERSION == "api-first-search-v2" else [],
+            expected=expected,
+            required=required_reference_discovery_routes(expected, library_metadata_enabled=False),
+            # A nested search for the same cited reference (its containing
+            # book, a single-authored book's text) shares its model allowance.
+            allowance=outer.allowance if outer is not None else None,
+        ))
         provisional_token = _PROVISIONAL_CANDIDATES.set([])
         graph_token = _LAST_GRAPH.set(None)
         try:
@@ -2298,19 +2260,10 @@ class SourceResolver:
                 self._enrich_journal_registration(reference)
                 self._enrich_book_editions()
             native = self._native_script_route(reference, identity_only=identity_only)
-            (
-                exc.reference_discovery_trace,
-                exc.reference_discovery,
-            ) = self._discovery_artifacts()
-            exc.reference_discovery_trace, exc.reference_discovery = self._attach_container_identity(
-                reference, exc.reference_discovery_trace, exc.reference_discovery, identity_only=identity_only)
-            self._attach_native_route(exc.reference_discovery_trace, exc.reference_discovery,
-                                      (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
-            self._attach_periodical_archive(exc.reference_discovery_trace, exc.reference_discovery)
-            if not identity_only and isinstance(exc.reference_discovery, dict):
-                mismatch = self._doi_title_mismatch()
-                if mismatch:
-                    exc.reference_discovery["doi_title_mismatch"] = mismatch
+            finished = self._finish_reference_discovery(reference, identity_only=identity_only)
+            exc.reference_discovery_trace, exc.reference_discovery = finished.trace, finished.record
+            declared = _ACTIVE_DISCOVERY_TRACE.get().declared_document_url
+            exc.declared_document_url = declared
             book = None if identity_only else self._single_authored_book_text(reference, exc.reference_discovery)
             if book is not None:
                 book.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
@@ -2321,15 +2274,18 @@ class SourceResolver:
                 native.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
                 native.metadata['reference_discovery'] = exc.reference_discovery
                 if not identity_only:
-                    self._update_search_memo(native, exc.reference_discovery_trace)
+                    self._update_search_memo(native, finished)
                 return native
             if not identity_only:
-                self._update_search_memo(candidates[0] if candidates else None,
-                                         exc.reference_discovery_trace)
+                self._update_search_memo(candidates[0] if candidates else None, finished)
             if candidates:
                 fallback = candidates[0]
                 fallback.metadata['reference_discovery_trace'] = exc.reference_discovery_trace
                 fallback.metadata['reference_discovery'] = exc.reference_discovery
+                if declared and not fallback.full_text:
+                    # The document link a page declared is kept on this path
+                    # too (discovery-recorder-v1).
+                    fallback.metadata.setdefault("declared_document_url", declared)
                 return fallback
             raise
         else:
@@ -2344,27 +2300,20 @@ class SourceResolver:
                 if native is not None and (native.full_text or (native.abstract and not result.abstract)):
                     result = native
             result.metadata = result.metadata or {}
-            trace_payload, discovery_payload = self._discovery_artifacts()
-            trace_payload, discovery_payload = self._attach_container_identity(
-                reference, trace_payload, discovery_payload, identity_only=identity_only)
-            self._attach_native_route(trace_payload, discovery_payload,
-                                      (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("native_script_route"))
-            self._attach_periodical_archive(trace_payload, discovery_payload)
+            finished = self._finish_reference_discovery(reference, identity_only=identity_only)
+            trace_payload, discovery_payload = finished.trace, finished.record
             if not identity_only and not result.full_text:
                 book = self._single_authored_book_text(reference, discovery_payload)
                 if book is not None:
                     result = book
             if not identity_only:
-                self._update_search_memo(result, trace_payload)
+                self._update_search_memo(result, finished)
             result.metadata["reference_discovery_trace"] = trace_payload
-            declared = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("declared_document_url")
+            declared = _ACTIVE_DISCOVERY_TRACE.get().declared_document_url
             if declared and not result.full_text:
                 result.metadata.setdefault("declared_document_url", declared)
             if discovery_payload is not None:
                 result.metadata["reference_discovery"] = discovery_payload
-                mismatch = self._doi_title_mismatch()
-                if mismatch:
-                    discovery_payload["doi_title_mismatch"] = mismatch
             return result
         finally:
             _LAST_GRAPH.reset(graph_token)
@@ -2415,12 +2364,12 @@ class SourceResolver:
         signals = other_language_signals(reference)
         if not signals:
             return None
-        expected: ExpectedBibliographicFields = trace["expected"]
+        expected: ExpectedBibliographicFields = trace.expected
         cited = split_cited_title(expected.title)
         route = {"policy_version": NATIVE_SCRIPT_ROUTE_POLICIES[-1], "signals": signals,
                  "cited_title": {k: cited[k] for k in ("romanised", "translation")} if cited else None,
                  "attempt_ids": [], "model_identity_calls": 0}
-        trace["native_script_route"] = route
+        trace.native_script_route = route
         if expired():
             route["status"] = "elapsed_budget_exhausted"
             return None
@@ -2441,9 +2390,10 @@ class SourceResolver:
         found: list[tuple[str, RetrievalResult]] = []
 
         def recorded(category: str, provider: str, result: RetrievalResult) -> str:
-            self._record_discovery_attempt(category=category, provider=provider, result=result, required=False)
-            attempt_id = trace["attempts"][-1].attempt_id
-            route["attempt_ids"].append(attempt_id)
+            attempt_id = self._record_discovery_attempt(category=category, provider=provider, result=result,
+                                                        required=False)
+            if attempt_id is not None:
+                route["attempt_ids"].append(attempt_id)
             return attempt_id
 
         translation = (cited or {}).get("translation")
@@ -2458,8 +2408,9 @@ class SourceResolver:
         if kind in self._NATIVE_BOOK_KINDS and not expired():
             from app.services.retrieval.google_books import GoogleBooksRetriever
             search = GoogleBooksRetriever().search_metadata_result(title=native_title, max_results=5)
-            self._record_book_search(expected, search, fallback=True)
-            route["attempt_ids"].append(trace["attempts"][-1].attempt_id)
+            attempt_id = self._record_book_search(expected, search, fallback=True)
+            if attempt_id is not None:
+                route["attempt_ids"].append(attempt_id)
 
         admitted: RetrievalResult | None = None
         expected_kind = _expected_source_kind_assessment(
@@ -2519,7 +2470,7 @@ class SourceResolver:
                 and not candidate.has_material_conflict
                 and any(c.field_name == "title" and c.outcome in {"agreement", "minor_difference"}
                         for c in candidate.comparisons)
-                for candidate in trace["candidates"])
+                for candidate in trace.candidates)
             if not agreed:
                 continue
             if (result.locations or result.full_text_url) and not expired():
@@ -2534,17 +2485,15 @@ class SourceResolver:
         return abstract
 
     @staticmethod
-    def _native_route_completion(trace: dict, attempt_ids: list[str], native_title: str) -> dict:
+    def _native_route_completion(trace, attempt_ids: list[str], native_title: str) -> dict:
         """Whether the native-script route completed, by the one completion rule
         (search-completion-v1) over its own attempts and its own-script title;
         one finished index suffices."""
         from app.services.search_completion import assess_search_completion
         completion = assess_search_completion(
-            {"expected": trace["expected"], "queries": trace["queries"], "attempts": trace["attempts"],
-             "required_web_providers": trace.get("required_web_providers")},
-            title=native_title, attempt_ids=set(attempt_ids), any_adapter=True)
-        attempts = [a for a in trace["attempts"] if a.attempt_id in set(attempt_ids)]
-        skipped = sorted({q.execution_provider for a in attempts for q in trace["queries"]
+            trace.completion_input(), title=native_title, attempt_ids=set(attempt_ids), any_adapter=True)
+        attempts = [a for a in trace.attempts if a.attempt_id in set(attempt_ids)]
+        skipped = sorted({q.execution_provider for a in attempts for q in trace.queries
                           if q.query_id in set(a.query_ids) and q.execution_outcome in {"budget_skipped", "cooldown_skipped"}}
                          - set(completion.web_routes))
         return {"status": "completed" if completion.complete else "incomplete",
@@ -2553,17 +2502,9 @@ class SourceResolver:
                 "web_completed": list(completion.web_routes), "web_skipped": skipped}
 
     @staticmethod
-    def _attach_native_route(trace_payload: dict | None, discovery_payload: dict | None, route: dict | None) -> None:
-        if not route:
-            return
-        for payload in (trace_payload, discovery_payload):
-            if isinstance(payload, dict):
-                payload["native_script_route"] = deepcopy(route)
-
-    @staticmethod
-    def _search_memo_key(trace: dict) -> str | None:
+    def _search_memo_key(trace) -> str | None:
         from app.services.search.search_memo import reference_key
-        expected: ExpectedBibliographicFields = trace["expected"]
+        expected: ExpectedBibliographicFields = trace.expected
         return reference_key(expected.doi, expected.title,
                              expected.authors[0] if expected.authors else None, expected.year)
 
@@ -2577,29 +2518,28 @@ class SourceResolver:
         from app.services.search import search_memo
         trace = _ACTIVE_DISCOVERY_TRACE.get()
         context = search_memo.active_context()
-        if trace is None or context is None or "bounded_web" not in trace["required"]:
+        if trace is None or context is None or "bounded_web" not in trace.required:
             return False
         key = self._search_memo_key(trace)
         if key is None:
             return False
-        record = search_memo.reusable_memo(context, key, source_kind=trace["expected"].source_kind)
+        record = search_memo.reusable_memo(context, key, source_kind=trace.expected.source_kind)
         if record is None:
             return False
         try:
             rebuilt = search_memo.reuse_attempts(
-                record, reference_id=trace["reference_id"],
-                expected_required_providers=list(trace.get("required_web_providers") or []))
+                record, reference_id=trace.reference_id,
+                expected_required_providers=list(trace.required_web_providers))
         except (KeyError, TypeError, ValueError):
             rebuilt = None
         if rebuilt is None:
             return False
         queries, attempts = rebuilt
-        trace["queries"].extend(queries)
-        trace["attempts"].extend(attempts)
-        trace["search_memo_reused"] = True
+        trace.add_attempts(attempts, queries)
+        trace.search_memo_reused = True
         return True
 
-    def _update_search_memo(self, result: RetrievalResult | None, trace_payload: dict | None) -> None:
+    def _update_search_memo(self, result: RetrievalResult | None, finished) -> None:
         """Record a completed no-source web search, or clear a memo once a source is found."""
         from app.services.search import search_memo
         trace = _ACTIVE_DISCOVERY_TRACE.get()
@@ -2617,10 +2557,10 @@ class SourceResolver:
                 result.representation is not None and result.representation.content)):
             search_memo.clear_memo(context, key)
             return
-        if trace.get("search_memo_reused"):
+        if trace.search_memo_reused:
             # Reuse never extends a memo; the next search after it expires does.
             return
-        summary = search_memo.completed_search_summary(trace_payload, trace.get("derived_outcome"))
+        summary = search_memo.completed_search_summary(finished.trace, finished.outcome)
         if summary is not None:
             search_memo.record_completed_search(context, key, summary)
 
@@ -2636,7 +2576,7 @@ class SourceResolver:
         """
         from app.services.bibliography_identity import POLICY
         trace = _ACTIVE_DISCOVERY_TRACE.get()
-        trace["limitations"].append(
+        trace.add_limitation(
             f"{POLICY}: source-byte reuse, direct URL and full-text acquisition "
             "are not attempted; identity-only-landing-metadata-v1 permits bounded HTML metadata inspection; "
             "identity-only-pdf-metadata-v1 permits temporary safety-gated PDF front-matter inspection."
@@ -2661,7 +2601,7 @@ class SourceResolver:
             expected.year or None, expected.source_kind)
         self._enrich_journal_registration(reference)
         self._enrich_book_editions()
-        _, discovery = self._discovery_artifacts()
+        discovery = self._discovery_finished(preview=True).record
         if (discovery or {}).get("outcome") not in {"confirmed", "confirmed_with_minor_differences"}:
             for source in self._retrieval_sources:
                 if "web_discovery" not in getattr(source, "capabilities", ()):
@@ -2725,9 +2665,17 @@ class SourceResolver:
                                                  "policy": "single-authored-book-of-part-v1"}}
         return found
 
-    def _attach_container_identity(self, reference, trace_payload: dict | None,
-                                   discovery: dict | None, *,
-                                   identity_only: bool = False) -> tuple[dict | None, dict | None]:
+    def _finish_reference_discovery(self, reference, *, identity_only: bool):
+        """Settle what depends on the record so far (the containing book, a
+        DOI that registers another title), then finish once."""
+        preview = self._discovery_finished(preview=True)
+        self._attach_container_identity(reference, preview.record, identity_only=identity_only)
+        if not identity_only:
+            _ACTIVE_DISCOVERY_TRACE.get().doi_title_mismatch = self._doi_title_mismatch()
+        return self._discovery_finished()
+
+    def _attach_container_identity(self, reference, discovery: dict | None, *,
+                                   identity_only: bool = False) -> None:
         """Identify the containing book whenever the cited part is not confirmed.
 
         The part search can end unconfirmed on either path out of
@@ -2739,8 +2687,9 @@ class SourceResolver:
         by other authors is another work, and the part's outcome is derived
         again without it (`is_part_title_namesake`).
         """
-        if not isinstance(discovery, dict):
-            return trace_payload, discovery
+        trace = _ACTIVE_DISCOVERY_TRACE.get()
+        if not isinstance(discovery, dict) or trace is None:
+            return
         if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES or identity_only:
             # The chapter itself is confirmed, or is an uncited entry that gets
             # only the identity lookup, so its book is not searched; but
@@ -2759,30 +2708,25 @@ class SourceResolver:
             if getattr(reference, "source_kind", "") == "book_section" and (recorded or container):
                 book = recorded or container
                 responsibility = self._container_responsibility(book, getattr(reference, "author", "") or "")
-                discovery["container_identity"] = {
+                trace.container_identity = {
                     "policy_version": "container-work-identity-v2",
                     "status": ("part_confirmed" if discovery.get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES
                                else "title_page_only"),
                     "searched_title": book, "title": book,
                     "is_monograph": responsibility.get("classification") == "single_authored",
                     "responsibility": responsibility}
-            return trace_payload, discovery
+            return
         container_identity = self._identify_container_work(reference)
         if not container_identity:
-            return trace_payload, discovery
-        trace = _ACTIVE_DISCOVERY_TRACE.get()
-        if container_identity.get("status") == "identified" and trace is not None:
-            namesakes = [candidate for candidate in trace["candidates"]
-                         if is_part_title_namesake(trace["expected"], candidate)]
-            for candidate in namesakes:
-                candidate.plausible_identity_match = False
-                candidate.disposition_reason_code = "part_title_namesake"
-            if namesakes:
-                rederived_trace, rederived = self._discovery_artifacts()
-                if isinstance(rederived, dict):
-                    trace_payload, discovery = rederived_trace, rederived
-        discovery["container_identity"] = container_identity
-        return trace_payload, discovery
+            return
+        if container_identity.get("status") == "identified":
+            # Records sharing only the chapter's title by other authors are
+            # another work; the finish derives the part's outcome without them.
+            for candidate in trace.candidates:
+                if is_part_title_namesake(trace.expected, candidate):
+                    candidate.plausible_identity_match = False
+                    candidate.disposition_reason_code = "part_title_namesake"
+        trace.container_identity = container_identity
 
     def _identify_container_work(self, reference):
         """Identify the book a miscited chapter names, without claiming the part.
@@ -2900,7 +2844,7 @@ class SourceResolver:
         one thing they can still contribute — measured across every stored job,
         they supplied the acquired representation once in seventy-five.
         """
-        _, discovery = self._discovery_artifacts()
+        discovery = self._discovery_finished(preview=True).record
         if (discovery or {}).get("outcome") not in _CONFIRMED_DISCOVERY_OUTCOMES:
             return False
         try:
@@ -2919,7 +2863,7 @@ class SourceResolver:
         """
         if not doi or not title:
             return
-        _, discovery = self._discovery_artifacts()
+        discovery = self._discovery_finished(preview=True).record
         if (discovery or {}).get("outcome") in _CONFIRMED_DISCOVERY_OUTCOMES:
             return
         from app.services.reference_verification import required_adapters
@@ -3119,7 +3063,7 @@ class SourceResolver:
         from app.services.retrieval import media_history_archive as archive
         from app.services.relevance import extract_surnames
         surnames = extract_surnames(author) if author else []
-        pages = re.findall(r"\d+", (trace["expected"].pages or "").strip())
+        pages = re.findall(r"\d+", (trace.expected.pages or "").strip())
         search = archive.find_periodical_article(
             title, container_title, year, surnames[0] if surnames else (author or ""),
             pages[0] if pages else "")
@@ -3142,7 +3086,7 @@ class SourceResolver:
         )
         if search.match is None:
             return None
-        trace["periodical_archive_match"] = {"policy_version": archive.VERSION,
+        trace.periodical_archive_match = {"policy_version": archive.VERSION,
                                              **dataclasses.asdict(search.match)}
         from app.services.retrieval import lantern as pages
         from app.services.retrieval import provider_gate
@@ -3161,15 +3105,6 @@ class SourceResolver:
         self._record_discovery_attempt(category="academic_adapter", provider="lantern",
                                        result=lantern, required=False)
         return lantern if lantern.success else None
-
-    @staticmethod
-    def _attach_periodical_archive(trace_payload: dict | None, discovery_payload: dict | None) -> None:
-        match = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get("periodical_archive_match")
-        if not match:
-            return
-        for payload in (trace_payload, discovery_payload):
-            if isinstance(payload, dict):
-                payload["periodical_archive_match"] = deepcopy(match)
 
     def _enrich_journal_registration(self, reference) -> None:
         """Optional bounded metadata escalation, never an exhaustive archive check."""
@@ -3190,18 +3125,18 @@ class SourceResolver:
         # Do not spend additional requests on already established identities.
         if any(c.is_credible and not c.has_material_conflict and
                sum(v.outcome == "agreement" for v in c.comparisons) >= 2
-               for c in trace["candidates"]):
+               for c in trace.candidates):
             return
         adapter = next((s for s in getattr(self, "_retrieval_sources", [])
                         if isinstance(s, CrossrefRetriever)), None)
         if adapter is None:
             return
         # Reserve structural room for every bounded result before any request.
-        if len(trace["candidates"]) > 73 or len(trace["queries"]) > 62 or len(trace["attempts"]) > 126:
+        if not trace.room_for(queries=2, attempts=2, candidates=55):
             return
-        trace["journal_checks"] = []
+        trace.journal_checks = []
         for check, rows in registration_checks(adapter, claim, reference.title):
-            trace["journal_checks"].append(check)
+            trace.journal_checks.append(check)
             if check.stage == "journal":
                 continue  # ISSN resolution is not an article identity search.
             success = check.outcome in {"candidates_found", "no_registered_candidates"}
@@ -3224,14 +3159,14 @@ class SourceResolver:
         from app.services.retrieval.google_books import GoogleBooksRetriever
 
         trace = _ACTIVE_DISCOVERY_TRACE.get()
-        if trace is None or not trace["expected"].edition_sensitive:
+        if trace is None or not trace.expected.edition_sensitive:
             return
-        expected = trace["expected"]
+        expected = trace.expected
         if not expected.supports_identity_search():
             return
         capabilities = getattr(self, "_acquisition_capabilities", None)
         if capabilities is not None and "academic_adapters" not in capabilities:
-            trace["limitations"].append("Book edition metadata was not requested under this acquisition profile.")
+            trace.add_limitation("Book edition metadata was not requested under this acquisition profile.")
             return
         from app.services.reference_verification import _EDITION, _book_title_matches
         # "(2nd ed.)" is not part of a catalogue title (Singer, 2026-09-30).
@@ -3253,8 +3188,8 @@ class SourceResolver:
             self._record_book_search(expected, GoogleBooksRetriever().search_metadata_result(
                 title=title, year=expected.year or None, max_results=5), fallback=True)
 
-    def _record_book_search(self, expected, search, *, fallback: bool = False) -> None:
-        """Record one Google Books metadata search as a discovery attempt."""
+    def _record_book_search(self, expected, search, *, fallback: bool = False) -> str | None:
+        """Record one Google Books metadata search as a discovery attempt; its id."""
         from app.services.book_metadata import isbn10_to_isbn13
         trace = _ACTIVE_DISCOVERY_TRACE.get()
         candidates = []
@@ -3288,18 +3223,19 @@ class SourceResolver:
                 "book_metadata_candidates": candidates,
             },
         )
-        self._record_discovery_attempt(
+        attempt_id = self._record_discovery_attempt(
             category="academic_adapter", provider="google_books", result=result, required=False,
         )
-        if fallback:
-            return
-        trace["limitations"].append(
+        if fallback or trace is None:
+            return attempt_id
+        trace.add_limitation(
             "Book catalog dates describe particular editions, not necessarily the copy used. "
             "Only matching observed ISBNs bind an edition comparison; publication and copyright dates may differ."
             if candidates else "The optional book-edition lookup did not establish an edition; this is not evidence that the reference is incorrect."
         )
         if not candidates:
             self._corroborate_book_from_archive(expected)
+        return attempt_id
 
     def _corroborate_book_from_archive(self, expected) -> None:
         """Ask a second catalogue whether the book exists, never whether it does not.
@@ -3372,7 +3308,7 @@ class SourceResolver:
             category="academic_adapter", provider="internet_archive",
             result=result, required=False,
         )
-        trace["limitations"].append(
+        trace.add_limitation(
             "A second catalogue holds a record for this work; catalogue presence "
             "identifies the work but does not establish the edition cited."
             if candidates else
@@ -3500,7 +3436,7 @@ class SourceResolver:
         if lookup_record_bypassed_for_trace:
             trace = _ACTIVE_DISCOVERY_TRACE.get()
             if trace is not None:
-                trace["limitations"].append(
+                trace.add_limitation(
                     "An unbound lookup-cache result was bypassed; live routes were rerun for discovery provenance."
                 )
         elif lookup_record_is_fresh:
@@ -4768,7 +4704,7 @@ class SourceResolver:
                     or settings.REPORT_AUTH_MODE not in {'personal_local', 'personal_bearer'}))):
             return {'status': 'not_run', 'reason_code': 'processing_not_authorized', 'decision_applied': False}
         from app.services.llm_input_boundary import redact_direct_identifiers
-        submitted = (_ACTIVE_DISCOVERY_TRACE.get() or {}).get('submitted_reference', '')
+        submitted = getattr(_ACTIVE_DISCOVERY_TRACE.get(), 'submitted_reference', '')
         submitted = re.sub(r'https?://\S+', '[submitted link omitted]', submitted)
         expected = ExpectedSourceIdentity(source_id=hashlib.sha256(content).hexdigest()[:32],
             title=title or 'Unknown', author_or_contributors=author, year=year, doi=doi,
@@ -5734,8 +5670,7 @@ class SourceResolver:
                 # MDPI blocks automated requests to its site; its own file
                 # host serves the same open-access PDF. Try that next, once.
                 active_trace = _ACTIVE_DISCOVERY_TRACE.get()
-                tried_mdpi = (active_trace.setdefault("mdpi_file_server_urls", set())
-                              if active_trace is not None else set())
+                tried_mdpi = active_trace.mdpi_file_server_urls if active_trace is not None else set()
                 for fallback in _mdpi_file_server_locations(
                         location, exc, expected_doi or result.doi):
                     if fallback.url in attempted_urls or fallback.url in tried_mdpi or any(
@@ -5878,7 +5813,7 @@ class SourceResolver:
         if not fields.get("title") or not authors:
             return None
         active_trace = _ACTIVE_DISCOVERY_TRACE.get()
-        expected = active_trace["expected"] if active_trace is not None else ExpectedBibliographicFields(
+        expected = active_trace.expected if active_trace is not None else ExpectedBibliographicFields(
             title=expected_title or "", doi=expected_doi or "",
             authors=[expected_author] if expected_author else [], year=expected_year or "",
         )
@@ -5917,7 +5852,7 @@ class SourceResolver:
         active_trace = _ACTIVE_DISCOVERY_TRACE.get()
         # Use the same complete expected fields as the final trace before
         # declaring identity or finalizing transient-provider audit counts.
-        expected = active_trace["expected"] if active_trace is not None else ExpectedBibliographicFields(
+        expected = active_trace.expected if active_trace is not None else ExpectedBibliographicFields(
             title=expected_title or "", doi=expected_doi or "",
             authors=[expected_author] if expected_author else [], year=expected_year or "",
         )
@@ -6314,8 +6249,8 @@ class SourceResolver:
             # abstract; a breadcrumb and a recommended citation are not text.
             declared_document_url = advertised[0].url
             active = _ACTIVE_DISCOVERY_TRACE.get()
-            if isinstance(active, dict):
-                active.setdefault("declared_document_url", declared_document_url)
+            if active is not None and active.declared_document_url is None:
+                active.declared_document_url = declared_document_url
 
         # Extract readable text
         import trafilatura
@@ -6675,7 +6610,7 @@ class SourceResolver:
         on the file's content alone. Returns None when nothing new is to try.
         """
         trace = _ACTIVE_DISCOVERY_TRACE.get()
-        tried = trace.setdefault("mdpi_file_server_urls", set()) if trace is not None else set()
+        tried = trace.mdpi_file_server_urls if trace is not None else set()
         urls = [url for url in mdpi_file_server_urls(doi) if url not in tried]
         if not urls:
             return None
@@ -7057,7 +6992,7 @@ class SourceResolver:
                 if not observation or attempt.get("outcome") not in {"unavailable", "identity_unconfirmed"}:
                     continue
                 candidate = build_reference_discovery_candidate(attempt_id="identity-stop",
-                    provider="independent_content", expected=trace["expected"],
+                    provider="independent_content", expected=trace.expected,
                     result=RetrievalResult(source_name="independent_content", success=True, **observation["observed"]))
                 # Work identity does not require classifying/acquiring its text.
                 # All supplied bibliographic fields still need agreement; this
@@ -7065,9 +7000,9 @@ class SourceResolver:
                 # change its transient confirmed-identity count.
                 unresolved = any(c.expected_sha256 and c.field_name != "source_kind"
                     and c.outcome not in {"agreement", "minor_difference"}
-                    and not (c.field_name == "year" and trace["expected"].year == "n.d.")
+                    and not (c.field_name == "year" and trace.expected.year == "n.d.")
                     for c in candidate.comparisons)
-                if (not trace["expected"].reference_parse_review and candidate.plausible_identity_match
+                if (not trace.expected.reference_parse_review and candidate.plausible_identity_match
                         and not candidate.has_material_conflict and not unresolved):
                     return True
             return False
@@ -7136,7 +7071,7 @@ class SourceResolver:
                 from app.services.identity_pdf import inspect as inspect_pdf, MAX_FILES
                 from app.services.reference_review_scope import scope
                 expected = _ACTIVE_DISCOVERY_TRACE.get()
-                expected = expected['expected'] if expected else ExpectedBibliographicFields(
+                expected = expected.expected if expected else ExpectedBibliographicFields(
                     title=title or '', authors=[author] if author else [], year=year or '', doi=doi or '')
                 try:
                     with (transient_discovery_logging() if transient else nullcontext()), (transient_acquisition_scope(attempted_urls, inspections_by_url) if transient else nullcontext()):
@@ -7469,7 +7404,7 @@ class SourceResolver:
             holder, reason = landing, "publisher_abstract_covers_third_party_page"
             basis = {"provider": landing.source_name, "doi": doi,
                      "publisher_abstract": dict((landing.metadata or {}).get("abstract_provenance") or {})}
-        _, discovery = self._discovery_artifacts()
+        discovery = self._discovery_finished(preview=True).record
         if discovery is not None and discovery.get("outcome") not in _CONFIRMED_DISCOVERY_OUTCOMES:
             return None
         representation = acquired.representation
@@ -8384,7 +8319,7 @@ def _expected_page_range(result: RetrievalResult) -> tuple[int, int] | None:
     # 18-page journal PDF judged "uncertain" and shown as limited text
     # (Franchise 2, 2026-10-07).
     trace = _ACTIVE_DISCOVERY_TRACE.get()
-    expected = trace.get("expected") if trace else None
+    expected = trace.expected if trace else None
     match = range_re.search(str(getattr(expected, "pages", "") or ""))
     if match:
         start, end = int(match.group(1)), int(match.group(2))

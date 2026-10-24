@@ -15,6 +15,7 @@ import pytest
 from app.services.retrieval.internet_archive_catalog import (
     InternetArchiveCatalogRetriever,
 )
+from tests.unit.discovery_support import recorder_from
 
 
 def _response(status_code: int, body: object) -> httpx.Response:
@@ -143,7 +144,7 @@ class TestWiredAsAGapFiller:
         # The recording moved into _record_book_search (2026-09-30); the
         # title-only fallback search never repeats the archive check.
         source = inspect.getsource(SourceResolver._record_book_search)
-        assert "if not candidates:" in source and "if fallback:" in source
+        assert "if not candidates:" in source and "if fallback or trace is None:" in source
         assert "_corroborate_book_from_archive" in source
 
     def test_its_candidates_are_recorded_under_their_own_provider(self):
@@ -184,16 +185,16 @@ def test_an_empty_archive_answer_is_a_completed_optional_search_not_a_failure(mo
     monkeypatch.setattr(InternetArchiveCatalogRetriever, "search_metadata_result",
                         lambda self, **kwargs: BookMetadataSearch('title:("Lanterns")', "no_results_low_coverage"))
     expected = ExpectedBibliographicFields(title="Lanterns", authors=["Quillby, O."], source_kind="monograph")
-    trace = {'reference_id': 'fixture', 'expected': expected, 'required': {'academic_adapter'},
+    trace = recorder_from({'reference_id': 'fixture', 'expected': expected, 'required': {'academic_adapter'},
              'queries': [], 'attempts': [], 'candidates': [], 'limitations': [],
-             'search_policy_version': 'api-first-search-v2'}
+             'search_policy_version': 'api-first-search-v2'})
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         SourceResolver._corroborate_book_from_archive(SourceResolver.__new__(SourceResolver), expected)
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
-    attempt, = trace['attempts']
-    query, = trace['queries']
+    attempt, = trace.attempts
+    query, = trace.queries
     assert attempt.outcome == 'no_match' and not attempt.required
     # Its silence is weak evidence: the query says so, and no review counts it.
     assert query.execution_outcome == 'no_results' and query.reason_code == 'low_coverage_catalogue'

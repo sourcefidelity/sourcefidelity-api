@@ -9,6 +9,7 @@ from app.config import settings
 from app.services import source_resolver
 from app.services.supplied_html_source import SuppliedHtmlRejected, qualify_supplied_html
 from app.services.web_page_identity import ask_model, model_admits
+from tests.unit.discovery_support import recorder_from
 
 ROMANISED = 'Shuju quanli yu falv baohu yanjiu (Research on data rights and legal protection)'
 NATIVE = '数据权利与法律保护研究'
@@ -85,7 +86,7 @@ def test_one_allowance_per_reference_across_routes_and_the_off_setting(page_judg
     monkeypatch.setattr(settings, "CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE", 3)
     ask = lambda n: ask_model(title='Cited title', author='Writer, A.', year='2020', page_titles=[f'页面{n}'],
                               page_date='2021', page_text='text')
-    token = source_resolver._ACTIVE_DISCOVERY_TRACE.set({})
+    token = source_resolver._ACTIVE_DISCOVERY_TRACE.set(recorder_from({}))
     try:
         answers = [ask(n) for n in range(4)]
         assert ask(0) is answers[0]          # the same page again: its first answer, no new call

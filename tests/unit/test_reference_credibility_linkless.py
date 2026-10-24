@@ -6,6 +6,7 @@ from app.services.reference_credibility import assess_reference_credibility, FIN
 from app.services.reference_discovery import ExpectedBibliographicFields, build_reference_discovery_candidate
 from app.services.retrieval.crossref import CrossrefRetriever
 from test_reference_credibility_cumulative import fixture
+from tests.unit.discovery_support import recorder_from
 
 
 def linkless(kind='journal_article'):
@@ -160,11 +161,11 @@ def test_real_catalog_adapter_receipt_counts_only_valid_empty(monkeypatch,payloa
     monkeypatch.setattr('app.services.retrieval.google_books.httpx.get',lambda *a,**kw:
         httpx.Response(200,request=httpx.Request('GET','https://www.googleapis.com/books/v1/volumes'),json=payload))
     resolver=SourceResolver.__new__(SourceResolver)
-    active=dict(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(**trace['expected']),
+    active=recorder_from(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(**trace['expected']),
         queries=[],attempts=[],candidates=[],required=set(),limitations=[])
     token=_ACTIVE_DISCOVERY_TRACE.set(active)
     try:
         resolver._enrich_book_editions()
-        assert active['queries'][0].result_count==expected
-        assert active['queries'][0].execution_outcome==('no_results' if expected==0 else 'response_invalid')
+        assert active.queries[0].result_count==expected
+        assert active.queries[0].execution_outcome==('no_results' if expected==0 else 'response_invalid')
     finally:_ACTIVE_DISCOVERY_TRACE.reset(token)

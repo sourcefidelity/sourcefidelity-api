@@ -128,6 +128,14 @@ def reused_result(index: dict, reference, *, identity_only: bool) -> dict | None
         return None
     prior_job_id, item = found
     record = copy.deepcopy(item)
+    from app.services.discovery_recorder import repaired_archive_record
+    repaired = repaired_archive_record(record.get("reference_discovery_trace"), record.get("reference_discovery"))
+    if repaired is not None and repaired.record is not None:
+        # A magazine-archive search stored as found with no candidate dropped
+        # the record; it is re-derived from the stored trace, without searching
+        # again (owner decision 2026-10-22).
+        record["reference_discovery_trace"], record["reference_discovery"] = repaired.trace, repaired.record
+        record["archive_record_repaired"] = True
     record["reference_id"] = reference.reference_id
     if isinstance(record.get("reference_discovery"), dict):
         record["reference_discovery"]["reference_id"] = reference.reference_id

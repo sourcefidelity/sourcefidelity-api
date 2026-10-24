@@ -70,6 +70,7 @@ from app.services.source_repository import (
     admit_representation,
     commit_source_admissions,
 )
+from tests.unit.discovery_support import recorder_from
 
 
 class MemoryStorage(StorageBackend):
@@ -1019,7 +1020,7 @@ def test_metadata_only_identity_survives_checkpoint_reload_and_report(monkeypatc
 
         def resolve_reference(self, reference):
             self.calls += 1
-            token = _ACTIVE_DISCOVERY_TRACE.set({
+            token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
                 "reference_id": reference.reference_id,
                 "expected": ExpectedBibliographicFields(title=reference.title,
                     authors=[reference.author], year=reference.year),
@@ -1027,7 +1028,7 @@ def test_metadata_only_identity_survives_checkpoint_reload_and_report(monkeypatc
                 "required_web_providers": ["brave", "exa"],
                 "required": {"academic_adapter", "bounded_web"},
                 "queries": [], "attempts": [], "candidates": [], "limitations": [],
-            })
+            }))
             try:
                 # Independently declared synthetic metadata; never source text.
                 SourceResolver._record_discovery_attempt(category="academic_adapter", provider="crossref",

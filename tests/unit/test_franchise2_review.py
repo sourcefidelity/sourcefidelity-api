@@ -6,6 +6,7 @@ import fitz
 
 from app.services.reference_discovery import ExpectedBibliographicFields
 from app.services.text_extractor import isolate_pdf_headings
+from tests.unit.discovery_support import recorder_from
 
 
 def test_a_slanted_regular_font_reads_as_italic():
@@ -72,7 +73,7 @@ def test_a_web_found_pdf_is_checked_against_the_references_page_range():
     from app.services.source_resolver import _ACTIVE_DISCOVERY_TRACE, _expected_page_range
     result = RetrievalResult(source_name="web_search", success=True)
     assert _expected_page_range(result) is None
-    token = _ACTIVE_DISCOVERY_TRACE.set({"expected": ExpectedBibliographicFields(title="A title", pages="537-554")})
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"expected": ExpectedBibliographicFields(title="A title", pages="537-554")}))
     try:
         assert _expected_page_range(result) == (537, 554)
     finally:

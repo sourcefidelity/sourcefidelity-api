@@ -3,6 +3,7 @@
 Each test names the reader-visible defect it prevents, so a later change that
 reintroduces one fails with the reason rather than with a bare assertion.
 """
+from app.services.discovery_recorder import Finished
 import pytest
 
 from app.services.abstract_shape import looks_like_contents_listing, describe
@@ -383,22 +384,28 @@ class TestRepeatedProviderRowDoesNotInvalidateATrace:
             candidate_key=volume_id, acquisition_outcome='identity_rejected',
         )
 
+    @staticmethod
+    def recorder():
+        from types import SimpleNamespace
+        from tests.unit.discovery_support import recorder_from
+        return recorder_from(attempts=[SimpleNamespace(attempt_id=a, provider='google_books') for a in 'ab'])
+
     def test_an_identical_repeated_record_is_appended_once(self):
         from app.services.source_resolver import _append_unique_candidate
 
-        trace = {'candidates': []}
+        trace = self.recorder()
         _append_unique_candidate(trace, self.candidate('vol-1'))
         _append_unique_candidate(trace, self.candidate('vol-1'))
-        assert len(trace['candidates']) == 1
+        assert len(trace.candidates) == 1
 
     def test_distinct_records_are_all_kept(self):
         from app.services.source_resolver import _append_unique_candidate
 
-        trace = {'candidates': []}
+        trace = self.recorder()
         _append_unique_candidate(trace, self.candidate('vol-1'))
         _append_unique_candidate(trace, self.candidate('vol-2'))
         _append_unique_candidate(trace, self.candidate('vol-1', attempt='b'))
-        assert len({c.candidate_id for c in trace['candidates']}) == 3
+        assert len({c.candidate_id for c in trace.candidates}) == 3
 
     def test_duplicate_ids_are_what_invalidated_the_trace(self):
         """Guards the reason the dedupe exists, not just the dedupe."""
@@ -677,7 +684,7 @@ class TestCorroborationAdaptersSkipOnlyWhenNothingIsAtStake:
         from app.services.source_resolver import SourceResolver
 
         resolver = SourceResolver.__new__(SourceResolver)
-        resolver._discovery_artifacts = staticmethod(lambda: (None, {"outcome": outcome}))
+        resolver._discovery_finished = staticmethod(lambda preview=False: Finished(None, {"outcome": outcome}, None))
         return resolver
 
     @staticmethod

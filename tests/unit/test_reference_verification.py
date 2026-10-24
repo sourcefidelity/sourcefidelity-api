@@ -4,6 +4,7 @@ to the kind of work completed without locating it (owner decision 2026-09-24).
 Failures, unattempted routes and possible matches stay neutral; nothing here
 claims that a work does not exist.
 """
+from app.services.discovery_recorder import Finished
 import hashlib
 from types import SimpleNamespace
 
@@ -167,7 +168,7 @@ def _resolver(outcome, calls):
     from app.services.source_resolver import SourceResolver
     from app.services.retrieval.base import RetrievalResult
     resolver = object.__new__(SourceResolver)
-    resolver._discovery_artifacts = lambda: (None, {'outcome': outcome})
+    resolver._discovery_finished = lambda preview=False: Finished(None, {'outcome': outcome}, None)
     resolver._lookup_structured_sources = lambda sources, doi, *rest: calls.append(
         ([s.name for s in sources], doi)) or [(s, RetrievalResult(source_name=s.name, success=False)) for s in sources]
     resolver._record_discovery_attempt = lambda **kwargs: calls.append(('recorded', kwargs['provider']))

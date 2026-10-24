@@ -7,6 +7,7 @@ import pytest
 from app.config import settings
 from app.services.reference_discovery import ExpectedBibliographicFields
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
+from tests.unit.discovery_support import recorder_from
 
 
 @pytest.mark.parametrize('mode,expected', [
@@ -25,17 +26,17 @@ def test_reuse_availability_is_not_a_completed_miss(monkeypatch, mode, expected)
         resolver._backend.download.side_effect = FileNotFoundError
     result = resolver._check_local_cache(None, None, 'Fixture title')
     assert lookup.call_count == (0 if mode == 'disabled' else 1)
-    token = _ACTIVE_DISCOVERY_TRACE.set({
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
         'reference_id':'fixture', 'expected':ExpectedBibliographicFields(title='Fixture title'),
         'required':set(), 'queries':[], 'attempts':[], 'candidates':[], 'limitations':[],
-    })
+    }))
     try:
         SourceResolver._record_discovery_attempt(category='durable_repository',
             provider='local_cache', result=result, required=False)
         trace = _ACTIVE_DISCOVERY_TRACE.get()
-        assert trace['attempts'][0].outcome == expected
-        assert trace['attempts'][0].required is False
-        assert trace['queries'][0].execution_outcome == (
+        assert trace.attempts[0].outcome == expected
+        assert trace.attempts[0].required is False
+        assert trace.queries[0].execution_outcome == (
             'no_results' if mode == 'empty' else 'operational_failure')
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)

@@ -20,6 +20,12 @@ def _fresh_authorized_pages():
     clear_cache()
 
 
+@pytest.fixture(autouse=True)
+def _strict_discovery_recorder(monkeypatch):
+    """A broken discovery-record link fails the test where it is written."""
+    monkeypatch.setattr("app.services.discovery_recorder.STRICT", True)
+
+
 @pytest.fixture
 def page_judge():
     """The fixed-answer model at the web page identity seam (web-page-identity-v1).

@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from app.services.retrieval import media_history_archive as archive
+from tests.unit.discovery_support import recorder_from
 
 
 class Response:
@@ -116,9 +117,9 @@ def test_the_search_step_reads_the_found_page_like_a_student_link(monkeypatch, r
     expected = ExpectedBibliographicFields(title="How Ada Lark has change!", authors=["Tamsin"], year="1945",
                                            container_title="Lanternland", pages="30-31",
                                            source_kind="journal_article")
-    trace = {'reference_id': 'fixture', 'expected': expected, 'required': {'academic_adapter'},
+    trace = recorder_from({'reference_id': 'fixture', 'expected': expected, 'required': {'academic_adapter'},
              'queries': [], 'attempts': [], 'candidates': [], 'limitations': [],
-             'search_policy_version': 'api-first-search-v2'}
+             'search_policy_version': 'api-first-search-v2'})
     links = []
     resolver = SourceResolver.__new__(SourceResolver)
     resolver._try_lantern = lambda url, **kwargs: (links.append(url) or RetrievalResult(
@@ -128,17 +129,20 @@ def test_the_search_step_reads_the_found_page_like_a_student_link(monkeypatch, r
         found = resolver._search_periodical_archive(
             title=expected.title, author="Tamsin", year="1945", container_title="Lanternland",
             raw_ref="x", expected_kind=SourceKindAssessment("journal_article", "high", ("fixture",)))
-        discovery = {}
-        SourceResolver._attach_periodical_archive({}, discovery)
+        discovery, record = SourceResolver._discovery_artifacts()
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
     assert links == ["https://lantern.mediahist.org/catalog/lantern49_0876"]
     assert (found is not None) is read
-    search, reading = trace['attempts']
-    assert search.provider == archive.PROVIDER and not search.required and search.outcome == 'candidate_found'
+    search, reading = trace.attempts
+    # A located page is kept on the trace, not as a candidate: found with no
+    # candidate failed the binding check and dropped the record (2026-10-21).
+    assert search.provider == archive.PROVIDER and not search.required
+    assert (search.outcome, search.reason_code) == ('no_match', 'archive_page_located')
+    assert record is not None
     assert reading.provider == 'lantern' and not reading.required
     # Only the reading of the cited pages records a located record.
-    assert bool(trace['candidates']) is read
+    assert bool(trace.candidates) is read
     assert discovery['periodical_archive_match']['publication'] == 'Lanternland'
 
 

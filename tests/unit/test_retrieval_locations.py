@@ -15,6 +15,7 @@ from app.services.reference_discovery import ExpectedBibliographicFields
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.source_resolver import _verify_text_content_identity
 from app.services.source_type import SourceKindAssessment
+from tests.unit.discovery_support import recorder_from
 
 
 def _resolver() -> SourceResolver:
@@ -406,14 +407,14 @@ def test_web_graph_uses_next_search_provider_after_candidates_are_rejected() -> 
 
 def test_bounded_web_discovery_trace_preserves_each_rejected_location_candidate() -> None:
     resolver = _resolver()
-    trace = {
+    trace = recorder_from({
         "reference_id": "ref-web",
         "expected": ExpectedBibliographicFields(title="Expected Work"),
         "required": set(),
         "queries": [],
         "attempts": [],
         "candidates": [],
-    }
+    })
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         result = RetrievalResult(
@@ -464,39 +465,39 @@ def test_bounded_web_discovery_trace_preserves_each_rejected_location_candidate(
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 
-    assert len(trace["candidates"]) == 2
-    assert {candidate.observed.title for candidate in trace["candidates"]} == {
+    assert len(trace.candidates) == 2
+    assert {candidate.observed.title for candidate in trace.candidates} == {
         "Wrong Work One",
         "Wrong Work Two",
     }
-    assert {candidate.acquisition_outcome for candidate in trace["candidates"]} == {
+    assert {candidate.acquisition_outcome for candidate in trace.candidates} == {
         "identity_rejected",
         "completeness_rejected",
     }
     assert all(
-        candidate.attempt_id == trace["attempts"][0].attempt_id
-        for candidate in trace["candidates"]
+        candidate.attempt_id == trace.attempts[0].attempt_id
+        for candidate in trace.candidates
     )
-    assert trace["queries"][0].normalized_query == '"expected work"'
-    assert trace["queries"][0].execution_provider == "tavily"
-    assert trace["queries"][0].execution_outcome == "results"
-    assert trace["queries"][0].result_count == 2
+    assert trace.queries[0].normalized_query == '"expected work"'
+    assert trace.queries[0].execution_provider == "tavily"
+    assert trace.queries[0].execution_outcome == "results"
+    assert trace.queries[0].result_count == 2
     assert all(
         candidate.discovery_provider == "tavily"
-        for candidate in trace["candidates"]
+        for candidate in trace.candidates
     )
 
 
 def test_bounded_web_discovery_trace_preserves_unattempted_bounded_location() -> None:
     resolver = _resolver()
-    trace = {
+    trace = recorder_from({
         "reference_id": "ref-web",
         "expected": ExpectedBibliographicFields(title="Expected Work"),
         "required": set(),
         "queries": [],
         "attempts": [],
         "candidates": [],
-    }
+    })
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         result = RetrievalResult(
@@ -529,22 +530,22 @@ def test_bounded_web_discovery_trace_preserves_unattempted_bounded_location() ->
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 
-    assert len(trace["candidates"]) == 1
-    candidate = trace["candidates"][0]
+    assert len(trace.candidates) == 1
+    candidate = trace.candidates[0]
     assert candidate.observed.title == "Candidate Search Title"
     assert candidate.acquisition_outcome == "metadata_only"
 
 
 def test_structured_trace_preserves_doi_enrichment_attempts_and_shared_disposition() -> None:
     resolver = _resolver()
-    trace = {
+    trace = recorder_from({
         "reference_id": "ref-structured",
         "expected": ExpectedBibliographicFields(title="Expected Work"),
         "required": set(),
         "queries": [],
         "attempts": [],
         "candidates": [],
-    }
+    })
     location = AcquisitionLocation(
         url="https://repository.example/work.pdf",
         provider="core",
@@ -587,10 +588,10 @@ def test_structured_trace_preserves_doi_enrichment_attempts_and_shared_dispositi
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 
-    assert len(trace["candidates"]) == 2
-    assert {c.attempt_id for c in trace["candidates"]} == {a.attempt_id for a in trace["attempts"]}
-    assert len({c.location_sha256 for c in trace["candidates"]}) == 1
-    for candidate in trace["candidates"]:
+    assert len(trace.candidates) == 2
+    assert {c.attempt_id for c in trace.candidates} == {a.attempt_id for a in trace.attempts}
+    assert len({c.location_sha256 for c in trace.candidates}) == 1
+    for candidate in trace.candidates:
         assert candidate.location_rank == 1
         assert candidate.origin_providers == ["core", "openalex"]
         assert candidate.acquisition_outcome == "not_attempted"

@@ -13,6 +13,7 @@ from app.services.search.base import SearchResult
 from app.services.search.candidate_audit import AUDIT_POLICY, build_candidate_audit
 from app.services.search.policy import API_FIRST_SEARCH_POLICY
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
+from tests.unit.discovery_support import recorder_from
 
 TITLE = "Frozen source control"
 
@@ -51,10 +52,10 @@ def _resolve_and_record(search, dispositions):
     resolver._download_and_cache = acquisition
     result = resolver._try_source(search, None, TITLE, "Writer", "2020")
     expected = ExpectedBibliographicFields(title=TITLE, authors=["Writer"], year="2020")
-    token = _ACTIVE_DISCOVERY_TRACE.set({
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
         "reference_id": "audit-control", "expected": expected,
         "search_policy_version": API_FIRST_SEARCH_POLICY,
-        "required": {"bounded_web"}, "queries": [], "attempts": [], "candidates": []})
+        "required": {"bounded_web"}, "queries": [], "attempts": [], "candidates": []}))
     try:
         resolver._record_discovery_attempt(category="bounded_web", provider="web_search",
                                            result=result, required=True)

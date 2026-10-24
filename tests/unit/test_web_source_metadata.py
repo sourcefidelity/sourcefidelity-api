@@ -11,6 +11,7 @@ from app.services.source_resolver import _ACTIVE_DISCOVERY_TRACE
 from app.services.reference_discovery import ExpectedBibliographicFields
 from app.services.retrieval.base import RetrievalResult
 from app.services.web_source_metadata import extract_web_source_metadata
+from tests.unit.discovery_support import recorder_from
 
 
 def page(author="Alex Rivera and Morgan Chen", date="2024-06-08"):
@@ -136,14 +137,14 @@ def test_visible_header_date_without_date_metadata():
 
 @pytest.mark.parametrize("error", ["http_500", "http_429", "connect_error", "response_invalid", "unexpected_error"])
 def test_redacted_provider_failures_never_become_no_match(error):
-    trace = dict(reference_id="failure-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
+    trace = recorder_from(reference_id="failure-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
                  required={"academic_adapter"}, queries=[], attempts=[], candidates=[])
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         SourceResolver._record_discovery_attempt(category="academic_adapter", provider="control",
             result=RetrievalResult(source_name="control", success=False, error=error), required=True)
-        assert trace["attempts"][0].outcome == "operational_failure"
-        assert trace["queries"][0].execution_outcome == "operational_failure"
+        assert trace.attempts[0].outcome == "operational_failure"
+        assert trace.queries[0].execution_outcome == "operational_failure"
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 
@@ -157,14 +158,14 @@ def test_failed_identifier_lookup_survives_empty_title_fallback():
     resolver = SourceResolver.__new__(SourceResolver)
     result = resolver._lookup_source(source, "10.1234/control", "A specific scholarly work", None)
     assert [a["outcome"] for a in result.metadata["structured_search_attempts"]] == ["operational_failure", "no_results"]
-    trace = dict(reference_id="failure-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
+    trace = recorder_from(reference_id="failure-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
                  required={"academic_adapter"}, queries=[], attempts=[], candidates=[])
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         resolver._record_discovery_attempt(category="academic_adapter", provider="control", result=result, required=True)
         completion = assess_reference_discovery_trace(dict(
-            reference_id=trace["reference_id"], expected=trace["expected"], required_route_categories=list(trace["required"]),
-            queries=trace["queries"], attempts=trace["attempts"], candidates=trace["candidates"],
+            reference_id=trace.reference_id, expected=trace.expected, required_route_categories=list(trace.required),
+            queries=trace.queries, attempts=trace.attempts, candidates=trace.candidates,
         ))
         assert completion.record.outcome == "search_incomplete"
     finally:
@@ -179,18 +180,18 @@ def test_doi_only_adapter_is_not_a_required_failed_title_search():
     result = resolver._lookup_source(source, None, "A specific scholarly work", None)
     source.search_by_title_author.assert_not_called()
     assert result.metadata["lookup_applicable"] is False
-    trace = dict(reference_id="capability-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
+    trace = recorder_from(reference_id="capability-control", expected=ExpectedBibliographicFields(title="A specific scholarly work"),
                  required={"academic_adapter"}, queries=[], attempts=[], candidates=[])
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         resolver._record_discovery_attempt(category="academic_adapter", provider="control", result=result, required=True)
-        assert trace["attempts"][0].required is False
-        assert trace["attempts"][0].reason_code == "route_not_applicable"
+        assert trace.attempts[0].required is False
+        assert trace.attempts[0].reason_code == "route_not_applicable"
         # A route the app declined is labelled declined, never as a provider
         # failure (it read `operational_failure` until 2026-09-25).
-        assert [q.execution_outcome for q in trace["queries"]] == ["declined"]
+        assert [q.execution_outcome for q in trace.queries] == ["declined"]
         # The declared academic-search requirement is not removed.
-        assert trace["required"] == {"academic_adapter"}
+        assert trace.required == {"academic_adapter"}
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
 

@@ -7,6 +7,7 @@ from app.config import settings
 from app.services import source_resolver
 from app.services.reference_discovery import ExpectedBibliographicFields, build_reference_discovery_candidate
 from app.services.retrieval.base import RetrievalResult
+from tests.unit.discovery_support import recorder_from
 
 CITED = "Frozen archives and the politics of memory"
 HAN_TITLE = "冻结的档案与记忆政治"
@@ -50,7 +51,7 @@ def test_a_page_with_a_title_in_the_cited_script_is_not_sent(judge, monkeypatch)
 def test_bounded_per_reference(judge, monkeypatch):
     monkeypatch.setattr(settings, "CROSS_SCRIPT_WEB_PAGE_JUDGMENT_ENABLED", True)
     monkeypatch.setattr(settings, "CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE", 2)
-    token = source_resolver._ACTIVE_DISCOVERY_TRACE.set({})
+    token = source_resolver._ACTIVE_DISCOVERY_TRACE.set(recorder_from({}))
     try:
         results = [_judgment(titles=[HAN_TITLE + "一二三"[i]]) for i in range(3)]
         again = _judgment(titles=[HAN_TITLE + "一"])

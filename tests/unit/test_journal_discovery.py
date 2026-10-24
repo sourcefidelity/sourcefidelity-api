@@ -6,6 +6,7 @@ from app.services.retrieval.crossref import CrossrefRetriever
 from app.services.reference_discovery import ExpectedBibliographicFields, build_reference_discovery_candidate, ReferenceDiscoveryTrace
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.schemas import ParsedReference
+from tests.unit.discovery_support import recorder_from
 
 
 def reference():
@@ -89,16 +90,16 @@ def test_resolver_enrichment_preserves_checks_and_candidates(monkeypatch):
     resolver = SourceResolver.__new__(SourceResolver)
     resolver._retrieval_sources = [obj]
     ref = reference()
-    trace = dict(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(
+    trace = recorder_from(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(
         title=ref.title,authors=[ref.author],year=ref.year,source_kind=ref.source_kind),
         required=set(),queries=[],attempts=[],candidates=[],limitations=[])
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         resolver._enrich_journal_registration(ref)
         assert len(calls) == 3
-        assert len(trace['journal_checks']) == 3
-        assert len(trace['candidates']) == 1
-        assert trace['candidates'][0].is_credible
+        assert len(trace.journal_checks) == 3
+        assert len(trace.candidates) == 1
+        assert trace.candidates[0].is_credible
         payload,_ = resolver._discovery_artifacts()
         assert len(payload['journal_checks']) == 3
     finally:
@@ -118,9 +119,9 @@ def test_no_extra_calls_when_unneeded_or_not_permitted(monkeypatch,mode):
     expected = ExpectedBibliographicFields(title=reference().title,authors=['River, A.'],year='2002')
     candidate = build_reference_discovery_candidate(attempt_id='a',provider='crossref',
         expected=expected,result=obj._parse_message(work()))
-    trace = dict(candidates=[candidate] if mode=='resolved' else [],queries=[],attempts=[])
+    trace = recorder_from(candidates=[candidate] if mode=='resolved' else [],queries=[],attempts=[])
     if mode=='disabled': resolver._acquisition_capabilities = set()
-    if mode=='capacity': trace['queries'] = [None]*63
+    if mode=='capacity': trace.queries = [None]*63
     token = _ACTIVE_DISCOVERY_TRACE.set(trace)
     try:
         resolver._enrich_journal_registration(reference())

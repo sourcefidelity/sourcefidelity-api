@@ -21,6 +21,7 @@ from app.services.reference_discovery import (
     ExpectedBibliographicFields, build_reference_discovery_candidate, derive_reference_discovery_record,
 )
 from app.services.retrieval.base import RetrievalResult
+from tests.unit.discovery_support import recorder_from
 
 ROMANISED = 'Shuju quanli yu falv baohu yanjiu (Research on data rights and legal protection)'
 NATIVE = '数据权利与法律保护研究'
@@ -285,10 +286,9 @@ def _resolver(monkeypatch, adapters, web):
 
 
 def _trace(expected):
-    return {'reference_id': 'ref-0001-000000000001', 'submitted_reference': ENTRY,
-            'search_policy_version': 'api-first-search-v2', 'required_web_providers': ['brave', 'exa'],
-            'expected': expected, 'required': {'academic_adapter', 'bounded_web'},
-            'queries': [], 'attempts': [], 'candidates': [], 'limitations': []}
+    return recorder_from({'reference_id': 'ref-0001-000000000001', 'submitted_reference': ENTRY,
+                          'search_policy_version': 'api-first-search-v2', 'required_web_providers': ['brave', 'exa'],
+                          'expected': expected, 'required': {'academic_adapter', 'bounded_web'}})
 
 
 def _han_record(title):
@@ -312,7 +312,7 @@ def test_the_route_searches_in_the_works_own_script_and_confirms_by_romanisation
     try:
         admitted = resolver._native_script_route(reference(), identity_only=False)
         trace = _ACTIVE_DISCOVERY_TRACE.get()
-        route = trace['native_script_route']
+        route = trace.native_script_route
         _trace_payload, discovery = SourceResolver._discovery_artifacts()
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
@@ -323,7 +323,7 @@ def test_the_route_searches_in_the_works_own_script_and_confirms_by_romanisation
     assert web.calls == [(NATIVE, '潘越')]
     assert route['status'] == 'completed' and route['policy_version'] == 'native-script-route-v1'
     assert route['adapters_completed'] == ['crossref', 'openalex'] and route['web_completed'] == ['brave']
-    assert set(route['attempt_ids']) <= {a.attempt_id for a in trace['attempts']}
+    assert set(route['attempt_ids']) <= {a.attempt_id for a in trace.attempts}
     assert route['cited_title']['romanised'] == 'Shuju quanli yu falv baohu yanjiu'
     assert discovery['outcome'] == 'confirmed'
     # The located record's abstract in its own language is admitted as abstract evidence.
@@ -336,7 +336,7 @@ def test_a_web_provider_skipped_by_a_budget_leaves_the_route_incomplete(monkeypa
     token = _ACTIVE_DISCOVERY_TRACE.set(_trace(_expected()))
     try:
         resolver._native_script_route(reference(), identity_only=True)
-        route = _ACTIVE_DISCOVERY_TRACE.get()['native_script_route']
+        route = _ACTIVE_DISCOVERY_TRACE.get().native_script_route
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
     assert route['status'] == 'incomplete' and route['web_skipped'] == ['brave']
@@ -351,11 +351,11 @@ def test_no_proposal_and_no_signal(monkeypatch):
     token = _ACTIVE_DISCOVERY_TRACE.set(_trace(_expected()))
     try:
         assert resolver._native_script_route(reference(), identity_only=True) is None
-        assert _ACTIVE_DISCOVERY_TRACE.get()['native_script_route']['status'] == 'proposal_unavailable'
+        assert _ACTIVE_DISCOVERY_TRACE.get().native_script_route['status'] == 'proposal_unavailable'
         english = reference(title='Rivers of the plain', raw='Lin, Q. (2021). Rivers of the plain. Example Press.')
-        _ACTIVE_DISCOVERY_TRACE.get().pop('native_script_route')
+        _ACTIVE_DISCOVERY_TRACE.get().native_script_route = None
         assert resolver._native_script_route(english, identity_only=True) is None
-        assert 'native_script_route' not in _ACTIVE_DISCOVERY_TRACE.get()
+        assert _ACTIVE_DISCOVERY_TRACE.get().native_script_route is None
     finally:
         _ACTIVE_DISCOVERY_TRACE.reset(token)
     assert web.calls == []
@@ -806,13 +806,15 @@ def test_an_organisation_is_not_contradicted_by_a_person_named_in_another_script
 
 
 def test_the_route_record_is_attached_to_both_payloads():
-    from app.services.source_resolver import SourceResolver
-    trace, record = {}, {}
+    from app.services.reference_discovery import ExpectedBibliographicFields
+    recorder = recorder_from({'expected': ExpectedBibliographicFields(title='A title', source_kind='webpage'),
+                              'required': {'bounded_web'}})
     route = {'policy_version': 'native-script-route-v1', 'status': 'completed'}
-    SourceResolver._attach_native_route(trace, record, route)
-    assert trace['native_script_route'] == record['native_script_route'] == route
-    assert trace['native_script_route'] is not route
-    SourceResolver._attach_native_route(None, None, route)  # nothing to attach to
+    recorder.native_script_route = route
+    done = recorder.finish()
+    assert done.trace['native_script_route'] == route
+    assert done.trace['native_script_route'] is not route
+    assert done.record is None or done.record['native_script_route'] == route
 
 
 def test_translated_queries_survive_later_evidence_steps():

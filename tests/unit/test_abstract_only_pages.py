@@ -1,6 +1,7 @@
 """A page that is only an abstract, or too short to be the work, yields an abstract
 (landing-abstract-back-matter-v1 and doi-abstract-over-short-page-v1, owner
 decisions 2026-10-13). Invented fixtures only."""
+from app.services.discovery_recorder import Finished
 import hashlib
 from unittest.mock import Mock, patch
 
@@ -199,7 +200,7 @@ class TestShortPage:
 class TestDoiAbstractPreference:
     def _resolver(self):
         resolver = SourceResolver.__new__(SourceResolver)
-        resolver._discovery_artifacts = lambda: (None, {"outcome": next(iter(_CONFIRMED_DISCOVERY_OUTCOMES))})
+        resolver._discovery_finished = lambda preview=False: Finished(None, {"outcome": next(iter(_CONFIRMED_DISCOVERY_OUTCOMES))}, None)
         return resolver
 
     def test_a_short_page_yields_to_the_confirmed_doi_abstract(self):
@@ -241,7 +242,7 @@ class TestDoiAbstractPreference:
 
     def test_an_unconfirmed_reference_keeps_its_page(self):
         resolver = SourceResolver.__new__(SourceResolver)
-        resolver._discovery_artifacts = lambda: (None, {"outcome": "bibliographic_conflict"})
+        resolver._discovery_finished = lambda preview=False: Finished(None, {"outcome": "bibliographic_conflict"}, None)
         assert resolver._abstract_instead_of_short_page(_page(595), _holder(), DOI, ARTICLE) is None
 
 
@@ -284,7 +285,7 @@ def _resolve(monkeypatch, sources, short_page, *, settled=True):
     resolver._record_canonical_location_outcomes = lambda result: None
     resolver._reuse_search_memo = lambda: False
     resolver._identity_settled = lambda graph: settled
-    resolver._discovery_artifacts = lambda: (None, {"outcome": "confirmed"})
+    resolver._discovery_finished = lambda preview=False: Finished(None, {"outcome": "confirmed"}, None)
     resolver._try_source = Mock(return_value=short_page)
     resolver._finalize_resolution_result = lambda result, *args: result
     return resolver.resolve(doi=DOI, title=TITLE, author="Harbour, A", year="2019",

@@ -26,6 +26,7 @@ from app.services.source_repository import (
 )
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.source_type import SourceKindAssessment
+from tests.unit.discovery_support import recorder_from
 
 TITLE = "Tariff Walls: A Drag on Coastal Growth"
 CITED = "Halvard, S. J., & Brisk, J."
@@ -156,12 +157,12 @@ LANDING_HTML = f'''<html><head><title>{TITLE}</title>
 
 
 def _trace_token(expected=None):
-    return _ACTIVE_DISCOVERY_TRACE.set({
+    return _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
         "reference_id": "invented-reference",
         "expected": expected or ExpectedBibliographicFields(title=TITLE, authors=[CITED], year=YEAR),
         "search_policy_version": "api-first-search-v2", "required_web_providers": ["exa"],
         "required": {"bounded_web"}, "queries": [], "attempts": [], "candidates": [],
-        "limitations": []})
+        "limitations": []}))
 
 
 def _acquire(location, pdf):
@@ -314,10 +315,10 @@ def _admit(factory, storage, content, *, kind=RepresentationKind.PDF, evidence=N
 def _reuse_outcome(resolver, title=TITLE):
     result = resolver._check_local_cache(None, None, title, author=CITED, year=YEAR,
                                          expected_source_kind=SourceKindAssessment())
-    token = _ACTIVE_DISCOVERY_TRACE.set({
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
         "reference_id": "invented-reference",
         "expected": ExpectedBibliographicFields(title=title, authors=[CITED], year=YEAR),
-        "required": set(), "queries": [], "attempts": [], "candidates": [], "limitations": []})
+        "required": set(), "queries": [], "attempts": [], "candidates": [], "limitations": []}))
     try:
         SourceResolver._record_discovery_attempt(category="durable_repository",
                                                  provider="local_cache", result=result, required=False)

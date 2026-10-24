@@ -12,6 +12,7 @@ from app.services.retrieval.base import RetrievalResult
 from app.services.retrieval.crossref import CrossrefRetriever
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from test_reference_credibility import kinds
+from tests.unit.discovery_support import recorder_from
 
 
 def fixture():
@@ -112,15 +113,15 @@ def test_actual_lookup_receipts_keep_doi_check_separate_from_title_search(monkey
     resolver=SourceResolver.__new__(SourceResolver)
     result=resolver._lookup_source(source,ref.doi,ref.title,ref.author,ref.year)
     from app.services.reference_discovery import ExpectedBibliographicFields
-    active=dict(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(**trace['expected']),
+    active=recorder_from(reference_id=ref.reference_id,expected=ExpectedBibliographicFields(**trace['expected']),
         queries=[],attempts=[],candidates=[],required=set(),limitations=[])
     token=_ACTIVE_DISCOVERY_TRACE.set(active)
     try:
         resolver._record_discovery_attempt(category='academic_adapter',provider='crossref',required=True,result=result)
-        assert len(active['queries'])==2
-        assert active['queries'][0].reason_code=='identifier_not_registered'
-        assert active['queries'][1].reason_code is None
-        assert all(q.result_count==0 for q in active['queries'])
+        assert len(active.queries)==2
+        assert active.queries[0].reason_code=='identifier_not_registered'
+        assert active.queries[1].reason_code is None
+        assert all(q.result_count==0 for q in active.queries)
     finally:_ACTIVE_DISCOVERY_TRACE.reset(token)
 
 

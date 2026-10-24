@@ -61,10 +61,12 @@ def use_judge(judge):
         _JUDGE.reset(token)
 
 
-def _allowance() -> dict | None:
-    """The current reference's model allowance, kept on its discovery trace."""
+def _allowance():
+    """The current reference's model allowance, kept on its discovery recorder
+    (shared with nested searches for the same reference); None outside one."""
     from app.services.source_resolver import _ACTIVE_DISCOVERY_TRACE
-    return _ACTIVE_DISCOVERY_TRACE.get()
+    recorder = _ACTIVE_DISCOVERY_TRACE.get()
+    return recorder.allowance if recorder is not None else None
 
 
 def ask_model(*, title: str, author: str | None, year: str | None, page_titles: list,
@@ -79,17 +81,15 @@ def ask_model(*, title: str, author: str | None, year: str | None, page_titles: 
     page = {"titles": titles, "date": page_date or "", "text": page_text or ""}
     from app.services.cross_script_identity import _payload
     key = hashlib.sha256(_payload(reference, page).encode()).hexdigest()
-    trace = _allowance()
-    asked = trace.setdefault("web_page_identity_answers", {}) if trace is not None else {}
-    if key in asked:
-        return asked[key]
-    if trace is not None:
-        used = trace.get("cross_script_page_judgments", 0)
-        if used >= settings.CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE:
+    allowance = _allowance()
+    if allowance is not None:
+        if key in allowance.answers:
+            return allowance.answers[key]
+        if not allowance.reserve(settings.CROSS_SCRIPT_PAGE_JUDGMENTS_PER_REFERENCE):
             return None
-        trace["cross_script_page_judgments"] = used + 1
     judged = (_JUDGE.get() or DeepSeekJudge())(reference, page)
-    asked[key] = judged
+    if allowance is not None:
+        allowance.answers[key] = judged
     return judged
 
 

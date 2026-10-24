@@ -170,11 +170,12 @@ def test_a_reference_never_reports_the_previous_references_doi_mismatch(monkeypa
 
     resolver = object.__new__(module.SourceResolver)
     discovery = {}
-    monkeypatch.setattr(module.SourceResolver, "_discovery_artifacts",
-                        staticmethod(lambda: ({}, discovery.setdefault("current", {}))))
+    from app.services.discovery_recorder import DiscoveryRecorder, Finished
+    monkeypatch.setattr(DiscoveryRecorder, "preview",
+                        lambda self, extra_limitations=(): Finished({}, discovery.setdefault("current", {}), None))
     monkeypatch.setattr(module.SourceResolver, "_enrich_journal_registration", lambda self, *args: None)
     monkeypatch.setattr(module.SourceResolver, "_attach_container_identity",
-                        lambda self, reference, trace, found, **kwargs: (trace, found))
+                        lambda self, reference, found, **kwargs: None)
     monkeypatch.setattr(module.SourceResolver, "_enrich_book_editions", lambda self: None)
     monkeypatch.setattr(module.SourceResolver, "_update_search_memo", lambda self, *args: None)
 

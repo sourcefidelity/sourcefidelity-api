@@ -4,6 +4,7 @@ from app.services.reference_discovery import ExpectedBibliographicFields
 from app.services.retrieval.base import RetrievalResult
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE, _student_link_disposition
 from app.services.web_fetch_diagnostics import WebFetchDiagnostic
+from tests.unit.discovery_support import recorder_from
 
 
 def _page(reason):
@@ -25,10 +26,10 @@ def test_answered_links_and_doi_pages_are_typed_and_failures_stay_failures():
 
 
 def _record(provider, result):
-    token = _ACTIVE_DISCOVERY_TRACE.set({
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({
         "reference_id": "fixture", "expected": ExpectedBibliographicFields(title="A source title", authors=["Rivera"], year="2024"),
         "required": set(), "queries": [], "attempts": [], "candidates": [], "limitations": [],
-        "search_policy_version": "api-first-search-v2"})
+        "search_policy_version": "api-first-search-v2"}))
     try:
         SourceResolver._record_discovery_attempt(category="student_url", provider=provider, result=result, required=False)
         trace, _record = SourceResolver._discovery_artifacts()

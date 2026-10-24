@@ -137,7 +137,8 @@ def test_fallback_only_after_routes_finish_and_never_replaces_confirmed(monkeypa
             source_name='abstract', success=True, abstract='Abstract only')
     monkeypatch.setattr(resolver, 'resolve', resolve)
     monkeypatch.setattr(resolver, '_enrich_book_editions', lambda: None)
-    monkeypatch.setattr(resolver, '_discovery_artifacts', lambda: ({'complete':False}, {'outcome':'search_incomplete'}))
+    from app.services.discovery_recorder import Finished
+    monkeypatch.setattr(resolver, '_discovery_finished', lambda preview=False: Finished({'complete': False}, {'outcome': 'search_incomplete'}, None))
     from app.services.schemas import ParsedReference
     result = resolver.resolve_reference(ParsedReference(reference_id='r1', title='A work',
         author='Smith', year='2020', source_kind='journal_article', raw_ref='Smith. A work.'))

@@ -10,6 +10,7 @@ from app.services.candidate_budget import (
 from app.services.retrieval.base import AcquisitionLocation, RepresentationKind, RetrievalResult
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.reference_discovery import ExpectedBibliographicFields
+from tests.unit.discovery_support import recorder_from
 
 
 def test_atomic_unique_candidate_accounting():
@@ -49,10 +50,10 @@ def test_unattempted_metadata_preserves_observation_without_judgment():
         result = reserve_metadata_candidate('crossref',result)
         assert original.success and 'candidate_budget_skipped' not in (original.metadata or {})
         assert result.success is False
-        token = _ACTIVE_DISCOVERY_TRACE.set({'reference_id':'fixture',
+        token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({'reference_id':'fixture',
             'expected':ExpectedBibliographicFields(title='A source title',authors=['Rivera'],year='2024'),
             'required':{'academic_adapter'},'queries':[],'attempts':[],'candidates':[],
-            'limitations':[], 'search_policy_version':'api-first-search-v2'})
+            'limitations':[], 'search_policy_version':'api-first-search-v2'}))
         try:
             SourceResolver._record_discovery_attempt(category='academic_adapter',provider='crossref',result=result,required=True)
             trace,record = SourceResolver._discovery_artifacts()

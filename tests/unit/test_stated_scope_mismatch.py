@@ -12,6 +12,7 @@ import hashlib
 import pytest
 
 from app.services.report_layers import topical_mismatch
+from tests.unit.discovery_support import recorder_from
 
 ABSTRACT = ("Digital production and distribution technologies may create new opportunities "
             "for filmmaking in Australia.")
@@ -545,9 +546,14 @@ def test_the_containing_book_is_looked_up_whenever_the_part_is_unconfirmed(outco
     resolver._identify_container_work = lambda reference: {'status': 'identified'}
     discovery = {'outcome': outcome}
     resolver._container_responsibility = lambda title, author: {'classification': 'unresolved'}
-    _trace, attached = resolver._attach_container_identity(parsed(BELTON, 'Belton, J'), {}, discovery)
+    recorder = recorder_from({})
+    token = sr._ACTIVE_DISCOVERY_TRACE.set(recorder)
+    try:
+        resolver._attach_container_identity(parsed(BELTON, 'Belton, J'), discovery)
+    finally:
+        sr._ACTIVE_DISCOVERY_TRACE.reset(token)
     # A confirmed chapter gets only the title-page check, never a book search.
-    assert (attached.get('container_identity', {}).get('status') == 'identified') is looked_up
+    assert ((recorder.container_identity or {}).get('status') == 'identified') is looked_up
 
 
 def test_once_the_book_is_identified_a_part_title_namesake_no_longer_decides_the_part():
@@ -556,7 +562,6 @@ def test_once_the_book_is_identified_a_part_title_namesake_no_longer_decides_the
                                                   ExpectedBibliographicFields, ReferenceDiscoveryCandidate)
     resolver = sr.SourceResolver.__new__(sr.SourceResolver)
     resolver._identify_container_work = lambda reference: {'status': 'identified', 'title': 'Bright lights'}
-    resolver._discovery_artifacts = lambda: ({'trace': 'again'}, {'outcome': 'possible_match'})
 
     def compare(field, outcome):
         return BibliographicFieldComparison(field_name=field, outcome=outcome, reason_code=f'{field}_{outcome}')
@@ -565,16 +570,15 @@ def test_once_the_book_is_identified_a_part_title_namesake_no_longer_decides_the
         comparisons=[compare('title', 'agreement'), compare('author', 'material_conflict')])
     expected = ExpectedBibliographicFields(title='Postwar changes', authors=['Quillby, O.'],
                                            container_title='Bright lights', source_kind='book_section')
-    token = sr._ACTIVE_DISCOVERY_TRACE.set({'expected': expected, 'candidates': [namesake]})
+    recorder = recorder_from({'expected': expected, 'candidates': [namesake]})
+    token = sr._ACTIVE_DISCOVERY_TRACE.set(recorder)
     try:
-        trace, discovery = resolver._attach_container_identity(
-            parsed(BELTON, 'Belton, J'), {'trace': 'first'}, {'outcome': 'bibliographic_conflict'})
+        resolver._attach_container_identity(parsed(BELTON, 'Belton, J'), {'outcome': 'bibliographic_conflict'})
     finally:
         sr._ACTIVE_DISCOVERY_TRACE.reset(token)
+    # The single finish derives the part's outcome without the namesake.
     assert not namesake.is_credible and namesake.disposition_reason_code == 'part_title_namesake'
-    assert trace == {'trace': 'again'}
-    assert discovery == {'outcome': 'possible_match', 'container_identity': {'status': 'identified',
-                                                                          'title': 'Bright lights'}}
+    assert recorder.container_identity == {'status': 'identified', 'title': 'Bright lights'}
 
 
 

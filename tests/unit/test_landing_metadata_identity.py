@@ -12,6 +12,7 @@ from app.services.reference_discovery import ExpectedBibliographicFields, assess
 from app.services.retrieval.base import AcquisitionLocation, RepresentationKind, RetrievalResult
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
 from app.services.search.transient import BRAVE_TRANSIENT_POLICY, finalize_transient_brave
+from tests.unit.discovery_support import recorder_from
 
 TITLE = "Synthetic bounded landing metadata control"
 DOI = "10.1234/synthetic-metadata-control"
@@ -44,11 +45,11 @@ def acquire(provider, html=HTML, status=200, expected_year="2020"):
         "outcome":"results","result_count":1,"provider_calls":1}],
         "location_attempts":result.metadata["location_attempts"],
         "transient_search_audits":result.metadata.get("transient_search_audits",[])}]
-    token = _ACTIVE_DISCOVERY_TRACE.set({"reference_id":"synthetic-reference",
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"reference_id":"synthetic-reference",
         "expected":ExpectedBibliographicFields(title=TITLE,doi=DOI,authors=["Example, Alice"],year=expected_year),
         "search_policy_version":"api-first-search-v2","search_retention_policy":BRAVE_TRANSIENT_POLICY,
         "required_web_providers":["brave","exa"],"required":{"bounded_web"},
-        "queries":[],"attempts":[],"candidates":[],"limitations":[]})
+        "queries":[],"attempts":[],"candidates":[],"limitations":[]}))
     try:
         resolver._record_discovery_attempt(category="bounded_web",provider="web_search",result=result,required=True)
         trace, record = resolver._discovery_artifacts()
@@ -149,7 +150,7 @@ def test_landing_identity_checks_complete_active_reference_before_promotion(extr
     expected = ExpectedBibliographicFields(
         title=TITLE, doi=DOI, authors=["Example, Alice"], year="2020", **extra,
     )
-    token = _ACTIVE_DISCOVERY_TRACE.set({"expected": expected})
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"expected": expected}))
     try:
         assert SourceResolver._landing_metadata_identity(
             response, expected_doi=DOI, expected_title=TITLE,
@@ -161,9 +162,9 @@ def test_landing_identity_checks_complete_active_reference_before_promotion(extr
 
 def test_landing_identity_with_complete_matching_active_reference_is_preserved():
     response = httpx.Response(200, text=HTML, request=httpx.Request("GET", URL))
-    token = _ACTIVE_DISCOVERY_TRACE.set({"expected": ExpectedBibliographicFields(
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"expected": ExpectedBibliographicFields(
         title=TITLE, doi=DOI, authors=["Example, Alice"], year="2020",
-    )})
+    )}))
     try:
         assert SourceResolver._landing_metadata_identity(
             response, expected_doi=DOI, expected_title=TITLE,
@@ -175,10 +176,10 @@ def test_landing_identity_with_complete_matching_active_reference_is_preserved()
 
 def test_parse_review_blocks_landing_identity_even_with_exact_fields():
     response = httpx.Response(200, text=HTML, request=httpx.Request("GET", URL))
-    token = _ACTIVE_DISCOVERY_TRACE.set({"expected": ExpectedBibliographicFields(
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"expected": ExpectedBibliographicFields(
         title=TITLE, doi=DOI, authors=["Example, Alice"], year="2020",
         reference_parse_review=True,
-    )})
+    )}))
     try:
         assert SourceResolver._landing_metadata_identity(
             response, expected_doi=DOI, expected_title=TITLE,

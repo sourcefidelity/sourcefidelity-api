@@ -1,5 +1,6 @@
 """Frozen policy controls. Provider doubles are not live quality acceptance."""
 
+from app.services.discovery_recorder import Finished
 from datetime import datetime, timezone
 import hashlib
 from unittest.mock import Mock
@@ -17,6 +18,7 @@ from app.services.retrieval.web_search import WebSearchRetriever
 from app.services.search.base import SearchResult
 from app.services.search.policy import API_FIRST_SEARCH_POLICY, LEGACY_SEARCH_POLICY
 from app.services.source_resolver import SourceResolver, _ACTIVE_DISCOVERY_TRACE
+from tests.unit.discovery_support import recorder_from
 
 
 @pytest.fixture
@@ -214,7 +216,7 @@ def test_provisional_brave_handoff_preserves_tier_accounting_not_candidate_url(c
         return result
     resolver.resolve = resolve
     resolver._enrich_book_editions = lambda: None
-    resolver._discovery_artifacts = lambda: (captured, {'outcome': 'search_incomplete'})
+    resolver._discovery_finished = lambda preview=False: Finished(captured, {'outcome': 'search_incomplete'}, None)
     result = resolver.resolve_reference(ParsedReference(reference_id='r1', title='Frozen source control',
         author='Writer', year='2020', source_kind='journal_article', raw_ref='Writer (2020). Frozen source control.'))
     assert result.full_text == b'%PDF-provisional-control'
@@ -310,10 +312,10 @@ def test_transient_dispositions_and_traces_do_not_retain_failed_results(cascade,
     # reference's title (search-completion-v1).
     result = resolver._try_source(search, None, "Frozen bibliographic control", "Writer", "2020")
     seed = trace_for(COMPLETE[:1])
-    token = _ACTIVE_DISCOVERY_TRACE.set({"reference_id": seed.reference_id, "expected": seed.expected,
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"reference_id": seed.reference_id, "expected": seed.expected,
         "search_policy_version": API_FIRST_SEARCH_POLICY, "search_retention_policy": "brave-operational-transient-v1",
         "required": {"academic_adapter", "bounded_web"}, "queries": seed.queries,
-        "attempts": seed.attempts, "candidates": []})
+        "attempts": seed.attempts, "candidates": []}))
     try:
         resolver._record_discovery_attempt(category="bounded_web", provider="web_search", result=result, required=True)
         trace, record = resolver._discovery_artifacts()
@@ -382,10 +384,10 @@ def test_independent_identity_provenance_survives_without_search_content(cascade
         "location_attempts": result.metadata["location_attempts"],
         "transient_search_audits": result.metadata["transient_search_audits"]}]
     seed = trace_for(COMPLETE[:1])
-    token = _ACTIVE_DISCOVERY_TRACE.set({"reference_id": seed.reference_id, "expected": seed.expected,
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"reference_id": seed.reference_id, "expected": seed.expected,
         "search_policy_version": API_FIRST_SEARCH_POLICY, "search_retention_policy": "brave-operational-transient-v1",
         "required": {"academic_adapter", "bounded_web"}, "queries": seed.queries,
-        "attempts": seed.attempts, "candidates": []})
+        "attempts": seed.attempts, "candidates": []}))
     try:
         SourceResolver._record_discovery_attempt(category="bounded_web", provider="web_search", result=result, required=True)
         trace, record = SourceResolver._discovery_artifacts()
@@ -623,10 +625,10 @@ def test_known_identity_does_not_require_full_text_or_exhaustive_search():
 
 def test_new_completed_negative_stays_suppressed_at_live_attachment_boundary():
     trace = trace_for(COMPLETE)
-    token = _ACTIVE_DISCOVERY_TRACE.set({"reference_id": trace.reference_id, "expected": trace.expected,
+    token = _ACTIVE_DISCOVERY_TRACE.set(recorder_from({"reference_id": trace.reference_id, "expected": trace.expected,
         "search_policy_version": trace.search_policy_version, "required": set(trace.required_route_categories),
         "required_web_providers": ["brave", "exa"], "queries": trace.queries,
-        "attempts": trace.attempts, "candidates": []})
+        "attempts": trace.attempts, "candidates": []}))
     try:
         saved, record = SourceResolver._discovery_artifacts()
     finally:
